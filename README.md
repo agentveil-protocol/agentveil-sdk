@@ -255,13 +255,21 @@ Submit up to 50 attestations in a single request. Each is validated independentl
 ```python
 results = agent.attest_batch([
     {"to_did": "did:key:z6MkAgent1...", "outcome": "positive", "weight": 0.9, "context": "code_review"},
-    {"to_did": "did:key:z6MkAgent2...", "outcome": "negative", "weight": 0.7, "evidence_hash": "sha256hex..."},
+    {
+        "to_did": "did:key:z6MkAgent2...",
+        "outcome": "negative",
+        "weight": 0.7,
+        "context": "failed_security_review",
+        "evidence_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    },
     {"to_did": "did:key:z6MkAgent3...", "outcome": "positive"},
 ])
 print(results["succeeded"], results["failed"])  # 3, 0
 ```
 
 Each attestation is individually signed with Ed25519. Optional fields: `context`, `evidence_hash`, `is_private`, `interaction_id`.
+Negative attestations require both `context` and a 64-character lowercase hex
+`evidence_hash`.
 
 ---
 
