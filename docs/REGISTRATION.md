@@ -76,6 +76,9 @@ Expected failures use SDK exception types:
 | `AVPServerError` | Backend dependency/configuration issue or malformed server response. |
 | `httpx.RequestError` | Network, DNS, TLS, or timeout failure before a response is returned. |
 
+See [Error Handling](ERRORS.md) for the full SDK exception hierarchy, HTTP
+status mapping, and recovery patterns.
+
 ## Onboarding
 
 Registration/verification and onboarding are different.

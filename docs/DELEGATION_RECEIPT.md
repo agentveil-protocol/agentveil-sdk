@@ -81,6 +81,8 @@ The verifier is offline: it does not call the AgentVeil API. Invalid receipts
 raise `agentveil.delegation.DelegationInvalid` with a `.reason` string such as
 `delegation expired`, `signature verification failed`,
 `verificationMethod does not match issuer`, or `invalid scope: ...`.
+See [Error Handling](ERRORS.md) for how `DelegationInvalid` fits with SDK
+HTTP exceptions.
 
 ## Common Patterns
 
