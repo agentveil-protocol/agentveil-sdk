@@ -17,6 +17,9 @@ Fresh release for the MCP action-control toolbox expansion.
   action-control toolbox for Runtime Gate, approval, and signed receipt
   workflows. Local/full mode now exposes 20 tools; hosted read-only mode
   remains at 8 tools.
+- Refreshed Glama metadata, roadmap, PyPI README, skill instructions, and MCP
+  integration examples so public-facing descriptions match the 20-tool
+  local/full MCP surface.
 
 ### Validation
 - MCP-1 production live smoke passed against `https://agentveil.dev`, covering

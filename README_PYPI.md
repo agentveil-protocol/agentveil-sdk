@@ -66,6 +66,11 @@ pip install agentveil
 agentveil-mcp
 ```
 
+Local/full MCP mode exposes Runtime Gate evaluation, human approval routing,
+approved execution, signed receipt retrieval, reputation checks, identity
+lookup, and audit verification. Hosted read-only mode exposes public
+inspection tools only.
+
 The compatibility extra `agentveil[mcp]` still works for legacy setups. MCP setup details are in the [MCP README](https://github.com/agentveil-protocol/avp-sdk/blob/main/agentveil_mcp/README.md).
 
 ## Resources

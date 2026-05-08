@@ -1,8 +1,8 @@
 # AVP Roadmap
 
-## Current — Public SDK 0.7.8 + Production API
+## Current — Public SDK 0.7.13 + Production API
 
-- [x] Public Python SDK 0.7.8 on PyPI: `pip install agentveil`
+- [x] Public Python SDK 0.7.13 on PyPI: `pip install agentveil`
 - [x] Production API for agent identity, advisory reputation, credentials, cards, audit verification, and Runtime Gate flows
 - [x] W3C DID identity (`did:key`, Ed25519)
 - [x] AVP-Sig request signing for authenticated protocol calls
@@ -12,7 +12,7 @@
 - [x] Signed runtime receipts and proof packet verification
 - [x] AVP JSON and W3C reputation credentials with offline verification
 - [x] Public security model: SDK mode vs gateway enforcement mode
-- [x] MCP server: 12 tools in local/full mode, with 8 read-only tools available in hosted mode
+- [x] MCP server: 20 tools in local/full mode, with 8 read-only tools available in hosted mode
 - [x] Framework examples for CrewAI, LangGraph, AutoGen, OpenAI, Claude MCP, Paperclip, Gemini, PydanticAI, and AWS Bedrock
 - [x] AVPProvider merged into Microsoft Agent Governance Toolkit (PR #1010)
 

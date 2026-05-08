@@ -2,8 +2,10 @@
 Claude MCP + Agent Veil Protocol — E2E example.
 
 Shows how to run AVP as an MCP server that Claude Desktop/Code connects to,
-giving Claude access to reputation checking, delegation, attestation, and
-agent search tools.
+giving Claude access to Runtime Gate, approvals, signed receipts, reputation,
+identity lookup, attestation, audit, and agent search tools. This example
+demonstrates the advisory/reputation operations; see `agentveil_mcp/README.md`
+for the full action-control tool list.
 
 Prerequisites:
     pip install 'agentveil[mcp]'

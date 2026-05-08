@@ -1,13 +1,12 @@
 ---
 name: avp-trust-enforcement
 description: >
-  AgentVeil advisory and audit tools for AI agent systems. Inspect agent public
-  profiles, check advisory reputation before delegation, submit signed
-  attestations after interactions, discover agents by capability, and verify
-  audit evidence through the AgentVeil MCP server. For risky action execution,
-  use the Python SDK Runtime Gate flow: integration_preflight(), controlled_action(),
-  and signed receipts.
-version: 1.2.0
+  AgentVeil action-control workflows for AI agent systems. Evaluate risky
+  actions with Runtime Gate, route human approvals, resume approved execution,
+  fetch signed receipts, inspect agent public profiles, check advisory
+  reputation, submit signed attestations, discover agents by capability, and
+  verify audit evidence through the AgentVeil MCP server and Python SDK.
+version: 1.3.0
 author: AgentVeil
 license: MIT
 metadata:
@@ -32,14 +31,18 @@ metadata:
         prompt: AgentVeil local agent name
 ---
 
-# AgentVeil — Advisory MCP Tools
+# AgentVeil — Action-Control MCP Workflows
 
-AgentVeil helps agents inspect public profiles, make advisory reputation
-checks, record signed interaction outcomes, and verify audit evidence.
+AgentVeil helps agents evaluate risky actions, route approvals, fetch signed
+receipts, inspect public profiles, make advisory reputation checks, record
+signed interaction outcomes, and verify audit evidence.
 
-This skill is for the AgentVeil MCP server. The MCP surface is the
-profile/advisory/audit interface. For risky action execution, use the Python SDK
-Runtime Gate flow:
+This skill is for the AgentVeil MCP server and Python SDK. Local/full MCP mode
+exposes explicit Runtime Gate, approval, approved execution, and receipt
+workflows alongside profile, advisory reputation, attestation, and audit
+tools. Hosted/read-only MCP deployments expose only public inspection tools.
+
+For direct Python integrations, use the SDK Runtime Gate flow:
 
 ```text
 integration_preflight() -> controlled_action() -> signed receipts
@@ -54,10 +57,12 @@ integration_preflight() -> controlled_action() -> signed receipts
 - Verify audit-chain integrity.
 - Register a local AgentVeil identity when using full local MCP mode.
 - Submit a signed attestation after an interaction.
+- Evaluate a risky action with Runtime Gate from local/full MCP mode.
+- Route human approval and resume approved execution.
+- Fetch signed DecisionReceipt and ExecutionReceipt artifacts.
 
-For risky actions such as deployments, data writes, payments, tool execution, or
-production changes, switch to the SDK Runtime Gate path and retain the signed
-receipts.
+For risky actions such as deployments, data writes, payments, tool execution,
+or production changes, use Runtime Gate and retain the signed receipts.
 
 ## Configuration
 
@@ -99,7 +104,9 @@ Example MCP client config:
 ```
 
 Hosted/read-only deployments expose public inspection tools. Local/full mode
-adds identity-backed tools that create local keys and sign write operations.
+adds identity-backed tools that create local keys, sign write operations, run
+Runtime Gate workflows, route approvals, resume approved execution, and fetch
+signed receipts.
 
 ## Available MCP Tools
 
@@ -116,7 +123,8 @@ Hosted/read-only mode exposes 8 public inspection tools:
 | `verify_audit_chain` | Verify audit-chain integrity. |
 | `get_protocol_stats` | Network-level counters. |
 
-Local/full mode includes 12 total tools by adding 4 identity-backed tools:
+Local/full mode includes 20 total tools by adding 4 identity-backed tools and
+8 action-control tools:
 
 | Tool | Purpose |
 |---|---|
@@ -124,6 +132,14 @@ Local/full mode includes 12 total tools by adding 4 identity-backed tools:
 | `submit_attestation` | Record a signed interaction outcome. |
 | `publish_agent_card` | Publish capabilities for discovery. |
 | `get_my_agent_info` | Inspect the local configured identity. |
+| `runtime_evaluate_action` | Ask Runtime Gate for ALLOW, WAITING_FOR_HUMAN_APPROVAL, or BLOCK. |
+| `controlled_action` | Run the SDK controlled-action flow and return the outcome. |
+| `get_approval_request` | Fetch a human approval request. |
+| `approve_action` | Approve a pending request and return signed receipt JCS plus sha256. |
+| `deny_action` | Deny a pending request and return signed receipt JCS plus sha256. |
+| `execute_after_approval` | Resume execution after approval using `approval_id`. |
+| `get_decision_receipt` | Fetch exact signed DecisionReceipt JCS plus sha256. |
+| `get_execution_receipt` | Fetch exact signed ExecutionReceipt JCS plus sha256. |
 
 ## Advisory Selection Pattern
 
@@ -135,7 +151,7 @@ Use this pattern when an agent needs to choose another agent for a task:
    borderline or high-impact.
 4. For low-risk delegation, proceed in your own workflow and record the result
    with `submit_attestation`.
-5. For risky actions, switch to the SDK Runtime Gate path before execution.
+5. For risky actions, use Runtime Gate before execution.
 6. Retain audit/proof references when the user needs evidence.
 
 ## Runtime Gate Path
@@ -161,13 +177,13 @@ outcome = agent.controlled_action(
 if outcome.status == "executed":
     receipt_jcs = outcome.receipt_jcs
 elif outcome.status == "approval_required":
-    approval_id = outcome.approval_id
+    approval_id = outcome.approval["approval_id"]
 elif outcome.status == "blocked":
     raise RuntimeError(outcome.reason)
 ```
 
-MCP tools can help select, inspect, and audit agents. Runtime Gate controls the
-execution boundary and produces signed receipts.
+MCP and SDK Runtime Gate workflows control the execution boundary and produce
+signed receipts.
 
 ## Boundaries
 
@@ -175,8 +191,10 @@ execution boundary and produces signed receipts.
 - Do not use MCP inspection tools as a substitute for Runtime Gate.
 - Do not send private keys, cloud credentials, raw private logs, or secrets to
   AgentVeil.
-- Hosted/read-only mode cannot register agents or submit attestations.
-- Identity-backed MCP write tools create local key files under `~/.avp/agents/`.
+- Hosted/read-only mode cannot register agents, submit attestations, or expose
+  action-control workflows.
+- Identity-backed MCP local/full tools create local key files under
+  `~/.avp/agents/`.
 - Controlled execution evidence should retain raw signed receipt text, not only
   parsed fields.
 

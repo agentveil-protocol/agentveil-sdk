@@ -1,6 +1,6 @@
 {
   "$schema": "https://glama.ai/mcp/schemas/server.json",
-  "description": "AgentVeil MCP exposes posture checks, trust decisions, audit verification, and signed evidence workflows for AI agent systems. Local/full mode includes 12 tools; hosted read-only mode exposes 8 tools.",
+  "description": "AgentVeil MCP brings action-control workflows to MCP clients: Runtime Gate evaluation, human approval routing, approved execution, signed receipt retrieval, reputation checks, identity lookup, and audit verification. Local/full mode exposes 20 tools; hosted read-only mode exposes 8 tools.",
   "maintainers": [
     "oleg-bk"
   ]

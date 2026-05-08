@@ -50,6 +50,10 @@ Full example: [`examples/autogen_example.py`](../examples/autogen_example.py)
 
 ## Claude (MCP Server)
 
+`agentveil-mcp` exposes Runtime Gate, approval, signed receipt, reputation,
+identity lookup, attestation, and audit workflows to MCP clients. Hosted
+read-only deployments expose public inspection tools only.
+
 ```bash
 pip install 'agentveil[mcp]'
 ```

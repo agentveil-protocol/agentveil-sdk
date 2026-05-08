@@ -2,7 +2,8 @@
 Claude MCP Server for Agent Veil Protocol.
 
 Runs as an MCP (Model Context Protocol) server that Claude Desktop/Code
-can connect to. Exposes AVP reputation tools as MCP tools.
+can connect to. The canonical `agentveil-mcp` server exposes AVP
+action-control, reputation, identity, attestation, and audit tools.
 
 Usage:
     agentveil-mcp
