@@ -13,3 +13,6 @@ venv/
 
 # Proof Pack demo artifacts — generated on every `run_demo.py` run
 examples/proof_pack/artifacts/
+
+# macOS Finder metadata
+.DS_Store
