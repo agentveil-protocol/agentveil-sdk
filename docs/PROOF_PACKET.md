@@ -10,6 +10,8 @@ or when you need to preserve the evidence around a blocked decision. For
 approval flows, include the signed HumanApprovalReceipt before treating the
 packet as fully verifiable approval evidence. A customer, auditor, or partner
 can verify the packet offline with trusted backend signer DID(s).
+See [Approval Routing](APPROVAL_ROUTING.md) for the approve/deny and resume
+path that produces the HumanApprovalReceipt.
 
 Proof Packets are different from the audit-chain walkthrough in
 [`examples/proof_pack/`](../examples/proof_pack/). A Proof Packet is one
@@ -160,7 +162,7 @@ Common causes include:
 | Failure | Recovery |
 |---|---|
 | Missing DecisionReceipt or ExecutionReceipt | Export the full proof artifacts from the controlled-action flow. |
-| Approval path without signed approval receipt | Fetch and include the HumanApprovalReceipt before verification. |
+| Approval path without signed approval receipt | Follow [Approval Routing](APPROVAL_ROUTING.md), then include the HumanApprovalReceipt before verification. |
 | Untrusted signer DID | Use the correct AVP backend signer DID for the environment. |
 | Signature invalid | Treat the packet as tampered or corrupted. Re-export from source artifacts. |
 | Hash linkage mismatch | Treat the packet as assembled from mismatched action artifacts. |

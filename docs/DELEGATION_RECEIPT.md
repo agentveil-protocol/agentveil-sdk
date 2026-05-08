@@ -90,7 +90,7 @@ HTTP exceptions.
 |---|---|---|
 | Short-lived deploy delegation | `allowed_categories=["deploy"]`, `valid_for=timedelta(minutes=15)` | Good default for release workflows and CI jobs. |
 | Multi-resource delegation | `allowed_categories=["deploy", "infrastructure"]` | The receipt authorizes categories; exact action/resource/environment are checked by `controlled_action(...)`. |
-| Approval-required delegation | `allowed_categories=["infrastructure"]`, short validity | Delegation supplies authority evidence; policy can still return `approval_required`. |
+| Approval-required delegation | `allowed_categories=["infrastructure"]`, short validity | Delegation supplies authority evidence; policy can still return `approval_required`. See [Approval Routing](APPROVAL_ROUTING.md). |
 | Long-lived service delegation | `valid_for=timedelta(days=7)` or similar | Use sparingly. Prefer short windows and rotate receipts when automation allows. |
 
 ## File Persistence
@@ -130,6 +130,8 @@ If `outcome.status == "executed"`, retain the signed receipt and export a proof
 packet with `agent.build_proof_packet(...)`. If the status is
 `approval_required`, route the approval to the principal and resume with
 `execute_after_approval(...)`.
+See [Approval Routing](APPROVAL_ROUTING.md) for the full grant and resume
+pattern.
 See [Proof Packet Guide](PROOF_PACKET.md) for export, save, and offline
 verification.
 

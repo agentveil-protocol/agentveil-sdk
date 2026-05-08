@@ -249,6 +249,7 @@ Each attestation is individually signed with Ed25519. Optional fields: `context`
 | [Customer Integration](docs/CUSTOMER_INTEGRATION.md) | Controlled-action flow, secrets, errors, and compliance evidence |
 | [Error Handling](docs/ERRORS.md) | Exception hierarchy, recovery patterns, HTTP status mapping |
 | [Proof Packet Guide](docs/PROOF_PACKET.md) | Build, save, verify signed action evidence offline |
+| [Approval Routing](docs/APPROVAL_ROUTING.md) | Resolve approval_required outcomes, grant/deny patterns, resume execution |
 | [Registration & Verification](docs/REGISTRATION.md) | Agent registration lifecycle, states, error cases, passphrase security |
 | [DelegationReceipt Guide](docs/DELEGATION_RECEIPT.md) | Issuance, verification, common patterns, error handling |
 | [Integrations](docs/INTEGRATIONS.md) | Framework-specific setup guides |
@@ -265,6 +266,7 @@ Each attestation is individually signed with Ed25519. Optional fields: `context`
 | Example | Description |
 |---------|-------------|
 | [`first_controlled_action.py`](examples/first_controlled_action.py) | **Action control demo** — preflight → Runtime Gate → approval routing → signed receipt |
+| [`approval_flow.py`](examples/approval_flow.py) | **Approval pattern** — controlled_action → approval_required → grant → execute_after_approval |
 | [`handle_errors.py`](examples/handle_errors.py) | **Error patterns** — typed exception handling for retry, re-auth, validation, network |
 | [`proof_packet_export.py`](examples/proof_packet_export.py) | **Proof packet export** — build, save, reload, verify offline (mock mode) |
 | [`registration/`](examples/registration/) | **Registration patterns** — first-time setup, verification state, encrypted reload |

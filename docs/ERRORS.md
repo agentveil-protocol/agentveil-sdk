@@ -72,7 +72,7 @@ of raising for common readiness states.
 | Rate limit during `attest_batch(...)` | `AVPRateLimitError`, `retry_after` | Sleep at least `retry_after`, then retry with jitter/backoff. |
 | Malformed DelegationReceipt in `runtime_evaluate(...)` | `AVPValidationError` | Verify the receipt offline first and correct input before retrying. |
 | Backend unavailable during `controlled_action(...)` | `AVPServerError` | Do not execute the action directly. Retry later or fail closed. |
-| Approval not ready or expired | `AVPValidationError` with a conflict-style message | Surface the state to the principal and create or wait for a valid approval. |
+| Approval not ready or expired | `AVPValidationError` with a conflict-style message | Surface the state to the principal and follow [Approval Routing](APPROVAL_ROUTING.md). |
 | Invalid DelegationReceipt offline | `DelegationInvalid` | Ask the principal for a fresh receipt with the intended scope and validity window. |
 
 ## Recovery Snippets
@@ -137,5 +137,6 @@ those as programming errors and validate inputs before calling the SDK.
 
 - [Customer Integration](CUSTOMER_INTEGRATION.md) for controlled-action error states and proof retention.
 - [Proof Packet Guide](PROOF_PACKET.md) for `ProofVerificationError` handling.
+- [Approval Routing](APPROVAL_ROUTING.md) for approval retry, timeout, and denial handling.
 - [Registration & Verification](REGISTRATION.md) for setup and verification recovery.
 - [DelegationReceipt Guide](DELEGATION_RECEIPT.md) for offline delegation validation failures.
