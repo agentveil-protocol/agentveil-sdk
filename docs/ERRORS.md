@@ -11,6 +11,7 @@ proof errors separately.
 Exception
 ├── httpx.RequestError
 ├── agentveil.delegation.DelegationInvalid
+├── agentveil.proof.ProofVerificationError
 └── AVPError
     ├── AVPAuthError
     ├── AVPNotFoundError
@@ -41,6 +42,7 @@ Exception
 | `AVPError` | Any other SDK-mapped response | `message`, `status_code`, `detail` | Unexpected status code or SDK-level failure | Log status/detail and fail safely. |
 | `httpx.RequestError` | Request could not reach the API | Native `httpx` fields | DNS, TLS, proxy, timeout, connection refused | Check `base_url`, network, TLS, and retry only after transport is healthy. |
 | `DelegationInvalid` | Offline DelegationReceipt verification failure | `reason` | Expired receipt, invalid signature, wrong issuer, unsupported scope | Obtain a fresh valid DelegationReceipt from the principal. |
+| `ProofVerificationError` | Offline proof artifact verification failure | Reason via `str(exc)` | Invalid signature, untrusted signer DID, malformed packet, or receipt hash mismatch | Treat as failed evidence verification and re-export from trusted source artifacts. |
 
 ## HTTP Mapping
 
@@ -134,5 +136,6 @@ those as programming errors and validate inputs before calling the SDK.
 ## Related Guides
 
 - [Customer Integration](CUSTOMER_INTEGRATION.md) for controlled-action error states and proof retention.
+- [Proof Packet Guide](PROOF_PACKET.md) for `ProofVerificationError` handling.
 - [Registration & Verification](REGISTRATION.md) for setup and verification recovery.
 - [DelegationReceipt Guide](DELEGATION_RECEIPT.md) for offline delegation validation failures.

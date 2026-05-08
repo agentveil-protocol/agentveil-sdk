@@ -143,7 +143,8 @@ proof_packet = packet.to_dict()
 The helper does not fetch remote resources. It preserves raw signed receipt
 text as `decision_receipt_jcs`, `execution_receipt_jcs`, and
 `approval_receipt_jcs`, and includes parsed receipt fields only as a convenience
-view.
+view. See [Proof Packet Guide](PROOF_PACKET.md) for export, save, reload, and
+offline verification patterns.
 
 Production applications should also catch SDK exceptions around
 `controlled_action(...)`, especially `AVPRateLimitError`, `AVPValidationError`,

@@ -156,6 +156,7 @@ After registration is ready:
 1. Run `agent.integration_preflight()`.
 2. Obtain or issue a DelegationReceipt for the intended action scope.
 3. Call `controlled_action(...)`.
+4. Export and verify Proof Packets with [Proof Packet Guide](PROOF_PACKET.md).
 
 See [Customer Integration](CUSTOMER_INTEGRATION.md) for the controlled-action
 path and [DelegationReceipt Guide](DELEGATION_RECEIPT.md) for delegation

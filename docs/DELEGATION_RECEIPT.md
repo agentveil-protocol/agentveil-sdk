@@ -130,6 +130,8 @@ If `outcome.status == "executed"`, retain the signed receipt and export a proof
 packet with `agent.build_proof_packet(...)`. If the status is
 `approval_required`, route the approval to the principal and resume with
 `execute_after_approval(...)`.
+See [Proof Packet Guide](PROOF_PACKET.md) for export, save, and offline
+verification.
 
 See [Customer Integration](CUSTOMER_INTEGRATION.md) for the full runtime path
 and [examples/delegation](../examples/delegation/) for runnable offline
