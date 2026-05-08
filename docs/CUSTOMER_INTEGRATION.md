@@ -118,7 +118,7 @@ if result.status == "executed":
     receipt_jcs = result.receipt_jcs      # exact signed proof artifact
     receipt = result.receipt              # parsed convenience view
 elif result.status == "approval_required":
-    approval_id = result.approval_id
+    approval_id = result.approval["approval_id"]
 elif result.status == "blocked":
     reason = result.reason
 ```
@@ -143,7 +143,8 @@ proof_packet = packet.to_dict()
 The helper does not fetch remote resources. It preserves raw signed receipt
 text as `decision_receipt_jcs`, `execution_receipt_jcs`, and
 `approval_receipt_jcs`, and includes parsed receipt fields only as a convenience
-view.
+view. See [Proof Packet Guide](PROOF_PACKET.md) for export, save, reload, and
+offline verification patterns.
 
 Production applications should also catch SDK exceptions around
 `controlled_action(...)`, especially `AVPRateLimitError`, `AVPValidationError`,
@@ -156,6 +157,11 @@ selecting the agent and defining the allowed action scope. Put that signed
 receipt in `AVP_DELEGATION_RECEIPT_FILE` or `AVP_DELEGATION_RECEIPT_JSON`.
 
 ## Approval Resume Path
+
+When `controlled_action(...)` returns `approval_required`, use
+`result.approval["approval_id"]` and route the request to the principal. See
+[Approval Routing](APPROVAL_ROUTING.md) for polling, approve/deny, and resume
+patterns.
 
 ```python
 receipt_result = agent.execute_after_approval(
@@ -176,6 +182,7 @@ Use these when your application wants to own orchestration:
 
 - `runtime_evaluate(...)`
 - `get_runtime_decision(audit_id)`
+- `get_decision_receipt(audit_id)`
 - `execute(...)`
 - `get_execution_receipt(receipt_id)`
 - `create_approval(...)`
@@ -190,7 +197,9 @@ Use these when your application wants to own orchestration:
 - `get_remediation_case(case_id)`
 - `add_remediation_evidence(...)`
 
-`execute()`, `get_execution_receipt()`, `approve()`, and `deny()` return exact signed JSON text. Keep that string for offline proof.
+`get_decision_receipt()`, `execute()`, `get_execution_receipt()`, `approve()`,
+and `deny()` return exact signed JSON text. Keep those strings for offline
+proof.
 
 ## Error Map
 

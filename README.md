@@ -98,7 +98,7 @@ outcome = agent.controlled_action(
 )
 
 if outcome.status == "approval_required":
-    wait_for_principal_approval(outcome.approval_id)
+    wait_for_principal_approval(outcome.approval["approval_id"])
 elif outcome.status == "executed":
     store(outcome.receipt_jcs)
 elif outcome.status == "blocked":
@@ -119,6 +119,38 @@ The response is a standard W3C VC with a `DataIntegrityProof` (`eddsa-jcs-2022`)
 cred = agent.get_reputation_credential(format="w3c")
 assert AVPAgent.verify_w3c_credential(cred)  # offline, no API call
 ```
+
+---
+
+## Mode A Quickstart
+
+Project owners can use AgentVeil as an action-control path for agents, tools,
+workflows, MCP servers, and CI jobs inside one project.
+
+1. Scan the project with Posture v0.1:
+
+   ```bash
+   pip install agentveil-posture        # (planned after Phase 1 acceptance)
+   agentveil-posture scan ./your-project
+   ```
+
+2. Define local policy:
+
+   ```bash
+   agentveil policy init                # (planned for v0.8 / Phase 3)
+   ```
+
+3. Evaluate actions before execution:
+
+   ```python
+   from agentveil import evaluate_action  # (planned for v0.8 / Phase 3)
+   ```
+
+4. Produce signed evidence today with `controlled_action(...)`,
+   DelegationReceipts, approval routing, and Proof Packets.
+
+See [Mode A Quickstart](docs/MODE_A_QUICKSTART.md) for the full Project Owner
+path and planned capability markers.
 
 ---
 
@@ -151,6 +183,8 @@ and the structural problem AgentVeil addresses.
 
 These advisory APIs feed the Runtime Gate's risk assessment. They inform
 action gating decisions but do not grant execution authority on their own.
+For direct reputation and agent-network usage, see
+[Agent Network (Advanced)](docs/ADVANCED_AGENT_NETWORK.md).
 
 For advisory selection and existing integrations, the SDK also includes:
 
@@ -221,13 +255,21 @@ Submit up to 50 attestations in a single request. Each is validated independentl
 ```python
 results = agent.attest_batch([
     {"to_did": "did:key:z6MkAgent1...", "outcome": "positive", "weight": 0.9, "context": "code_review"},
-    {"to_did": "did:key:z6MkAgent2...", "outcome": "negative", "weight": 0.7, "evidence_hash": "sha256hex..."},
+    {
+        "to_did": "did:key:z6MkAgent2...",
+        "outcome": "negative",
+        "weight": 0.7,
+        "context": "failed_security_review",
+        "evidence_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    },
     {"to_did": "did:key:z6MkAgent3...", "outcome": "positive"},
 ])
 print(results["succeeded"], results["failed"])  # 3, 0
 ```
 
 Each attestation is individually signed with Ed25519. Optional fields: `context`, `evidence_hash`, `is_private`, `interaction_id`.
+Negative attestations require both `context` and a 64-character lowercase hex
+`evidence_hash`.
 
 ---
 
@@ -247,11 +289,19 @@ Each attestation is individually signed with Ed25519. Optional fields: `context`
 |-----|-------------|
 | [API Reference](docs/API.md) | Full SDK method reference with examples |
 | [Customer Integration](docs/CUSTOMER_INTEGRATION.md) | Controlled-action flow, secrets, errors, and compliance evidence |
+| [Mode A Quickstart](docs/MODE_A_QUICKSTART.md) | Project owner path — scan, policy, evaluate, evidence |
+| [Error Handling](docs/ERRORS.md) | Exception hierarchy, recovery patterns, HTTP status mapping |
+| [Proof Packet Guide](docs/PROOF_PACKET.md) | Build, save, verify signed action evidence offline |
+| [Live Developer Adoption Smoke](docs/LIVE_DEVELOPER_ADOPTION_SMOKE.md) | Production validation for Runtime Gate, approval, proof packets, typed errors |
+| [Approval Routing](docs/APPROVAL_ROUTING.md) | Resolve approval_required outcomes, grant/deny patterns, resume execution |
+| [Registration & Verification](docs/REGISTRATION.md) | Agent registration lifecycle, states, error cases, passphrase security |
+| [DelegationReceipt Guide](docs/DELEGATION_RECEIPT.md) | Issuance, verification, common patterns, error handling |
 | [Integrations](docs/INTEGRATIONS.md) | Framework-specific setup guides |
 | [Webhook Alerts](docs/WEBHOOKS.md) | Push notification setup |
 | [Protocol Spec](docs/PROTOCOL.md) | AgentVeil wire format and authentication |
 | [Security Model](docs/SECURITY_MODEL.md) | Mode 1 SDK developer flow, Mode 2/3 gateway enforcement roadmap |
 | [Security Context](docs/SECURITY_CONTEXT.md) | Why agent trust matters — CVEs and market data |
+| [Agent Network (Advanced)](docs/ADVANCED_AGENT_NETWORK.md) | Reputation, attestations, agent identity — internal mechanisms |
 | [Changelog](CHANGELOG.md) | Version history |
 
 ---
@@ -261,8 +311,13 @@ Each attestation is individually signed with Ed25519. Optional fields: `context`
 | Example | Description |
 |---------|-------------|
 | [`first_controlled_action.py`](examples/first_controlled_action.py) | **Action control demo** — preflight → Runtime Gate → approval routing → signed receipt |
+| [`approval_flow.py`](examples/approval_flow.py) | **Approval pattern** — controlled_action → approval_required → grant → execute_after_approval |
+| [`handle_errors.py`](examples/handle_errors.py) | **Error patterns** — typed exception handling for retry, re-auth, validation, network |
+| [`proof_packet_export.py`](examples/proof_packet_export.py) | **Proof packet export** — build, save, reload, verify offline (mock mode) |
+| [`registration/`](examples/registration/) | **Registration patterns** — first-time setup, verification state, encrypted reload |
+| [`delegation/`](examples/delegation/) | **DelegationReceipt patterns** — issue, verify offline, persist/reload, multi-scope |
 | [`proof_pack/`](examples/proof_pack/) | **Offline audit verification** — local-backend demo: signed events → tamper-resistant chain → independent offline verification (no SDK or AVP API needed). Local backend required. |
-| [`standalone_demo.py`](examples/standalone_demo.py) | **Reputation flow demo** — registration, peer attestations, scoring (mock mode, no server) |
+| [`standalone_demo.py`](examples/standalone_demo.py) | **Agent network primitives** — registration, peer attestations, scoring (mock mode, no server). Advanced internal surface. For action control, see [Mode A Quickstart](docs/MODE_A_QUICKSTART.md). |
 | [`quickstart.py`](examples/quickstart.py) | Register, publish card, check reputation |
 | [`two_agents.py`](examples/two_agents.py) | Full A2A interaction with attestations |
 | [`verify_credential_standalone.py`](examples/verify_credential_standalone.py) | Offline credential verification (no SDK needed) |

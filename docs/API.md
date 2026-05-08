@@ -77,7 +77,7 @@ outcome = agent.controlled_action(
 if outcome.status == "executed":
     receipt_jcs = outcome.receipt_jcs
 elif outcome.status == "approval_required":
-    approval_id = outcome.approval_id
+    approval_id = outcome.approval["approval_id"]
 elif outcome.status == "blocked":
     raise RuntimeError(outcome.reason)
 ```
@@ -188,6 +188,7 @@ views, but `receipt_jcs` is the proof artifact.
 
 ```python
 if outcome.status == "executed":
+    decision_receipt_jcs = agent.get_decision_receipt(outcome.decision["audit_id"])
     receipt_jcs = outcome.receipt_jcs
     receipt = outcome.receipt
 ```

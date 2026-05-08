@@ -84,7 +84,7 @@ def handle_outcome(result: ControlledActionOutcome) -> None:
     if result.status == "approval_required":
         print("status=approval_required")
         print(f"audit_id={result.decision.get('audit_id') if result.decision else ''}")
-        print(f"approval_id={result.approval.get('id') if result.approval else ''}")
+        print(f"approval_id={result.approval.get('approval_id') if result.approval else ''}")
         print("next_action=principal must approve, then call execute_after_approval(...)")
         return
 

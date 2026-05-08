@@ -312,6 +312,34 @@ class TestRuntimeControlContract:
         assert captured["body"]["params"] == {"resource_id": "resource:1"}
         assert result == raw
 
+    def test_get_decision_receipt_returns_exact_raw_receipt_text(self):
+        agent = _make_agent()
+        captured = {}
+        raw = '{"audit_id":"urn:uuid:11111111-1111-1111-1111-111111111111","schema_version":"decision_receipt/2"}'
+
+        def mock_get(url, **kwargs):
+            captured["url"] = url
+            captured["headers"] = kwargs.get("headers")
+            resp = MagicMock(spec=httpx.Response)
+            resp.status_code = 200
+            resp.text = raw
+            resp.json.return_value = {
+                "audit_id": "urn:uuid:11111111-1111-1111-1111-111111111111",
+                "schema_version": "decision_receipt/2",
+            }
+            return resp
+
+        with patch.object(httpx.Client, "get", side_effect=mock_get):
+            result = agent.get_decision_receipt(
+                "urn:uuid:11111111-1111-1111-1111-111111111111"
+            )
+
+        assert captured["url"] == (
+            "/v1/runtime/decisions/urn:uuid:11111111-1111-1111-1111-111111111111/receipt"
+        )
+        assert "Authorization" in captured["headers"]
+        assert result == raw
+
     def test_create_approval_sends_full_delegation_receipt(self):
         agent = _make_agent()
         captured = {}
@@ -321,7 +349,7 @@ class TestRuntimeControlContract:
             captured["body"] = json.loads(kwargs.get("content", b"{}"))
             resp = MagicMock(spec=httpx.Response)
             resp.status_code = 200
-            resp.json.return_value = {"id": "urn:uuid:approval", "status": "PENDING"}
+            resp.json.return_value = {"approval_id": "urn:uuid:approval", "status": "PENDING"}
             return resp
 
         receipt = {"id": "urn:uuid:receipt", "issuer": "did:key:z6MkIssuer"}

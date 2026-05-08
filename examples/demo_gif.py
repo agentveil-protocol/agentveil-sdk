@@ -94,7 +94,7 @@ p(f"{Y}  PAUSED{RST}  AgentVeil gates the action before it runs", 0.68)
 # Scene 4: Approval + controlled execution
 header("4", "Approval unlocks execution")
 
-code("approval = owner.approve(outcome.approval['id'])", 0.24)
+code("approval = owner.approve(outcome.approval['approval_id'])", 0.24)
 code("outcome = agent.execute_after_approval(...)", 0.24)
 p(f"{D}  {{")
 kv("approval", '"operator_approved"', G)

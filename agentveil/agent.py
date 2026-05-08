@@ -1357,6 +1357,15 @@ class AVPAgent:
         """Fetch this agent's Runtime Gate decision by audit_id."""
         return self._get_json(f"/v1/runtime/decisions/{audit_id}")
 
+    def get_decision_receipt(self, audit_id: str) -> str:
+        """
+        Fetch the exact signed Runtime Gate DecisionReceipt JSON text.
+
+        Pass this exact string to ``build_proof_packet(...)``; parsing and
+        re-serializing changes the signed bytes.
+        """
+        return self._get_raw_json(f"/v1/runtime/decisions/{audit_id}/receipt")
+
     def execute(
         self,
         audit_id: str,

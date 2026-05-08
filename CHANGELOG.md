@@ -2,6 +2,52 @@
 
 All notable changes to the `agentveil` SDK.
 
+## [0.7.12] - 2026-05-08
+
+Self-service developer adoption: Proof Packet export helper, corrected
+approval payload references, Live Developer Adoption Smoke evidence path, and
+Mode A onboarding docs.
+
+### Added
+- Added `AVPAgent.get_decision_receipt(audit_id: str) -> str` so customers can
+  fetch exact signed Runtime Gate DecisionReceipt JSON text and pass it into
+  `build_proof_packet(...)` without parsing and re-serializing the signed
+  bytes. See `docs/PROOF_PACKET.md` and `docs/API.md`.
+- Added the production release-gate smoke
+  `examples/live_developer_adoption_smoke.py` with
+  `docs/LIVE_DEVELOPER_ADOPTION_SMOKE.md`. It validates the self-service path
+  against `https://agentveil.dev`: DelegationReceipt issue/verify, all three
+  Runtime Gate outcomes, approval resume, Proof Packet export, strict offline
+  verification, and typed SDK errors.
+- Added Mode A and advanced network onboarding docs:
+  `docs/MODE_A_QUICKSTART.md` for the Project Owner path and
+  `docs/ADVANCED_AGENT_NETWORK.md` for reputation, attestations, DID identity,
+  and W3C VC primitives.
+
+### Fixed
+- Corrected approval-required snippets, docs, examples, and mocks to use
+  `outcome.approval["approval_id"]`, matching the production payload. Previous
+  docs used either `outcome.approval_id` (not populated on the initial
+  `approval_required` outcome) or `outcome.approval["id"]` from mock-only
+  examples. See `docs/APPROVAL_ROUTING.md`,
+  `docs/CUSTOMER_INTEGRATION.md`, and `examples/approval_flow.py`.
+- Corrected the README `attest_batch(...)` example so the negative attestation
+  includes both `context` and a 64-character lowercase hex `evidence_hash`.
+  The `# 3, 0` success/failure comment now matches the server contract.
+
+### Changed
+- Linked the new release smoke from the README documentation table and
+  cross-linked the Proof Packet, approval, registration, delegation, and error
+  guides so the self-service flow has a complete evidence path.
+- Repositioned the public docs around the primary action-control path while
+  keeping advanced agent-network primitives discoverable for customers who need
+  reputation, attestations, or credential workflows.
+
+### Validation
+- Live Developer Adoption Smoke passed against production `agentveil.dev` with
+  strict trusted signer DID verification.
+- `python -m pytest -q` passed with `256 passed, 1 warning`.
+
 ## [0.7.11] — 2026-05-08
 
 ### Changed

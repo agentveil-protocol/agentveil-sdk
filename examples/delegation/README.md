@@ -4,13 +4,17 @@ A delegation receipt is a W3C VC v2.0 credential signed by a *principal* that
 authorizes an *agent* to act within a stated scope. Receipts are verifiable
 **offline** by anyone — no network, no AVP backend, no SDK required.
 
-This directory contains a standalone reference verifier you can read end to
-end and run against any AgentVeil delegation receipt.
+This directory contains runnable DelegationReceipt examples plus a standalone
+reference verifier you can read end to end and run against any AgentVeil
+delegation receipt.
 
 ## Files
 
 | File | Purpose |
 |---|---|
+| `issue_and_verify_offline.py` | Minimal SDK example: issue and verify locally in mock mode. |
+| `persist_and_reload.py` | Save a receipt as JSON, reload it, and verify it offline. |
+| `multi_scope_delegation.py` | Issue one receipt with multiple categories and a spend cap. |
 | `verify.py` | Standalone verifier (~180 lines). No `agentveil` SDK dependency. |
 | `samples/valid.json` | Properly signed receipt, large validity window. |
 | `samples/expired.json` | Properly signed receipt with `validUntil` in the past. |
@@ -20,6 +24,10 @@ end and run against any AgentVeil delegation receipt.
 ## Quick start
 
 ```bash
+python issue_and_verify_offline.py
+python persist_and_reload.py
+python multi_scope_delegation.py
+
 pip install pynacl base58 jcs
 
 # pass a file

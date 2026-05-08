@@ -55,7 +55,7 @@ def test_controlled_action_waiting_creates_approval_without_executing():
         "decision": "WAITING_FOR_HUMAN_APPROVAL",
         "reason": "destructive_production_action",
     }
-    approval = {"id": "urn:uuid:approval", "status": "PENDING"}
+    approval = {"approval_id": "urn:uuid:approval", "status": "PENDING"}
     delegation_receipt = {"id": "urn:uuid:receipt"}
 
     with patch.object(agent, "runtime_evaluate", return_value=decision), \
@@ -217,7 +217,7 @@ def test_build_proof_packet_includes_optional_approval_and_remediation_artifacts
     outcome = ControlledActionOutcome(
         status="approval_required",
         decision={"audit_id": "urn:uuid:audit", "decision": "WAITING_FOR_HUMAN_APPROVAL"},
-        approval={"id": "urn:uuid:approval", "status": "PENDING"},
+        approval={"approval_id": "urn:uuid:approval", "status": "PENDING"},
     )
 
     packet = agent.build_proof_packet(
@@ -229,7 +229,7 @@ def test_build_proof_packet_includes_optional_approval_and_remediation_artifacts
     )
 
     assert packet.outcome_status == "approval_required"
-    assert packet.approval == {"id": "urn:uuid:approval", "status": "PENDING"}
+    assert packet.approval == {"approval_id": "urn:uuid:approval", "status": "PENDING"}
     assert packet.approval_receipt_jcs == approval_receipt_jcs
     assert packet.approval_receipt["status"] == "APPROVED"
     assert packet.remediation_case["id"] == "urn:uuid:case"
