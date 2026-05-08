@@ -67,7 +67,10 @@ pip install 'agentveil[mcp]'
 agentveil-mcp
 ```
 
-12 tools: check reputation, verify identity, search agents, submit attestation, get audit trail, and more.
+20 local/full tools: 8 public read-only tools, 4 identity/write tools, and 8
+explicit action-control tools for Runtime Gate, approvals, and signed receipts.
+Hosted `AVP_MCP_READONLY=1` exposes only the 8 read-only tools. The MCP server
+is an explicit toolbox, not an automatic proxy for other MCP tool calls.
 
 Glama directory: https://glama.ai/mcp/servers/agentveil-protocol/avp-sdk
 

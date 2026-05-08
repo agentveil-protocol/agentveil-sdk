@@ -234,7 +234,7 @@ def review_code(pr_url: str) -> str:
 | **LangGraph** | `pip install agentveil langgraph` | `ToolNode([avp_check_reputation, avp_should_delegate, avp_log_interaction])` |
 | **AutoGen** | `pip install agentveil autogen-core` | `avp_reputation_tools()` |
 | **OpenAI** | `pip install agentveil openai` | `avp_tool_definitions()` + `handle_avp_tool_call(...)` from `agentveil.tools.openai` |
-| **MCP clients** | `pip install 'agentveil[mcp]'` | `agentveil-mcp` for Claude Desktop, Cursor, Windsurf, and VS Code ([docs](agentveil_mcp/README.md)) |
+| **MCP clients** | `pip install 'agentveil[mcp]'` | `agentveil-mcp` explicit action-control toolbox for Runtime Gate, approvals, receipts, reputation, and audit; not an automatic MCP proxy ([docs](agentveil_mcp/README.md)) |
 | **Gemini** | `pip install agentveil google-generativeai` | Function-calling example: [`examples/gemini_example.py`](examples/gemini_example.py) |
 | **PydanticAI** | `pip install agentveil pydantic-ai` | Tool example: [`examples/pydantic_ai_example.py`](examples/pydantic_ai_example.py) |
 | **Paperclip** | `pip install agentveil` | `avp_should_delegate(...)`, `avp_evaluate_team(...)`, `avp_plugin_tools()` |

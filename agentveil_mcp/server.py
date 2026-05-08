@@ -9,7 +9,7 @@ Usage:
     python -m agentveil_mcp       # equivalent to stdio transport
 
 Hosted mode env vars (HTTP transport only):
-    AVP_MCP_READONLY=1               # skip write-tool registration
+    AVP_MCP_READONLY=1               # skip local/full tool registration
     AVP_MCP_TOKEN=<secret>           # required for --http; requests without
                                      # Authorization: Bearer <token> return 401
     AVP_MCP_ALLOWED_HOSTS=host1,...  # comma-separated public hostnames to
@@ -22,7 +22,8 @@ Hosted mode env vars (HTTP transport only):
 import json
 import os
 import logging
-from typing import Annotated
+import hashlib
+from typing import Annotated, Any, Optional
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -87,13 +88,13 @@ def _build_transport_security() -> TransportSecuritySettings:
 mcp = FastMCP(
     "Agent Veil Protocol",
     instructions=(
-        "AgentVeil helps AI agents inspect public profiles, make advisory reputation checks, "
-        "verify audit evidence, and record signed interaction outcomes. "
+        "AgentVeil MCP is an explicit action-control toolbox, not an automatic MCP proxy. "
+        "It does not intercept other MCP tools by itself. "
+        "Use it to evaluate risky actions with AVP Runtime Gate, route human approvals, "
+        "resume approved execution, fetch signed receipts, inspect public profiles, "
+        "make advisory reputation checks, verify audit evidence, and record signed outcomes. "
         "Use read-only tools to inspect agent reputation, public profiles, audit history, "
-        "and protocol stats. Use write tools only when a local AgentVeil identity is configured. "
-        "For risky action execution, use the Python SDK Runtime Gate flow "
-        "(`integration_preflight`, `controlled_action`, and signed receipts); "
-        "the MCP server currently exposes advisory and audit tools."
+        "and protocol stats. Use local/full tools only when a local AgentVeil identity is configured."
     ),
     transport_security=_build_transport_security(),
 )
@@ -119,6 +120,47 @@ def _get_agent() -> AVPAgent:
 def _err(e: Exception) -> str:
     """Format error for MCP response."""
     return json.dumps({"error": str(e), "type": type(e).__name__})
+
+
+def _parse_json_object(value: Any, field_name: str, *, default: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Parse an MCP JSON-object string without accepting lists/scalars."""
+    if isinstance(value, dict):
+        return value
+    if value is None:
+        if default is not None:
+            return dict(default)
+        raise ValueError(f"{field_name} must be a JSON object string")
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a JSON object string")
+
+    text = value.strip()
+    if not text:
+        if default is not None:
+            return dict(default)
+        raise ValueError(f"{field_name} must be a JSON object string")
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{field_name} must be valid JSON: {exc.msg}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{field_name} must decode to a JSON object")
+    return parsed
+
+
+def _sha256_text(text: str) -> str:
+    """Return sha256 hex digest for exact UTF-8 text."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _receipt_jcs_response(key: str, receipt_jcs: str) -> str:
+    """Wrap exact signed JCS text without parsing or re-serializing it."""
+    if not isinstance(receipt_jcs, str) or not receipt_jcs:
+        raise ValueError(f"{key} must be a non-empty string")
+    return json.dumps({
+        key: receipt_jcs,
+        "sha256": _sha256_text(receipt_jcs),
+    }, indent=2)
 
 
 # ============================================================
@@ -391,7 +433,7 @@ def get_audit_trail(
 
 
 # ============================================================
-# WRITE TOOLS (require agent identity)
+# LOCAL/FULL TOOLS (require agent identity)
 #
 # In readonly mode (AVP_MCP_READONLY=1) these tools are NOT registered with
 # FastMCP at all. They never appear in tools/list, never get invoked, and
@@ -578,6 +620,170 @@ def get_my_agent_info() -> str:
 
 
 # ============================================================
+# ACTION-CONTROL TOOLS (require agent identity)
+#
+# These tools expose the AVP Runtime Gate / approval / receipt workflow as an
+# explicit MCP toolbox. They do not proxy or intercept other MCP tool calls.
+# They are registered only in local/full mode by `_register_write_tools()`.
+# ============================================================
+
+def runtime_evaluate_action(
+    action: Annotated[str, Field(description="Action name to evaluate. Examples: deploy.release, infra.volume.delete, payment.transfer")],
+    resource: Annotated[str, Field(description="Target resource identifier. Examples: service:checkout, volume:vol-123, account:vendor-7")],
+    environment: Annotated[str, Field(description="Execution environment. Examples: development, staging, production")],
+    delegation_receipt: Annotated[str, Field(description="DelegationReceipt JSON object string issued by the workflow owner/principal")],
+    amount: Annotated[Optional[float], Field(description="Optional monetary amount for spend-sensitive actions. Omit when not applicable")] = None,
+    currency: Annotated[str, Field(description="Optional ISO currency code for spend-sensitive actions. Example: USD")] = "",
+) -> str:
+    """Evaluate one proposed action with AVP Runtime Gate.
+
+    Returns the Runtime Gate decision payload from AVP. The decision is expected
+    to be one of ALLOW, WAITING_FOR_HUMAN_APPROVAL, or BLOCK. This tool only
+    evaluates the action; it does not execute anything and does not intercept
+    other MCP tool calls.
+    """
+    try:
+        agent = _get_agent()
+        receipt = _parse_json_object(delegation_receipt, "delegation_receipt")
+        result = agent.runtime_evaluate(
+            action=action,
+            resource=resource,
+            environment=environment,
+            delegation_receipt=receipt,
+            amount=amount,
+            currency=currency or None,
+        )
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return _err(e)
+
+
+def controlled_action(
+    action: Annotated[str, Field(description="Action name to evaluate and execute only if Runtime Gate allows it")],
+    resource: Annotated[str, Field(description="Target resource identifier bound into the Runtime Gate decision")],
+    environment: Annotated[str, Field(description="Execution environment. Examples: development, staging, production")],
+    delegation_receipt: Annotated[str, Field(description="DelegationReceipt JSON object string issued by the workflow owner/principal")],
+    params: Annotated[str, Field(description="Optional execution params as a JSON object string. Default: {}")] = "{}",
+    amount: Annotated[Optional[float], Field(description="Optional monetary amount for spend-sensitive actions. Omit when not applicable")] = None,
+    currency: Annotated[str, Field(description="Optional ISO currency code for spend-sensitive actions. Example: USD")] = "",
+    approval_expires_in_seconds: Annotated[int, Field(description="Approval TTL in seconds when Runtime Gate returns WAITING_FOR_HUMAN_APPROVAL")] = 3600,
+) -> str:
+    """Run the high-level AVP controlled-action flow.
+
+    Returns `ControlledActionOutcome.to_dict()` as a JSON string. Possible
+    statuses are `executed`, `approval_required`, and `blocked`. Human approval
+    is never auto-approved; after approval, call `execute_after_approval`.
+    """
+    try:
+        agent = _get_agent()
+        receipt = _parse_json_object(delegation_receipt, "delegation_receipt")
+        parsed_params = _parse_json_object(params, "params", default={})
+        outcome = agent.controlled_action(
+            action=action,
+            resource=resource,
+            environment=environment,
+            delegation_receipt=receipt,
+            params=parsed_params,
+            amount=amount,
+            currency=currency or None,
+            approval_expires_in_seconds=approval_expires_in_seconds,
+        )
+        return json.dumps(outcome.to_dict(), indent=2)
+    except Exception as e:
+        return _err(e)
+
+
+def get_approval_request(
+    approval_id: Annotated[str, Field(description="Human approval request id returned as approval.approval_id")],
+) -> str:
+    """Fetch a human approval request visible to the local agent identity."""
+    try:
+        agent = _get_agent()
+        result = agent.get_approval(approval_id)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return _err(e)
+
+
+def approve_action(
+    approval_id: Annotated[str, Field(description="Human approval request id returned as approval.approval_id")],
+) -> str:
+    """Approve a pending human approval request and return signed receipt JCS plus sha256."""
+    try:
+        agent = _get_agent()
+        receipt_jcs = agent.approve(approval_id)
+        return _receipt_jcs_response("approval_receipt_jcs", receipt_jcs)
+    except Exception as e:
+        return _err(e)
+
+
+def deny_action(
+    approval_id: Annotated[str, Field(description="Human approval request id returned as approval.approval_id")],
+    reason: Annotated[str, Field(description="Optional denial reason recorded with the signed denial receipt")] = "",
+) -> str:
+    """Deny a pending human approval request and return signed receipt JCS plus sha256."""
+    try:
+        agent = _get_agent()
+        receipt_jcs = agent.deny(approval_id, reason=reason or None)
+        return _receipt_jcs_response("denial_receipt_jcs", receipt_jcs)
+    except Exception as e:
+        return _err(e)
+
+
+def execute_after_approval(
+    audit_id: Annotated[str, Field(description="Runtime Gate audit_id from the WAITING_FOR_HUMAN_APPROVAL decision")],
+    approval_id: Annotated[str, Field(description="Approved human approval id. Use approval.approval_id, not approval.id")],
+    action: Annotated[str, Field(description="Action name bound to the Runtime Gate decision")],
+    resource: Annotated[str, Field(description="Resource identifier bound to the Runtime Gate decision")],
+    environment: Annotated[str, Field(description="Execution environment bound to the Runtime Gate decision")],
+    params: Annotated[str, Field(description="Optional execution params as a JSON object string. Default: {}")] = "{}",
+) -> str:
+    """Resume a controlled action after principal approval.
+
+    The approval payload key is `approval_id`. This tool deliberately passes
+    that key through to `AVPAgent.execute_after_approval(...)`.
+    """
+    try:
+        agent = _get_agent()
+        parsed_params = _parse_json_object(params, "params", default={})
+        outcome = agent.execute_after_approval(
+            audit_id=audit_id,
+            approval_id=approval_id,
+            action=action,
+            resource=resource,
+            environment=environment,
+            params=parsed_params,
+        )
+        return json.dumps(outcome.to_dict(), indent=2)
+    except Exception as e:
+        return _err(e)
+
+
+def get_decision_receipt(
+    audit_id: Annotated[str, Field(description="Runtime Gate audit_id whose signed DecisionReceipt should be fetched")],
+) -> str:
+    """Fetch exact signed DecisionReceipt JCS text and its sha256 digest."""
+    try:
+        agent = _get_agent()
+        receipt_jcs = agent.get_decision_receipt(audit_id)
+        return _receipt_jcs_response("decision_receipt_jcs", receipt_jcs)
+    except Exception as e:
+        return _err(e)
+
+
+def get_execution_receipt(
+    receipt_id: Annotated[str, Field(description="Execution receipt id whose signed ExecutionReceipt should be fetched")],
+) -> str:
+    """Fetch exact signed ExecutionReceipt JCS text and its sha256 digest."""
+    try:
+        agent = _get_agent()
+        receipt_jcs = agent.get_execution_receipt(receipt_id)
+        return _receipt_jcs_response("execution_receipt_jcs", receipt_jcs)
+    except Exception as e:
+        return _err(e)
+
+
+# ============================================================
 # RESOURCES
 # ============================================================
 
@@ -586,15 +792,20 @@ def protocol_info() -> str:
     """Information about AgentVeil action-control and advisory MCP tools."""
     return json.dumps({
         "name": "Agent Veil Protocol (AVP)",
-        "description": "Agent profile inspection, advisory reputation, audit verification, and signed evidence for AI agent systems",
+        "description": "Explicit action-control MCP toolbox, advisory reputation, audit verification, and signed evidence for AI agent systems",
         "api": f"{BASE_URL}/docs",
         "explorer": f"{BASE_URL}/live",       # Deprecated alias; kept for compatibility.
         "live_network": f"{BASE_URL}/live",
         "sdk": "pip install agentveil",
         "mcp": "pip install 'agentveil[mcp]'",
         "github": "https://github.com/agentveil-protocol/avp-sdk",
+        "boundary": "Explicit MCP toolbox; does not automatically proxy or intercept other MCP tool calls.",
         "features": [
             "W3C DID Identity (Ed25519)",
+            "Runtime Gate action decisions",
+            "Human approval routing",
+            "Approved execution resume",
+            "Signed DecisionReceipt and ExecutionReceipt fetch",
             "Agent profile and reputation inspection",
             "Advisory reputation checks",
             "Offline-verifiable credentials",
@@ -606,13 +817,13 @@ def protocol_info() -> str:
 
 
 # ============================================================
-# CONDITIONAL WRITE-TOOL REGISTRATION
+# CONDITIONAL LOCAL/FULL TOOL REGISTRATION
 # ============================================================
 
 def _register_write_tools() -> None:
-    """Register the 4 write tools with the FastMCP server.
+    """Register the 12 local/full tools with the FastMCP server.
 
-    Called only when NOT in readonly mode. In readonly mode the write tool
+    Called only when NOT in readonly mode. In readonly mode these local/full
     functions above remain plain Python callables but are not reachable via
     the MCP protocol — they do not appear in tools/list.
     """
@@ -620,13 +831,21 @@ def _register_write_tools() -> None:
     mcp.add_tool(submit_attestation)
     mcp.add_tool(publish_agent_card)
     mcp.add_tool(get_my_agent_info)
+    mcp.add_tool(runtime_evaluate_action)
+    mcp.add_tool(controlled_action)
+    mcp.add_tool(get_approval_request)
+    mcp.add_tool(approve_action)
+    mcp.add_tool(deny_action)
+    mcp.add_tool(execute_after_approval)
+    mcp.add_tool(get_decision_receipt)
+    mcp.add_tool(get_execution_receipt)
 
 
 if not IS_READONLY:
     _register_write_tools()
-    log.info("write tools registered (full mode)")
+    log.info("local/full tools registered")
 else:
-    log.info("readonly mode: write tools not registered")
+    log.info("readonly mode: local/full tools not registered")
 
 
 # ============================================================

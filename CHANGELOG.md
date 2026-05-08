@@ -2,6 +2,31 @@
 
 All notable changes to the `agentveil` SDK.
 
+## [0.7.13] - 2026-05-08
+
+Fresh release for the MCP action-control toolbox expansion.
+
+### Added
+- Added 8 local/full `agentveil-mcp` action-control tools:
+  `runtime_evaluate_action`, `controlled_action`, `get_approval_request`,
+  `approve_action`, `deny_action`, `execute_after_approval`,
+  `get_decision_receipt`, and `get_execution_receipt`.
+
+### Changed
+- Updated MCP docs and instructions to position the server as an explicit
+  action-control toolbox for Runtime Gate, approval, and signed receipt
+  workflows. Local/full mode now exposes 20 tools; hosted read-only mode
+  remains at 8 tools.
+
+### Validation
+- MCP-1 production live smoke passed against `https://agentveil.dev`, covering
+  full/readonly tool registration, Runtime Gate evaluation, controlled action
+  allow/wait/block outcomes, approval get/approve/deny, approved execution,
+  and DecisionReceipt / ExecutionReceipt fetches with sha256 verification.
+- `python -m pytest tests/test_mcp_hosted.py tests/test_mcp_packaging.py -q`
+  passed with `36 passed`.
+- `python -m pytest -q` passed with `262 passed, 1 warning`.
+
 ## [0.7.12] - 2026-05-08
 
 Self-service developer adoption: Proof Packet export helper, corrected

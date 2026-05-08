@@ -2,8 +2,9 @@
 MCP Slice 4 — hosted-mode tests.
 
 Covers three new behaviors added for the hosted HTTP deployment:
-- AVP_MCP_READONLY=1 gates write tools at REGISTRATION, not call-time. The
-  four write tools must not appear in the FastMCP tool registry.
+- AVP_MCP_READONLY=1 gates local/full tools at REGISTRATION, not call-time.
+  Identity/write and action-control tools must not appear in the FastMCP
+  tool registry.
 - The HTTP ASGI app enforces Authorization: Bearer <AVP_MCP_TOKEN> on every
   path except /healthz, which returns 200 unauthenticated.
 - main() with --http and an empty AVP_MCP_TOKEN refuses to start
@@ -15,7 +16,9 @@ All tests skip when the optional `mcp` runtime isn't installed.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
+import json
 import os
 import sys
 from typing import Iterable
@@ -38,12 +41,23 @@ requires_mcp = pytest.mark.skipif(
 
 
 WRITE_TOOLS = {"register_agent", "submit_attestation", "publish_agent_card", "get_my_agent_info"}
+ACTION_CONTROL_TOOLS = {
+    "runtime_evaluate_action",
+    "controlled_action",
+    "get_approval_request",
+    "approve_action",
+    "deny_action",
+    "execute_after_approval",
+    "get_decision_receipt",
+    "get_execution_receipt",
+}
 READ_TOOLS = {
     "check_reputation", "check_trust", "get_agent_info", "search_agents",
     "get_attestations_received", "get_protocol_stats", "verify_audit_chain",
     "get_audit_trail",
 }
-ALL_TOOLS = WRITE_TOOLS | READ_TOOLS
+LOCAL_ONLY_TOOLS = WRITE_TOOLS | ACTION_CONTROL_TOOLS
+ALL_TOOLS = READ_TOOLS | LOCAL_ONLY_TOOLS
 
 
 def _reload_server_with_env(env_overrides: dict) -> object:
@@ -82,11 +96,11 @@ def _tool_names(server_mod) -> set[str]:
 # ------------------------------------------------------------------
 
 @requires_mcp
-def test_full_mode_registers_all_12_tools():
+def test_full_mode_registers_all_20_tools():
     s = _reload_server_with_env({"AVP_MCP_READONLY": None})
     try:
         names = _tool_names(s)
-        assert names == ALL_TOOLS, f"expected all 12 tools, got {names}"
+        assert names == ALL_TOOLS, f"expected all 20 tools, got {names}"
     finally:
         # Leave module state fresh-ish for next test by clearing it.
         sys.modules.pop("agentveil_mcp.server", None)
@@ -99,9 +113,9 @@ def test_readonly_mode_registers_only_read_tools():
     try:
         names = _tool_names(s)
         assert names == READ_TOOLS, f"expected 8 read tools, got {names}"
-        # Bright-line check: none of the four write names must be present.
-        for w in WRITE_TOOLS:
-            assert w not in names, f"write tool {w!r} leaked into readonly mode"
+        # Bright-line check: none of the local/full names must be present.
+        for name in LOCAL_ONLY_TOOLS:
+            assert name not in names, f"local/full tool {name!r} leaked into readonly mode"
     finally:
         sys.modules.pop("agentveil_mcp.server", None)
         sys.modules.pop("agentveil_mcp", None)
@@ -119,6 +133,191 @@ def test_readonly_write_callables_still_exist_as_plain_python():
     try:
         for name in WRITE_TOOLS:
             assert callable(getattr(s, name, None)), f"{name} missing as module attr"
+    finally:
+        sys.modules.pop("agentveil_mcp.server", None)
+        sys.modules.pop("agentveil_mcp", None)
+
+
+@requires_mcp
+def test_runtime_evaluate_action_parses_delegation_receipt(monkeypatch):
+    s = _reload_server_with_env({"AVP_MCP_READONLY": None})
+
+    class FakeAgent:
+        def __init__(self):
+            self.call = None
+
+        def runtime_evaluate(self, **kwargs):
+            self.call = kwargs
+            return {
+                "audit_id": "audit-1",
+                "decision": "WAITING_FOR_HUMAN_APPROVAL",
+                "reason": "requires_principal_review",
+            }
+
+    fake = FakeAgent()
+    monkeypatch.setattr(s, "_get_agent", lambda: fake)
+    try:
+        body = json.loads(s.runtime_evaluate_action(
+            action="deploy.release",
+            resource="service:api",
+            environment="production",
+            delegation_receipt='{"id":"delegation-1","scope":[{"type":"allowed_category","value":"deploy"}]}',
+            amount=42.5,
+            currency="USD",
+        ))
+        assert body["decision"] == "WAITING_FOR_HUMAN_APPROVAL"
+        assert fake.call["delegation_receipt"]["id"] == "delegation-1"
+        assert fake.call["amount"] == 42.5
+        assert fake.call["currency"] == "USD"
+
+        error = json.loads(s.runtime_evaluate_action(
+            action="deploy.release",
+            resource="service:api",
+            environment="production",
+            delegation_receipt='["not", "an", "object"]',
+        ))
+        assert error["type"] == "ValueError"
+        assert "delegation_receipt" in error["error"]
+    finally:
+        sys.modules.pop("agentveil_mcp.server", None)
+        sys.modules.pop("agentveil_mcp", None)
+
+
+@requires_mcp
+def test_execute_after_approval_uses_approval_id_and_parses_params(monkeypatch):
+    s = _reload_server_with_env({"AVP_MCP_READONLY": None})
+
+    class FakeOutcome:
+        def __init__(self, data):
+            self._data = data
+
+        def to_dict(self):
+            return dict(self._data)
+
+    class FakeAgent:
+        def __init__(self):
+            self.call = None
+
+        def execute_after_approval(self, **kwargs):
+            self.call = kwargs
+            return FakeOutcome({
+                "status": "executed",
+                "audit_id": kwargs["audit_id"],
+                "approval_id": kwargs["approval_id"],
+                "receipt_jcs": '{"receipt_id":"receipt-1"}',
+            })
+
+    fake = FakeAgent()
+    monkeypatch.setattr(s, "_get_agent", lambda: fake)
+    try:
+        body = json.loads(s.execute_after_approval(
+            audit_id="audit-1",
+            approval_id="approval-1",
+            action="deploy.release",
+            resource="service:api",
+            environment="production",
+            params='{"ticket":"CHG-1"}',
+        ))
+        assert body["status"] == "executed"
+        assert body["approval_id"] == "approval-1"
+        assert fake.call["approval_id"] == "approval-1"
+        assert "id" not in fake.call
+        assert fake.call["params"] == {"ticket": "CHG-1"}
+    finally:
+        sys.modules.pop("agentveil_mcp.server", None)
+        sys.modules.pop("agentveil_mcp", None)
+
+
+@requires_mcp
+def test_decision_receipt_preserves_raw_jcs_and_adds_sha256(monkeypatch):
+    s = _reload_server_with_env({"AVP_MCP_READONLY": None})
+    raw_jcs = '{"schema_version":"decision_receipt/2","decision":"ALLOW","nested":{"keep":"exact"}}'
+
+    class FakeAgent:
+        def get_decision_receipt(self, audit_id):
+            assert audit_id == "audit-1"
+            return raw_jcs
+
+    monkeypatch.setattr(s, "_get_agent", lambda: FakeAgent())
+    try:
+        body = json.loads(s.get_decision_receipt("audit-1"))
+        assert body["decision_receipt_jcs"] == raw_jcs
+        assert body["sha256"] == hashlib.sha256(raw_jcs.encode("utf-8")).hexdigest()
+    finally:
+        sys.modules.pop("agentveil_mcp.server", None)
+        sys.modules.pop("agentveil_mcp", None)
+
+
+@requires_mcp
+def test_approve_action_preserves_raw_jcs_and_adds_sha256(monkeypatch):
+    s = _reload_server_with_env({"AVP_MCP_READONLY": None})
+    raw_jcs = '{"schema_version":"human_approval_receipt/2","status":"APPROVED"}'
+
+    class FakeAgent:
+        def __init__(self):
+            self.approval_id = None
+
+        def approve(self, approval_id):
+            self.approval_id = approval_id
+            return raw_jcs
+
+    fake = FakeAgent()
+    monkeypatch.setattr(s, "_get_agent", lambda: fake)
+    try:
+        body = json.loads(s.approve_action("approval-1"))
+        assert fake.approval_id == "approval-1"
+        assert body["approval_receipt_jcs"] == raw_jcs
+        assert body["sha256"] == hashlib.sha256(raw_jcs.encode("utf-8")).hexdigest()
+    finally:
+        sys.modules.pop("agentveil_mcp.server", None)
+        sys.modules.pop("agentveil_mcp", None)
+
+
+@requires_mcp
+def test_deny_action_preserves_raw_jcs_and_default_reason_is_none(monkeypatch):
+    s = _reload_server_with_env({"AVP_MCP_READONLY": None})
+    raw_jcs = '{"schema_version":"human_approval_receipt/2","status":"DENIED"}'
+
+    class FakeAgent:
+        def __init__(self):
+            self.call = None
+
+        def deny(self, approval_id, reason=None):
+            self.call = {"approval_id": approval_id, "reason": reason}
+            return raw_jcs
+
+    fake = FakeAgent()
+    monkeypatch.setattr(s, "_get_agent", lambda: fake)
+    try:
+        body = json.loads(s.deny_action("approval-1"))
+        assert fake.call == {"approval_id": "approval-1", "reason": None}
+        assert body["denial_receipt_jcs"] == raw_jcs
+        assert body["sha256"] == hashlib.sha256(raw_jcs.encode("utf-8")).hexdigest()
+    finally:
+        sys.modules.pop("agentveil_mcp.server", None)
+        sys.modules.pop("agentveil_mcp", None)
+
+
+@requires_mcp
+def test_execution_receipt_preserves_raw_jcs_and_adds_sha256(monkeypatch):
+    s = _reload_server_with_env({"AVP_MCP_READONLY": None})
+    raw_jcs = '{"schema_version":"execution_receipt/2","receipt_id":"receipt-1"}'
+
+    class FakeAgent:
+        def __init__(self):
+            self.receipt_id = None
+
+        def get_execution_receipt(self, receipt_id):
+            self.receipt_id = receipt_id
+            return raw_jcs
+
+    fake = FakeAgent()
+    monkeypatch.setattr(s, "_get_agent", lambda: fake)
+    try:
+        body = json.loads(s.get_execution_receipt("receipt-1"))
+        assert fake.receipt_id == "receipt-1"
+        assert body["execution_receipt_jcs"] == raw_jcs
+        assert body["sha256"] == hashlib.sha256(raw_jcs.encode("utf-8")).hexdigest()
     finally:
         sys.modules.pop("agentveil_mcp.server", None)
         sys.modules.pop("agentveil_mcp", None)

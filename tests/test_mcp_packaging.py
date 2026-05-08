@@ -111,7 +111,10 @@ def test_tool_count_sanity():
         "check_reputation", "check_trust", "get_agent_info", "search_agents",
         "get_attestations_received", "get_protocol_stats", "verify_audit_chain",
         "get_audit_trail", "register_agent", "submit_attestation",
-        "publish_agent_card", "get_my_agent_info",
+        "publish_agent_card", "get_my_agent_info", "runtime_evaluate_action",
+        "controlled_action", "get_approval_request", "approve_action",
+        "deny_action", "execute_after_approval", "get_decision_receipt",
+        "get_execution_receipt",
     }
     present = {name for name in expected if callable(getattr(s, name, None))}
     assert present == expected, f"missing tool callables: {expected - present}"
