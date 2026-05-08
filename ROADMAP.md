@@ -11,6 +11,7 @@
 - [x] Local DelegationReceipt v1 issuance with `issue_delegation_receipt(...)`
 - [x] Signed runtime receipts and proof packet verification
 - [x] AVP JSON and W3C reputation credentials with offline verification
+- [ ] Public security model: SDK mode vs gateway enforcement mode
 - [x] MCP server: 12 tools in local/full mode, with 8 read-only tools available in hosted mode
 - [x] Framework examples for CrewAI, LangGraph, AutoGen, OpenAI, Claude MCP, Paperclip, Gemini, PydanticAI, and AWS Bedrock
 - [x] AVPProvider merged into Microsoft Agent Governance Toolkit (PR #1010)
@@ -30,6 +31,10 @@
 - [ ] Deployment documentation for approved customer environments
 - [ ] Formal protocol specification v1.0
 - [ ] Expanded Runtime Gate examples for common agent stacks
+- [ ] Execution boundary and gateway adapter contract
+- [ ] CLI: `agentveil demo controlled-action`
+- [ ] CLI: `agentveil proof export` and `agentveil proof verify --offline`
+- [ ] Posture Check report for risky tools, write access, credentials location, and bypass paths
 
 ## Research / Future
 
