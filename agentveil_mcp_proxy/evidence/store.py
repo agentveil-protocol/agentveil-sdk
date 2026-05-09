@@ -14,16 +14,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields
 from enum import Enum
+import hashlib
 import os
 from pathlib import Path
 import sqlite3
 import threading
 import time
-from typing import Any
+from typing import Any, Iterable, Mapping
+
+import jcs
 
 
-EVIDENCE_SCHEMA_VERSION = 1
+EVIDENCE_SCHEMA_VERSION = 2
 DEFAULT_MAX_RECORDS = 10_000
+GENESIS_PREV_EVENT_HASH = "sha256:" + hashlib.sha256(
+    b"agentveil_mcp_proxy/evidence/genesis-v1"
+).hexdigest()
 
 
 class ApprovalEvidenceError(RuntimeError):
@@ -106,6 +112,7 @@ class PendingApproval:
     status: str
     created_at: int
     expires_at: int
+    prev_event_hash: str | None = None
     decision_audit_id: str | None = None
     decision_receipt_sha256: str | None = None
     approval_token_hash: str | None = None
@@ -134,6 +141,7 @@ _COLUMNS = tuple(field.name for field in fields(PendingApproval))
 _OPTIONAL_COLUMNS = {
     "client_id",
     "resource_hash",
+    "prev_event_hash",
     "policy_rule_id",
     "decision_audit_id",
     "decision_receipt_sha256",
@@ -165,6 +173,7 @@ _TRANSITION_FIELDS = {
 _HASH_COLUMNS = {
     "resource_hash",
     "payload_hash",
+    "prev_event_hash",
     "approval_token_hash",
     "result_hash",
 }
@@ -224,6 +233,7 @@ class ApprovalEvidenceStore:
                     f"INSERT INTO pending_approvals ({', '.join(_COLUMNS)}) VALUES ({placeholders})",
                     values,
                 )
+                self._rebuild_chain_locked()
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()
@@ -300,6 +310,7 @@ class ApprovalEvidenceStore:
                     f"UPDATE pending_approvals SET {assignments} WHERE request_id = ?",
                     (*updates.values(), request_id),
                 )
+                self._rebuild_chain_locked()
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()
@@ -331,6 +342,7 @@ class ApprovalEvidenceStore:
                             for request_id in request_ids
                         ],
                     )
+                    self._rebuild_chain_locked()
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()
@@ -349,6 +361,64 @@ class ApprovalEvidenceStore:
             pending_after=pending_after,
             expired_request_ids=expired,
         )
+
+    def list_records(
+        self,
+        *,
+        since_timestamp: int | None = None,
+        until_timestamp: int | None = None,
+        request_ids: Iterable[str] | None = None,
+    ) -> list[PendingApproval]:
+        """List evidence records in deterministic chain order."""
+
+        clauses: list[str] = []
+        params: list[Any] = []
+        if since_timestamp is not None:
+            clauses.append("created_at >= ?")
+            params.append(int(since_timestamp))
+        if until_timestamp is not None:
+            clauses.append("created_at <= ?")
+            params.append(int(until_timestamp))
+        ids = tuple(request_ids or ())
+        if ids:
+            placeholders = ", ".join("?" for _ in ids)
+            clauses.append(f"request_id IN ({placeholders})")
+            params.extend(ids)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {', '.join(_COLUMNS)} FROM pending_approvals "
+                f"{where} ORDER BY created_at, request_id",
+                params,
+            ).fetchall()
+        return [_row_to_record(row) for row in rows]
+
+    def vacuum_terminal_records(self, *, before_timestamp: int) -> int:
+        """Delete old terminal records and reconstruct the remaining chain."""
+
+        terminal = tuple(sorted(TERMINAL_STATUSES))
+        placeholders = ", ".join("?" for _ in terminal)
+        with self._lock:
+            self._begin()
+            try:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) FROM pending_approvals "
+                    f"WHERE status IN ({placeholders}) AND created_at < ?",
+                    (*terminal, int(before_timestamp)),
+                ).fetchone()
+                deleted = int(row[0])
+                if deleted:
+                    self._conn.execute(
+                        "DELETE FROM pending_approvals "
+                        f"WHERE status IN ({placeholders}) AND created_at < ?",
+                        (*terminal, int(before_timestamp)),
+                    )
+                    self._rebuild_chain_locked()
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return deleted
 
     def _ensure_db_file(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -376,6 +446,8 @@ class ApprovalEvidenceStore:
                 self._conn.execute(
                     "CREATE TABLE IF NOT EXISTS evidence_schema_version (version INTEGER NOT NULL)"
                 )
+                self._conn.execute(_CREATE_PENDING_APPROVALS_SQL)
+                self._ensure_optional_columns()
                 rows = self._conn.execute(
                     "SELECT version FROM evidence_schema_version"
                 ).fetchall()
@@ -384,6 +456,7 @@ class ApprovalEvidenceStore:
                         "INSERT INTO evidence_schema_version (version) VALUES (?)",
                         (EVIDENCE_SCHEMA_VERSION,),
                     )
+                    self._rebuild_chain_locked()
                 else:
                     version = max(int(row["version"]) for row in rows)
                     if version > EVIDENCE_SCHEMA_VERSION:
@@ -391,12 +464,13 @@ class ApprovalEvidenceStore:
                             f"evidence schema version {version} is newer than supported version "
                             f"{EVIDENCE_SCHEMA_VERSION}"
                         )
-                    if version < EVIDENCE_SCHEMA_VERSION:
+                    if version < 1:
                         raise ApprovalEvidenceSchemaError(
                             f"evidence schema version {version} is unsupported"
                         )
-                self._conn.execute(_CREATE_PENDING_APPROVALS_SQL)
-                self._ensure_optional_columns()
+                    if version < EVIDENCE_SCHEMA_VERSION:
+                        self._migrate_schema_locked(version)
+                self._validate_chain_locked()
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()
@@ -412,9 +486,52 @@ class ApprovalEvidenceStore:
             "granted_scope_expires_at": "INTEGER NULL",
             "matched_policy_rule": "TEXT NULL",
             "user_decision_timestamp": "INTEGER NULL",
+            "prev_event_hash": "TEXT NULL",
         }.items():
             if column not in existing:
                 self._conn.execute(f"ALTER TABLE pending_approvals ADD COLUMN {column} {column_type}")
+
+    def _migrate_schema_locked(self, version: int) -> None:
+        if version == 1:
+            self._rebuild_chain_locked()
+            self._conn.execute("DELETE FROM evidence_schema_version")
+            self._conn.execute(
+                "INSERT INTO evidence_schema_version (version) VALUES (?)",
+                (EVIDENCE_SCHEMA_VERSION,),
+            )
+            return
+        raise ApprovalEvidenceSchemaError(f"evidence schema version {version} is unsupported")
+
+    def _rebuild_chain_locked(self) -> None:
+        rows = self._conn.execute(
+            f"SELECT {', '.join(_COLUMNS)} FROM pending_approvals ORDER BY created_at, request_id"
+        ).fetchall()
+        prev_hash = GENESIS_PREV_EVENT_HASH
+        for row in rows:
+            record = _row_to_record(row)
+            self._conn.execute(
+                "UPDATE pending_approvals SET prev_event_hash = ? WHERE request_id = ?",
+                (prev_hash, record.request_id),
+            )
+            data = _record_dict(record)
+            data["prev_event_hash"] = prev_hash
+            prev_hash = record_hash(data)
+
+    def _validate_chain_locked(self) -> None:
+        rows = self._conn.execute(
+            f"SELECT {', '.join(_COLUMNS)} FROM pending_approvals ORDER BY created_at, request_id"
+        ).fetchall()
+        prev_hash = GENESIS_PREV_EVENT_HASH
+        for row in rows:
+            record = _row_to_record(row)
+            if record.prev_event_hash is None:
+                self._rebuild_chain_locked()
+                return
+            if record.prev_event_hash != prev_hash:
+                raise ApprovalEvidenceSchemaError(
+                    f"evidence hash chain mismatch at request_id {record.request_id}"
+                )
+            prev_hash = record_hash(record)
 
     def _begin(self) -> None:
         self._conn.execute("BEGIN IMMEDIATE")
@@ -456,14 +573,16 @@ class ApprovalEvidenceStore:
                 _require_hash_like(column, value)
 
     def _count_status(self, status: str) -> int:
-        row = self._conn.execute(
-            "SELECT COUNT(*) FROM pending_approvals WHERE status = ?",
-            (status,),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM pending_approvals WHERE status = ?",
+                (status,),
+            ).fetchone()
         return int(row[0])
 
     def _count_records(self) -> int:
-        row = self._conn.execute("SELECT COUNT(*) FROM pending_approvals").fetchone()
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) FROM pending_approvals").fetchone()
         return int(row[0])
 
 
@@ -473,6 +592,18 @@ def _record_values(record: PendingApproval) -> tuple[Any, ...]:
 
 def _record_dict(record: PendingApproval) -> dict[str, Any]:
     return {column: getattr(record, column) for column in _COLUMNS}
+
+
+def record_hash(record: PendingApproval | Mapping[str, Any]) -> str:
+    """Return the canonical sha256 hash for one evidence record."""
+
+    if isinstance(record, PendingApproval):
+        data = _record_dict(record)
+    else:
+        data = dict(record)
+    data.pop("prev_event_hash", None)
+    data.pop("record_hash", None)
+    return "sha256:" + hashlib.sha256(jcs.canonicalize(data)).hexdigest()
 
 
 def _row_to_record(row: sqlite3.Row) -> PendingApproval:
@@ -513,6 +644,7 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
     status TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
+    prev_event_hash TEXT NULL,
     decision_audit_id TEXT NULL,
     decision_receipt_sha256 TEXT NULL,
     approval_token_hash TEXT NULL,
@@ -538,7 +670,9 @@ __all__ = [
     "ApprovalEvidenceStore",
     "ApprovalEvidenceTransitionError",
     "ApprovalStatus",
+    "GENESIS_PREV_EVENT_HASH",
     "PendingApproval",
     "RecoveryReport",
     "TERMINAL_STATUSES",
+    "record_hash",
 ]

@@ -34,7 +34,14 @@ from agentveil_mcp_proxy.approval import (
     HeadlessPolicyError,
 )
 from agentveil_mcp_proxy.classification import ToolCallClassifier
-from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore
+from agentveil_mcp_proxy.evidence import (
+    ApprovalEvidenceStore,
+    EvidenceExportError,
+    EvidenceVerificationError,
+    export_evidence_bundle,
+    parse_utc_timestamp,
+    verify_evidence_bundle_file,
+)
 from agentveil_mcp_proxy.identity import (
     IdentityDecryptError,
     IdentityError,
@@ -63,6 +70,7 @@ DEFAULT_CONTROL_GRANT_TTL_DAYS = 30
 CONTROL_GRANT_EXPIRY_WARNING_DAYS = 7
 REISSUE_GRANT_FORCE_THRESHOLD_SECONDS = 24 * 60 * 60
 DEFAULT_ALLOWED_CATEGORIES = ("mcp_proxy",)
+DEFAULT_EVIDENCE_VACUUM_MAX_AGE_DAYS = 90
 AGENTVEIL_DEV_SIGNER_DIDS = (
     "did:key:z6MkkvQQ9SxaNX9eEVHd5NtEamVY3YiZSpHZE567Vxs5jQQ3",
     "did:key:z6Mkjw22249tpNN4LJGLyq1oGSq1Skh3ks94fiMrgi4oqveo",
@@ -761,6 +769,138 @@ def reissue_grant(
     )
 
 
+def _receipt_fetcher_for_export(
+    *,
+    identity: Mapping[str, Any],
+    config: ProxyConfig,
+    passphrase: str | None,
+    passphrase_file: Path | None,
+) -> Any | None:
+    if (
+        identity.get("encrypted") is True
+        and passphrase is None
+        and passphrase_file is None
+        and os.environ.get(PASSPHRASE_ENV) is None
+    ):
+        return None
+    try:
+        identity_passphrase = _resolve_existing_identity_passphrase(
+            identity,
+            passphrase=passphrase,
+            passphrase_file=passphrase_file,
+        )
+        agent = _load_proxy_agent(
+            identity=identity,
+            config=config,
+            passphrase=identity_passphrase,
+            timeout=2.0,
+        )
+    except ProxyCliError:
+        return None
+    return agent.get_decision_receipt
+
+
+def export_evidence(
+    *,
+    output_path: Path,
+    home: Path | None = None,
+    config_path: Path | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    request_ids: Iterable[str] | None = None,
+    passphrase: str | None = None,
+    passphrase_file: Path | None = None,
+    out: TextIO | None = None,
+) -> dict[str, Any]:
+    """Export local evidence records as an offline verification bundle."""
+
+    out = out or sys.stdout
+    paths = proxy_paths(home, config_path)
+    config = load_proxy_config(paths.config_path)
+    identity = _read_json(paths.identity_path(config.avp.agent_name), "agent identity")
+    since_timestamp = None if since is None else parse_utc_timestamp(since)
+    until_timestamp = None if until is None else parse_utc_timestamp(until)
+    receipt_fetcher = _receipt_fetcher_for_export(
+        identity=identity,
+        config=config,
+        passphrase=passphrase,
+        passphrase_file=passphrase_file,
+    )
+    with ApprovalEvidenceStore(paths.proxy_dir / "evidence.sqlite") as store:
+        bundle = export_evidence_bundle(
+            store,
+            output_path,
+            proxy_identity_did=identity.get("did") if isinstance(identity.get("did"), str) else None,
+            trusted_signer_dids=config.avp.trusted_signer_dids,
+            client_id=config.avp.agent_name,
+            since_timestamp=since_timestamp,
+            until_timestamp=until_timestamp,
+            request_ids=request_ids,
+            receipt_fetcher=receipt_fetcher,
+        )
+    print(
+        "Evidence exported: "
+        f"{output_path} ({len(bundle['records'])} records, "
+        f"{len(bundle['signed_receipts'])} signed receipts)",
+        file=out,
+    )
+    return bundle
+
+
+def verify_evidence(
+    *,
+    bundle_path: Path,
+    output_format: str = "human",
+    trusted_signer_dids: Iterable[str] | None = None,
+    out: TextIO | None = None,
+) -> int:
+    """Verify an evidence bundle offline."""
+
+    out = out or sys.stdout
+    result = verify_evidence_bundle_file(
+        bundle_path,
+        trusted_signer_dids=trusted_signer_dids,
+    )
+    if output_format == "json":
+        print(json.dumps({
+            "status": "ok",
+            "record_count": result.record_count,
+            "signed_receipt_count": result.signed_receipt_count,
+            "chain_root_hash": result.chain_root_hash,
+        }, sort_keys=True), file=out)
+    else:
+        print(
+            "OK: bundle integrity verified, "
+            f"{result.record_count} records, {result.signed_receipt_count} signed receipts",
+            file=out,
+        )
+    return 0
+
+
+def vacuum_events(
+    *,
+    home: Path | None = None,
+    config_path: Path | None = None,
+    max_age_days: int = DEFAULT_EVIDENCE_VACUUM_MAX_AGE_DAYS,
+    before: str | None = None,
+    out: TextIO | None = None,
+) -> int:
+    """Prune old terminal evidence records and rebuild the local chain."""
+
+    if max_age_days <= 0:
+        raise ProxyCliError("--max-age-days must be positive")
+    out = out or sys.stdout
+    paths = proxy_paths(home, config_path)
+    if before is None:
+        cutoff = int(datetime.now(timezone.utc).timestamp()) - max_age_days * 24 * 60 * 60
+    else:
+        cutoff = parse_utc_timestamp(before)
+    with ApprovalEvidenceStore(paths.proxy_dir / "evidence.sqlite") as store:
+        deleted = store.vacuum_terminal_records(before_timestamp=cutoff)
+    print(f"Evidence vacuum deleted {deleted} terminal records", file=out)
+    return deleted
+
+
 def run_proxy(
     *,
     home: Path | None = None,
@@ -899,6 +1039,29 @@ def build_parser() -> argparse.ArgumentParser:
     reissue.add_argument("--force", action="store_true")
     reissue.add_argument("--auto", action="store_true")
 
+    export = subparsers.add_parser("export-evidence", help="Export local evidence bundle")
+    _add_common_path_args(export)
+    _add_passphrase_args(export)
+    export.add_argument("output_path", type=Path)
+    export.add_argument("--since", default=None, help="Include records at or after UTC timestamp")
+    export.add_argument("--until", default=None, help="Include records at or before UTC timestamp")
+    export.add_argument("--request-id", action="append", default=None)
+
+    verify = subparsers.add_parser("verify", help="Verify an evidence bundle offline")
+    verify.add_argument("bundle_path", type=Path)
+    verify.add_argument("--output", choices=["human", "json"], default="human")
+    verify.add_argument("--trusted-signer-did", action="append", default=None)
+
+    events = subparsers.add_parser("events", help="Manage local evidence records")
+    _add_common_path_args(events)
+    events.add_argument("--vacuum", action="store_true", help="Prune old terminal evidence records")
+    events.add_argument(
+        "--max-age-days",
+        type=int,
+        default=DEFAULT_EVIDENCE_VACUUM_MAX_AGE_DAYS,
+    )
+    events.add_argument("--before", default=None, help="Prune terminal records before UTC timestamp")
+
     return parser
 
 
@@ -956,9 +1119,37 @@ def main(argv: list[str] | None = None) -> int:
                 auto=args.auto,
             )
             return 0
-    except ProxyCliError as exc:
+        if args.command == "export-evidence":
+            export_evidence(
+                output_path=args.output_path,
+                home=args.home,
+                config_path=args.config,
+                since=args.since,
+                until=args.until,
+                request_ids=args.request_id,
+                passphrase=args.passphrase,
+                passphrase_file=args.passphrase_file,
+            )
+            return 0
+        if args.command == "verify":
+            return verify_evidence(
+                bundle_path=args.bundle_path,
+                output_format=args.output,
+                trusted_signer_dids=args.trusted_signer_did,
+            )
+        if args.command == "events":
+            if not args.vacuum:
+                raise ProxyCliError("events requires --vacuum", exit_code=2)
+            vacuum_events(
+                home=args.home,
+                config_path=args.config,
+                max_age_days=args.max_age_days,
+                before=args.before,
+            )
+            return 0
+    except (ProxyCliError, EvidenceExportError, EvidenceVerificationError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
-        return exc.exit_code
+        return exc.exit_code if isinstance(exc, ProxyCliError) else 1
     raise AssertionError(f"unhandled command: {args.command}")
 
 

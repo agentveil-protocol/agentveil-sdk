@@ -21,6 +21,7 @@ from agentveil_mcp_proxy.evidence import (
     ApprovalEvidenceStore,
     ApprovalEvidenceTransitionError,
     ApprovalStatus,
+    GENESIS_PREV_EVENT_HASH,
     PendingApproval,
 )
 
@@ -95,11 +96,12 @@ def test_write_pending_creates_durable_record_with_all_fields(tmp_path):
         store.write_pending(record)
         fetched = store.get_pending("req-all")
 
-    assert fetched == record
+    assert fetched == PendingApproval(**{**asdict(record), "prev_event_hash": GENESIS_PREV_EVENT_HASH})
 
     with ApprovalEvidenceStore(db_path) as reopened:
-        assert reopened.get_pending("req-all") == record
-        assert reopened.list_pending() == [record]
+        expected = PendingApproval(**{**asdict(record), "prev_event_hash": GENESIS_PREV_EVENT_HASH})
+        assert reopened.get_pending("req-all") == expected
+        assert reopened.list_pending() == [expected]
 
 
 def test_write_pending_rejects_duplicate_request_id(tmp_path):
@@ -299,7 +301,7 @@ def test_schema_version_mismatch_refuses_to_open_for_forward_incompatible(tmp_pa
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute("CREATE TABLE evidence_schema_version (version INTEGER NOT NULL)")
-        conn.execute("INSERT INTO evidence_schema_version (version) VALUES (2)")
+        conn.execute("INSERT INTO evidence_schema_version (version) VALUES (3)")
         conn.commit()
     finally:
         conn.close()

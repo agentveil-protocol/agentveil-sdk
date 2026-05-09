@@ -58,6 +58,44 @@ Pending approval records are written before an approval prompt can authorize
 downstream execution. On startup, stale pending records are marked expired; the
 store never auto-approves a request during recovery.
 
+Evidence schema version 2 adds a local hash chain. Each request record stores
+`prev_event_hash`; `record_hash` is computed over the canonical JCS form of the
+record fields excluding `prev_event_hash` and `record_hash` themselves. Chain
+nodes are per request ID. Approval transitions update the existing request
+record and the store reconstructs following chain pointers inside the same
+transaction.
+
+To export an offline verification bundle:
+
+```bash
+agentveil-mcp-proxy export-evidence /secure/path/evidence-bundle.json \
+  --since 2026-05-01T00:00:00Z
+agentveil-mcp-proxy verify /secure/path/evidence-bundle.json
+agentveil-mcp-proxy verify /secure/path/evidence-bundle.json --output json
+```
+
+The export bundle is written with `0600` permissions and includes schema
+version, export time, proxy DID, trusted signer DID set, chain root hash,
+privacy-preserving records, and any signed receipts that can be fetched
+opportunistically. Receipt JCS strings are stored byte-exact so offline
+verification can validate backend signatures.
+
+`verify` performs offline checks only: record hashes, chain linkage, signed
+receipt signatures against pinned trusted signer DIDs, and payload-hash binding
+between records and DecisionReceipts when those receipts are present. It does
+not call the AVP backend.
+
+To prune old terminal records and rebuild the local chain:
+
+```bash
+agentveil-mcp-proxy events --vacuum --max-age-days 90
+agentveil-mcp-proxy events --vacuum --before 2026-05-01T00:00:00Z
+```
+
+Vacuum removes only terminal states (`executed`, `denied`, `expired`,
+`invalidated`, `error`, `blocked`) older than the cutoff. Pending and approved
+records are preserved regardless of age.
+
 ## Local Approval Surface
 
 Approval-required tool calls are routed to a loopback approval server bound to
