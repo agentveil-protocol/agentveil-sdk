@@ -44,6 +44,7 @@ mcp = ["mcp>=1.0.0"]
 
 [project.scripts]
 agentveil-mcp = "agentveil_mcp.server:main"
+agentveil-mcp-proxy = "agentveil_mcp_proxy.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["agentveil*", "agentveil_mcp*", "mcp_server*"]

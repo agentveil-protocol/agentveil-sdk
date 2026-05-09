@@ -1,8 +1,8 @@
 """Experimental MCP proxy config and policy primitives.
 
-This package is intentionally limited to the P1 foundation: config schema
-validation and internal local policy evaluation. It does not implement MCP
-transport, backend Runtime Gate calls, approval UI, or CLI commands yet.
+This package currently includes the P1 config/policy foundation and the P2
+minimal CLI. It does not implement MCP transport, backend Runtime Gate calls,
+or approval UI yet.
 """
 
 from agentveil_mcp_proxy.policy import (
@@ -27,6 +27,7 @@ from agentveil_mcp_proxy.policy import (
     builtin_policy_pack,
     policy_context_hash,
 )
+from agentveil_mcp_proxy.cli import init_proxy, load_proxy_config, proxy_paths
 
 __all__ = [
     "ApprovalConfig",
@@ -48,5 +49,8 @@ __all__ = [
     "TimeoutAction",
     "ToolCallContext",
     "builtin_policy_pack",
+    "init_proxy",
+    "load_proxy_config",
     "policy_context_hash",
+    "proxy_paths",
 ]
