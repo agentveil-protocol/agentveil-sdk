@@ -2,8 +2,8 @@
 
 Status: P0 design document.
 
-This document is the source of truth for the experimental MCP Proxy v0.1
-workstream. It intentionally does not redefine the existing `agentveil-mcp`
+This document is the source of truth for the MCP Proxy v0.1 workstream. It
+intentionally does not redefine the existing `agentveil-mcp`
 toolbox. The current MCP server remains an explicit AVP action-control toolbox.
 The proxy is a separate enforcement integration layer.
 
@@ -20,9 +20,9 @@ Agent Economy remains the trust foundation underneath Action Control:
 - MCP Proxy: the first local enforcement integration layer for Action Control.
 
 Customer-facing language should prefer Action Control Plane, Action Gateway, or
-Runtime Control Layer. "Firewall" is acceptable as internal shorthand but should
-not be the primary public claim, because v0.1 only controls calls routed through
-the proxy.
+Runtime Control Layer. The proxy should not be positioned as automatic
+interception outside configured MCP routing, because v0.1 only controls calls
+routed through the proxy.
 
 ## P0 Scope
 
@@ -40,7 +40,7 @@ P0 must settle the decisions needed before P1 implementation:
 - backend-down fallback behavior;
 - MCP protocol scope;
 - local policy and `ask_backend` semantics;
-- GitHub demo target;
+- GitHub scenario target;
 - Posture boundary;
 - license/dual-use decision placeholder.
 
@@ -80,7 +80,7 @@ Do not pull forward:
 
 ## Architecture Boundary
 
-Add the proxy as an experimental public SDK layer:
+Add the proxy as a public SDK layer:
 
 ```text
 agentveil_mcp_proxy/
@@ -553,13 +553,14 @@ Recommended order:
 4. P3: MCP pass-through skeleton.
 5. P4: tool classification and privacy hashing.
 6. P5: Runtime Gate integration.
-7. P6: local web approval UX.
-8. P7: local evidence store with WAL crash recovery.
-9. P8: backend fallback and circuit breaker.
-10. P9: concurrency and correlation handling.
-11. P10: Posture-to-proxy bridge.
-12. P10.5: five-minute onboarding flow.
-13. P11: GitHub demo, docs, and experimental packaging.
+7. P6.0: approval UX design contract.
+8. P7a: durable approval/evidence core.
+9. P6: local web approval UX implementation.
+10. P7b: evidence proof and export hardening.
+11. P8: backend fallback and circuit breaker.
+12. P9: concurrency and correlation handling.
+13. P10.5: five-minute onboarding flow.
+14. P11: GitHub scenario, docs, and release gate.
 
 ## Evidence Inspection CLI
 
@@ -594,7 +595,7 @@ Acceptance:
 
 ## P11 Release Gate
 
-Before public beta narrative or experimental release, run load smoke against
+Before public release positioning, run load smoke against
 `agentveil.dev` using a simulated proxy profile:
 
 ```text
@@ -619,18 +620,18 @@ Measure:
 
 The proxy should not call the backend for every read-only action by default.
 
-## GitHub Demo Target
+## GitHub Scenario Target
 
-Use the official GitHub MCP server for the first demo:
+Use the official GitHub MCP server for the first validation scenario:
 
 ```text
 github/github-mcp-server
 ```
 
-Pin version or container digest where possible. Do not build the primary demo
+Pin version or container digest where possible. Do not build the primary scenario
 around an unvetted community fork.
 
-Demo behavior:
+Scenario behavior:
 
 - GitHub read operation: allow;
 - create/update/merge/write operation: approval;
@@ -647,8 +648,14 @@ Posture remains a separate top-of-funnel product:
 - no runtime enforcement;
 - best-effort bypass detection.
 
-Posture can later generate recommended proxy configs and policies. The proxy
-must not require Posture for core runtime operation.
+Posture is outside the MCP adapter v0.1 polishing scope. It can later generate
+recommended proxy configs and policies, but the proxy must not require Posture
+for core runtime operation and this v0.1 sequence does not include a Posture
+integration step.
+
+A future Posture-to-proxy bridge would be a separate opt-in slice added only if
+customer demand surfaces. Posture remains an orthogonal pre-deployment scanner,
+not a runtime dependency for the MCP Proxy.
 
 Posture bypass detection is advisory. It can flag direct MCP config entries that
 avoid the proxy, but authoritative enforcement requires routing through the
@@ -683,7 +690,6 @@ Minimum tests before beta:
 - wrong approval ID cannot resume another call;
 - downstream server unreachable;
 - proxy crash mid-call recovery;
-- Posture bypass warning;
 - local evidence inspection commands.
 
 Live smoke:
