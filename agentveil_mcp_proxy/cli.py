@@ -1,7 +1,7 @@
 """Minimal CLI for the experimental MCP proxy.
 
-P3 adds stdio pass-through transport. It still does not implement policy
-classification, AVP Runtime Gate calls, approval UI, or enforcement.
+P4 adds local tool-call classification and privacy hashing. It still does not
+implement AVP Runtime Gate calls, approval UI, or enforcement.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from nacl.signing import SigningKey
 
 from agentveil.agent import AVPAgent
 from agentveil.delegation import DelegationInvalid, verify_delegation
+from agentveil_mcp_proxy.classification import ToolCallClassifier
 from agentveil_mcp_proxy.policy import (
     PROXY_CONFIG_SCHEMA_VERSION,
     PolicyConfig,
@@ -397,7 +398,8 @@ def run_proxy(
         return health
     try:
         downstream = DownstreamConfig.from_proxy_config(config)
-        return McpPassthrough(downstream).run_stdio(client_in, out)
+        classifier = ToolCallClassifier(config, server_name=downstream.name)
+        return McpPassthrough(downstream, classifier=classifier).run_stdio(client_in, out)
     except PassthroughError as exc:
         raise ProxyCliError(str(exc), exit_code=1) from exc
 

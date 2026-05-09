@@ -1,7 +1,8 @@
 """MCP stdio pass-through skeleton for the experimental proxy.
 
-P3 only mirrors downstream MCP traffic. It does not classify tools, call AVP
-Runtime Gate, ask for approval, or write enforcement evidence.
+P4 mirrors downstream MCP traffic while building local tool-call classification
+metadata. It does not call AVP Runtime Gate, ask for approval, block calls, or
+write enforcement evidence.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import subprocess
 import threading
 from typing import Any, Callable, Mapping, TextIO
 
+from agentveil_mcp_proxy.classification import ClassifiedToolCall, ToolCallClassifier
 from agentveil_mcp_proxy.policy import ProxyConfig
 
 
@@ -112,9 +114,18 @@ def jsonrpc_error(request_id: Any, code: int, message: str) -> dict[str, Any]:
 class McpPassthrough:
     """Synchronous stdio JSON-RPC pass-through to one downstream MCP server."""
 
-    def __init__(self, downstream: DownstreamConfig, *, cwd: Path | None = None):
+    def __init__(
+        self,
+        downstream: DownstreamConfig,
+        *,
+        cwd: Path | None = None,
+        classifier: ToolCallClassifier | None = None,
+        on_tool_call: Callable[[ClassifiedToolCall], None] | None = None,
+    ):
         self.downstream = downstream
         self.cwd = cwd
+        self.classifier = classifier
+        self.on_tool_call = on_tool_call
         self.process: subprocess.Popen[str] | None = None
         self._stdout_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
@@ -251,6 +262,11 @@ class McpPassthrough:
             return [jsonrpc_error(request_id, JSONRPC_INVALID_REQUEST, "invalid JSON-RPC request")]
 
         try:
+            classification = None
+            if self.classifier is not None:
+                classification = self.classifier.classify_jsonrpc(message)
+            if classification is not None and self.on_tool_call is not None:
+                self.on_tool_call(classification)
             self._send_downstream(message)
             if not has_id:
                 return []
