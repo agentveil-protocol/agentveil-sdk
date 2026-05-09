@@ -2,8 +2,9 @@
 
 P5 is intentionally narrow: it submits privacy-filtered metadata to Runtime
 Gate, verifies signed DecisionReceipt JCS against pinned signer DIDs, and
-returns the verified backend decision to the passthrough layer. It does not
-create approval UI, write WAL evidence, or implement a circuit breaker.
+returns the verified backend decision to the passthrough layer. P8 adds an
+in-memory circuit breaker so sustained backend availability failures fail fast
+through the existing local fallback policy.
 """
 
 from __future__ import annotations
@@ -16,6 +17,10 @@ from typing import Any, Callable, Mapping
 from agentveil.agent import AVPAgent
 from agentveil.delegation import DelegationInvalid, verify_delegation
 from agentveil.proof import ProofVerificationError, verify_signed_jcs
+from agentveil_mcp_proxy.circuit_breaker import (
+    CircuitBreaker,
+    CircuitBreakerOpenError,
+)
 from agentveil_mcp_proxy.classification import ClassifiedToolCall
 from agentveil_mcp_proxy.identity import (
     IdentityError,
@@ -78,12 +83,16 @@ class RuntimeGateClient:
         config: ProxyConfig,
         control_grant: Mapping[str, Any],
         environment: str = DEFAULT_RUNTIME_ENVIRONMENT,
+        circuit_breaker: CircuitBreaker | None = None,
     ):
         self.agent = agent
         self.config = config
         self.control_grant = dict(control_grant)
         self.environment = environment
         self.trusted_signer_dids = tuple(config.avp.trusted_signer_dids)
+        self.circuit_breaker = circuit_breaker or CircuitBreaker(
+            config.circuit_breaker.to_runtime_config()
+        )
 
     @classmethod
     def from_files(
@@ -96,6 +105,7 @@ class RuntimeGateClient:
         passphrase: str | None = None,
         timeout: float = DEFAULT_RUNTIME_GATE_TIMEOUT_SECONDS,
         environment: str = DEFAULT_RUNTIME_ENVIRONMENT,
+        circuit_breaker: CircuitBreaker | None = None,
     ) -> "RuntimeGateClient":
         """Load local proxy identity/control grant and build a Runtime Gate client."""
 
@@ -135,6 +145,7 @@ class RuntimeGateClient:
             config=config,
             control_grant=control_grant,
             environment=environment,
+            circuit_breaker=circuit_breaker,
         )
 
     def evaluate(self, classification: ClassifiedToolCall) -> RuntimeGateDecision:
@@ -142,24 +153,39 @@ class RuntimeGateClient:
 
         request = self._build_request(classification)
         try:
-            response = self.agent.runtime_evaluate(
-                action=request.action,
-                resource=request.resource,
-                environment=request.environment,
-                delegation_receipt=self.control_grant,
-                payload_hash=request.payload_hash,
-                risk_class=request.risk_class,
-                policy_context_hash=request.policy_context_hash,
-            )
-        except Exception as exc:
-            raise RuntimeGateUnavailableError("runtime gate request failed") from exc
-        if not isinstance(response, Mapping):
-            raise RuntimeGateUnavailableError("runtime gate response invalid")
+            self.circuit_breaker.before_call()
+        except CircuitBreakerOpenError as exc:
+            raise RuntimeGateUnavailableError("runtime gate circuit breaker open") from exc
+        try:
+            try:
+                response = self.agent.runtime_evaluate(
+                    action=request.action,
+                    resource=request.resource,
+                    environment=request.environment,
+                    delegation_receipt=self.control_grant,
+                    payload_hash=request.payload_hash,
+                    risk_class=request.risk_class,
+                    policy_context_hash=request.policy_context_hash,
+                )
+            except Exception as exc:
+                raise RuntimeGateUnavailableError("runtime gate request failed") from exc
+            if not isinstance(response, Mapping):
+                raise RuntimeGateUnavailableError("runtime gate response invalid")
 
-        receipt_jcs = self._decision_receipt_jcs(response)
-        verified = self._verify_decision_receipt(receipt_jcs)
-        body = verified["body"]
-        self._validate_decision_body(body, response=response, request=request)
+            receipt_jcs = self._decision_receipt_jcs(response)
+            verified = self._verify_decision_receipt(receipt_jcs)
+            body = verified["body"]
+            self._validate_decision_body(body, response=response, request=request)
+        except RuntimeGateUnavailableError:
+            self.circuit_breaker.record_failure()
+            raise
+        except RuntimeGateUntrustedError:
+            raise
+        except Exception as exc:
+            self.circuit_breaker.record_failure()
+            raise RuntimeGateUnavailableError("runtime gate request failed") from exc
+
+        self.circuit_breaker.record_success()
         return RuntimeGateDecision(
             decision=body["decision"],
             audit_id=_optional_str(body.get("audit_id")),
@@ -167,6 +193,11 @@ class RuntimeGateClient:
             receipt_digest=verified["digest"],
             receipt_body=body,
         )
+
+    def drain_circuit_events(self) -> tuple[Mapping[str, Any], ...]:
+        """Return and clear sanitized circuit breaker state-change events."""
+
+        return self.circuit_breaker.drain_events()
 
     def _build_request(self, classification: ClassifiedToolCall) -> _RuntimeGateRequest:
         metadata = classification.backend_metadata()

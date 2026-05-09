@@ -3,8 +3,8 @@
 The CLI creates encrypted local proxy identities by default, manages the
 control grant used by Runtime Gate, and runs stdio passthrough for configured
 downstream MCP servers. Approval-required calls can route through the local
-approval surface and durable evidence store. Circuit breaking remains a future
-slice.
+approval surface and durable evidence store. Runtime Gate calls use an
+in-memory circuit breaker for sustained backend failures.
 """
 
 from __future__ import annotations
@@ -414,6 +414,12 @@ def _build_config_payload(
             "approval_timeout_seconds": 300,
             "on_timeout": "deny",
         },
+        "circuit_breaker": {
+            "failures_before_open": 5,
+            "window_seconds": 60,
+            "cooldown_seconds": 30,
+            "half_open_test_count": 1,
+        },
         "policy": _policy_to_dict(policy),
         "downstream": {},
     }
@@ -660,6 +666,12 @@ def doctor_proxy(
         print(f"OK: identity {identity_path}", file=out)
         print(f"OK: control grant {grant_path}", file=out)
         print(f"OK: trusted signers {len(config.avp.trusted_signer_dids)}", file=out)
+        print(
+            "OK: circuit breaker closed "
+            f"(threshold {config.circuit_breaker.failures_before_open}, "
+            f"cooldown {config.circuit_breaker.cooldown_seconds}s)",
+            file=out,
+        )
         for warning in warnings:
             print(f"WARN: {warning}", file=out)
         return 0

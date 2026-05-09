@@ -3,7 +3,8 @@
 This package includes the local config/policy foundation, encrypted proxy
 identity management, MCP stdio passthrough, local classification with privacy
 hashing, Runtime Gate enforcement, and durable local approval evidence storage.
-Circuit breaking remains a future slice.
+Runtime Gate calls use an in-memory circuit breaker for sustained backend
+failures.
 """
 
 from agentveil_mcp_proxy.approval import (
@@ -14,6 +15,12 @@ from agentveil_mcp_proxy.approval import (
     ApprovalServer,
     HeadlessPolicy,
     HeadlessPolicyError,
+)
+from agentveil_mcp_proxy.circuit_breaker import (
+    CircuitBreaker,
+    CircuitBreakerConfig,
+    CircuitBreakerOpenError,
+    CircuitState,
 )
 from agentveil_mcp_proxy.classification import (
     ClassifiedToolCall,
@@ -69,6 +76,7 @@ from agentveil_mcp_proxy.policy import (
     PolicyReloadResult,
     PolicyRule,
     PolicyRuntime,
+    ProxyCircuitBreakerConfig,
     PrivacyConfig,
     ProxyConfig,
     ProxyConfigError,
@@ -102,6 +110,10 @@ __all__ = [
     "ApprovalServer",
     "ApprovalStatus",
     "AvpConfig",
+    "CircuitBreaker",
+    "CircuitBreakerConfig",
+    "CircuitBreakerOpenError",
+    "CircuitState",
     "ClassifiedToolCall",
     "DecisionMode",
     "DownstreamConfig",
@@ -127,6 +139,7 @@ __all__ = [
     "PrivacyConfig",
     "ProxyConfig",
     "ProxyConfigError",
+    "ProxyCircuitBreakerConfig",
     "RecoveryReport",
     "RiskClass",
     "RuntimeGateClient",

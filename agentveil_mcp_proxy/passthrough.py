@@ -3,7 +3,8 @@
 P6 applies local policy to MCP ``tools/call`` requests and, for
 ``ask_backend``, calls AVP Runtime Gate before forwarding. Approval-required
 decisions can be routed through the local approval manager before downstream
-execution. Circuit breaking remains a future slice.
+execution. Runtime Gate circuit breaker state changes are recorded as sanitized
+security events.
 
 Lifecycle behavior by platform:
   - Linux: downstream starts in its own process group and receives SIGTERM via
@@ -612,6 +613,7 @@ class McpPassthrough:
             decision = self._runtime_gate_client().evaluate(classification)
         except RuntimeGateUntrustedError:
             self._runtime_gate_errors += 1
+            self._record_runtime_gate_events()
             self._record_security_event({
                 "type": "runtime_decision_untrusted",
                 "action": "blocked",
@@ -625,10 +627,13 @@ class McpPassthrough:
             )
         except RuntimeGateUnavailableError:
             self._runtime_gate_errors += 1
+            self._record_runtime_gate_events()
             return self._fallback_error_response(classification, request_id)
         except RuntimeGateError:
             self._runtime_gate_errors += 1
+            self._record_runtime_gate_events()
             return self._fallback_error_response(classification, request_id)
+        self._record_runtime_gate_events()
 
         if decision.decision == DECISION_ALLOW:
             return None
@@ -746,6 +751,17 @@ class McpPassthrough:
                 raise RuntimeGateUnavailableError("runtime gate not configured")
             self._runtime_gate = self.runtime_gate_factory()
         return self._runtime_gate
+
+    def _record_runtime_gate_events(self) -> None:
+        gate = self._runtime_gate
+        drain = getattr(gate, "drain_circuit_events", None)
+        if not callable(drain):
+            return
+        try:
+            for event in drain():
+                self._record_security_event(event)
+        except Exception:
+            return
 
     def _record_security_event(self, event: Mapping[str, Any]) -> None:
         self._security_events.append(dict(event))

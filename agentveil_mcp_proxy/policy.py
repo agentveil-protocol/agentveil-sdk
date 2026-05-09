@@ -17,6 +17,8 @@ from typing import Any, Deque, Mapping, Sequence
 
 import jcs
 
+from agentveil_mcp_proxy.circuit_breaker import CircuitBreakerConfig
+
 
 PROXY_CONFIG_SCHEMA_VERSION = 1
 POLICY_SCHEMA_VERSION = 1
@@ -331,6 +333,39 @@ class ApprovalConfig:
 
 
 @dataclass(frozen=True)
+class ProxyCircuitBreakerConfig:
+    """Backend circuit breaker config wrapper for proxy schema validation."""
+
+    failures_before_open: int = 5
+    window_seconds: int = 60
+    cooldown_seconds: int = 30
+    half_open_test_count: int = 1
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any] | None = None) -> "ProxyCircuitBreakerConfig":
+        try:
+            parsed = CircuitBreakerConfig.from_dict(data)
+        except ValueError as exc:
+            raise ProxyConfigError(str(exc)) from exc
+        return cls(
+            failures_before_open=parsed.failures_before_open,
+            window_seconds=parsed.window_seconds,
+            cooldown_seconds=parsed.cooldown_seconds,
+            half_open_test_count=parsed.half_open_test_count,
+        )
+
+    def to_runtime_config(self) -> CircuitBreakerConfig:
+        """Return the gateway-agnostic runtime circuit breaker config."""
+
+        return CircuitBreakerConfig(
+            failures_before_open=self.failures_before_open,
+            window_seconds=self.window_seconds,
+            cooldown_seconds=self.cooldown_seconds,
+            half_open_test_count=self.half_open_test_count,
+        )
+
+
+@dataclass(frozen=True)
 class PolicyMatch:
     """Rule match criteria.
 
@@ -479,6 +514,7 @@ class ProxyConfig:
     privacy: PrivacyConfig = field(default_factory=PrivacyConfig)
     fallback: FallbackConfig = field(default_factory=FallbackConfig)
     approval: ApprovalConfig = field(default_factory=ApprovalConfig)
+    circuit_breaker: ProxyCircuitBreakerConfig = field(default_factory=ProxyCircuitBreakerConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     downstream: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
 
@@ -494,6 +530,7 @@ class ProxyConfig:
                 "privacy",
                 "fallback",
                 "approval",
+                "circuit_breaker",
                 "policy",
                 "downstream",
             },
@@ -511,6 +548,7 @@ class ProxyConfig:
             privacy=PrivacyConfig.from_dict(data.get("privacy", {})),
             fallback=FallbackConfig.from_dict(data.get("fallback", {})),
             approval=ApprovalConfig.from_dict(data.get("approval", {})),
+            circuit_breaker=ProxyCircuitBreakerConfig.from_dict(data.get("circuit_breaker")),
             policy=PolicyConfig.from_dict(data.get("policy", {})),
             downstream=MappingProxyType(dict(downstream)),
         )
