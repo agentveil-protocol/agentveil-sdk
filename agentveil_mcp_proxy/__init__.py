@@ -2,8 +2,8 @@
 
 This package includes the local config/policy foundation, encrypted proxy
 identity management, MCP stdio passthrough, local classification with privacy
-hashing, and Runtime Gate enforcement. Approval UI, WAL evidence, and circuit
-breaking remain future slices.
+hashing, Runtime Gate enforcement, and durable local approval evidence storage.
+Approval UI and circuit breaking remain future slices.
 """
 
 from agentveil_mcp_proxy.classification import (
@@ -20,6 +20,18 @@ from agentveil_mcp_proxy.cli import (
     proxy_paths,
     reissue_grant,
     run_proxy,
+)
+from agentveil_mcp_proxy.evidence import (
+    ApprovalEvidenceCapacityError,
+    ApprovalEvidenceDuplicateError,
+    ApprovalEvidenceError,
+    ApprovalEvidenceNotFoundError,
+    ApprovalEvidenceSchemaError,
+    ApprovalEvidenceStore,
+    ApprovalEvidenceTransitionError,
+    ApprovalStatus,
+    PendingApproval,
+    RecoveryReport,
 )
 from agentveil_mcp_proxy.passthrough import DownstreamConfig, McpPassthrough, PassthroughError
 from agentveil_mcp_proxy.policy import (
@@ -54,6 +66,14 @@ from agentveil_mcp_proxy.runtime_gate import (
 
 __all__ = [
     "ApprovalConfig",
+    "ApprovalEvidenceCapacityError",
+    "ApprovalEvidenceDuplicateError",
+    "ApprovalEvidenceError",
+    "ApprovalEvidenceNotFoundError",
+    "ApprovalEvidenceSchemaError",
+    "ApprovalEvidenceStore",
+    "ApprovalEvidenceTransitionError",
+    "ApprovalStatus",
     "AvpConfig",
     "ClassifiedToolCall",
     "DecisionMode",
@@ -61,6 +81,7 @@ __all__ = [
     "FallbackConfig",
     "McpPassthrough",
     "PassthroughError",
+    "PendingApproval",
     "PolicyConfig",
     "PolicyDecision",
     "PolicyEngine",
@@ -72,6 +93,7 @@ __all__ = [
     "PrivacyConfig",
     "ProxyConfig",
     "ProxyConfigError",
+    "RecoveryReport",
     "RiskClass",
     "RuntimeGateClient",
     "RuntimeGateDecision",

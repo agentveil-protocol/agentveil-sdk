@@ -41,6 +41,23 @@ message is bounded to 1 MiB. If a downstream response exceeds that limit or is
 not a JSON object, the proxy returns a sanitized downstream-unavailable error to
 the client and does not include response content in logs or client output.
 
+## Local Evidence Storage
+
+Approval flows use a local SQLite evidence database at
+`~/.avp/mcp-proxy/evidence.sqlite`. The database file is created with `0600`
+permissions and uses SQLite WAL mode so pending approvals survive a proxy
+restart.
+
+The store contains approval state and privacy-preserving metadata only: request
+IDs, session/client labels, server/tool names, action and risk classes, resource
+hashes, payload hashes, policy context hashes, receipt hashes, approval token
+hashes, timestamps, and sanitized result/error classes. It must never contain raw
+MCP arguments, prompts, outputs, tokens, source code, secrets, or private logs.
+
+Pending approval records are written before an approval prompt can authorize
+downstream execution. On startup, stale pending records are marked expired; the
+store never auto-approves a request during recovery.
+
 ## Proxy Identity Storage
 
 `agentveil-mcp-proxy init` encrypts the local proxy identity by default. In an
