@@ -194,6 +194,7 @@ class ApprovalEvidenceStore:
         self._conn.row_factory = sqlite3.Row
         self._configure_connection()
         self._apply_schema()
+        self._secure_auxiliary_files()
 
     def close(self) -> None:
         """Close the SQLite connection."""
@@ -235,6 +236,7 @@ class ApprovalEvidenceStore:
                 )
                 self._rebuild_chain_locked()
                 self._conn.commit()
+                self._secure_auxiliary_files()
             except Exception:
                 self._conn.rollback()
                 raise
@@ -312,6 +314,7 @@ class ApprovalEvidenceStore:
                 )
                 self._rebuild_chain_locked()
                 self._conn.commit()
+                self._secure_auxiliary_files()
             except Exception:
                 self._conn.rollback()
                 raise
@@ -344,6 +347,7 @@ class ApprovalEvidenceStore:
                     )
                     self._rebuild_chain_locked()
                 self._conn.commit()
+                self._secure_auxiliary_files()
             except Exception:
                 self._conn.rollback()
                 raise
@@ -415,6 +419,7 @@ class ApprovalEvidenceStore:
                     )
                     self._rebuild_chain_locked()
                 self._conn.commit()
+                self._secure_auxiliary_files()
             except Exception:
                 self._conn.rollback()
                 raise
@@ -432,6 +437,12 @@ class ApprovalEvidenceStore:
         flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
         fd = os.open(self.db_path, flags, 0o600)
         os.close(fd)
+
+    def _secure_auxiliary_files(self) -> None:
+        for suffix in ("-wal", "-shm"):
+            aux_path = Path(f"{self.db_path}{suffix}")
+            if aux_path.exists():
+                os.chmod(aux_path, 0o600)
 
     def _configure_connection(self) -> None:
         self._conn.execute("PRAGMA journal_mode=WAL")

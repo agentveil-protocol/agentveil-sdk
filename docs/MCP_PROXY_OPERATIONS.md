@@ -162,6 +162,16 @@ storage is available only through the explicit `--plaintext` opt-out on `init`;
 the command prints a warning because the private key is then protected only by
 local file permissions.
 
+Encrypted identity storage uses an Argon2id key derivation function with
+moderate operation and memory limits. Each CLI invocation that opens the
+identity derives the key again, which can take a few seconds depending on host
+hardware; the derived key is never cached on disk. Scripts can set
+`AVP_PROXY_PASSPHRASE` once per shell session to avoid repeated passphrase
+prompts, but each command still pays the derivation cost. For high-frequency
+automation, prefer a long-lived `agentveil-mcp-proxy run` process over repeated
+short-lived CLI invocations. The explicit `--plaintext` opt-out avoids the KDF
+cost by storing the private key unencrypted on disk.
+
 ### Migrate Existing Plaintext Identity
 
 Do not use `agentveil-mcp-proxy init --force` to migrate an existing plaintext

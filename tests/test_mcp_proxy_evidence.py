@@ -296,6 +296,47 @@ def test_evidence_db_file_has_0600_permissions(tmp_path):
     assert _mode(db_path) == 0o600
 
 
+def test_evidence_db_wal_file_has_0600_permissions(tmp_path):
+    if os.name == "nt":
+        pytest.skip("POSIX mode bits are not stable on Windows")
+
+    db_path = tmp_path / "evidence.sqlite"
+    old_umask = os.umask(0o022)
+    try:
+        with ApprovalEvidenceStore(db_path) as store:
+            store.write_pending(_record("req-wal"))
+            aux_paths = [Path(f"{db_path}-wal"), Path(f"{db_path}-shm")]
+            existing = [path for path in aux_paths if path.exists()]
+            assert existing
+            assert all(_mode(path) == 0o600 for path in existing)
+    finally:
+        os.umask(old_umask)
+
+
+def test_evidence_db_wal_permissions_preserved_across_reconnect(tmp_path):
+    if os.name == "nt":
+        pytest.skip("POSIX mode bits are not stable on Windows")
+
+    db_path = tmp_path / "evidence.sqlite"
+    old_umask = os.umask(0o022)
+    try:
+        with ApprovalEvidenceStore(db_path) as store:
+            store.write_pending(_record("req-wal-reconnect"))
+
+        with ApprovalEvidenceStore(db_path) as reopened:
+            reopened.transition(
+                "req-wal-reconnect",
+                ApprovalStatus.APPROVED.value,
+                approval_token_hash=APPROVAL_TOKEN_HASH,
+            )
+            aux_paths = [Path(f"{db_path}-wal"), Path(f"{db_path}-shm")]
+            existing = [path for path in aux_paths if path.exists()]
+            assert existing
+            assert all(_mode(path) == 0o600 for path in existing)
+    finally:
+        os.umask(old_umask)
+
+
 def test_schema_version_mismatch_refuses_to_open_for_forward_incompatible(tmp_path):
     db_path = tmp_path / "evidence.sqlite"
     conn = sqlite3.connect(str(db_path))
