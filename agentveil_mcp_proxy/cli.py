@@ -1,7 +1,7 @@
 """Minimal CLI for the experimental MCP proxy.
 
-P2 owns only `init`, `doctor`, and a guarded `run` stub. It does not implement
-MCP transport or AVP Runtime Gate calls.
+P3 adds stdio pass-through transport. It still does not implement policy
+classification, AVP Runtime Gate calls, approval UI, or enforcement.
 """
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from datetime import timedelta
+import io
 import json
 import os
 from pathlib import Path
@@ -26,6 +27,7 @@ from agentveil_mcp_proxy.policy import (
     ProxyConfigError,
     builtin_policy_pack,
 )
+from agentveil_mcp_proxy.passthrough import DownstreamConfig, McpPassthrough, PassthroughError
 
 
 DEFAULT_BASE_URL = "https://agentveil.dev"
@@ -372,24 +374,38 @@ def doctor_proxy(
         return 1
 
 
-def run_proxy_stub(
+def run_proxy(
     *,
     home: Path | None = None,
     config_path: Path | None = None,
     out: TextIO | None = None,
+    client_in: TextIO | None = None,
+    err: TextIO | None = None,
 ) -> int:
-    """Validate readiness and refuse to start until P3 transport lands."""
+    """Validate readiness and run stdio MCP pass-through."""
 
     out = out or sys.stdout
+    client_in = client_in or sys.stdin
+    err = err or sys.stderr
     paths = proxy_paths(home, config_path)
     config = load_proxy_config(paths.config_path)
-    if not config.avp.trusted_signer_dids:
-        raise ProxyCliError("trusted signer DID set is empty; run doctor/init first")
-    health = doctor_proxy(home=paths.home, config_path=paths.config_path, out=out)
+    doctor_out = io.StringIO()
+    health = doctor_proxy(home=paths.home, config_path=paths.config_path, out=doctor_out)
     if health != 0:
+        err.write(doctor_out.getvalue())
+        err.flush()
         return health
-    print("MCP transport is not implemented until P3; run refused.", file=out)
-    return 3
+    try:
+        downstream = DownstreamConfig.from_proxy_config(config)
+        return McpPassthrough(downstream).run_stdio(client_in, out)
+    except PassthroughError as exc:
+        raise ProxyCliError(str(exc), exit_code=1) from exc
+
+
+def run_proxy_stub(**kwargs: Any) -> int:
+    """Backward-compatible wrapper for the P2 name."""
+
+    return run_proxy(**kwargs)
 
 
 def _add_common_path_args(parser: argparse.ArgumentParser) -> None:
@@ -414,7 +430,7 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = subparsers.add_parser("doctor", help="Validate local proxy config and files")
     _add_common_path_args(doctor)
 
-    run = subparsers.add_parser("run", help="Validate readiness; MCP transport starts in P3")
+    run = subparsers.add_parser("run", help="Run stdio MCP passthrough")
     _add_common_path_args(run)
 
     return parser
@@ -445,7 +461,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "doctor":
             return doctor_proxy(home=args.home, config_path=args.config)
         if args.command == "run":
-            return run_proxy_stub(home=args.home, config_path=args.config)
+            return run_proxy(home=args.home, config_path=args.config)
     except ProxyCliError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return exc.exit_code

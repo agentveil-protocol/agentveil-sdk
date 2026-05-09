@@ -16,7 +16,7 @@ from agentveil_mcp_proxy.cli import (
     init_proxy,
     main,
     proxy_paths,
-    run_proxy_stub,
+    run_proxy,
 )
 from agentveil_mcp_proxy.policy import ProxyConfig
 
@@ -142,16 +142,21 @@ def test_doctor_passes_after_init_without_printing_secrets(tmp_path):
     assert private_key not in out.getvalue()
 
 
-def test_run_validates_config_then_refuses_until_p3_transport(tmp_path):
+def test_run_without_downstream_config_fails_without_printing_secrets(tmp_path):
     home = tmp_path / "avp-home"
     result = init_proxy(home=home, agent_name="proxy")
     private_key = _load(result.identity_path)["private_key_hex"]
 
     out = io.StringIO()
-    code = run_proxy_stub(home=home, out=out)
+    try:
+        run_proxy(home=home, out=out)
+    except ProxyCliError as exc:
+        assert exc.exit_code == 1
+        assert "downstream.command" in str(exc)
+    else:
+        raise AssertionError("expected run to require downstream.command")
 
-    assert code == 3
-    assert "MCP transport is not implemented until P3" in out.getvalue()
+    assert out.getvalue() == ""
     assert private_key not in out.getvalue()
 
 
@@ -164,7 +169,7 @@ def test_run_does_not_start_without_trusted_signer_config(tmp_path):
     os.chmod(result.config_path, 0o600)
 
     try:
-        run_proxy_stub(home=home)
+        run_proxy(home=home)
     except ProxyCliError as exc:
         assert exc.exit_code == 1
         assert "trusted_signer_dids" in str(exc)
@@ -186,7 +191,9 @@ def test_main_init_doctor_and_run_exit_codes(tmp_path, capsys):
     assert "OK: trusted signers" in doctor.out
     assert private_key not in doctor.out
 
-    assert main(["run", "--home", str(home)]) == 3
+    assert main(["run", "--home", str(home)]) == 1
     run = capsys.readouterr()
-    assert "not implemented until P3" in run.out
+    assert run.out == ""
+    assert "downstream.command" in run.err
     assert private_key not in run.out
+    assert private_key not in run.err
