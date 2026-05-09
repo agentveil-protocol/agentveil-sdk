@@ -1,9 +1,9 @@
-"""Experimental MCP proxy config and policy primitives.
+"""MCP proxy config, policy, and Runtime Gate primitives.
 
 This package currently includes the P1 config/policy foundation, the P2
-minimal CLI, the P3 MCP pass-through skeleton, and P4 local classification with
-privacy hashing. It does not implement backend Runtime Gate calls, approval UI,
-or enforcement yet.
+minimal CLI, the P3 MCP pass-through skeleton, P4 local classification with
+privacy hashing, and P5 Runtime Gate enforcement. Approval UI, WAL evidence,
+and circuit breaking remain future slices.
 """
 
 from agentveil_mcp_proxy.classification import (
@@ -38,6 +38,13 @@ from agentveil_mcp_proxy.policy import (
     builtin_policy_pack,
     policy_context_hash,
 )
+from agentveil_mcp_proxy.runtime_gate import (
+    RuntimeGateClient,
+    RuntimeGateDecision,
+    RuntimeGateError,
+    RuntimeGateUnavailableError,
+    RuntimeGateUntrustedError,
+)
 
 __all__ = [
     "ApprovalConfig",
@@ -60,6 +67,11 @@ __all__ = [
     "ProxyConfig",
     "ProxyConfigError",
     "RiskClass",
+    "RuntimeGateClient",
+    "RuntimeGateDecision",
+    "RuntimeGateError",
+    "RuntimeGateUnavailableError",
+    "RuntimeGateUntrustedError",
     "TimeoutAction",
     "ToolCallClassifier",
     "ToolCallContext",

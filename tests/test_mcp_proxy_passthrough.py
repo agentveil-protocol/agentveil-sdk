@@ -44,6 +44,26 @@ def _set_downstream(config_path: Path, script: Path, *, log_path: Path | None = 
     _write_json(config_path, config)
 
 
+def _set_allow_policy(config_path: Path, *, server: str, tool: str) -> None:
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["policy"] = {
+        "id": "allow-test",
+        "policy_schema_version": 1,
+        "default_decision": "ask_backend",
+        "default_risk_class": "unknown",
+        "rules": [
+            {
+                "id": "allow-tool",
+                "source": "user",
+                "decision": "allow",
+                "risk_class": "read",
+                "match": {"server": server, "tool": tool},
+            }
+        ],
+    }
+    _write_json(config_path, config)
+
+
 def _normal_downstream(tmp_path: Path) -> Path:
     script = tmp_path / "fake_downstream.py"
     script.write_text(
@@ -223,11 +243,18 @@ def test_run_mirrors_initialize_initialized_and_tools_list(tmp_path):
     assert "OK:" not in client_out.getvalue()
 
 
-def test_run_passthrough_forwards_tools_call_without_backend_or_gate(tmp_path):
+def test_run_passthrough_forwards_local_allow_without_backend_or_gate(tmp_path, monkeypatch):
     home = tmp_path / "avp-home"
     init = init_proxy(home=home, agent_name="proxy")
     log_path = tmp_path / "downstream.log"
     _set_downstream(init.config_path, _normal_downstream(tmp_path), log_path=log_path)
+    _set_allow_policy(init.config_path, server="fake-downstream", tool="read_file")
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("local allow must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
 
     client_in = io.StringIO(
         _json_line({

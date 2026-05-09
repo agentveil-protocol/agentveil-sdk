@@ -1332,6 +1332,9 @@ class AVPAgent:
         delegation_receipt: dict,
         amount: Optional[float] = None,
         currency: Optional[str] = None,
+        payload_hash: Optional[str] = None,
+        risk_class: Optional[str] = None,
+        policy_context_hash: Optional[str] = None,
     ) -> dict:
         """
         Evaluate whether this agent may perform one action right now.
@@ -1351,6 +1354,12 @@ class AVPAgent:
             body_data["amount"] = amount
         if currency is not None:
             body_data["currency"] = currency
+        if payload_hash is not None:
+            body_data["payload_hash"] = payload_hash
+        if risk_class is not None:
+            body_data["risk_class"] = risk_class
+        if policy_context_hash is not None:
+            body_data["policy_context_hash"] = policy_context_hash
         return self._post_json("/v1/runtime/evaluate", body_data)
 
     def get_runtime_decision(self, audit_id: str) -> dict:

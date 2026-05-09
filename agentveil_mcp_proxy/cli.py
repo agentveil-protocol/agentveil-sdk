@@ -1,7 +1,7 @@
-"""Minimal CLI for the experimental MCP proxy.
+"""Minimal CLI for the MCP proxy.
 
-P4 adds local tool-call classification and privacy hashing. It still does not
-implement AVP Runtime Gate calls, approval UI, or enforcement.
+P5 adds Runtime Gate enforcement for ``ask_backend`` policy decisions. Approval
+UI, WAL evidence, and circuit breaking remain future slices.
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ from agentveil_mcp_proxy.policy import (
     builtin_policy_pack,
 )
 from agentveil_mcp_proxy.passthrough import DownstreamConfig, McpPassthrough, PassthroughError
+from agentveil_mcp_proxy.runtime_gate import RuntimeGateClient
 
 
 DEFAULT_BASE_URL = "https://agentveil.dev"
@@ -399,7 +400,19 @@ def run_proxy(
     try:
         downstream = DownstreamConfig.from_proxy_config(config)
         classifier = ToolCallClassifier(config, server_name=downstream.name)
-        return McpPassthrough(downstream, classifier=classifier).run_stdio(client_in, out)
+        identity_path = paths.identity_path(config.avp.agent_name)
+        control_grant_path = paths.control_grant_path(config.avp.agent_name)
+        runtime_gate_factory = lambda: RuntimeGateClient.from_files(
+            identity_path=identity_path,
+            control_grant_path=control_grant_path,
+            config=config,
+            agent_cls=AVPAgent,
+        )
+        return McpPassthrough(
+            downstream,
+            classifier=classifier,
+            runtime_gate_factory=runtime_gate_factory,
+        ).run_stdio(client_in, out)
     except PassthroughError as exc:
         raise ProxyCliError(str(exc), exit_code=1) from exc
 
