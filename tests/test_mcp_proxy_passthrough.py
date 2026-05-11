@@ -381,6 +381,27 @@ def _wait_for_file(path: Path, timeout: float = 2.0) -> str:
     raise AssertionError(f"timed out waiting for {path}")
 
 
+def _wait_for_file_or_process(path: Path, proc: subprocess.Popen[str], timeout: float = 30.0) -> str:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            value = path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            value = ""
+        if value:
+            return value
+        if proc.poll() is not None:
+            stdout, stderr = proc.communicate(timeout=1.0)
+            raise AssertionError(
+                f"process exited before {path}: "
+                f"returncode={proc.returncode}, stdout={stdout!r}, stderr={stderr!r}"
+            )
+        time.sleep(0.02)
+    raise AssertionError(
+        f"timed out waiting for {path}; process returncode={proc.poll()}"
+    )
+
+
 def _process_is_running(pid: int) -> bool:
     if os.name == "nt":
         kernel32 = ctypes.windll.kernel32
@@ -755,7 +776,8 @@ def test_run_proxy_responds_to_sigterm_with_clean_shutdown(tmp_path):
     )
     downstream_pid: int | None = None
     try:
-        _wait_for_file(downstream_ready_file, timeout=10.0)
+        _wait_for_file_or_process(ready_file, proc, timeout=10.0)
+        _wait_for_file_or_process(downstream_ready_file, proc, timeout=60.0)
         downstream_pid = int(_wait_for_file(downstream_pid_file))
         assert _process_is_running(downstream_pid)
 

@@ -8,6 +8,8 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
 from agentveil.delegation import verify_delegation
 from agentveil_mcp_proxy.cli import (
     AGENTVEIL_DEV_SIGNER_DIDS,
@@ -107,11 +109,12 @@ def test_init_creates_identity_config_and_control_grant_with_0600(tmp_path):
     assert result.identity_path == home / "agents" / "proxy.json"
     assert result.config_path == home / "mcp-proxy" / "config.json"
     assert result.control_grant_path == home / "mcp-proxy" / "proxy.control-grant.json"
-    assert _mode(result.identity_path) == 0o600
-    assert _mode(result.config_path) == 0o600
-    assert _mode(result.control_grant_path) == 0o600
-    assert _mode(result.identity_path.parent) == 0o700
-    assert _mode(result.config_path.parent) == 0o700
+    if os.name != "nt":
+        assert _mode(result.identity_path) == 0o600
+        assert _mode(result.config_path) == 0o600
+        assert _mode(result.control_grant_path) == 0o600
+        assert _mode(result.identity_path.parent) == 0o700
+        assert _mode(result.config_path.parent) == 0o700
 
     identity = _load(result.identity_path)
     assert identity["name"] == "proxy"
@@ -245,6 +248,9 @@ def test_doctor_fails_when_trusted_signers_empty(tmp_path):
 
 
 def test_doctor_fails_on_insecure_identity_permissions(tmp_path):
+    if os.name == "nt":
+        pytest.skip("POSIX chmod permissions are not the Windows ACL enforcement surface")
+
     home = tmp_path / "avp-home"
     result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
     os.chmod(result.identity_path, 0o644)

@@ -92,6 +92,9 @@ class TestAVPAgentSaveLoad:
             AVPAgent.load("https://example.com", name="nonexistent_agent_xyz")
 
     def test_save_file_permissions(self, private_key):
+        if os.name == "nt":
+            pytest.skip("POSIX mode bits do not represent Windows profile ACLs")
+
         with tempfile.TemporaryDirectory() as tmpdir:
             import agentveil.agent as agent_mod
             original_dir = agent_mod.AGENTS_DIR
