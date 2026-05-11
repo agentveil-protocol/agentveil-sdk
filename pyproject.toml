@@ -51,6 +51,7 @@ include = ["agentveil*", "agentveil_mcp*", "mcp_server*"]
 
 [tool.setuptools.package-data]
 agentveil_mcp = ["README.md"]
+agentveil_mcp_proxy = ["README.md"]
 mcp_server = ["README.md"]
 
 [tool.pytest.ini_options]
