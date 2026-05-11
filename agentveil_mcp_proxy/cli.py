@@ -313,6 +313,9 @@ def _resolve_existing_identity_passphrase(
 
 
 def _owner_only(path: Path) -> bool:
+    if os.name == "nt":
+        # Windows profile ACLs, not POSIX mode bits, enforce owner-only access.
+        return True
     try:
         return (path.stat().st_mode & 0o777) == 0o600
     except FileNotFoundError:

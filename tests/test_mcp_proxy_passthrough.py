@@ -307,6 +307,8 @@ import sys
 import time
 
 Path(sys.argv[1]).write_text(str(os.getpid()), encoding="utf-8")
+if len(sys.argv) > 2:
+    Path(sys.argv[2]).write_text("ready", encoding="utf-8")
 while True:
     time.sleep(1)
 """.lstrip(),
@@ -728,11 +730,17 @@ def test_run_proxy_responds_to_sigterm_with_clean_shutdown(tmp_path):
     home = tmp_path / "avp-home"
     init = init_proxy(home=home, agent_name="proxy", plaintext=True)
     downstream_pid_file = tmp_path / "downstream.pid"
+    downstream_ready_file = tmp_path / "downstream.ready"
     config = json.loads(init.config_path.read_text(encoding="utf-8"))
     config["downstream"] = {
         "name": "graceful-child",
         "command": sys.executable,
-        "args": ["-u", str(_ungraceful_child_downstream(tmp_path)), str(downstream_pid_file)],
+        "args": [
+            "-u",
+            str(_ungraceful_child_downstream(tmp_path)),
+            str(downstream_pid_file),
+            str(downstream_ready_file),
+        ],
     }
     _write_json(init.config_path, config)
 
@@ -747,7 +755,7 @@ def test_run_proxy_responds_to_sigterm_with_clean_shutdown(tmp_path):
     )
     downstream_pid: int | None = None
     try:
-        _wait_for_file(ready_file)
+        _wait_for_file(downstream_ready_file, timeout=10.0)
         downstream_pid = int(_wait_for_file(downstream_pid_file))
         assert _process_is_running(downstream_pid)
 

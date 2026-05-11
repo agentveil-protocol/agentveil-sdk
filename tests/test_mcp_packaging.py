@@ -212,7 +212,7 @@ def test_project_name_unchanged(pyproject):
 # ------------------------------------------------------------------
 
 def test_canonical_readme_declares_agentveil_mcp_as_canonical():
-    text = CANONICAL_README.read_text()
+    text = CANONICAL_README.read_text(encoding="utf-8")
     assert "agentveil-mcp" in text
     assert "canonical" in text.lower(), (
         "agentveil_mcp/README.md must explicitly label the canonical path"
@@ -220,13 +220,13 @@ def test_canonical_readme_declares_agentveil_mcp_as_canonical():
 
 
 def test_canonical_readme_marks_mcp_server_as_deprecated():
-    text = CANONICAL_README.read_text().lower()
+    text = CANONICAL_README.read_text(encoding="utf-8").lower()
     assert "deprecated" in text, "README must mention deprecation of mcp_server"
     assert "mcp_server" in text, "README must reference old mcp_server path to migrate from"
 
 
 def test_top_readme_uses_extras_install_form():
-    text = TOP_README.read_text()
+    text = TOP_README.read_text(encoding="utf-8")
     # The Claude/Hermes rows should use the `'agentveil[mcp]'` extras form,
     # not the bare `pip install agentveil mcp` two-package form.
     assert "pip install 'agentveil[mcp]'" in text, (
@@ -243,22 +243,22 @@ def test_top_readme_uses_extras_install_form():
 
 
 def test_mcp_dockerfile_uses_extras_install_form():
-    text = MCP_DOCKERFILE.read_text()
+    text = MCP_DOCKERFILE.read_text(encoding="utf-8")
     assert "pip install --no-cache-dir 'agentveil[mcp]' httpx" in text
     assert "pip install --no-cache-dir agentveil mcp" not in text
 
 
 def test_mcp_protocol_info_advertises_mcp_extra_install():
-    text = MCP_SERVER.read_text()
+    text = MCP_SERVER.read_text(encoding="utf-8")
     assert '"mcp": "pip install \'agentveil[mcp]\'"' in text
 
 
 def test_public_mcp_docs_use_canonical_install_and_command_paths():
     docs = {
-        "AGENTS.md": AGENTS_DOC.read_text(),
-        "docs/INTEGRATIONS.md": INTEGRATIONS_DOC.read_text(),
-        "examples/claude_mcp_example.py": CLAUDE_MCP_EXAMPLE.read_text(),
-        "agentveil/tools/claude_mcp.py": LEGACY_CLAUDE_MCP_MODULE.read_text(),
+        "AGENTS.md": AGENTS_DOC.read_text(encoding="utf-8"),
+        "docs/INTEGRATIONS.md": INTEGRATIONS_DOC.read_text(encoding="utf-8"),
+        "examples/claude_mcp_example.py": CLAUDE_MCP_EXAMPLE.read_text(encoding="utf-8"),
+        "agentveil/tools/claude_mcp.py": LEGACY_CLAUDE_MCP_MODULE.read_text(encoding="utf-8"),
     }
 
     for name, text in docs.items():
@@ -278,11 +278,11 @@ def test_public_mcp_docs_use_canonical_install_and_command_paths():
             f"{name} should not advertise deprecated mcp_server.server config"
         )
 
-    assert "pip install 'agentveil[mcp]'" in AGENTS_DOC.read_text()
-    assert "pip install 'agentveil[mcp]'" in INTEGRATIONS_DOC.read_text()
-    assert "pip install 'agentveil[mcp]'" in CLAUDE_MCP_EXAMPLE.read_text()
-    assert "pip install 'agentveil[mcp]'" in LEGACY_CLAUDE_MCP_MODULE.read_text()
-    assert "agentveil-mcp" in AGENTS_DOC.read_text()
-    assert '"command": "agentveil-mcp"' in INTEGRATIONS_DOC.read_text()
-    assert '"command": "agentveil-mcp"' in CLAUDE_MCP_EXAMPLE.read_text()
-    assert '"command": "agentveil-mcp"' in LEGACY_CLAUDE_MCP_MODULE.read_text()
+    assert "pip install 'agentveil[mcp]'" in AGENTS_DOC.read_text(encoding="utf-8")
+    assert "pip install 'agentveil[mcp]'" in INTEGRATIONS_DOC.read_text(encoding="utf-8")
+    assert "pip install 'agentveil[mcp]'" in CLAUDE_MCP_EXAMPLE.read_text(encoding="utf-8")
+    assert "pip install 'agentveil[mcp]'" in LEGACY_CLAUDE_MCP_MODULE.read_text(encoding="utf-8")
+    assert "agentveil-mcp" in AGENTS_DOC.read_text(encoding="utf-8")
+    assert '"command": "agentveil-mcp"' in INTEGRATIONS_DOC.read_text(encoding="utf-8")
+    assert '"command": "agentveil-mcp"' in CLAUDE_MCP_EXAMPLE.read_text(encoding="utf-8")
+    assert '"command": "agentveil-mcp"' in LEGACY_CLAUDE_MCP_MODULE.read_text(encoding="utf-8")
