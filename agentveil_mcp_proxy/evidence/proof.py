@@ -26,6 +26,7 @@ _RECEIPT_RECORD_CROSS_CHECK_FIELDS = (
     ("payload_hash", "payload_hash"),
     ("risk_class", "client_risk_class"),
     ("policy_context_hash", "client_policy_context_hash"),
+    ("decision_audit_id", "audit_id"),
 )
 
 
@@ -228,6 +229,7 @@ def verify_evidence_bundle(
         verified_bodies[digest] = receipt_body
 
     referenced_receipt_digests: set[str] = set()
+    seen_record_references: set[str] = set()
     for record in records:
         if not isinstance(record, dict):
             continue
@@ -236,6 +238,11 @@ def verify_evidence_bundle(
             continue
         if receipt_digest not in verified_bodies:
             continue
+        if receipt_digest in seen_record_references:
+            raise EvidenceVerificationError(
+                f"DecisionReceipt {receipt_digest[:16]}... referenced by multiple records"
+            )
+        seen_record_references.add(receipt_digest)
         referenced_receipt_digests.add(receipt_digest)
         receipt_body = verified_bodies[receipt_digest]
         for record_field, receipt_field in _RECEIPT_RECORD_CROSS_CHECK_FIELDS:

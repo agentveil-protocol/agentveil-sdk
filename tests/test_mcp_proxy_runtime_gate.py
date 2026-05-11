@@ -333,6 +333,66 @@ def test_ask_backend_runtime_request_is_privacy_safe_metadata_only():
         assert forbidden not in body_text
 
 
+def test_runtime_gate_rejects_zero_cache_ttl():
+    with pytest.raises(ValueError, match="cache_ttl_seconds must be positive"):
+        RuntimeGateClient(
+            agent=MagicMock(),
+            config=_config(),
+            control_grant={"id": "grant"},
+            cache_ttl_seconds=0,
+        )
+
+
+def test_runtime_gate_rejects_negative_cache_ttl():
+    with pytest.raises(ValueError, match="cache_ttl_seconds must be positive"):
+        RuntimeGateClient(
+            agent=MagicMock(),
+            config=_config(),
+            control_grant={"id": "grant"},
+            cache_ttl_seconds=-1.0,
+        )
+
+
+def test_runtime_gate_rejects_zero_cache_max_entries():
+    with pytest.raises(ValueError, match="cache_max_entries must be positive"):
+        RuntimeGateClient(
+            agent=MagicMock(),
+            config=_config(),
+            control_grant={"id": "grant"},
+            cache_max_entries=0,
+        )
+
+
+def test_runtime_gate_rejects_negative_cache_max_entries():
+    with pytest.raises(ValueError, match="cache_max_entries must be positive"):
+        RuntimeGateClient(
+            agent=MagicMock(),
+            config=_config(),
+            control_grant={"id": "grant"},
+            cache_max_entries=-1,
+        )
+
+
+def test_runtime_gate_accepts_positive_cache_settings():
+    client = RuntimeGateClient(agent=MagicMock(), config=_config(), control_grant={"id": "grant"})
+
+    assert client.cache_ttl_seconds > 0
+    assert client.cache_max_entries > 0
+
+
+def test_runtime_gate_accepts_minimal_positive_cache_settings():
+    client = RuntimeGateClient(
+        agent=MagicMock(),
+        config=_config(),
+        control_grant={"id": "grant"},
+        cache_ttl_seconds=0.001,
+        cache_max_entries=1,
+    )
+
+    assert client.cache_ttl_seconds == 0.001
+    assert client.cache_max_entries == 1
+
+
 def test_replay_of_previously_verified_receipt_is_rejected_as_untrusted():
     config = _config()
     agent = RecordingAgent()

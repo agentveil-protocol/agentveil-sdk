@@ -107,8 +107,14 @@ class RuntimeGateClient:
         self.circuit_breaker = circuit_breaker or CircuitBreaker(
             config.circuit_breaker.to_runtime_config()
         )
-        self.cache_ttl_seconds = float(cache_ttl_seconds)
-        self.cache_max_entries = int(cache_max_entries)
+        cache_ttl_seconds = float(cache_ttl_seconds)
+        if cache_ttl_seconds <= 0:
+            raise ValueError("cache_ttl_seconds must be positive")
+        self.cache_ttl_seconds = cache_ttl_seconds
+        cache_max_entries = int(cache_max_entries)
+        if cache_max_entries <= 0:
+            raise ValueError("cache_max_entries must be positive")
+        self.cache_max_entries = cache_max_entries
         self._seen_receipt_digests: dict[str, float] = {}
         self._cache_lock = threading.Lock()
 

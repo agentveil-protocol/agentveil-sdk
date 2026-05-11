@@ -97,12 +97,13 @@ def _sign_jcs(body: dict, seed: bytes = BACKEND_SEED) -> str:
 def _decision_receipt_body(
     payload_hash: str = PAYLOAD_HASH,
     *,
+    audit_id: str = "audit-1",
     risk_class: str = "write",
     policy_context_hash: str = POLICY_CONTEXT_HASH,
 ) -> dict:
     return {
         "schema_version": "decision_receipt/2",
-        "audit_id": "audit-1",
+        "audit_id": audit_id,
         "agent_did": "did:key:z6Mkagent",
         "decision": "WAITING_FOR_HUMAN_APPROVAL",
         "payload_hash": payload_hash,
@@ -115,12 +116,14 @@ def _decision_receipt(
     payload_hash: str = PAYLOAD_HASH,
     seed: bytes = BACKEND_SEED,
     *,
+    audit_id: str = "audit-1",
     risk_class: str = "write",
     policy_context_hash: str = POLICY_CONTEXT_HASH,
 ) -> str:
     return _sign_jcs(
         _decision_receipt_body(
             payload_hash,
+            audit_id=audit_id,
             risk_class=risk_class,
             policy_context_hash=policy_context_hash,
         ),
@@ -466,6 +469,16 @@ def test_verify_rejects_receipt_with_missing_audit_id(tmp_path):
         verify_evidence_bundle(bundle)
 
 
+def test_verify_rejects_receipt_missing_audit_id_when_record_has_one(tmp_path):
+    body = _decision_receipt_body()
+    body.pop("audit_id")
+    bundle = _bundle_with_receipt(tmp_path, receipt_jcs=_sign_jcs(body))
+    assert bundle["records"][0]["decision_audit_id"] == "audit-1"
+
+    with pytest.raises(EvidenceVerificationError, match="audit_id missing"):
+        verify_evidence_bundle(bundle)
+
+
 def test_verify_rejects_receipt_missing_payload_hash_when_referenced(tmp_path):
     body = _decision_receipt_body()
     body.pop("payload_hash")
@@ -491,6 +504,129 @@ def test_verify_rejects_receipt_missing_client_policy_context_hash_when_referenc
 
     with pytest.raises(EvidenceVerificationError, match="client_policy_context_hash missing"):
         verify_evidence_bundle(bundle)
+
+
+def test_verify_rejects_receipt_audit_id_mismatch_with_record(tmp_path):
+    receipt_jcs = _decision_receipt(audit_id="audit-Y")
+    bundle = _bundle_with_receipt(tmp_path, receipt_jcs=receipt_jcs)
+
+    with pytest.raises(EvidenceVerificationError, match="audit_id mismatch"):
+        verify_evidence_bundle(bundle)
+
+
+def test_verify_accepts_matching_audit_id(tmp_path):
+    receipt_jcs = _decision_receipt(audit_id="audit-X")
+    digest = hashlib.sha256(receipt_jcs.encode("utf-8")).hexdigest()
+    with _store(tmp_path) as store:
+        store.write_pending(_record(
+            "req-audit-match",
+            decision_audit_id="audit-X",
+            decision_receipt_sha256=digest,
+        ))
+        bundle = build_evidence_bundle(
+            store,
+            proxy_identity_did="did:key:z6Mkproxy",
+            trusted_signer_dids=[BACKEND_DID],
+            receipt_fetcher=lambda _audit_id: receipt_jcs,
+        )
+
+    assert verify_evidence_bundle(bundle).valid is True
+
+
+def test_verify_skips_audit_id_check_for_cache_hit_records(tmp_path):
+    with _store(tmp_path) as store:
+        store.write_pending(_record(
+            "req-cache-hit",
+            decision_audit_id=None,
+            decision_receipt_sha256=None,
+        ))
+        bundle = build_evidence_bundle(
+            store,
+            proxy_identity_did="did:key:z6Mkproxy",
+            trusted_signer_dids=[BACKEND_DID],
+        )
+
+    assert verify_evidence_bundle(bundle).valid is True
+
+
+def test_verify_rejects_bundle_with_duplicate_receipt_references(tmp_path):
+    receipt_jcs = _decision_receipt()
+    digest = hashlib.sha256(receipt_jcs.encode("utf-8")).hexdigest()
+    with _store(tmp_path) as store:
+        store.write_pending(_record(
+            "req-first",
+            created_at=1_700_000_000,
+            decision_audit_id="audit-1",
+            decision_receipt_sha256=digest,
+        ))
+        store.write_pending(_record(
+            "req-second",
+            created_at=1_700_000_001,
+            decision_audit_id="audit-1",
+            decision_receipt_sha256=digest,
+        ))
+        bundle = build_evidence_bundle(
+            store,
+            proxy_identity_did="did:key:z6Mkproxy",
+            trusted_signer_dids=[BACKEND_DID],
+            receipt_fetcher=lambda _audit_id: receipt_jcs,
+        )
+
+    with pytest.raises(EvidenceVerificationError, match="referenced by multiple records"):
+        verify_evidence_bundle(bundle)
+
+
+def test_verify_accepts_bundle_with_distinct_receipt_per_record(tmp_path):
+    receipts = {
+        "audit-1": _decision_receipt(audit_id="audit-1"),
+        "audit-2": _decision_receipt(audit_id="audit-2"),
+    }
+    digests = {
+        audit_id: hashlib.sha256(receipt.encode("utf-8")).hexdigest()
+        for audit_id, receipt in receipts.items()
+    }
+    with _store(tmp_path) as store:
+        for index, audit_id in enumerate(("audit-1", "audit-2")):
+            store.write_pending(_record(
+                f"req-{index}",
+                created_at=1_700_000_000 + index,
+                decision_audit_id=audit_id,
+                decision_receipt_sha256=digests[audit_id],
+            ))
+        bundle = build_evidence_bundle(
+            store,
+            proxy_identity_did="did:key:z6Mkproxy",
+            trusted_signer_dids=[BACKEND_DID],
+            receipt_fetcher=receipts.__getitem__,
+        )
+
+    assert verify_evidence_bundle(bundle).valid is True
+
+
+def test_verify_accepts_bundle_with_cache_hit_records_no_receipt_reference(tmp_path):
+    receipt_jcs = _decision_receipt()
+    digest = hashlib.sha256(receipt_jcs.encode("utf-8")).hexdigest()
+    with _store(tmp_path) as store:
+        store.write_pending(_record(
+            "req-receipt",
+            created_at=1_700_000_000,
+            decision_audit_id="audit-1",
+            decision_receipt_sha256=digest,
+        ))
+        store.write_pending(_record(
+            "req-cache-hit",
+            created_at=1_700_000_001,
+            decision_audit_id=None,
+            decision_receipt_sha256=None,
+        ))
+        bundle = build_evidence_bundle(
+            store,
+            proxy_identity_did="did:key:z6Mkproxy",
+            trusted_signer_dids=[BACKEND_DID],
+            receipt_fetcher=lambda _audit_id: receipt_jcs,
+        )
+
+    assert verify_evidence_bundle(bundle).valid is True
 
 
 def test_verify_warns_on_orphan_signed_receipt_not_referenced(tmp_path):
