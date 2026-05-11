@@ -229,6 +229,54 @@ def test_risk_inference_destructive_wins_over_production_compounds():
     assert infer_risk_class("auth.revoke_prod_access", tool="revoke_prod_access") is RiskClass.DESTRUCTIVE
 
 
+def test_infer_risk_class_recognizes_purge_as_destructive():
+    assert infer_risk_class("database.purge_database", tool="purge_database") is (
+        RiskClass.DESTRUCTIVE
+    )
+
+
+def test_infer_risk_class_recognizes_truncate_as_destructive():
+    assert infer_risk_class("database.truncate_table", tool="truncate_table") is (
+        RiskClass.DESTRUCTIVE
+    )
+
+
+def test_infer_risk_class_recognizes_wipe_as_destructive():
+    assert infer_risk_class("storage.wipe_disk", tool="wipe_disk") is RiskClass.DESTRUCTIVE
+
+
+def test_infer_risk_class_recognizes_format_as_destructive():
+    assert infer_risk_class("storage.format_volume", tool="format_volume") is (
+        RiskClass.DESTRUCTIVE
+    )
+
+
+def test_infer_risk_class_recognizes_rm_as_destructive():
+    assert infer_risk_class("filesystem.rm", tool="rm") is RiskClass.DESTRUCTIVE
+
+
+def test_infer_risk_class_recognizes_rmdir_as_destructive():
+    assert infer_risk_class("filesystem.rmdir_tree", tool="rmdir_tree") is (
+        RiskClass.DESTRUCTIVE
+    )
+
+
+def test_infer_risk_class_recognizes_unlink_as_destructive():
+    assert infer_risk_class("filesystem.unlink_file", tool="unlink_file") is (
+        RiskClass.DESTRUCTIVE
+    )
+
+
+def test_infer_risk_class_recognizes_clean_as_destructive():
+    assert infer_risk_class("filesystem.clean_temp", tool="clean_temp") is RiskClass.DESTRUCTIVE
+
+
+def test_infer_risk_class_destructive_wins_over_read_on_compound():
+    assert infer_risk_class("filesystem.purge_files", tool="purge_files") is (
+        RiskClass.DESTRUCTIVE
+    )
+
+
 def test_risk_inference_does_not_over_classify_substring_collisions():
     assert infer_risk_class("github.get_infrastructure", tool="get_infrastructure") is RiskClass.READ
     assert infer_risk_class("github.list_endpoints", tool="list_endpoints") is RiskClass.READ

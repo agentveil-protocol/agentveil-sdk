@@ -55,7 +55,22 @@ _WRITE_PREFIXES = (
     "open",
     "close",
 )
-_DESTRUCTIVE_PREFIXES = ("delete", "remove", "destroy", "drop", "revoke", "terminate")
+_DESTRUCTIVE_PREFIXES = (
+    "delete",
+    "remove",
+    "destroy",
+    "drop",
+    "revoke",
+    "terminate",
+    "purge",
+    "truncate",
+    "wipe",
+    "format",
+    "rm",
+    "rmdir",
+    "unlink",
+    "clean",
+)
 _PRODUCTION_WORDS = ("prod", "production", "deploy", "release", "rollback", "infra", "cluster")
 _FINANCIAL_WORDS = ("payment", "transfer", "invoice", "billing", "payroll", "purchase", "refund")
 

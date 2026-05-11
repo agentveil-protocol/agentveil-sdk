@@ -66,6 +66,44 @@ def _base_config(**overrides):
     return data
 
 
+def _pack_config(name: str) -> ProxyConfig:
+    pack = builtin_policy_pack(name)
+
+    def match_dict(rule):
+        data = {}
+        if rule.match.server:
+            data["server"] = list(rule.match.server)
+        if rule.match.tool:
+            data["tool"] = list(rule.match.tool)
+        if rule.match.action:
+            data["action"] = list(rule.match.action)
+        if rule.match.risk_class:
+            data["risk_class"] = [risk.value for risk in rule.match.risk_class]
+        return data
+
+    return ProxyConfig.from_dict(_base_config(policy={
+        "id": pack.id,
+        "policy_schema_version": 1,
+        "rules": [
+            {
+                "id": rule.id,
+                "source": rule.source,
+                "decision": rule.decision.value,
+                "risk_class": rule.risk_class.value if rule.risk_class else None,
+                "match": match_dict(rule),
+            }
+            for rule in pack.rules
+        ],
+    }))
+
+
+def _evaluate_builtin_pack(name: str, *, server: str, tool: str):
+    return PolicyEngine(_pack_config(name)).evaluate({
+        "server": server,
+        "tool": tool,
+    })
+
+
 def test_proxy_config_schema_requires_version_and_trusted_signers():
     cfg = ProxyConfig.from_dict(_base_config())
     assert cfg.proxy_config_schema_version == 1
@@ -305,34 +343,7 @@ def test_policy_context_hash_is_stable_and_metadata_only():
 
 
 def test_builtin_policy_packs_are_metadata_only_and_match_expected_rules():
-    github = builtin_policy_pack("github")
-
-    def match_dict(rule):
-        data = {}
-        if rule.match.server:
-            data["server"] = list(rule.match.server)
-        if rule.match.tool:
-            data["tool"] = list(rule.match.tool)
-        if rule.match.action:
-            data["action"] = list(rule.match.action)
-        if rule.match.risk_class:
-            data["risk_class"] = [risk.value for risk in rule.match.risk_class]
-        return data
-
-    cfg = ProxyConfig.from_dict(_base_config(policy={
-        "id": github.id,
-        "policy_schema_version": 1,
-        "rules": [
-            {
-                "id": rule.id,
-                "source": rule.source,
-                "decision": rule.decision.value,
-                "risk_class": rule.risk_class.value if rule.risk_class else None,
-                "match": match_dict(rule),
-            }
-            for rule in github.rules
-        ],
-    }))
+    cfg = _pack_config("github")
     read = PolicyEngine(cfg).evaluate({"server": "github", "tool": "get_file_contents"})
     write = PolicyEngine(cfg).evaluate({"server": "github", "tool": "create_issue"})
     destructive = PolicyEngine(cfg).evaluate({"server": "github", "tool": "delete_branch"})
@@ -345,3 +356,69 @@ def test_builtin_policy_packs_are_metadata_only_and_match_expected_rules():
 
     with pytest.raises(ProxyConfigError, match="unknown built-in policy pack"):
         builtin_policy_pack("aws")
+
+
+def test_filesystem_pack_blocks_purge_tools():
+    result = _evaluate_builtin_pack("filesystem", server="filesystem", tool="purge_logs")
+    assert result.decision is PolicyDecision.BLOCK
+    assert result.policy_rule_id == "filesystem-delete"
+
+
+def test_filesystem_pack_blocks_truncate_tools():
+    result = _evaluate_builtin_pack("filesystem", server="filesystem", tool="truncate_table")
+    assert result.decision is PolicyDecision.BLOCK
+    assert result.policy_rule_id == "filesystem-delete"
+
+
+def test_filesystem_pack_blocks_wipe_tools():
+    result = _evaluate_builtin_pack("filesystem", server="filesystem", tool="wipe_disk")
+    assert result.decision is PolicyDecision.BLOCK
+    assert result.policy_rule_id == "filesystem-delete"
+
+
+def test_filesystem_pack_blocks_format_tools():
+    result = _evaluate_builtin_pack("filesystem", server="filesystem", tool="format_volume")
+    assert result.decision is PolicyDecision.BLOCK
+    assert result.policy_rule_id == "filesystem-delete"
+
+
+def test_filesystem_pack_blocks_rm_exact_tool():
+    result = _evaluate_builtin_pack("filesystem", server="filesystem", tool="rm")
+    assert result.decision is PolicyDecision.BLOCK
+    assert result.policy_rule_id == "filesystem-delete"
+
+
+def test_filesystem_pack_blocks_rmdir_tools():
+    result = _evaluate_builtin_pack("filesystem", server="filesystem", tool="rmdir_tree")
+    assert result.decision is PolicyDecision.BLOCK
+    assert result.policy_rule_id == "filesystem-delete"
+
+
+def test_filesystem_pack_blocks_unlink_tools():
+    result = _evaluate_builtin_pack("filesystem", server="filesystem", tool="unlink_file")
+    assert result.decision is PolicyDecision.BLOCK
+    assert result.policy_rule_id == "filesystem-delete"
+
+
+def test_filesystem_pack_blocks_clean_tools():
+    result = _evaluate_builtin_pack("filesystem", server="filesystem", tool="clean_temp")
+    assert result.decision is PolicyDecision.BLOCK
+    assert result.policy_rule_id == "filesystem-delete"
+
+
+def test_github_pack_approval_required_for_revoke_tools():
+    result = _evaluate_builtin_pack("github", server="github", tool="revoke_token")
+    assert result.decision is PolicyDecision.APPROVAL
+    assert result.policy_rule_id == "github-destructive"
+
+
+def test_github_pack_approval_required_for_destroy_tools():
+    result = _evaluate_builtin_pack("github", server="github", tool="destroy_repository")
+    assert result.decision is PolicyDecision.APPROVAL
+    assert result.policy_rule_id == "github-destructive"
+
+
+def test_github_pack_approval_required_for_drop_tools():
+    result = _evaluate_builtin_pack("github", server="github", tool="drop_ref")
+    assert result.decision is PolicyDecision.APPROVAL
+    assert result.policy_rule_id == "github-destructive"

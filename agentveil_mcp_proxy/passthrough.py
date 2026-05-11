@@ -63,6 +63,7 @@ MAX_DOWNSTREAM_MESSAGE_BYTES = 1 * 1024 * 1024
 MAX_CLIENT_MESSAGE_BYTES = 1 * 1024 * 1024
 MAX_PENDING_RESPONSES = 1000
 DEFAULT_TIMED_OUT_ID_RETENTION_SECONDS = 600.0
+_ENV_PASSTHROUGH_BLOCKED_PREFIXES = ("AVP_",)
 SAFE_ENV_KEYS = (
     "PATH",
     "HOME",
@@ -233,6 +234,12 @@ class DownstreamConfig:
             for item in env_passthrough
         ):
             raise PassthroughError("downstream.env_passthrough must be a list of strings")
+        for item in env_passthrough:
+            if any(item.startswith(prefix) for prefix in _ENV_PASSTHROUGH_BLOCKED_PREFIXES):
+                raise PassthroughError(
+                    f"downstream.env_passthrough cannot forward {item!r}: "
+                    "AVP_* prefix is reserved for proxy-internal secrets"
+                )
 
         response_timeout = data.get(
             "response_timeout_seconds",

@@ -238,8 +238,9 @@ class ApprovalEvidenceStore:
                 record = replace(record, prev_event_hash=prev_event_hash)
                 values = _record_values(record)
                 placeholders = ", ".join("?" for _ in _COLUMNS)
+                # SQL is safe: _COLUMNS is static and values are bound.
                 self._conn.execute(
-                    f"INSERT INTO pending_approvals ({', '.join(_COLUMNS)}) VALUES ({placeholders})",
+                    f"INSERT INTO pending_approvals ({', '.join(_COLUMNS)}) VALUES ({placeholders})",  # nosec B608
                     values,
                 )
                 if not append_only:
@@ -254,8 +255,9 @@ class ApprovalEvidenceStore:
         """Return the approval record for a request ID, if present."""
 
         with self._lock:
+            # SQL is safe: _COLUMNS is static and request_id is bound.
             row = self._conn.execute(
-                f"SELECT {', '.join(_COLUMNS)} FROM pending_approvals WHERE request_id = ?",
+                f"SELECT {', '.join(_COLUMNS)} FROM pending_approvals WHERE request_id = ?",  # nosec B608
                 (request_id,),
             ).fetchone()
         return None if row is None else _row_to_record(row)
@@ -265,14 +267,16 @@ class ApprovalEvidenceStore:
 
         with self._lock:
             if since_timestamp is None:
+                # SQL is safe: _COLUMNS is static and status is bound.
                 rows = self._conn.execute(
-                    f"SELECT {', '.join(_COLUMNS)} FROM pending_approvals WHERE status = ? "
+                    f"SELECT {', '.join(_COLUMNS)} FROM pending_approvals WHERE status = ? "  # nosec B608
                     "ORDER BY created_at, request_id",
                     (ApprovalStatus.PENDING.value,),
                 ).fetchall()
             else:
+                # SQL is safe: _COLUMNS is static and filters are bound.
                 rows = self._conn.execute(
-                    f"SELECT {', '.join(_COLUMNS)} FROM pending_approvals WHERE status = ? "
+                    f"SELECT {', '.join(_COLUMNS)} FROM pending_approvals WHERE status = ? "  # nosec B608
                     "AND created_at >= ? ORDER BY created_at, request_id",
                     (ApprovalStatus.PENDING.value, since_timestamp),
                 ).fetchall()
@@ -290,8 +294,9 @@ class ApprovalEvidenceStore:
         with self._lock:
             self._begin()
             try:
+                # SQL is safe: _COLUMNS is static and request_id is bound.
                 row = self._conn.execute(
-                    f"SELECT {', '.join(_COLUMNS)} FROM pending_approvals WHERE request_id = ?",
+                    f"SELECT {', '.join(_COLUMNS)} FROM pending_approvals WHERE request_id = ?",  # nosec B608
                     (request_id,),
                 ).fetchone()
                 if row is None:
@@ -317,8 +322,9 @@ class ApprovalEvidenceStore:
                 updates["status"] = normalized
                 self._validate_transition_fields(updates)
                 assignments = ", ".join(f"{column} = ?" for column in updates)
+                # SQL is safe: assignment columns are restricted and values are bound.
                 self._conn.execute(
-                    f"UPDATE pending_approvals SET {assignments} WHERE request_id = ?",
+                    f"UPDATE pending_approvals SET {assignments} WHERE request_id = ?",  # nosec B608
                     (*updates.values(), request_id),
                 )
                 self._rebuild_chain_locked()
@@ -438,8 +444,9 @@ class ApprovalEvidenceStore:
             params.extend(ids)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         with self._lock:
+            # SQL is safe: _COLUMNS is static and where clauses are validated.
             rows = self._conn.execute(
-                f"SELECT {', '.join(_COLUMNS)} FROM pending_approvals "
+                f"SELECT {', '.join(_COLUMNS)} FROM pending_approvals "  # nosec B608
                 f"{where} ORDER BY created_at, request_id",
                 params,
             ).fetchall()
@@ -465,8 +472,9 @@ class ApprovalEvidenceStore:
         )
         placeholders = ", ".join("?" for _ in reusable_statuses)
         with self._lock:
+            # SQL is safe: _COLUMNS is static and filters are bound.
             row = self._conn.execute(
-                f"SELECT {', '.join(_COLUMNS)} FROM pending_approvals "
+                f"SELECT {', '.join(_COLUMNS)} FROM pending_approvals "  # nosec B608
                 f"WHERE status IN ({placeholders}) "
                 "AND approval_scope = ? AND granted_scope_expires_at > ? "
                 "AND downstream_server = ? AND tool_name = ? AND risk_class = ? "
@@ -494,16 +502,18 @@ class ApprovalEvidenceStore:
         with self._lock:
             self._begin()
             try:
+                # SQL is safe: terminal status placeholders and cutoff are controlled.
                 row = self._conn.execute(
                     "SELECT COUNT(*) FROM pending_approvals "
-                    f"WHERE status IN ({placeholders}) AND created_at < ?",
+                    f"WHERE status IN ({placeholders}) AND created_at < ?",  # nosec B608
                     (*terminal, int(before_timestamp)),
                 ).fetchone()
                 deleted = int(row[0])
                 if deleted:
+                    # SQL is safe: terminal status placeholders and cutoff are controlled.
                     self._conn.execute(
                         "DELETE FROM pending_approvals "
-                        f"WHERE status IN ({placeholders}) AND created_at < ?",
+                        f"WHERE status IN ({placeholders}) AND created_at < ?",  # nosec B608
                         (*terminal, int(before_timestamp)),
                     )
                     self._rebuild_chain_locked()
@@ -607,8 +617,9 @@ class ApprovalEvidenceStore:
         # SQLite cannot relax a NOT NULL column constraint in place; rebuild the table.
         columns = ", ".join(_COLUMNS)
         self._conn.execute(_CREATE_PENDING_APPROVALS_MIGRATION_SQL)
+        # SQL is safe: migration columns are restricted to static _COLUMNS.
         self._conn.execute(
-            f"INSERT INTO pending_approvals_new ({columns}) "
+            f"INSERT INTO pending_approvals_new ({columns}) "  # nosec B608
             f"SELECT {columns} FROM pending_approvals"
         )
         self._conn.execute("DROP TABLE pending_approvals")
@@ -624,8 +635,9 @@ class ApprovalEvidenceStore:
         )
 
     def _compute_chain_link_for_insert_locked(self, record: PendingApproval) -> tuple[str, bool]:
+        # SQL is safe: _COLUMNS is static.
         row = self._conn.execute(
-            f"SELECT {', '.join(_COLUMNS)} FROM pending_approvals "
+            f"SELECT {', '.join(_COLUMNS)} FROM pending_approvals "  # nosec B608
             "ORDER BY created_at DESC, request_id DESC LIMIT 1"
         ).fetchone()
         if row is None:
@@ -639,8 +651,9 @@ class ApprovalEvidenceStore:
         return GENESIS_PREV_EVENT_HASH, False
 
     def _rebuild_chain_locked(self) -> None:
+        # SQL is safe: _COLUMNS is static.
         rows = self._conn.execute(
-            f"SELECT {', '.join(_COLUMNS)} FROM pending_approvals ORDER BY created_at, request_id"
+            f"SELECT {', '.join(_COLUMNS)} FROM pending_approvals ORDER BY created_at, request_id"  # nosec B608
         ).fetchall()
         prev_hash = GENESIS_PREV_EVENT_HASH
         for row in rows:
@@ -654,8 +667,9 @@ class ApprovalEvidenceStore:
             prev_hash = record_hash(data)
 
     def _validate_chain_locked(self) -> None:
+        # SQL is safe: _COLUMNS is static.
         rows = self._conn.execute(
-            f"SELECT {', '.join(_COLUMNS)} FROM pending_approvals ORDER BY created_at, request_id"
+            f"SELECT {', '.join(_COLUMNS)} FROM pending_approvals ORDER BY created_at, request_id"  # nosec B608
         ).fetchall()
         prev_hash = GENESIS_PREV_EVENT_HASH
         for row in rows:

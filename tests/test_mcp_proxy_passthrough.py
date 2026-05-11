@@ -58,6 +58,39 @@ def _write_json(path: Path, data: dict) -> None:
     os.chmod(path, 0o600)
 
 
+def _config_with_env_passthrough(env_passthrough: list[str]) -> ProxyConfig:
+    return ProxyConfig.from_dict({
+        "proxy_config_schema_version": 1,
+        "avp": {
+            "base_url": "https://agentveil.dev",
+            "agent_name": "agentveil-mcp-proxy",
+            "trusted_signer_dids": ["did:key:z6MktrustedSigner"],
+        },
+        "mode": "protect",
+        "privacy": {
+            "action": "redacted",
+            "resource": "hash",
+            "payload": "hash_only",
+            "evidence_upload": False,
+        },
+        "fallback": {},
+        "approval": {},
+        "policy": {
+            "id": "test-policy",
+            "policy_schema_version": 1,
+            "default_decision": "ask_backend",
+            "default_risk_class": "unknown",
+            "rules": [],
+        },
+        "downstream": {
+            "name": "env-test",
+            "command": sys.executable,
+            "args": [],
+            "env_passthrough": env_passthrough,
+        },
+    })
+
+
 def _set_downstream(config_path: Path, script: Path, *, log_path: Path | None = None) -> None:
     config = json.loads(config_path.read_text(encoding="utf-8"))
     env = {}
@@ -167,7 +200,7 @@ for line in sys.stdin:
     result = {
         "secret": os.environ.get("AWS_SECRET_ACCESS_KEY"),
         "explicit": os.environ.get("EXPLICIT_DOWNSTREAM_ENV"),
-        "passthrough": os.environ.get("AVP_TEST_ALLOWED_ENV"),
+        "passthrough": os.environ.get("MY_TOOL_ALLOWED_ENV"),
     }
     print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": result}), flush=True)
 """.lstrip(),
@@ -547,7 +580,7 @@ def test_run_passthrough_does_not_construct_avp_agent_or_call_backend(tmp_path, 
 
 def test_downstream_env_is_minimal_by_default_and_explicit_only(tmp_path, monkeypatch):
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", SECRET)
-    monkeypatch.setenv("AVP_TEST_ALLOWED_ENV", "allowed")
+    monkeypatch.setenv("MY_TOOL_ALLOWED_ENV", "allowed")
     home = tmp_path / "avp-home"
     init = init_proxy(home=home, agent_name="proxy", plaintext=True)
     config = json.loads(init.config_path.read_text(encoding="utf-8"))
@@ -556,7 +589,7 @@ def test_downstream_env_is_minimal_by_default_and_explicit_only(tmp_path, monkey
         "command": sys.executable,
         "args": ["-u", str(_env_downstream(tmp_path))],
         "env": {"EXPLICIT_DOWNSTREAM_ENV": "explicit"},
-        "env_passthrough": ["AVP_TEST_ALLOWED_ENV"],
+        "env_passthrough": ["MY_TOOL_ALLOWED_ENV"],
     }
     _write_json(init.config_path, config)
 
@@ -572,6 +605,43 @@ def test_downstream_env_is_minimal_by_default_and_explicit_only(tmp_path, monkey
         "explicit": "explicit",
         "passthrough": "allowed",
     }
+
+
+def test_downstream_config_rejects_avp_passphrase_in_env_passthrough():
+    config = _config_with_env_passthrough(["AVP_PROXY_PASSPHRASE"])
+
+    with pytest.raises(passthrough_module.PassthroughError, match="AVP_\\* prefix"):
+        DownstreamConfig.from_proxy_config(config)
+
+
+def test_downstream_config_rejects_other_avp_var_in_env_passthrough():
+    config = _config_with_env_passthrough(["AVP_HOME"])
+
+    with pytest.raises(passthrough_module.PassthroughError, match="AVP_\\* prefix"):
+        DownstreamConfig.from_proxy_config(config)
+
+
+def test_downstream_config_accepts_non_avp_env_passthrough():
+    config = _config_with_env_passthrough(["MY_TOOL_VAR", "HOME"])
+
+    parsed = DownstreamConfig.from_proxy_config(config)
+
+    assert parsed.env_passthrough == ("MY_TOOL_VAR", "HOME")
+
+
+def test_downstream_config_accepts_lowercase_avp_var():
+    config = _config_with_env_passthrough(["avp_internal"])
+
+    parsed = DownstreamConfig.from_proxy_config(config)
+
+    assert parsed.env_passthrough == ("avp_internal",)
+
+
+def test_downstream_config_rejects_avp_var_among_safe_vars():
+    config = _config_with_env_passthrough(["HOME", "AVP_PROXY_PASSPHRASE", "PATH"])
+
+    with pytest.raises(passthrough_module.PassthroughError, match="AVP_PROXY_PASSPHRASE"):
+        DownstreamConfig.from_proxy_config(config)
 
 
 def test_downstream_notifications_are_forwarded_before_matching_response(tmp_path):
