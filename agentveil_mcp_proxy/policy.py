@@ -831,6 +831,7 @@ __all__ = [
     "MAX_RUNTIME_EVENTS",
     "PROXY_CONFIG_SCHEMA_VERSION",
     "POLICY_SCHEMA_VERSION",
+    "ProxyCircuitBreakerConfig",
     "ProxyConfig",
     "ProxyConfigError",
     "RiskClass",

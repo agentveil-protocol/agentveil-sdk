@@ -22,6 +22,7 @@ from agentveil_mcp_proxy.circuit_breaker import (
 )
 from agentveil_mcp_proxy.classification import ToolCallClassifier
 from agentveil_mcp_proxy.cli import doctor_proxy, init_proxy
+import agentveil_mcp_proxy.policy as policy_module
 from agentveil_mcp_proxy.passthrough import (
     DownstreamConfig,
     JSONRPC_RUNTIME_GATE_UNAVAILABLE,
@@ -143,8 +144,8 @@ def _sign_jcs(body: dict, seed: bytes = BACKEND_SEED) -> str:
     return jcs.canonicalize(signed).decode("utf-8")
 
 
-def _decision_receipt(request: dict, *, seed: bytes = BACKEND_SEED) -> str:
-    return _sign_jcs({
+def _decision_receipt_body(request: dict) -> dict:
+    return {
         "schema_version": "decision_receipt/2",
         "audit_id": AUDIT_ID,
         "agent_did": AGENT_DID,
@@ -155,7 +156,11 @@ def _decision_receipt(request: dict, *, seed: bytes = BACKEND_SEED) -> str:
         "payload_hash": request["payload_hash"],
         "client_risk_class": request["risk_class"],
         "client_policy_context_hash": request["policy_context_hash"],
-    }, seed=seed)
+    }
+
+
+def _decision_receipt(request: dict, *, seed: bytes = BACKEND_SEED) -> str:
+    return _sign_jcs(_decision_receipt_body(request), seed=seed)
 
 
 class RecordingAgent:
@@ -175,6 +180,75 @@ class RecordingAgent:
             "decision": "ALLOW",
             "decision_receipt_jcs": _decision_receipt(kwargs, seed=self.seed),
         }
+
+
+_UNTRUSTED_FIELD_MISMATCHES = {
+    "field_action_mismatch": "action",
+    "field_resource_mismatch": "resource",
+    "field_environment_mismatch": "environment",
+    "field_payload_hash_mismatch": "payload_hash",
+    "field_client_risk_class_mismatch": "client_risk_class",
+    "field_client_policy_context_hash_mismatch": "client_policy_context_hash",
+}
+
+_UNTRUSTED_FIELD_MISSING = {
+    "field_action_missing": "action",
+    "field_resource_missing": "resource",
+    "field_environment_missing": "environment",
+    "field_payload_hash_missing": "payload_hash",
+    "field_client_risk_class_missing": "client_risk_class",
+    "field_client_policy_context_hash_missing": "client_policy_context_hash",
+}
+
+
+class UntrustedReceiptAgent:
+    did = AGENT_DID
+
+    def __init__(self, scenario: str):
+        self.scenario = scenario
+        self.calls: list[dict] = []
+        self.receipt_jcs = ""
+
+    def runtime_evaluate(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.scenario == "receipt_missing_response":
+            return {"decision": "ALLOW"}
+
+        body = _decision_receipt_body(kwargs)
+        response = {"audit_id": AUDIT_ID, "decision": "ALLOW"}
+        seed = BACKEND_SEED
+
+        if self.scenario == "receipt_fetch_empty":
+            self.receipt_jcs = ""
+            return response
+        if self.scenario == "signature_fail":
+            seed = OTHER_BACKEND_SEED
+        elif self.scenario == "schema_unsupported":
+            body["schema_version"] = "decision_receipt/99"
+        elif self.scenario == "decision_unsupported":
+            body["decision"] = "UNKNOWN"
+            response["decision"] = "UNKNOWN"
+        elif self.scenario == "audit_id_missing":
+            body.pop("audit_id")
+        elif self.scenario == "response_decision_mismatch":
+            response["decision"] = "BLOCK"
+        elif self.scenario == "response_audit_id_mismatch":
+            response["audit_id"] = "urn:uuid:22222222-2222-4222-8222-222222222222"
+        elif self.scenario == "agent_did_mismatch":
+            body["agent_did"] = BACKEND_DID
+        elif self.scenario in _UNTRUSTED_FIELD_MISMATCHES:
+            body[_UNTRUSTED_FIELD_MISMATCHES[self.scenario]] = "mismatch"
+        elif self.scenario in _UNTRUSTED_FIELD_MISSING:
+            body.pop(_UNTRUSTED_FIELD_MISSING[self.scenario])
+        elif self.scenario != "empty_trusted_signer_dids":
+            raise AssertionError(f"unhandled untrusted scenario: {self.scenario}")
+
+        self.receipt_jcs = _sign_jcs(body, seed=seed)
+        return {**response, "decision_receipt_jcs": self.receipt_jcs}
+
+    def get_decision_receipt(self, audit_id: str) -> str:
+        assert audit_id == AUDIT_ID
+        return self.receipt_jcs
 
 
 def _json_line(message: dict) -> str:
@@ -241,6 +315,29 @@ def test_circuit_starts_closed():
     assert breaker.state_change_count == 0
 
 
+def test_circuit_has_no_dead_cooldown_remaining_property():
+    assert not hasattr(CircuitBreaker(), "cooldown_" + "remaining_seconds")
+
+
+def test_events_deque_bounded_under_repeated_state_changes():
+    clock = Clock()
+    breaker = CircuitBreaker(
+        CircuitBreakerConfig(failures_before_open=1, cooldown_seconds=1),
+        time_func=clock,
+    )
+
+    for _ in range(334):
+        breaker.record_failure()
+        clock.advance(1)
+        breaker.before_call()
+        breaker.record_success()
+
+    assert len(breaker._events) == 1000
+    events = breaker.drain_events()
+    assert events[0]["state_change_count"] == 3
+    assert events[-1]["state_change_count"] == 1002
+
+
 def test_circuit_opens_after_threshold_failures():
     breaker = CircuitBreaker(CircuitBreakerConfig(failures_before_open=2))
 
@@ -264,6 +361,20 @@ def test_circuit_failure_window_excludes_old_failures():
     clock.advance(11)
     breaker.record_failure()
 
+    assert breaker.state == CircuitState.CLOSED
+
+
+def test_record_success_clears_failure_window_in_closed_state():
+    breaker = CircuitBreaker(CircuitBreakerConfig(failures_before_open=5))
+
+    for _ in range(3):
+        breaker.record_failure()
+    assert breaker.state == CircuitState.CLOSED
+
+    breaker.record_success()
+
+    for _ in range(4):
+        breaker.record_failure()
     assert breaker.state == CircuitState.CLOSED
 
 
@@ -401,6 +512,49 @@ def test_runtime_gate_client_does_not_count_untrusted_errors_as_circuit_failures
     assert breaker.state_change_count == 0
 
 
+@pytest.mark.parametrize("scenario", [
+    "receipt_missing_response",
+    "receipt_fetch_empty",
+    "signature_fail",
+    "schema_unsupported",
+    "decision_unsupported",
+    "audit_id_missing",
+    "response_decision_mismatch",
+    "response_audit_id_mismatch",
+    "agent_did_mismatch",
+    "field_action_mismatch",
+    "field_resource_mismatch",
+    "field_environment_mismatch",
+    "field_payload_hash_mismatch",
+    "field_client_risk_class_mismatch",
+    "field_client_policy_context_hash_mismatch",
+    "field_action_missing",
+    "field_resource_missing",
+    "field_environment_missing",
+    "field_payload_hash_missing",
+    "field_client_risk_class_missing",
+    "field_client_policy_context_hash_missing",
+    "empty_trusted_signer_dids",
+])
+def test_untrusted_boundary_does_not_trip_circuit_breaker_across_all_paths(scenario):
+    config = _config()
+    breaker = CircuitBreaker(CircuitBreakerConfig(failures_before_open=1))
+    client = RuntimeGateClient(
+        agent=UntrustedReceiptAgent(scenario),
+        config=config,
+        control_grant={"id": "grant"},
+        circuit_breaker=breaker,
+    )
+    if scenario == "empty_trusted_signer_dids":
+        client.trusted_signer_dids = ()
+
+    with pytest.raises(RuntimeGateUntrustedError):
+        client.evaluate(_classification(config))
+
+    assert breaker.state == CircuitState.CLOSED
+    assert breaker.state_change_count == 0
+
+
 def test_open_circuit_skips_backend_call_entirely():
     config = _config()
     agent = RecordingAgent()
@@ -432,6 +586,18 @@ def test_circuit_breaker_config_validates_positive_integers():
             _config(circuit_breaker={field: True})
 
 
+@pytest.mark.parametrize("field", [
+    "failures_before_open",
+    "window_seconds",
+    "cooldown_seconds",
+    "half_open_test_count",
+])
+@pytest.mark.parametrize("invalid_value", [-1, 5.0, 5.5, None, "5", [], {}])
+def test_circuit_breaker_config_rejects_invalid_types_and_values(field, invalid_value):
+    with pytest.raises(ProxyConfigError):
+        _config(circuit_breaker={field: invalid_value})
+
+
 def test_circuit_breaker_config_rejects_unknown_fields():
     with pytest.raises(ProxyConfigError, match="unknown"):
         _config(circuit_breaker={"unknown": 1})
@@ -444,6 +610,10 @@ def test_circuit_breaker_config_defaults_when_block_absent():
     assert config.circuit_breaker.window_seconds == 60
     assert config.circuit_breaker.cooldown_seconds == 30
     assert config.circuit_breaker.half_open_test_count == 1
+
+
+def test_proxy_circuit_breaker_config_in_policy_all():
+    assert "ProxyCircuitBreakerConfig" in policy_module.__all__
 
 
 def test_open_circuit_cascades_to_existing_fallback_policy_per_risk_class(tmp_path):

@@ -86,7 +86,7 @@ class CircuitBreaker:
         self._opened_at: float | None = None
         self._half_open_successes = 0
         self._state_change_count = 0
-        self._events: Deque[dict[str, Any]] = deque()
+        self._events: Deque[dict[str, Any]] = deque(maxlen=1000)
 
     @property
     def state(self) -> CircuitState:
@@ -101,16 +101,6 @@ class CircuitBreaker:
 
         with self._lock:
             return self._state_change_count
-
-    @property
-    def cooldown_remaining_seconds(self) -> float:
-        """Return seconds until an open circuit can move to half-open."""
-
-        with self._lock:
-            if self._state is not CircuitState.OPEN or self._opened_at is None:
-                return 0.0
-            elapsed = self._time_func() - self._opened_at
-            return max(0.0, self.config.cooldown_seconds - elapsed)
 
     def before_call(self) -> None:
         """Allow a backend call or raise when the circuit is open."""
