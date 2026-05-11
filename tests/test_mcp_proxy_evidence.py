@@ -68,6 +68,65 @@ def _record(
     )
 
 
+def _record_with_null_expires_at(
+    request_id: str = "req-null",
+    *,
+    created_at: int = 1_700_000_000,
+) -> PendingApproval:
+    return PendingApproval(
+        **{**asdict(_record(request_id, created_at=created_at)), "expires_at": None}
+    )
+
+
+def _chain_records(*records: PendingApproval) -> list[PendingApproval]:
+    chained: list[PendingApproval] = []
+    prev_hash = GENESIS_PREV_EVENT_HASH
+    for record in records:
+        chained_record = PendingApproval(**{**asdict(record), "prev_event_hash": prev_hash})
+        chained.append(chained_record)
+        prev_hash = record_hash(chained_record)
+    return chained
+
+
+def _create_v3_evidence_db(db_path: Path, records: list[PendingApproval]) -> None:
+    columns = tuple(asdict(records[0]).keys())
+    integer_columns = {
+        "created_at",
+        "approval_decided_at",
+        "granted_scope_expires_at",
+        "user_decision_timestamp",
+    }
+    column_defs = []
+    for column in columns:
+        if column == "request_id":
+            column_defs.append("request_id TEXT PRIMARY KEY")
+        elif column == "expires_at":
+            column_defs.append("expires_at INTEGER NOT NULL")
+        elif column == "created_at":
+            column_defs.append("created_at INTEGER NOT NULL")
+        elif column in integer_columns:
+            column_defs.append(f"{column} INTEGER NULL")
+        else:
+            column_defs.append(f"{column} TEXT NULL")
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("CREATE TABLE evidence_schema_version (version INTEGER NOT NULL)")
+        conn.execute("INSERT INTO evidence_schema_version (version) VALUES (3)")
+        conn.execute("CREATE TABLE pending_approvals (" + ", ".join(column_defs) + ")")
+        for record in records:
+            values = asdict(record)
+            conn.execute(
+                f"INSERT INTO pending_approvals ({', '.join(columns)}) "
+                f"VALUES ({', '.join('?' for _ in columns)})",
+                [values[column] for column in columns],
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    os.chmod(db_path, 0o600)
+
+
 def _store(tmp_path: Path, *, max_records: int = 10_000) -> ApprovalEvidenceStore:
     return ApprovalEvidenceStore(tmp_path / "evidence.sqlite", max_records=max_records)
 
@@ -111,6 +170,22 @@ def test_write_pending_rejects_duplicate_request_id(tmp_path):
 
         with pytest.raises(ApprovalEvidenceDuplicateError):
             store.write_pending(_record("req-dup"))
+
+
+def test_write_pending_accepts_null_expires_at(tmp_path):
+    with _store(tmp_path) as store:
+        store.write_pending(_record_with_null_expires_at("req-hang"))
+        record = store.get_pending("req-hang")
+
+    assert record is not None
+    assert record.expires_at is None
+    assert record.status == ApprovalStatus.PENDING.value
+
+
+def test_write_pending_rejects_non_null_expires_at_before_created_at(tmp_path):
+    with _store(tmp_path) as store:
+        with pytest.raises(ApprovalEvidenceTransitionError, match="expires_at must be after"):
+            store.write_pending(_record("req-invalid-expiry", created_at=100, expires_at=100))
 
 
 def test_write_pending_is_durable_before_return(tmp_path):
@@ -250,6 +325,32 @@ def test_expire_overdue_marks_stale_pending_as_expired_in_bulk(tmp_path):
         assert store.get_pending("req-fresh").status == ApprovalStatus.PENDING.value
 
 
+def test_expire_overdue_skips_records_with_null_expires_at(tmp_path):
+    now = 1_700_000_000
+    with _store(tmp_path) as store:
+        store.write_pending(_record("req-deny", created_at=now - 600, expires_at=now - 1))
+        store.write_pending(_record_with_null_expires_at("req-hang", created_at=now - 600))
+
+        expired = store.expire_overdue(now_timestamp=now)
+
+        assert expired == ["req-deny"]
+        assert store.get_pending("req-deny").status == ApprovalStatus.EXPIRED.value
+        hang_record = store.get_pending("req-hang")
+        assert hang_record.status == ApprovalStatus.PENDING.value
+        assert hang_record.expires_at is None
+
+
+def test_expire_overdue_still_processes_records_with_concrete_expires_at(tmp_path):
+    now = 1_700_000_000
+    with _store(tmp_path) as store:
+        store.write_pending(_record("req-concrete", created_at=now - 600, expires_at=now - 1))
+
+        expired = store.expire_overdue(now_timestamp=now)
+
+        assert expired == ["req-concrete"]
+        assert store.get_pending("req-concrete").status == ApprovalStatus.EXPIRED.value
+
+
 def test_recover_on_startup_marks_stale_pending_as_expired_does_not_approve(tmp_path):
     now = int(time.time())
     db_path = tmp_path / "evidence.sqlite"
@@ -268,6 +369,38 @@ def test_recover_on_startup_marks_stale_pending_as_expired_does_not_approve(tmp_
     assert stale.status == ApprovalStatus.EXPIRED.value
     assert open_record.status == ApprovalStatus.PENDING.value
     assert stale.status != ApprovalStatus.APPROVED.value
+
+
+def test_recover_on_startup_does_not_expire_hang_pending_records(tmp_path):
+    now = 1_700_000_000
+    db_path = tmp_path / "evidence.sqlite"
+    with ApprovalEvidenceStore(db_path) as store:
+        store.write_pending(_record_with_null_expires_at("req-hang", created_at=now - 600))
+
+    with ApprovalEvidenceStore(db_path) as reopened:
+        report = reopened.recover_on_startup(now_timestamp=now)
+        record = reopened.get_pending("req-hang")
+
+    assert report.pending_before == 1
+    assert report.pending_after == 1
+    assert report.expired_request_ids == ()
+    assert record.status == ApprovalStatus.PENDING.value
+    assert record.expires_at is None
+
+
+def test_recover_on_startup_still_expires_deny_overdue_records(tmp_path):
+    now = 1_700_000_000
+    db_path = tmp_path / "evidence.sqlite"
+    with ApprovalEvidenceStore(db_path) as store:
+        store.write_pending(_record("req-deny", created_at=now - 600, expires_at=now - 1))
+
+    with ApprovalEvidenceStore(db_path) as reopened:
+        report = reopened.recover_on_startup(now_timestamp=now)
+        record = reopened.get_pending("req-deny")
+
+    assert report.expired_request_ids == ("req-deny",)
+    assert report.pending_after == 0
+    assert record.status == ApprovalStatus.EXPIRED.value
 
 
 def test_recover_on_startup_expires_stale_approved_records_past_grace_period(tmp_path):
@@ -507,7 +640,7 @@ def test_schema_version_mismatch_refuses_to_open_for_forward_incompatible(tmp_pa
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute("CREATE TABLE evidence_schema_version (version INTEGER NOT NULL)")
-        conn.execute("INSERT INTO evidence_schema_version (version) VALUES (4)")
+        conn.execute("INSERT INTO evidence_schema_version (version) VALUES (5)")
         conn.commit()
     finally:
         conn.close()
@@ -517,7 +650,64 @@ def test_schema_version_mismatch_refuses_to_open_for_forward_incompatible(tmp_pa
         ApprovalEvidenceStore(db_path)
 
 
-def test_schema_v2_migrates_to_v3_with_granted_by_column_without_data_loss(tmp_path):
+def test_schema_v3_migrates_to_v4_preserving_records_and_chain(tmp_path):
+    db_path = tmp_path / "evidence.sqlite"
+    first, second = _chain_records(
+        _record("req-v3-a", created_at=10, expires_at=310),
+        _record("req-v3-b", created_at=20, expires_at=320),
+    )
+    _create_v3_evidence_db(db_path, [first, second])
+
+    with ApprovalEvidenceStore(db_path) as store:
+        migrated_first = store.get_pending("req-v3-a")
+        migrated_second = store.get_pending("req-v3-b")
+
+    assert migrated_first == first
+    assert migrated_second == second
+    conn = sqlite3.connect(str(db_path))
+    try:
+        version = conn.execute("SELECT version FROM evidence_schema_version").fetchone()[0]
+        rows = conn.execute("PRAGMA table_info(pending_approvals)").fetchall()
+        expires_at_notnull = next(row[3] for row in rows if row[1] == "expires_at")
+        count = conn.execute("SELECT COUNT(*) FROM pending_approvals").fetchone()[0]
+    finally:
+        conn.close()
+    assert version == 4
+    assert expires_at_notnull == 0
+    assert count == 2
+
+
+def test_schema_v3_to_v4_migration_preserves_non_null_expires_at(tmp_path):
+    db_path = tmp_path / "evidence.sqlite"
+    (record,) = _chain_records(_record("req-v3-expiry", created_at=10, expires_at=999))
+    _create_v3_evidence_db(db_path, [record])
+
+    with ApprovalEvidenceStore(db_path) as store:
+        migrated = store.get_pending("req-v3-expiry")
+
+    assert migrated is not None
+    assert migrated.expires_at == 999
+
+
+def test_fresh_v4_schema_allows_null_expires_at(tmp_path):
+    db_path = tmp_path / "evidence.sqlite"
+    with ApprovalEvidenceStore(db_path) as store:
+        store.write_pending(_record_with_null_expires_at("req-null-fresh"))
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        version = conn.execute("SELECT version FROM evidence_schema_version").fetchone()[0]
+        expires_at = conn.execute(
+            "SELECT expires_at FROM pending_approvals WHERE request_id = ?",
+            ("req-null-fresh",),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert version == 4
+    assert expires_at is None
+
+
+def test_schema_v2_migrates_to_v4_with_granted_by_column_without_data_loss(tmp_path):
     db_path = tmp_path / "evidence.sqlite"
     conn = sqlite3.connect(str(db_path))
     try:
@@ -553,7 +743,7 @@ def test_schema_v2_migrates_to_v3_with_granted_by_column_without_data_loss(tmp_p
         columns = {row[1] for row in conn.execute("PRAGMA table_info(pending_approvals)")}
     finally:
         conn.close()
-    assert version == 3
+    assert version == 4
     assert "granted_by_request_id" in columns
 
 

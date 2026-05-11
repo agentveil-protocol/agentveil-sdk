@@ -1326,8 +1326,28 @@ def test_timeout_marks_pending_as_expired_and_returns_sanitized_error(tmp_path):
     try:
         assert outcome.status == ApprovalStatus.EXPIRED.value
         assert record.status == ApprovalStatus.EXPIRED.value
+        assert record.expires_at is not None
         assert record.error_class == "approval_timeout"
         assert SECRET not in outcome.reason
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_deny_mode_writes_pending_record_with_concrete_expires_at(tmp_path):
+    config = _config(policy_rule=_write_rule(), approval_timeout_seconds=60)
+    manager, store, server, _cli = _manager(tmp_path, config=config)
+
+    def wait_for_decision(request_id, *, timeout):
+        return ApprovalServerDecision(request_id=request_id, decision="approve", approval_scope="exact")
+
+    server.wait_for_decision = wait_for_decision  # type: ignore[method-assign]
+    try:
+        outcome = manager.request_approval(_classification(config), reason="local_approval_required")
+        record = store.get_pending(outcome.request_id)
+
+        assert record.expires_at is not None
+        assert record.expires_at > record.created_at
     finally:
         server.stop()
         store.close()
@@ -1379,6 +1399,25 @@ def test_approval_timeout_hang_waits_for_eventual_decision(tmp_path):
         assert len(calls) == 2
         assert outcome.approved
         assert record.status == ApprovalStatus.APPROVED.value
+        assert record.expires_at is None
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_hang_mode_writes_pending_record_with_null_expires_at(tmp_path):
+    config = _config(policy_rule=_write_rule(), approval_timeout_seconds=60, on_timeout="hang")
+    manager, store, server, _cli = _manager(tmp_path, config=config)
+
+    def wait_for_decision(request_id, *, timeout):
+        return ApprovalServerDecision(request_id=request_id, decision="approve", approval_scope="exact")
+
+    server.wait_for_decision = wait_for_decision  # type: ignore[method-assign]
+    try:
+        outcome = manager.request_approval(_classification(config), reason="local_approval_required")
+        record = store.get_pending(outcome.request_id)
+
+        assert record.expires_at is None
     finally:
         server.stop()
         store.close()

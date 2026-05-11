@@ -25,7 +25,7 @@ from typing import Any, Iterable, Mapping
 import jcs
 
 
-EVIDENCE_SCHEMA_VERSION = 3
+EVIDENCE_SCHEMA_VERSION = 4
 DEFAULT_MAX_RECORDS = 10_000
 GENESIS_PREV_EVENT_HASH = "sha256:" + hashlib.sha256(
     b"agentveil_mcp_proxy/evidence/genesis-v1"
@@ -112,7 +112,7 @@ class PendingApproval:
     policy_context_hash: str
     status: str
     created_at: int
-    expires_at: int
+    expires_at: int | None
     prev_event_hash: str | None = None
     decision_audit_id: str | None = None
     decision_receipt_sha256: str | None = None
@@ -144,6 +144,7 @@ _COLUMNS = tuple(field.name for field in fields(PendingApproval))
 _OPTIONAL_COLUMNS = {
     "client_id",
     "resource_hash",
+    "expires_at",
     "prev_event_hash",
     "policy_rule_id",
     "decision_audit_id",
@@ -339,8 +340,8 @@ class ApprovalEvidenceStore:
             self._begin()
             try:
                 rows = self._conn.execute(
-                    "SELECT request_id FROM pending_approvals WHERE status = ? AND expires_at <= ? "
-                    "ORDER BY created_at, request_id",
+                    "SELECT request_id FROM pending_approvals WHERE status = ? "
+                    "AND expires_at IS NOT NULL AND expires_at <= ? ORDER BY created_at, request_id",
                     (ApprovalStatus.PENDING.value, now),
                 ).fetchall()
                 request_ids = [str(row["request_id"]) for row in rows]
@@ -594,13 +595,33 @@ class ApprovalEvidenceStore:
     def _migrate_schema_locked(self, version: int) -> None:
         if version in {1, 2}:
             self._rebuild_chain_locked()
-            self._conn.execute("DELETE FROM evidence_schema_version")
-            self._conn.execute(
-                "INSERT INTO evidence_schema_version (version) VALUES (?)",
-                (EVIDENCE_SCHEMA_VERSION,),
-            )
+            self._set_schema_version_locked(3)
+            self._migrate_v3_to_v4_locked()
+            return
+        if version == 3:
+            self._migrate_v3_to_v4_locked()
             return
         raise ApprovalEvidenceSchemaError(f"evidence schema version {version} is unsupported")
+
+    def _migrate_v3_to_v4_locked(self) -> None:
+        # SQLite cannot relax a NOT NULL column constraint in place; rebuild the table.
+        columns = ", ".join(_COLUMNS)
+        self._conn.execute(_CREATE_PENDING_APPROVALS_MIGRATION_SQL)
+        self._conn.execute(
+            f"INSERT INTO pending_approvals_new ({columns}) "
+            f"SELECT {columns} FROM pending_approvals"
+        )
+        self._conn.execute("DROP TABLE pending_approvals")
+        self._conn.execute("ALTER TABLE pending_approvals_new RENAME TO pending_approvals")
+        self._set_schema_version_locked(EVIDENCE_SCHEMA_VERSION)
+        self._validate_chain_locked()
+
+    def _set_schema_version_locked(self, version: int) -> None:
+        self._conn.execute("DELETE FROM evidence_schema_version")
+        self._conn.execute(
+            "INSERT INTO evidence_schema_version (version) VALUES (?)",
+            (version,),
+        )
 
     def _compute_chain_link_for_insert_locked(self, record: PendingApproval) -> tuple[str, bool]:
         row = self._conn.execute(
@@ -654,7 +675,7 @@ class ApprovalEvidenceStore:
     def _validate_pending_record(self, record: PendingApproval) -> None:
         if record.status != ApprovalStatus.PENDING.value:
             raise ApprovalEvidenceTransitionError("write_pending only accepts pending records")
-        if record.expires_at <= record.created_at:
+        if record.expires_at is not None and record.expires_at <= record.created_at:
             raise ApprovalEvidenceTransitionError("expires_at must be after created_at")
         for column in _COLUMNS:
             value = getattr(record, column)
@@ -758,7 +779,7 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
     policy_context_hash TEXT NOT NULL,
     status TEXT NOT NULL,
     created_at INTEGER NOT NULL,
-    expires_at INTEGER NOT NULL,
+    expires_at INTEGER,
     prev_event_hash TEXT NULL,
     decision_audit_id TEXT NULL,
     decision_receipt_sha256 TEXT NULL,
@@ -775,6 +796,12 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
     granted_by_request_id TEXT NULL
 )
 """
+
+_CREATE_PENDING_APPROVALS_MIGRATION_SQL = _CREATE_PENDING_APPROVALS_SQL.replace(
+    "CREATE TABLE IF NOT EXISTS pending_approvals",
+    "CREATE TABLE pending_approvals_new",
+    1,
+)
 
 
 __all__ = [

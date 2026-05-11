@@ -91,7 +91,12 @@ class ApprovalManager:
 
         now = int(time.time())
         timeout = self.config.approval.approval_timeout_seconds
-        expires_at = now + timeout
+        prompt_expires_at = now + timeout
+        record_expires_at = (
+            None
+            if self.config.approval.on_timeout is TimeoutAction.HANG
+            else prompt_expires_at
+        )
         request_id = str(uuid.uuid4())
         scope_allowed = self._scope_expansion_allowed(classification)
         active_similar_grant = None
@@ -108,14 +113,14 @@ class ApprovalManager:
             classification,
             request_id=request_id,
             created_at=now,
-            expires_at=expires_at,
+            expires_at=prompt_expires_at,
             scope_expansion_allowed=scope_allowed,
         )
         record = self._pending_record(
             classification,
             request_id=request_id,
             created_at=now,
-            expires_at=expires_at,
+            expires_at=record_expires_at,
             runtime_decision=None if active_similar_grant is not None else runtime_decision,
             granted_by_request_id=(
                 None if active_similar_grant is None else active_similar_grant.request_id
@@ -270,7 +275,7 @@ class ApprovalManager:
         *,
         request_id: str,
         created_at: int,
-        expires_at: int,
+        expires_at: int | None,
         runtime_decision: RuntimeGateDecision | None,
         granted_by_request_id: str | None = None,
     ) -> PendingApproval:

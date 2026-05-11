@@ -194,7 +194,7 @@ def test_chain_integrity_breaks_if_record_field_tampered(tmp_path):
         ApprovalEvidenceStore(db_path)
 
 
-def test_schema_v1_migrates_to_v3_atomically_with_chain_backfill(tmp_path):
+def test_schema_v1_migrates_to_v4_atomically_with_chain_backfill(tmp_path):
     db_path = tmp_path / "evidence.sqlite"
     conn = sqlite3.connect(str(db_path))
     try:
@@ -232,15 +232,15 @@ def test_schema_v1_migrates_to_v3_atomically_with_chain_backfill(tmp_path):
         version = conn.execute("SELECT version FROM evidence_schema_version").fetchone()[0]
     finally:
         conn.close()
-    assert version == 3
+    assert version == 4
 
 
-def test_schema_v4_rejects_forward_incompatible_version(tmp_path):
+def test_schema_v5_rejects_forward_incompatible_version(tmp_path):
     db_path = tmp_path / "evidence.sqlite"
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute("CREATE TABLE evidence_schema_version (version INTEGER NOT NULL)")
-        conn.execute("INSERT INTO evidence_schema_version (version) VALUES (4)")
+        conn.execute("INSERT INTO evidence_schema_version (version) VALUES (5)")
         conn.commit()
     finally:
         conn.close()
