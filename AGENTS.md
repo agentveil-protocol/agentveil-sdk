@@ -2,7 +2,7 @@
 
 ## Project overview
 
-AVP SDK - Python client for Agent Veil Protocol. Trust enforcement for autonomous agents: identity (W3C DID), reputation (EigenTrust), sybil resistance (NetFlow), attestations, audit trail, webhook alerts, jobs delegation.
+AVP SDK — Python client for Agent Veil Protocol. Trust enforcement for autonomous agents: identity (W3C DID), reputation (EigenTrust), sybil resistance (NetFlow), attestations, audit trail, webhook alerts, jobs delegation.
 
 Production API: https://agentveil.dev
 PyPI: `pip install agentveil`
@@ -15,7 +15,7 @@ pip install agentveil
 pip install agentveil[test]
 ```
 
-No external services needed for development - the SDK connects to the public API at agentveil.dev by default.
+No external services needed for development — the SDK connects to the public API at agentveil.dev by default.
 
 ## Build and test
 
@@ -92,14 +92,14 @@ Agents are identified by W3C Decentralized Identifiers:
 did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK
 ```
 
-Format: Ed25519 public key, multicodec-encoded, base58btc. Generated locally - no registry needed for creation. Registered on AVP for reputation tracking.
+Format: Ed25519 public key, multicodec-encoded, base58btc. Generated locally — no registry needed for creation. Registered on AVP for reputation tracking.
 
 ## Examples
 
 | File | Framework | Description |
 |---|---|---|
-| `quickstart.py` | - | 5-step minimal demo |
-| `two_agents.py` | - | Multi-agent attestation flow |
+| `quickstart.py` | — | 5-step minimal demo |
+| `two_agents.py` | — | Multi-agent attestation flow |
 | `aws_bedrock.py` | AWS Bedrock | Trust-gated delegation via Converse API |
 | `openai_example.py` | OpenAI | Function calling with AVP tools |
 | `claude_mcp_example.py` | Claude MCP | MCP server integration |
@@ -111,5 +111,5 @@ Format: Ed25519 public key, multicodec-encoded, base58btc. Generated locally - n
 
 - All write operations require Ed25519 signature (`AVP-Sig` header)
 - Proof-of-Work (24-bit) required at registration to prevent spam
-- Never hardcode private keys - use `agent.save(passphrase="...")` for encrypted storage
+- Never hardcode private keys — use `agent.save(passphrase="...")` for encrypted storage
 - API responses should always be validated before acting on them
