@@ -30,6 +30,16 @@ python tests/test_live_e2e.py
 AVP_URL=http://localhost:8000 pytest tests/ -v
 ```
 
+## CI policy
+
+Follow [`docs/CI_POLICY.md`](docs/CI_POLICY.md).
+
+- Run relevant local tests before pushing code changes.
+- The push fast gate is not release verification.
+- The full OS/Python compatibility gate must pass before release tags or PyPI publication.
+- Do not use `[skip ci]` for code, packaging, security, or behavior changes.
+- When reporting done, state the local commands and CI gates that actually ran.
+
 ## Code style
 
 - Python 3.10+
