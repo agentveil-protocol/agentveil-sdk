@@ -63,7 +63,7 @@ cred = agent.get_reputation_credential(format="w3c")
 assert AVPAgent.verify_w3c_credential(cred)
 ```
 
-## MCP Server
+## AgentVeil MCP Toolbox
 
 The base install includes the MCP runtime dependency:
 
@@ -76,6 +76,9 @@ Local/full MCP mode exposes Runtime Gate evaluation, human approval routing,
 approved execution, signed receipt retrieval, reputation checks, identity
 lookup, and audit verification. Hosted read-only mode exposes public
 inspection tools only.
+
+This server is an explicit toolbox. It does not intercept, monitor, or gate
+other MCP tools; MCP clients must call these AVP tools directly.
 
 The compatibility extra `agentveil[mcp]` still works for legacy setups. MCP setup details are in the [MCP README](https://github.com/agentveil-protocol/agentveil-sdk/blob/main/agentveil_mcp/README.md).
 

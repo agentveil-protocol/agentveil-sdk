@@ -1,17 +1,24 @@
-# agentveil-mcp
+# AgentVeil MCP Toolbox
 
-Model Context Protocol server for **Agent Veil Protocol**. It exposes an
-explicit action-control toolbox for Runtime Gate decisions, human approval
-routing, signed receipts, reputation checks, and audit verification.
+Model Context Protocol server for **Agent Veil Protocol**. It exposes the
+**AgentVeil MCP Toolbox**: explicit AVP tools for Runtime Gate decisions,
+human approval routing, signed receipts, reputation checks, and audit
+verification.
 
 This is **not** an automatic MCP proxy. It does not intercept Claude Desktop,
 Cursor, Cline, or third-party MCP tool calls by itself; MCP clients call these
 AVP tools explicitly.
 
+For downstream MCP tool-call control, use
+[`agentveil-mcp-proxy`](../agentveil_mcp_proxy/README.md). The proxy sits
+between an MCP client and a downstream MCP server so AVP policy can decide
+whether to forward, require approval, or block a tool call.
+
 Local/full mode includes 20 tools: 8 public read-only tools, 4 identity/write
 tools, and 8 action-control tools. Hosted read-only mode exposes 8 tools.
 
-- **Status:** local/full mode over stdio for identities and action control;
+- **Status:** local/full toolbox mode over stdio for identities and explicit
+  action-control calls;
   hosted read-only mode for public catalog use.
 - **Package:** bundled inside `agentveil` on PyPI (installed via extras).
 - **License:** MIT.
@@ -186,6 +193,10 @@ that a local agent identity exists (either loaded or created on first use).
 Action-control tools are explicit AVP API wrappers. They do not proxy,
 monitor, or automatically gate other MCP tools.
 
+Use this server when you want an MCP client to call AVP directly. Use
+`agentveil-mcp-proxy` when you need AVP to sit in front of another MCP server
+and control downstream tool calls.
+
 ### Read-only
 
 | Tool | Purpose |
@@ -232,7 +243,7 @@ and are not parsed or re-serialized by the MCP wrapper.
 
 ## Relationship to the AVP API
 
-`agentveil_mcp` is a thin MCP wrapper over:
+`agentveil_mcp` is a thin MCP toolbox wrapper over:
 
 - Public read endpoints on `https://agentveil.dev` (no auth) — invoked
   directly via `httpx` for read-only tools.

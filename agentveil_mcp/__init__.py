@@ -1,5 +1,5 @@
 """
-agentveil-mcp — Model Context Protocol server for Agent Veil Protocol.
+agentveil-mcp — AgentVeil MCP Toolbox.
 
 Canonical package. The old `mcp_server` import path is retained as a
 deprecation shim and forwards here.

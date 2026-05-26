@@ -8,7 +8,7 @@
 [![Python](https://img.shields.io/pypi/pyversions/agentveil)](https://pypi.org/project/agentveil/)
 [![Tests](https://github.com/agentveil-protocol/agentveil-sdk/actions/workflows/tests.yml/badge.svg)](https://github.com/agentveil-protocol/agentveil-sdk/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Glama MCP Directory](https://img.shields.io/badge/Glama-MCP%20Directory-blue)](https://glama.ai/mcp/servers/agentveil-protocol/agentveil-sdk)
+[![Glama MCP Directory](https://img.shields.io/badge/Glama-MCP%20Directory-blue)](https://glama.ai/mcp/servers/agentveil-protocol/avp-sdk)
 
 **Action control for autonomous agents — check pre-runtime risk, gate risky actions, prove execution.**
 
@@ -255,7 +255,7 @@ def review_code(pr_url: str) -> str:
 | **LangGraph** | `pip install agentveil langgraph` | `ToolNode([avp_check_reputation, avp_should_delegate, avp_log_interaction])` |
 | **AutoGen** | `pip install agentveil autogen-core` | `avp_reputation_tools()` |
 | **OpenAI** | `pip install agentveil openai` | `avp_tool_definitions()` + `handle_avp_tool_call(...)` from `agentveil.tools.openai` |
-| **MCP clients** | `pip install 'agentveil[mcp]'` | `agentveil-mcp` for Runtime Gate, approvals, receipts, reputation, identity lookup, and audit ([docs](agentveil_mcp/README.md)) |
+| **MCP clients** | `pip install 'agentveil[mcp]'` | `agentveil-mcp` toolbox for explicit Runtime Gate evaluation, approvals, receipts, reputation, identity lookup, and audit. It does not intercept or gate other MCP tools. ([docs](agentveil_mcp/README.md)) |
 | **MCP transport proxy** | `pip install agentveil` | `agentveil-mcp-proxy` wraps downstream MCP servers (filesystem, github, shell) with Action Control Plane gating, approval routing, durable signed evidence, and replay defense for Claude Desktop, Cursor, Cline, Windsurf, and VS Code ([docs](agentveil_mcp_proxy/README.md)) |
 | **Gemini** | `pip install agentveil google-generativeai` | Function-calling example: [`examples/gemini_example.py`](examples/gemini_example.py) |
 | **PydanticAI** | `pip install agentveil pydantic-ai` | Tool example: [`examples/pydantic_ai_example.py`](examples/pydantic_ai_example.py) |

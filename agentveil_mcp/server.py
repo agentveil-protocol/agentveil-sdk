@@ -86,13 +86,14 @@ def _build_transport_security() -> TransportSecuritySettings:
 
 
 mcp = FastMCP(
-    "Agent Veil Protocol",
+    "AgentVeil MCP Toolbox",
     instructions=(
-        "AgentVeil MCP is an explicit action-control toolbox, not an automatic MCP proxy. "
-        "It does not intercept other MCP tools by itself. "
+        "AgentVeil MCP Toolbox is an explicit AVP toolbox, not an automatic MCP proxy. "
+        "It does not intercept, monitor, or gate other MCP tools by itself. "
         "Use it to evaluate risky actions with AVP Runtime Gate, route human approvals, "
         "resume approved execution, fetch signed receipts, inspect public profiles, "
         "make advisory reputation checks, verify audit evidence, and record signed outcomes. "
+        "Use agentveil-mcp-proxy when downstream MCP tool-call control is required. "
         "Use read-only tools to inspect agent reputation, public profiles, audit history, "
         "and protocol stats. Use local/full tools only when a local AgentVeil identity is configured."
     ),
@@ -789,17 +790,19 @@ def get_execution_receipt(
 
 @mcp.resource("avp://protocol/info")
 def protocol_info() -> str:
-    """Information about AgentVeil action-control and advisory MCP tools."""
+    """Information about AgentVeil MCP Toolbox."""
     return json.dumps({
-        "name": "Agent Veil Protocol (AVP)",
-        "description": "Explicit action-control MCP toolbox, advisory reputation, audit verification, and signed evidence for AI agent systems",
+        "name": "AgentVeil MCP Toolbox",
+        "description": "Explicit AVP MCP toolbox for Runtime Gate evaluation, approval routing, signed receipts, advisory reputation, identity lookup, and audit verification",
         "api": f"{BASE_URL}/docs",
         "explorer": f"{BASE_URL}/live",       # Deprecated alias; kept for compatibility.
         "live_network": f"{BASE_URL}/live",
         "sdk": "pip install agentveil",
         "mcp": "pip install 'agentveil[mcp]'",
+        "proxy": "agentveil-mcp-proxy",
         "github": "https://github.com/agentveil-protocol/agentveil-sdk",
-        "boundary": "Explicit MCP toolbox; does not automatically proxy or intercept other MCP tool calls.",
+        "boundary": "Explicit MCP toolbox only; does not intercept, monitor, or gate other MCP tools.",
+        "recommended_for_downstream_mcp_control": "Use agentveil-mcp-proxy to wrap downstream MCP servers.",
         "features": [
             "W3C DID Identity (Ed25519)",
             "Runtime Gate action decisions",
