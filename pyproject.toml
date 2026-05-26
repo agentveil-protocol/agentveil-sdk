@@ -43,11 +43,13 @@ test = ["pytest>=8.0.0", "pytest-asyncio>=0.23.0"]
 mcp = ["mcp>=1.0.0"]
 
 [project.scripts]
+agentveil = "agentveil_paperclip.cli:agentveil_main"
 agentveil-mcp = "agentveil_mcp.server:main"
 agentveil-mcp-proxy = "agentveil_mcp_proxy.cli:main"
+agentveil-paperclip = "agentveil_paperclip.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["agentveil*", "agentveil_mcp*", "mcp_server*"]
+include = ["agentveil*", "agentveil_mcp*", "agentveil_paperclip*", "mcp_server*"]
 
 [tool.setuptools.package-data]
 agentveil_mcp = ["README.md"]
