@@ -9,6 +9,26 @@ All notable changes to the `agentveil` SDK.
   named while AgentVeil is described as an external trust and reputation
   integration.
 
+## [0.7.16] - 2026-05-26
+
+Paperclip MCP integration helper release. Adds read-only local helper commands
+for operators who route Paperclip-managed Claude/Codex tool calls through the
+AgentVeil MCP proxy.
+
+### Added
+- Added `agentveil paperclip doctor` and `agentveil-paperclip doctor` for
+  read-only local readiness checks covering the AgentVeil MCP proxy and local
+  Claude/Codex runtime configuration presence.
+- Added `agentveil paperclip init --dry-run` and
+  `agentveil-paperclip init --dry-run` for a non-mutating setup preview. Plain
+  `init` remains refused in this release.
+- Added privacy-by-default redaction of local filesystem paths in Paperclip
+  helper output, with `--show-paths` as an explicit local diagnostic opt-in.
+
+### Changed
+- Added a Paperclip integration guide documenting the MCP-routed action
+  boundary, the read-only helpers, and current sandbox/remote limitations.
+
 ## [0.7.15] - 2026-05-12
 
 Post-launch polish release: discoverability fixes for the v0.1 MCP Proxy
