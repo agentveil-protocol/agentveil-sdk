@@ -312,3 +312,219 @@ def test_init_dry_run_never_prints_planted_secret_contents(tmp_path, monkeypatch
     assert codex_secret not in captured.err
     assert auth_secret not in captured.out
     assert auth_secret not in captured.err
+
+
+# ---------------------------------------------------------------------------
+# Privacy-by-default path redaction (Stage 5F) tests
+# ---------------------------------------------------------------------------
+
+
+def _fake_cli_path(name: str) -> str:
+    return f"/private/tmp/stage5f-fakebin/{name}"
+
+
+def test_doctor_default_omits_local_filesystem_paths(tmp_path, capsys):
+    """Default doctor output must not contain CLI or config file paths."""
+    home = _empty_home(tmp_path)
+    claude_dir = home / ".claude"
+    claude_dir.mkdir()
+    settings = claude_dir / "settings.json"
+    settings.write_text("{}")
+    codex_dir = home / ".codex"
+    codex_dir.mkdir()
+    codex_config = codex_dir / "config.toml"
+    codex_config.write_text("# placeholder\n")
+
+    with patch(
+        "agentveil_paperclip.doctor.shutil.which",
+        side_effect=_fake_cli_path,
+    ):
+        report = collect_doctor_report(home=home, cwd=tmp_path)
+    text = render_doctor_report(report)
+
+    # No fake CLI paths.
+    assert "/private/tmp/stage5f-fakebin/agentveil-mcp-proxy" not in text
+    assert "/private/tmp/stage5f-fakebin/claude" not in text
+    assert "/private/tmp/stage5f-fakebin/codex" not in text
+    # No config file paths (test home or config files).
+    assert str(home) not in text
+    assert str(settings) not in text
+    assert str(codex_config) not in text
+    # The redaction footer must explain the default.
+    assert "--show-paths" in text
+
+
+def test_doctor_show_paths_includes_paths(tmp_path):
+    """`render_doctor_report(..., show_paths=True)` reveals path details."""
+    home = _empty_home(tmp_path)
+    claude_dir = home / ".claude"
+    claude_dir.mkdir()
+    settings = claude_dir / "settings.json"
+    settings.write_text("{}")
+    codex_dir = home / ".codex"
+    codex_dir.mkdir()
+    codex_config = codex_dir / "config.toml"
+    codex_config.write_text("# placeholder\n")
+
+    with patch(
+        "agentveil_paperclip.doctor.shutil.which",
+        side_effect=_fake_cli_path,
+    ):
+        report = collect_doctor_report(home=home, cwd=tmp_path)
+    text = render_doctor_report(report, show_paths=True)
+
+    assert "/private/tmp/stage5f-fakebin/agentveil-mcp-proxy" in text
+    assert "/private/tmp/stage5f-fakebin/claude" in text
+    assert "/private/tmp/stage5f-fakebin/codex" in text
+    assert str(settings) in text
+    assert str(codex_config) in text
+    # The redaction footer must NOT appear when paths are shown.
+    assert "Local filesystem paths are omitted" not in text
+
+
+def test_doctor_cli_default_omits_paths(capsys, tmp_path):
+    """`agentveil paperclip doctor` (no flag) must omit paths on the real machine."""
+    with patch(
+        "agentveil_paperclip.doctor.shutil.which",
+        side_effect=_fake_cli_path,
+    ):
+        return_code = agentveil_main(["paperclip", "doctor"])
+    assert return_code == 0
+    captured = capsys.readouterr()
+    assert "/private/tmp/stage5f-fakebin/" not in captured.out
+    assert "--show-paths" in captured.out
+
+
+def test_doctor_cli_show_paths_includes_paths(capsys):
+    """`agentveil paperclip doctor --show-paths` reveals paths."""
+    with patch(
+        "agentveil_paperclip.doctor.shutil.which",
+        side_effect=_fake_cli_path,
+    ):
+        return_code = agentveil_main(["paperclip", "doctor", "--show-paths"])
+    assert return_code == 0
+    captured = capsys.readouterr()
+    assert "/private/tmp/stage5f-fakebin/agentveil-mcp-proxy" in captured.out
+    assert "Local filesystem paths are omitted" not in captured.out
+
+
+def test_doctor_alias_default_omits_paths(capsys):
+    """`agentveil-paperclip doctor` (alias entry) also omits paths by default."""
+    with patch(
+        "agentveil_paperclip.doctor.shutil.which",
+        side_effect=_fake_cli_path,
+    ):
+        return_code = main(["doctor"])
+    assert return_code == 0
+    captured = capsys.readouterr()
+    assert "/private/tmp/stage5f-fakebin/" not in captured.out
+
+
+def test_doctor_alias_show_paths_includes_paths(capsys):
+    """`agentveil-paperclip doctor --show-paths` reveals paths."""
+    with patch(
+        "agentveil_paperclip.doctor.shutil.which",
+        side_effect=_fake_cli_path,
+    ):
+        return_code = main(["doctor", "--show-paths"])
+    assert return_code == 0
+    captured = capsys.readouterr()
+    assert "/private/tmp/stage5f-fakebin/agentveil-mcp-proxy" in captured.out
+
+
+def test_init_dry_run_default_omits_paths(capsys, tmp_path, monkeypatch):
+    """Default `init --dry-run` output must not contain absolute paths."""
+    home = _empty_home(tmp_path)
+    monkeypatch.setenv("HOME", str(home))
+    claude_dir = home / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / "settings.json").write_text("{}")
+    codex_dir = home / ".codex"
+    codex_dir.mkdir()
+    (codex_dir / "config.toml").write_text("# placeholder\n")
+
+    with patch(
+        "agentveil_paperclip.doctor.shutil.which",
+        side_effect=_fake_cli_path,
+    ):
+        return_code = agentveil_main(["paperclip", "init", "--dry-run"])
+    assert return_code == 0
+    captured = capsys.readouterr()
+
+    assert "/private/tmp/stage5f-fakebin/" not in captured.out
+    assert str(home) not in captured.out
+    assert "--show-paths" in captured.out
+    # The dry-run summary still appears.
+    assert "AgentVeil Paperclip Init Plan (dry-run)" in captured.out
+    assert "Would:" in captured.out
+
+
+def test_init_dry_run_show_paths_includes_paths(capsys, tmp_path, monkeypatch):
+    """`init --dry-run --show-paths` includes paths when CLIs / configs are present."""
+    home = _empty_home(tmp_path)
+    monkeypatch.setenv("HOME", str(home))
+    claude_dir = home / ".claude"
+    claude_dir.mkdir()
+    settings = claude_dir / "settings.json"
+    settings.write_text("{}")
+    codex_dir = home / ".codex"
+    codex_dir.mkdir()
+    codex_config = codex_dir / "config.toml"
+    codex_config.write_text("# placeholder\n")
+
+    with patch(
+        "agentveil_paperclip.doctor.shutil.which",
+        side_effect=_fake_cli_path,
+    ):
+        return_code = agentveil_main(
+            ["paperclip", "init", "--dry-run", "--show-paths"]
+        )
+    assert return_code == 0
+    captured = capsys.readouterr()
+
+    assert "/private/tmp/stage5f-fakebin/agentveil-mcp-proxy" in captured.out
+    assert str(settings) in captured.out
+    assert str(codex_config) in captured.out
+    assert "Local filesystem paths are omitted" not in captured.out
+
+
+def test_init_dry_run_alias_default_omits_paths(capsys):
+    """Alias `agentveil-paperclip init --dry-run` also omits paths by default."""
+    with patch(
+        "agentveil_paperclip.doctor.shutil.which",
+        side_effect=_fake_cli_path,
+    ):
+        return_code = main(["init", "--dry-run"])
+    assert return_code == 0
+    captured = capsys.readouterr()
+    assert "/private/tmp/stage5f-fakebin/" not in captured.out
+
+
+def test_init_dry_run_alias_show_paths_includes_paths(capsys):
+    """Alias `agentveil-paperclip init --dry-run --show-paths` reveals paths."""
+    with patch(
+        "agentveil_paperclip.doctor.shutil.which",
+        side_effect=_fake_cli_path,
+    ):
+        return_code = main(["init", "--dry-run", "--show-paths"])
+    assert return_code == 0
+    captured = capsys.readouterr()
+    assert "/private/tmp/stage5f-fakebin/agentveil-mcp-proxy" in captured.out
+
+
+def test_underlying_check_result_still_carries_path(tmp_path):
+    """Structured `CheckResult.detail` retains the path internally for tests / future JSON output."""
+    home = _empty_home(tmp_path)
+    claude_dir = home / ".claude"
+    claude_dir.mkdir()
+    settings = claude_dir / "settings.json"
+    settings.write_text("{}")
+
+    with patch(
+        "agentveil_paperclip.doctor.shutil.which",
+        side_effect=_fake_cli_path,
+    ):
+        report = collect_doctor_report(home=home, cwd=tmp_path)
+
+    assert report.claude_cli.detail == "/private/tmp/stage5f-fakebin/claude"
+    assert report.claude_mcp_config.detail == str(settings)

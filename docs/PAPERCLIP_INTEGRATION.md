@@ -145,9 +145,8 @@ commands are:
 - `agentveil paperclip doctor` reports whether the AgentVeil proxy,
   the local Claude runtime, and the local Codex runtime are
   discoverable on this machine, and whether their MCP configuration
-  files are present at the documented locations. It reports paths
-  only — it never reads the contents of any configuration or
-  credential file.
+  files are present at the documented locations. It never reads the
+  contents of any configuration or credential file.
 - `agentveil paperclip init --dry-run` previews the setup steps that
   would need to happen for each integration surface (proxy, local
   Claude, local Codex, sandbox / remote, Paperclip plugin). Each
@@ -158,8 +157,13 @@ commands are:
 Both commands are strictly read-only. Neither writes to Claude,
 Codex, or Paperclip configuration files; neither creates any proxy
 state; neither calls the AgentVeil backend or any agent runtime.
-Their output uses path-level disclosure only — never file contents,
-secrets, or proxy policy internals.
+
+By default, both commands also redact absolute local filesystem
+paths from their output. Status words (`found` / `missing` /
+`not_checked` and the corresponding "Current" / "Would" lines for
+the dry-run plan) are always shown; CLI and configuration-file paths
+are omitted. Use `--show-paths` only when you need local diagnostic
+detail.
 
 Both commands report sandbox / remote as **not verified by this
 local doctor or dry-run**. That boundary is intentional: the helpers

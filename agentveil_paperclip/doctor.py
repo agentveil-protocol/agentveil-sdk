@@ -149,14 +149,21 @@ def _summarise(cli_check: CheckResult, config_check: CheckResult) -> str:
     return "not checked"
 
 
-def _line_with_detail(label: str, check: CheckResult) -> str:
-    if check.detail is None:
+def _line_with_detail(label: str, check: CheckResult, *, show_paths: bool = False) -> str:
+    if check.detail is None or not show_paths:
         return f"  {label}: {check.status}"
     return f"  {label}: {check.status} ({check.detail})"
 
 
-def render_doctor_report(report: DoctorReport) -> str:
-    """Render a `DoctorReport` as a human-readable text block."""
+def render_doctor_report(report: DoctorReport, *, show_paths: bool = False) -> str:
+    """Render a `DoctorReport` as a human-readable text block.
+
+    Privacy-by-default: absolute local filesystem paths are omitted
+    unless ``show_paths=True`` is passed. The structured
+    :class:`CheckResult` data on ``report`` always retains the
+    underlying paths internally; this flag only controls what the
+    operator-visible text reveals.
+    """
 
     lines: list[str] = [
         "AgentVeil Paperclip Doctor",
@@ -168,16 +175,16 @@ def render_doctor_report(report: DoctorReport) -> str:
         "  of scope for this proxy.",
         "",
         "AgentVeil MCP proxy:",
-        _line_with_detail("CLI", report.proxy),
+        _line_with_detail("CLI", report.proxy, show_paths=show_paths),
         "",
         "Local Claude:",
-        _line_with_detail("CLI", report.claude_cli),
-        _line_with_detail("MCP config file", report.claude_mcp_config),
+        _line_with_detail("CLI", report.claude_cli, show_paths=show_paths),
+        _line_with_detail("MCP config file", report.claude_mcp_config, show_paths=show_paths),
         f"  Status: {_summarise(report.claude_cli, report.claude_mcp_config)}",
         "",
         "Local Codex:",
-        _line_with_detail("CLI", report.codex_cli),
-        _line_with_detail("MCP config file", report.codex_mcp_config),
+        _line_with_detail("CLI", report.codex_cli, show_paths=show_paths),
+        _line_with_detail("MCP config file", report.codex_mcp_config, show_paths=show_paths),
         f"  Status: {_summarise(report.codex_cli, report.codex_mcp_config)}",
         "",
         "Sandbox / remote:",
@@ -189,4 +196,10 @@ def render_doctor_report(report: DoctorReport) -> str:
         "Paperclip plugin:",
         "  Optional advisory companion. Not the runtime control layer.",
     ]
+    if not show_paths:
+        lines.extend([
+            "",
+            "(Local filesystem paths are omitted by default. Re-run with",
+            "`--show-paths` to include them.)",
+        ])
     return "\n".join(lines) + "\n"

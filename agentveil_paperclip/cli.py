@@ -4,6 +4,10 @@ Subcommands today:
 
 * ``doctor`` — read-only local readiness report for the AgentVeil MCP
   proxy + Paperclip-managed Claude/Codex integration.
+* ``init --dry-run`` — read-only preview of the setup steps that
+  would need to happen for each integration surface. Running ``init``
+  without ``--dry-run`` is refused; no mutating init flow is
+  implemented today.
 
 The CLI is intentionally minimal. It does not write configuration, mutate
 user files, generate identities, or call the AgentVeil backend.
@@ -19,11 +23,17 @@ from .doctor import collect_doctor_report, render_doctor_report
 from .init_plan import collect_init_plan, render_init_plan
 
 
-def cmd_doctor(_args: argparse.Namespace, *, out: TextIO) -> int:
+_SHOW_PATHS_HELP = (
+    "Include local filesystem paths in the output. Off by default for "
+    "privacy. May reveal absolute paths from your home directory or system."
+)
+
+
+def cmd_doctor(args: argparse.Namespace, *, out: TextIO) -> int:
     """Render the read-only doctor report to `out`."""
 
     report = collect_doctor_report()
-    out.write(render_doctor_report(report))
+    out.write(render_doctor_report(report, show_paths=args.show_paths))
     return 0
 
 
@@ -38,8 +48,8 @@ def cmd_init(args: argparse.Namespace, *, out: TextIO) -> int:
         )
         return 2
 
-    plan = collect_init_plan()
-    out.write(render_init_plan(plan))
+    plan = collect_init_plan(show_paths=args.show_paths)
+    out.write(render_init_plan(plan, show_paths=args.show_paths))
     return 0
 
 
@@ -50,6 +60,11 @@ def _add_doctor_subcommand(subparsers: argparse._SubParsersAction) -> None:
             "Report local readiness for the AgentVeil MCP proxy and "
             "Paperclip integration. Read-only."
         ),
+    )
+    doctor.add_argument(
+        "--show-paths",
+        action="store_true",
+        help=_SHOW_PATHS_HELP,
     )
     doctor.set_defaults(handler=cmd_doctor)
 
@@ -69,6 +84,11 @@ def _add_init_subcommand(subparsers: argparse._SubParsersAction) -> None:
             "Print the proposed setup plan without writing any files or "
             "creating any proxy state. Required in this release."
         ),
+    )
+    init.add_argument(
+        "--show-paths",
+        action="store_true",
+        help=_SHOW_PATHS_HELP,
     )
     init.set_defaults(handler=cmd_init)
 

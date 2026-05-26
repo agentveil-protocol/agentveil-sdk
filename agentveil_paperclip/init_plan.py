@@ -38,9 +38,9 @@ class InitPlan:
     plugin: InitProposal
 
 
-def _proxy_proposal(report: DoctorReport) -> InitProposal:
+def _proxy_proposal(report: DoctorReport, *, show_paths: bool = False) -> InitProposal:
     current = f"CLI {report.proxy.status}"
-    if report.proxy.detail:
+    if show_paths and report.proxy.detail:
         current += f" ({report.proxy.detail})"
     if report.proxy.status == "found":
         would = (
@@ -59,11 +59,14 @@ def _proxy_proposal(report: DoctorReport) -> InitProposal:
     )
 
 
-def _claude_proposal(report: DoctorReport) -> InitProposal:
-    current = (
-        f"CLI {report.claude_cli.status}, "
-        f"MCP config file {report.claude_mcp_config.status}"
-    )
+def _claude_proposal(report: DoctorReport, *, show_paths: bool = False) -> InitProposal:
+    cli_part = f"CLI {report.claude_cli.status}"
+    if show_paths and report.claude_cli.detail:
+        cli_part += f" ({report.claude_cli.detail})"
+    cfg_part = f"MCP config file {report.claude_mcp_config.status}"
+    if show_paths and report.claude_mcp_config.detail:
+        cfg_part += f" ({report.claude_mcp_config.detail})"
+    current = f"{cli_part}, {cfg_part}"
     if report.claude_cli.status != "found":
         would = (
             "install the Claude CLI before configuring the integration. "
@@ -90,11 +93,14 @@ def _claude_proposal(report: DoctorReport) -> InitProposal:
     )
 
 
-def _codex_proposal(report: DoctorReport) -> InitProposal:
-    current = (
-        f"CLI {report.codex_cli.status}, "
-        f"MCP config file {report.codex_mcp_config.status}"
-    )
+def _codex_proposal(report: DoctorReport, *, show_paths: bool = False) -> InitProposal:
+    cli_part = f"CLI {report.codex_cli.status}"
+    if show_paths and report.codex_cli.detail:
+        cli_part += f" ({report.codex_cli.detail})"
+    cfg_part = f"MCP config file {report.codex_mcp_config.status}"
+    if show_paths and report.codex_mcp_config.detail:
+        cfg_part += f" ({report.codex_mcp_config.detail})"
+    current = f"{cli_part}, {cfg_part}"
     if report.codex_cli.status != "found":
         would = (
             "install the Codex CLI before configuring the integration. "
@@ -147,21 +153,35 @@ def collect_init_plan(
     *,
     home: Path | None = None,
     cwd: Path | None = None,
+    show_paths: bool = False,
 ) -> InitPlan:
-    """Build a read-only init plan from the same probes the doctor uses."""
+    """Build a read-only init plan from the same probes the doctor uses.
+
+    Privacy-by-default: when ``show_paths`` is ``False`` (the default)
+    the proposals' ``current`` strings omit absolute local filesystem
+    paths. The underlying :class:`DoctorReport` always retains the
+    paths internally; this flag controls only what the operator-visible
+    plan reveals.
+    """
 
     report = collect_doctor_report(home=home, cwd=cwd)
     return InitPlan(
-        proxy=_proxy_proposal(report),
-        claude=_claude_proposal(report),
-        codex=_codex_proposal(report),
+        proxy=_proxy_proposal(report, show_paths=show_paths),
+        claude=_claude_proposal(report, show_paths=show_paths),
+        codex=_codex_proposal(report, show_paths=show_paths),
         sandbox=_sandbox_proposal(),
         plugin=_plugin_proposal(),
     )
 
 
-def render_init_plan(plan: InitPlan) -> str:
-    """Render an :class:`InitPlan` as a human-readable dry-run preview."""
+def render_init_plan(plan: InitPlan, *, show_paths: bool = False) -> str:
+    """Render an :class:`InitPlan` as a human-readable dry-run preview.
+
+    Privacy-by-default: when ``show_paths`` is ``False`` the rendered
+    output appends a footer note explaining that paths are omitted.
+    The proposals' ``current`` strings must have been built with the
+    same flag value (see :func:`collect_init_plan`).
+    """
 
     lines: list[str] = [
         "AgentVeil Paperclip Init Plan (dry-run)",
@@ -188,6 +208,12 @@ def render_init_plan(plan: InitPlan) -> str:
     lines.append(
         "To apply any of the proposed steps, perform them manually after review."
     )
+    if not show_paths:
+        lines.extend([
+            "",
+            "(Local filesystem paths are omitted by default. Re-run with",
+            "`--show-paths` to include them.)",
+        ])
     return "\n".join(lines) + "\n"
 
 
