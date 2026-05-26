@@ -1,9 +1,13 @@
 # AgentVeil for Paperclip — Operator Guide
 
-This guide describes how to use AgentVeil with Paperclip as of the current
-release of both products. It is written for operators who already run
-Paperclip and who want to add runtime controls around MCP-routed tool
-calls. It is not a substitute for either project's primary documentation.
+This guide describes how to use AgentVeil with Paperclip as of the
+AgentVeil SDK source version that includes the Paperclip helper
+commands described below. Older published `agentveil` releases may not
+yet contain those helpers; check the `agentveil-paperclip` console
+script availability after installation. The guide is written for
+operators who already run Paperclip and who want to add runtime
+controls around MCP-routed tool calls. It is not a substitute for
+either project's primary documentation.
 
 ---
 
@@ -131,9 +135,12 @@ to AgentVeil.
 
 ### Read-only local helpers
 
-Two read-only helper commands ship with the AgentVeil package to help
-you sanity-check your local environment before you wire anything up by
-hand:
+The AgentVeil SDK source includes two read-only helper commands for
+sanity-checking your local environment before you wire anything up by
+hand. Use an `agentveil` package release that includes these helpers,
+or install from an updated source tree that contains them; the
+currently published PyPI release may not yet ship them. The two
+commands are:
 
 - `agentveil paperclip doctor` reports whether the AgentVeil proxy,
   the local Claude runtime, and the local Codex runtime are
