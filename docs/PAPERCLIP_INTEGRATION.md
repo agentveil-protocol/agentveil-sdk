@@ -129,6 +129,37 @@ language in the prompt that tolerates a brief retry while the MCP layer
 finishes coming up. This is a generic MCP-stdio behavior, not specific
 to AgentVeil.
 
+### Read-only local helpers
+
+Two read-only helper commands ship with the AgentVeil package to help
+you sanity-check your local environment before you wire anything up by
+hand:
+
+- `agentveil paperclip doctor` reports whether the AgentVeil proxy,
+  the local Claude runtime, and the local Codex runtime are
+  discoverable on this machine, and whether their MCP configuration
+  files are present at the documented locations. It reports paths
+  only — it never reads the contents of any configuration or
+  credential file.
+- `agentveil paperclip init --dry-run` previews the setup steps that
+  would need to happen for each integration surface (proxy, local
+  Claude, local Codex, sandbox / remote, Paperclip plugin). Each
+  step is described as a "would" action and explicitly marked as
+  requiring manual review. Running `init` without `--dry-run` is
+  refused; the helper does not implement a mutating init flow today.
+
+Both commands are strictly read-only. Neither writes to Claude,
+Codex, or Paperclip configuration files; neither creates any proxy
+state; neither calls the AgentVeil backend or any agent runtime.
+Their output uses path-level disclosure only — never file contents,
+secrets, or proxy policy internals.
+
+Both commands report sandbox / remote as **not verified by this
+local doctor or dry-run**. That boundary is intentional: the helpers
+inspect the local machine only. Sandbox-side coverage continues to
+require the AgentVeil proxy to be installed inside the sandbox
+runtime environment, as described in the next section.
+
 ---
 
 ## Sandbox / Remote Setup Shape (High Level)
