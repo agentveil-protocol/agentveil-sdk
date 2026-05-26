@@ -105,6 +105,8 @@ avp_evaluate_team(dids=["did:key:z6Mk1...", "did:key:z6Mk2..."])
 
 Full example: [`examples/paperclip_example.py`](../examples/paperclip_example.py)
 
+For the runtime MCP proxy integration with Paperclip-managed Claude and Codex agents, see [`PAPERCLIP_INTEGRATION.md`](./PAPERCLIP_INTEGRATION.md).
+
 ## Hermes (Nous Research)
 
 AVP integrates with [Hermes Agent](https://github.com/NousResearch/hermes-agent) via MCP + agentskills.io skill.
