@@ -15,10 +15,20 @@ from .doctor import (
     collect_doctor_report,
     render_doctor_report,
 )
+from .init_plan import (
+    InitPlan,
+    InitProposal,
+    collect_init_plan,
+    render_init_plan,
+)
 
 __all__ = [
     "CheckResult",
     "DoctorReport",
+    "InitPlan",
+    "InitProposal",
     "collect_doctor_report",
+    "collect_init_plan",
     "render_doctor_report",
+    "render_init_plan",
 ]

@@ -155,11 +155,11 @@ def test_doctor_never_prints_config_or_auth_file_contents(tmp_path):
     codex_dir = home / ".codex"
     codex_dir.mkdir()
     config_toml = codex_dir / "config.toml"
-    codex_passphrase = "AVP_PROXY_PASSPHRASE_DO_NOT_LEAK_98765"
-    config_toml.write_text(f"AVP_PROXY_PASSPHRASE = '{codex_passphrase}'\n")
+    codex_secret_value = "CODEX_RUNTIME_SECRET_DO_NOT_LEAK_98765"
+    config_toml.write_text(f"SECRET_FIELD = '{codex_secret_value}'\n")
     auth_json = codex_dir / "auth.json"
-    auth_secret = "OPENAI_API_KEY_DO_NOT_LEAK_98765"
-    auth_json.write_text(f'{{"OPENAI_API_KEY":"{auth_secret}"}}')
+    auth_secret = "RUNTIME_AUTH_SECRET_DO_NOT_LEAK_98765"
+    auth_json.write_text(f'{{"AUTH_SECRET":"{auth_secret}"}}')
 
     with patch(
         "agentveil_paperclip.doctor.shutil.which",
@@ -169,7 +169,7 @@ def test_doctor_never_prints_config_or_auth_file_contents(tmp_path):
     text = render_doctor_report(report)
 
     assert claude_secret not in text
-    assert codex_passphrase not in text
+    assert codex_secret_value not in text
     assert auth_secret not in text
 
 
@@ -204,3 +204,111 @@ def test_main_entry_requires_subcommand(capsys):
     captured = capsys.readouterr()
     # argparse prints usage to stderr when a required subcommand is missing.
     assert "agentveil-paperclip" in captured.err or "usage" in captured.err.lower()
+
+
+# ---------------------------------------------------------------------------
+# `init --dry-run` (Stage 5B) tests
+# ---------------------------------------------------------------------------
+
+
+def test_init_dry_run_via_agentveil_entry_returns_zero(capsys):
+    """`agentveil paperclip init --dry-run` returns 0 and prints the plan."""
+    return_code = agentveil_main(["paperclip", "init", "--dry-run"])
+    assert return_code == 0
+
+    captured = capsys.readouterr()
+    assert "AgentVeil Paperclip Init Plan (dry-run)" in captured.out
+    # The plan must use the "would" / "manual review" wording, not claim a
+    # ready state from file presence alone.
+    assert "Would:" in captured.out
+    assert "Manual review required" in captured.out
+    assert "ready" not in captured.out.lower()
+
+
+def test_init_dry_run_via_paperclip_helper_entry_returns_zero(capsys):
+    """`agentveil-paperclip init --dry-run` also runs and exits 0."""
+    return_code = main(["init", "--dry-run"])
+    assert return_code == 0
+
+    captured = capsys.readouterr()
+    assert "AgentVeil Paperclip Init Plan (dry-run)" in captured.out
+    assert "MCP-routed tool calls only" in captured.out
+
+
+def test_init_dry_run_describes_each_integration_surface(capsys):
+    """Dry-run output must describe every integration surface, not just one."""
+    return_code = agentveil_main(["paperclip", "init", "--dry-run"])
+    assert return_code == 0
+
+    text = capsys.readouterr().out
+    assert "AgentVeil MCP proxy:" in text
+    assert "Local Claude:" in text
+    assert "Local Codex:" in text
+    assert "Sandbox / remote:" in text
+    assert "Paperclip plugin:" in text
+    # Sandbox boundary must remain present and qualified.
+    assert "not verified by this dry-run" in text
+
+
+def test_init_without_dry_run_fails_with_clear_message(capsys):
+    """`init` without --dry-run must exit non-zero and explain --dry-run."""
+    return_code = agentveil_main(["paperclip", "init"])
+    assert return_code != 0
+
+    captured = capsys.readouterr()
+    assert "--dry-run" in captured.err
+    # The error must say nothing has been written.
+    assert "No mutating init implementation" in captured.err
+
+
+def test_init_dry_run_does_not_write_any_file(monkeypatch):
+    """The dry-run must never call an io-write API."""
+    write_targets: list[tuple[str, str]] = []
+    real_open = open
+
+    def tracking_open(file, mode="r", *args, **kwargs):  # type: ignore[no-untyped-def]
+        if any(flag in mode for flag in ("w", "a", "x", "+")):
+            write_targets.append((str(file), mode))
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", tracking_open)
+    return_code = agentveil_main(["paperclip", "init", "--dry-run"])
+    assert return_code == 0
+    assert write_targets == []
+
+
+def test_init_dry_run_never_prints_planted_secret_contents(tmp_path, monkeypatch, capsys):
+    """Mock-planted secret contents in real-shaped configs must not leak into output."""
+    home = _empty_home(tmp_path)
+    monkeypatch.setenv("HOME", str(home))
+
+    claude_dir = home / ".claude"
+    claude_dir.mkdir()
+    claude_secret = "INIT_PLAN_CLAUDE_SECRET_DO_NOT_LEAK_42424"
+    (claude_dir / "settings.json").write_text(claude_secret)
+
+    codex_dir = home / ".codex"
+    codex_dir.mkdir()
+    codex_secret = "INIT_PLAN_RUNTIME_SECRET_DO_NOT_LEAK_42424"
+    (codex_dir / "config.toml").write_text(
+        f"SECRET_FIELD = '{codex_secret}'\n"
+    )
+    auth_secret = "INIT_PLAN_AUTH_SECRET_DO_NOT_LEAK_42424"
+    (codex_dir / "auth.json").write_text(
+        f'{{"AUTH_SECRET":"{auth_secret}"}}'
+    )
+
+    with patch(
+        "agentveil_paperclip.doctor.shutil.which",
+        side_effect=lambda name: f"/usr/local/bin/{name}",
+    ):
+        return_code = agentveil_main(["paperclip", "init", "--dry-run"])
+    assert return_code == 0
+
+    captured = capsys.readouterr()
+    assert claude_secret not in captured.out
+    assert claude_secret not in captured.err
+    assert codex_secret not in captured.out
+    assert codex_secret not in captured.err
+    assert auth_secret not in captured.out
+    assert auth_secret not in captured.err
