@@ -17,8 +17,15 @@ from nacl.signing import SigningKey
 
 from agentveil.agent import AVPAgent
 from agentveil.delegation import _public_key_to_did
+from agentveil_mcp_proxy.approval import ApprovalManager, ApprovalServer
 from agentveil_mcp_proxy.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
 from agentveil_mcp_proxy.classification import ToolCallClassifier
+from agentveil_mcp_proxy.evidence import (
+    ApprovalEvidenceStore,
+    ApprovalStatus,
+    export_evidence_bundle,
+    verify_evidence_bundle,
+)
 from agentveil_mcp_proxy.passthrough import (
     DownstreamConfig,
     JSONRPC_APPROVAL_REQUIRED,
@@ -210,6 +217,20 @@ class RecordingAgent:
         raise AssertionError("inline decision_receipt_jcs should avoid a receipt fetch")
 
 
+class FetchableRecordingAgent(RecordingAgent):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.receipts: dict[str, str] = {}
+
+    def runtime_evaluate(self, **kwargs):
+        response = super().runtime_evaluate(**kwargs)
+        self.receipts[response["audit_id"]] = response["decision_receipt_jcs"]
+        return response
+
+    def get_decision_receipt(self, audit_id: str) -> str:
+        return self.receipts[audit_id]
+
+
 class SequencedReceiptAgent:
     did = AGENT_DID
 
@@ -269,7 +290,13 @@ for line in sys.stdin:
     return script
 
 
-def _passthrough(tmp_path: Path, gate: object, config: ProxyConfig) -> tuple[McpPassthrough, Path]:
+def _passthrough(
+    tmp_path: Path,
+    gate: object,
+    config: ProxyConfig,
+    *,
+    approval_manager: ApprovalManager | None = None,
+) -> tuple[McpPassthrough, Path]:
     log_path = tmp_path / "downstream.log"
     passthrough = McpPassthrough(
         DownstreamConfig(
@@ -280,6 +307,7 @@ def _passthrough(tmp_path: Path, gate: object, config: ProxyConfig) -> tuple[Mcp
         ),
         classifier=ToolCallClassifier(config, server_name="github"),
         runtime_gate_factory=lambda: gate,
+        approval_manager=approval_manager,
     )
     return passthrough, log_path
 
@@ -553,6 +581,92 @@ def test_verified_allow_forwards_downstream(tmp_path):
     assert len(gate.calls) == 1
 
 
+def test_verified_allow_records_runtime_receipt_and_downstream_result(tmp_path):
+    config = _config()
+    digest = "aa" * 32
+    gate = StaticGate(RuntimeGateDecision(
+        decision="ALLOW",
+        audit_id=AUDIT_ID,
+        approval_id=None,
+        receipt_digest=digest,
+        receipt_body={},
+    ))
+    with ApprovalEvidenceStore(tmp_path / "evidence.sqlite") as store:
+        manager = ApprovalManager(
+            evidence_store=store,
+            approval_server=ApprovalServer(),
+            config=config,
+            client_id="pytest",
+            session_id="session-runtime-allow",
+        )
+        passthrough, log_path = _passthrough(
+            tmp_path,
+            gate,
+            config,
+            approval_manager=manager,
+        )
+        client_out = io.StringIO()
+
+        assert passthrough.run_stdio(io.StringIO(_tool_call()), client_out) == 0
+
+        records = store.list_records()
+
+    assert _responses(client_out.getvalue()) == [{
+        "jsonrpc": "2.0",
+        "id": "call-1",
+        "result": {"content": [{"type": "text", "text": "forwarded"}]},
+    }]
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/call"]
+    assert len(records) == 1
+    record = records[0]
+    assert record.status == ApprovalStatus.EXECUTED.value
+    assert record.decision_audit_id == AUDIT_ID
+    assert record.decision_receipt_sha256 == digest
+    assert record.result_status == "executed"
+    assert record.result_hash is not None
+    assert record.approval_token_hash is None
+    assert record.approval_decided_by is None
+
+
+def test_verified_allow_export_bundle_attaches_signed_decision_receipt(tmp_path):
+    config = _config()
+    agent = FetchableRecordingAgent(decision="ALLOW")
+    gate = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+    bundle_path = tmp_path / "evidence-bundle.json"
+    with ApprovalEvidenceStore(tmp_path / "evidence.sqlite") as store:
+        manager = ApprovalManager(
+            evidence_store=store,
+            approval_server=ApprovalServer(),
+            config=config,
+            client_id="pytest",
+            session_id="session-runtime-bundle",
+        )
+        passthrough, _log_path = _passthrough(
+            tmp_path,
+            gate,
+            config,
+            approval_manager=manager,
+        )
+        client_out = io.StringIO()
+
+        assert passthrough.run_stdio(io.StringIO(_tool_call()), client_out) == 0
+
+        bundle = export_evidence_bundle(
+            store,
+            bundle_path,
+            proxy_identity_did=AGENT_DID,
+            trusted_signer_dids=[BACKEND_DID],
+            receipt_fetcher=agent.get_decision_receipt,
+        )
+
+    result = verify_evidence_bundle(bundle, trusted_signer_dids=[BACKEND_DID])
+    assert result.valid is True
+    assert result.record_count == 1
+    assert result.signed_receipt_count == 1
+    assert result.unverified_receipt_count == 0
+    assert result.warnings == ()
+
+
 def test_block_does_not_forward_and_returns_sanitized_error(tmp_path):
     config = _config()
     gate = StaticGate(RuntimeGateDecision(
@@ -574,6 +688,52 @@ def test_block_does_not_forward_and_returns_sanitized_error(tmp_path):
     assert response["error"]["data"]["audit_id"] == AUDIT_ID
     assert SECRET not in client_out.getvalue()
     assert not log_path.exists()
+
+
+def test_verified_block_records_runtime_receipt_without_forwarding(tmp_path):
+    config = _config()
+    digest = "aa" * 32
+    gate = StaticGate(RuntimeGateDecision(
+        decision="BLOCK",
+        audit_id=AUDIT_ID,
+        approval_id=None,
+        receipt_digest=digest,
+        receipt_body={},
+    ))
+    with ApprovalEvidenceStore(tmp_path / "evidence.sqlite") as store:
+        manager = ApprovalManager(
+            evidence_store=store,
+            approval_server=ApprovalServer(),
+            config=config,
+            client_id="pytest",
+            session_id="session-runtime-block",
+        )
+        passthrough, log_path = _passthrough(
+            tmp_path,
+            gate,
+            config,
+            approval_manager=manager,
+        )
+        client_out = io.StringIO()
+
+        assert passthrough.run_stdio(io.StringIO(_tool_call()), client_out) == 0
+
+        records = store.list_records()
+
+    response = _responses(client_out.getvalue())[0]
+    assert response["error"]["code"] == JSONRPC_POLICY_BLOCKED
+    assert response["error"]["data"]["reason"] == "runtime_gate_block"
+    assert SECRET not in client_out.getvalue()
+    assert not log_path.exists()
+    assert len(records) == 1
+    record = records[0]
+    assert record.status == ApprovalStatus.BLOCKED.value
+    assert record.decision_audit_id == AUDIT_ID
+    assert record.decision_receipt_sha256 == digest
+    assert record.result_status == "blocked"
+    assert record.error_class == "runtime_gate_block"
+    assert record.approval_token_hash is None
+    assert record.approval_decided_by is None
 
 
 def test_waiting_does_not_forward_and_returns_approval_required_shape(tmp_path):

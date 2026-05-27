@@ -28,6 +28,13 @@ script. No additional extras are required.
 
 ## Quick Start
 
+For the full step-by-step customer cold path (install → init → doctor →
+configure downstream → run → export evidence → offline verify) and the
+honest list of what the bundle currently does and does not prove, see
+[`docs/MCP_PROXY_QUICKSTART.md`](../docs/MCP_PROXY_QUICKSTART.md).
+
+The short form is:
+
 Create a local proxy identity, config, and control grant:
 
 ```bash
@@ -221,6 +228,8 @@ exhaustive; review patterns for your specific downstream server.
 |---|---|
 | `init` | Create encrypted identity, config, and control grant. |
 | `doctor` | Validate local files and control grant. |
+| `doctor --check-backend` | Add a read-only preflight that the backend is reachable and the proxy identity is registered. |
+| `register` | Register the existing proxy identity with the configured backend. |
 | `run` | Run stdio passthrough, the proxy mode used by MCP clients. |
 | `reissue-grant` | Refresh the local control grant before expiry. |
 | `export-evidence <path>` | Export durable evidence bundle for offline verification. |
