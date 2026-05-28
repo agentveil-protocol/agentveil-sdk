@@ -13,6 +13,7 @@ import pytest
 
 import agentveil_mcp_proxy.cli as proxy_cli
 from agentveil.delegation import verify_delegation
+from agentveil.exceptions import AVPNotFoundError, AVPServerError, AVPValidationError
 from agentveil_mcp_proxy.cli import (
     AGENTVEIL_DEV_SIGNER_DIDS,
     MIN_IDENTITY_PASSPHRASE_LENGTH,
@@ -22,6 +23,7 @@ from agentveil_mcp_proxy.cli import (
     init_proxy,
     main,
     proxy_paths,
+    register_proxy,
     reissue_grant,
     run_proxy,
 )
@@ -618,6 +620,379 @@ def test_doctor_fails_when_grant_already_expired(tmp_path):
     output = out.getvalue()
     assert "FAIL: control grant expired at" in output
     assert secret not in output
+
+
+def test_doctor_fails_when_identity_file_missing(tmp_path):
+    home = tmp_path / "avp-home"
+    init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    identity_path = proxy_paths(home).identity_path("proxy")
+    identity_path.unlink()
+
+    out = io.StringIO()
+    code = doctor_proxy(home=home, passphrase=TEST_PASSPHRASE, out=out)
+
+    assert code == 1
+    output = out.getvalue()
+    assert "FAIL: agent identity not found" in output
+
+
+class _StubBackendAgent:
+    """Minimal stub for `--check-backend` tests.
+
+    Counts ``health()`` and ``get_onboarding_status()`` invocations so a
+    regression test can assert the doctor does not call the backend
+    without ``--check-backend``.
+    """
+
+    def __init__(self, *, did: str, health_raises: Exception | None = None,
+                 onboarding_raises: Exception | None = None):
+        self.did = did
+        self._health_raises = health_raises
+        self._onboarding_raises = onboarding_raises
+        self.health_calls = 0
+        self.onboarding_calls = 0
+
+    def health(self) -> dict:
+        self.health_calls += 1
+        if self._health_raises is not None:
+            raise self._health_raises
+        return {"status": "ok"}
+
+    def get_onboarding_status(self) -> dict:
+        self.onboarding_calls += 1
+        if self._onboarding_raises is not None:
+            raise self._onboarding_raises
+        return {"status": "verified"}
+
+
+def _install_stub_agent(monkeypatch, agent: _StubBackendAgent) -> None:
+    monkeypatch.setattr(
+        proxy_cli,
+        "_load_proxy_agent",
+        lambda **_kwargs: agent,
+    )
+
+
+def test_doctor_local_only_does_not_call_backend(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    identity = _load(result.identity_path)
+    stub = _StubBackendAgent(did=identity["did"])
+    _install_stub_agent(monkeypatch, stub)
+
+    out = io.StringIO()
+    code = doctor_proxy(home=home, passphrase=TEST_PASSPHRASE, out=out)
+
+    assert code == 0
+    assert stub.health_calls == 0
+    assert stub.onboarding_calls == 0
+    assert "backend reachable" not in out.getvalue()
+
+
+def test_doctor_check_backend_succeeds_with_registered_agent(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    identity = _load(result.identity_path)
+    stub = _StubBackendAgent(did=identity["did"])
+    _install_stub_agent(monkeypatch, stub)
+
+    out = io.StringIO()
+    code = doctor_proxy(
+        home=home,
+        passphrase=TEST_PASSPHRASE,
+        out=out,
+        check_backend=True,
+    )
+
+    assert code == 0
+    assert stub.health_calls == 1
+    assert stub.onboarding_calls == 1
+    output = out.getvalue()
+    assert "OK: backend reachable at " in output
+    assert "agent registered" in output
+
+
+def test_doctor_check_backend_fails_when_backend_unreachable(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    identity = _load(result.identity_path)
+    stub = _StubBackendAgent(
+        did=identity["did"],
+        health_raises=ConnectionError("connection refused"),
+    )
+    _install_stub_agent(monkeypatch, stub)
+
+    out = io.StringIO()
+    code = doctor_proxy(
+        home=home,
+        passphrase=TEST_PASSPHRASE,
+        out=out,
+        check_backend=True,
+    )
+
+    assert code == 1
+    output = out.getvalue()
+    assert "FAIL: backend unreachable at" in output
+    assert stub.health_calls == 1
+    assert stub.onboarding_calls == 0
+    assert "connection refused" not in output
+
+
+def test_doctor_check_backend_fails_when_agent_not_registered(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    identity = _load(result.identity_path)
+    stub = _StubBackendAgent(
+        did=identity["did"],
+        onboarding_raises=AVPNotFoundError("agent not found", 404, "agent not found"),
+    )
+    _install_stub_agent(monkeypatch, stub)
+
+    out = io.StringIO()
+    code = doctor_proxy(
+        home=home,
+        passphrase=TEST_PASSPHRASE,
+        out=out,
+        check_backend=True,
+    )
+
+    assert code == 1
+    output = out.getvalue()
+    assert "FAIL: agent " in output
+    assert "is not registered with backend at" in output
+    assert stub.health_calls == 1
+    assert stub.onboarding_calls == 1
+
+
+def test_doctor_check_backend_fails_on_server_error(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    identity = _load(result.identity_path)
+    stub = _StubBackendAgent(
+        did=identity["did"],
+        health_raises=AVPServerError("server error", 500, "server error"),
+    )
+    _install_stub_agent(monkeypatch, stub)
+
+    out = io.StringIO()
+    code = doctor_proxy(
+        home=home,
+        passphrase=TEST_PASSPHRASE,
+        out=out,
+        check_backend=True,
+    )
+
+    assert code == 1
+    output = out.getvalue()
+    assert "FAIL: backend health check failed at" in output
+    assert "status 500" in output
+    assert stub.health_calls == 1
+    assert stub.onboarding_calls == 0
+
+
+def test_doctor_check_backend_skipped_when_local_checks_fail(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    identity = _load(result.identity_path)
+    stub = _StubBackendAgent(did=identity["did"])
+    _install_stub_agent(monkeypatch, stub)
+
+    # Break a local check (empty signer set) so backend preflight is skipped.
+    config = _load(result.config_path)
+    config["avp"]["trusted_signer_dids"] = []
+    result.config_path.write_text(json.dumps(config), encoding="utf-8")
+    os.chmod(result.config_path, 0o600)
+
+    out = io.StringIO()
+    code = doctor_proxy(
+        home=home,
+        passphrase=TEST_PASSPHRASE,
+        out=out,
+        check_backend=True,
+    )
+
+    assert code == 1
+    assert stub.health_calls == 0
+    assert stub.onboarding_calls == 0
+    assert "trusted_signer_dids" in out.getvalue()
+
+
+def _install_fake_register(monkeypatch, *, raises=None, capture_dids=None):
+    """Replace ``AVPAgent.register`` with a deterministic fake.
+
+    ``raises`` — exception instance to raise instead of completing.
+    ``capture_dids`` — optional list to append the agent DID for each call.
+    """
+
+    from agentveil.agent import AVPAgent
+
+    def fake_register(self):
+        if capture_dids is not None:
+            capture_dids.append(self.did)
+        if raises is not None:
+            raise raises
+        self._is_registered = True
+        self._is_verified = True
+        return {"did": self.did, "onboarding_pending": True}
+
+    monkeypatch.setattr(AVPAgent, "register", fake_register)
+
+
+def test_register_loads_existing_proxy_did(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    identity_before = _load(result.identity_path)
+    captured: list[str] = []
+    _install_fake_register(monkeypatch, capture_dids=captured)
+
+    out = io.StringIO()
+    code = register_proxy(home=home, passphrase=TEST_PASSPHRASE, out=out)
+
+    assert code == 0
+    assert captured == [identity_before["did"]]
+    # Identity file still exists, still encrypted, same DID, registered flag set.
+    identity_after = _load(result.identity_path)
+    assert identity_after["did"] == identity_before["did"]
+    assert identity_after["encrypted"] is True
+    assert identity_after.get("registered") is True
+
+
+def test_register_success_prints_sanitized_ok_and_no_secret(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    identity = _load(result.identity_path)
+    secret = _secret_material(identity)
+    _install_fake_register(monkeypatch)
+
+    out = io.StringIO()
+    code = register_proxy(home=home, passphrase=TEST_PASSPHRASE, out=out)
+
+    output = out.getvalue()
+    assert code == 0
+    assert "OK: agent " in output
+    assert identity["did"] in output
+    assert secret not in output
+    assert "private_key" not in output
+    assert "encryption_salt" not in output
+
+
+def test_register_backend_failure_prints_sanitized_fail(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    secret = _secret_material(_load(result.identity_path))
+    _install_fake_register(
+        monkeypatch,
+        raises=AVPServerError("server boom raw body", 500, "raw response detail"),
+    )
+
+    out = io.StringIO()
+    code = register_proxy(home=home, passphrase=TEST_PASSPHRASE, out=out)
+
+    output = out.getvalue()
+    assert code == 1
+    assert "FAIL: registration failed at " in output
+    assert "status 500" in output
+    assert "server boom raw body" not in output
+    assert "raw response detail" not in output
+    assert secret not in output
+
+
+def test_register_backend_unreachable_prints_sanitized_fail(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    secret = _secret_material(_load(result.identity_path))
+    _install_fake_register(
+        monkeypatch,
+        raises=ConnectionError("connect timeout to host"),
+    )
+
+    out = io.StringIO()
+    code = register_proxy(home=home, passphrase=TEST_PASSPHRASE, out=out)
+
+    output = out.getvalue()
+    assert code == 1
+    assert "FAIL: backend unreachable at " in output
+    assert "ConnectionError" in output
+    assert "connect timeout to host" not in output
+    assert secret not in output
+
+
+def test_register_already_registered_returns_ok(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    identity_before = _load(result.identity_path)
+    _install_fake_register(
+        monkeypatch,
+        raises=AVPValidationError("agent already exists", 409, "conflict"),
+    )
+
+    out = io.StringIO()
+    code = register_proxy(home=home, passphrase=TEST_PASSPHRASE, out=out)
+
+    output = out.getvalue()
+    assert code == 0
+    assert "already registered" in output
+
+    # The 409 path must keep the identity encrypted and update the
+    # local `registered` / `verified` flags to True so the file is not
+    # left in a stale state contradicting the CLI message.
+    identity_after = _load(result.identity_path)
+    assert identity_after["did"] == identity_before["did"]
+    assert identity_after["encrypted"] is True
+    assert "private_key_hex" not in identity_after
+    assert identity_after.get("registered") is True
+    assert identity_after.get("verified") is True
+    if os.name != "nt":
+        assert _mode(result.identity_path) == 0o600
+
+
+def test_register_encrypted_identity_requires_passphrase(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    _install_fake_register(monkeypatch)
+    monkeypatch.delenv("AVP_PROXY_PASSPHRASE", raising=False)
+
+    out = io.StringIO()
+    try:
+        register_proxy(home=home, out=out)
+    except ProxyCliError as exc:
+        assert "passphrase" in str(exc)
+        assert exc.exit_code == 1
+    else:
+        raise AssertionError("expected register to require encrypted identity passphrase")
+
+
+def test_register_does_not_downgrade_encrypted_identity_to_plaintext(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    encrypted_blob_before = _load(result.identity_path).get("encrypted_blob")
+    assert encrypted_blob_before  # sanity: init produced an encrypted identity
+    _install_fake_register(monkeypatch)
+
+    register_proxy(home=home, passphrase=TEST_PASSPHRASE, out=io.StringIO())
+
+    identity_after = _load(result.identity_path)
+    assert identity_after["encrypted"] is True
+    # No plaintext private key should ever appear in the file after register.
+    assert "private_key_hex" not in identity_after
+    if os.name != "nt":
+        assert _mode(result.identity_path) == 0o600
+
+
+def test_register_wired_through_main(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "avp-home"
+    init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    _install_fake_register(monkeypatch)
+
+    exit_code = main([
+        "register",
+        "--home", str(home),
+        "--passphrase", TEST_PASSPHRASE,
+    ])
+    out, _err = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "OK: agent " in out
 
 
 def test_reissue_grant_creates_new_grant_with_default_ttl(tmp_path):

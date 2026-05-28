@@ -84,6 +84,9 @@ _ALLOWED_TRANSITIONS = {
         ApprovalStatus.DENIED.value,
         ApprovalStatus.EXPIRED.value,
         ApprovalStatus.INVALIDATED.value,
+        ApprovalStatus.EXECUTED.value,
+        ApprovalStatus.BLOCKED.value,
+        ApprovalStatus.ERROR.value,
     },
     ApprovalStatus.APPROVED.value: {
         ApprovalStatus.EXECUTED.value,

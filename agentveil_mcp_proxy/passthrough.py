@@ -352,6 +352,25 @@ def _blocked_error(
     return jsonrpc_error(request_id, JSONRPC_POLICY_BLOCKED, message, data=data)
 
 
+def _runtime_evidence_unavailable_error(
+    request_id: Any,
+    decision: RuntimeGateDecision,
+) -> dict[str, Any]:
+    data: dict[str, Any] = {
+        "status": "blocked",
+        "reason": "runtime_gate_evidence_unavailable",
+        "decision": decision.decision,
+    }
+    if decision.audit_id is not None:
+        data["audit_id"] = decision.audit_id
+    return jsonrpc_error(
+        request_id,
+        JSONRPC_POLICY_BLOCKED,
+        "runtime decision evidence unavailable",
+        data=data,
+    )
+
+
 def _approval_required_error(
     request_id: Any,
     *,
@@ -723,7 +742,16 @@ class McpPassthrough:
         self._record_runtime_gate_events()
 
         if decision.decision == DECISION_ALLOW:
-            return None, None
+            if self.approval_manager is None:
+                return None, None
+            try:
+                outcome = self.approval_manager.record_runtime_allow(
+                    classification,
+                    runtime_decision=decision,
+                )
+            except ApprovalFlowError:
+                return _runtime_evidence_unavailable_error(request_id, decision), None
+            return None, outcome
         if decision.decision == DECISION_WAITING:
             return self._approval_flow_response(
                 classification,
@@ -732,6 +760,14 @@ class McpPassthrough:
                 runtime_decision=decision,
             )
         if decision.decision == DECISION_BLOCK:
+            if self.approval_manager is not None:
+                try:
+                    self.approval_manager.record_runtime_block(
+                        classification,
+                        runtime_decision=decision,
+                    )
+                except ApprovalFlowError:
+                    return _runtime_evidence_unavailable_error(request_id, decision), None
             return _blocked_error(
                 request_id,
                 "blocked by AVP Runtime Gate",

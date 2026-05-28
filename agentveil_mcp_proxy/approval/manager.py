@@ -122,6 +122,7 @@ class ApprovalManager:
             created_at=now,
             expires_at=record_expires_at,
             runtime_decision=None if active_similar_grant is not None else runtime_decision,
+            approval_token_hash=self.approval_server.token_hash,
             granted_by_request_id=(
                 None if active_similar_grant is None else active_similar_grant.request_id
             ),
@@ -177,6 +178,45 @@ class ApprovalManager:
                 "user_approved",
             )
         return self._deny(request_id, "user_denied")
+
+    def record_runtime_allow(
+        self,
+        classification: ClassifiedToolCall,
+        *,
+        runtime_decision: RuntimeGateDecision,
+    ) -> ApprovalOutcome:
+        """Persist a verified Runtime Gate ALLOW decision before forwarding."""
+
+        request_id = self._write_runtime_decision_record(
+            classification,
+            runtime_decision=runtime_decision,
+        )
+        return ApprovalOutcome(
+            request_id,
+            ApprovalStatus.APPROVED.value,
+            "runtime_gate_allow",
+        )
+
+    def record_runtime_block(
+        self,
+        classification: ClassifiedToolCall,
+        *,
+        runtime_decision: RuntimeGateDecision,
+    ) -> None:
+        """Persist a verified Runtime Gate BLOCK decision as terminal evidence."""
+
+        request_id = self._write_runtime_decision_record(
+            classification,
+            runtime_decision=runtime_decision,
+        )
+        try:
+            self.evidence_store.transition(
+                request_id,
+                ApprovalStatus.BLOCKED.value,
+                error_class="runtime_gate_block",
+            )
+        except ApprovalEvidenceError as exc:
+            raise ApprovalFlowError("runtime decision evidence persistence failed") from exc
 
     def record_execution_result(self, outcome: ApprovalOutcome, response: dict[str, Any]) -> None:
         """Append execution result evidence for an approved downstream call."""
@@ -277,6 +317,7 @@ class ApprovalManager:
         created_at: int,
         expires_at: int | None,
         runtime_decision: RuntimeGateDecision | None,
+        approval_token_hash: str | None = None,
         granted_by_request_id: str | None = None,
     ) -> PendingApproval:
         return PendingApproval(
@@ -297,10 +338,31 @@ class ApprovalManager:
             expires_at=expires_at,
             decision_audit_id=None if runtime_decision is None else runtime_decision.audit_id,
             decision_receipt_sha256=None if runtime_decision is None else runtime_decision.receipt_digest,
-            approval_token_hash=self.approval_server.token_hash,
+            approval_token_hash=approval_token_hash,
             matched_policy_rule=classification.policy_evaluation.policy_rule_id,
             granted_by_request_id=granted_by_request_id,
         )
+
+    def _write_runtime_decision_record(
+        self,
+        classification: ClassifiedToolCall,
+        *,
+        runtime_decision: RuntimeGateDecision,
+    ) -> str:
+        now = int(time.time())
+        request_id = str(uuid.uuid4())
+        record = self._pending_record(
+            classification,
+            request_id=request_id,
+            created_at=now,
+            expires_at=None,
+            runtime_decision=runtime_decision,
+        )
+        try:
+            self.evidence_store.write_pending(record)
+        except ApprovalEvidenceError as exc:
+            raise ApprovalFlowError("runtime decision evidence persistence failed") from exc
+        return request_id
 
     def _prompt_for(
         self,

@@ -27,6 +27,7 @@ from nacl.signing import SigningKey
 
 from agentveil.agent import AVPAgent
 from agentveil.delegation import DelegationInvalid, verify_delegation
+from agentveil.exceptions import AVPError, AVPNotFoundError, AVPValidationError
 from agentveil_mcp_proxy.approval import (
     ApprovalManager,
     ApprovalServer,
@@ -635,6 +636,68 @@ def _load_proxy_agent(
         raise ProxyCliError("proxy identity invalid", exit_code=1) from exc
 
 
+def _check_backend_preflight(
+    *,
+    identity: Mapping[str, Any],
+    config: ProxyConfig,
+    passphrase: str | None,
+    timeout_seconds: float = 5.0,
+) -> str | None:
+    """Issue two read-only GETs to verify backend readiness.
+
+    Returns a failure description on the first failure, or ``None`` on
+    success. Network and SDK exceptions are sanitized to category +
+    sender; raw response bodies are not surfaced. No state is mutated
+    on the backend (only ``GET /v1/health`` and
+    ``GET /v1/onboarding/{did}``).
+    """
+
+    try:
+        agent = _load_proxy_agent(
+            identity=identity,
+            config=config,
+            passphrase=passphrase,
+            timeout=timeout_seconds,
+        )
+    except ProxyCliError as exc:
+        return f"backend preflight skipped: {exc}"
+
+    base_url = config.avp.base_url
+    try:
+        agent.health()
+    except AVPError as exc:
+        return (
+            f"backend health check failed at {base_url}: "
+            f"status {exc.status_code}"
+        )
+    except Exception as exc:
+        return (
+            f"backend unreachable at {base_url}: "
+            f"{type(exc).__name__}"
+        )
+
+    try:
+        agent.get_onboarding_status()
+    except AVPNotFoundError:
+        did = identity.get("did")
+        return (
+            f"agent {did} is not registered with backend at {base_url}; "
+            "run `agentveil-mcp-proxy register` to register this identity"
+        )
+    except AVPError as exc:
+        return (
+            "backend onboarding status check failed: "
+            f"status {exc.status_code}"
+        )
+    except Exception as exc:
+        return (
+            "backend onboarding status unreachable: "
+            f"{type(exc).__name__}"
+        )
+
+    return None
+
+
 def doctor_proxy(
     *,
     home: Path | None = None,
@@ -642,11 +705,20 @@ def doctor_proxy(
     passphrase: str | None = None,
     passphrase_file: Path | None = None,
     out: TextIO | None = None,
+    check_backend: bool = False,
 ) -> int:
-    """Validate local proxy files without starting transport."""
+    """Validate local proxy files without starting transport.
+
+    When ``check_backend`` is True, also issue two read-only GET
+    requests against the configured backend (``/v1/health`` and
+    ``/v1/onboarding/{did}``) to confirm reachability and that the
+    proxy agent identity is registered. No backend state is mutated.
+    Skipped if any local check already failed.
+    """
 
     out = out or sys.stdout
     paths = proxy_paths(home, config_path)
+    backend_ok = False
     try:
         config = load_proxy_config(paths.config_path)
         identity_path = paths.identity_path(config.avp.agent_name)
@@ -703,6 +775,17 @@ def doctor_proxy(
             else:
                 failures.append(f"control grant invalid: {exc}")
 
+        if check_backend and not failures:
+            backend_failure = _check_backend_preflight(
+                identity=identity,
+                config=config,
+                passphrase=identity_passphrase,
+            )
+            if backend_failure is not None:
+                failures.append(backend_failure)
+            else:
+                backend_ok = True
+
         if failures:
             for failure in failures:
                 print(f"FAIL: {failure}", file=out)
@@ -719,12 +802,137 @@ def doctor_proxy(
             f"{config.circuit_breaker.cooldown_seconds}s cooldown)",
             file=out,
         )
+        if backend_ok:
+            print(
+                f"OK: backend reachable at {config.avp.base_url}, agent registered",
+                file=out,
+            )
         for warning in warnings:
             print(f"WARN: {warning}", file=out)
         return 0
     except ProxyCliError as exc:
         print(f"FAIL: {exc}", file=out)
         return 1
+
+
+def _rewrite_proxy_identity_after_register(
+    *,
+    identity_path: Path,
+    agent: Any,
+    passphrase: str | None,
+) -> None:
+    """Persist updated registration status in the proxy's identity format.
+
+    ``AVPAgent.register(...)`` calls ``self.save()`` which writes a
+    different file layout to the same path as the proxy identity. We
+    block that save during ``register_proxy`` and rewrite here using
+    the proxy's own helpers so the file format and encryption are
+    preserved.
+    """
+
+    if passphrase is None:
+        payload = plaintext_identity_payload(agent)
+    else:
+        payload = encrypted_identity_payload(agent, passphrase)
+    _secure_write_json(identity_path, payload, force=True)
+
+
+def register_proxy(
+    *,
+    home: Path | None = None,
+    config_path: Path | None = None,
+    passphrase: str | None = None,
+    passphrase_file: Path | None = None,
+    out: TextIO | None = None,
+) -> int:
+    """Register the existing proxy identity with the configured backend.
+
+    Reuses the same identity file ``init`` created (preserving the DID
+    and the encrypted-at-rest format), calls the SDK's
+    ``AVPAgent.register()`` against the same ``base_url`` from the
+    proxy config, and rewrites the identity file with
+    ``registered: true``. Backend network errors are sanitized to
+    category + status code; private key material and raw response
+    bodies are never printed.
+    """
+
+    out = out or sys.stdout
+    paths = proxy_paths(home, config_path)
+    config = load_proxy_config(paths.config_path)
+    identity_path = paths.identity_path(config.avp.agent_name)
+    identity = _read_json(identity_path, "agent identity")
+    identity_passphrase = _resolve_existing_identity_passphrase(
+        identity,
+        passphrase=passphrase,
+        passphrase_file=passphrase_file,
+    )
+    agent = _load_proxy_agent(
+        identity=identity,
+        config=config,
+        passphrase=identity_passphrase,
+    )
+
+    # ``AVPAgent.register`` calls ``self.save()`` internally which would
+    # rewrite ~/.avp/agents/<name>.json in the SDK's plaintext format
+    # and DOWNGRADE the proxy's encrypted identity. Replace with a
+    # no-op on this instance; we rewrite the file ourselves below using
+    # the proxy's own payload helpers.
+    agent.save = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+
+    base_url = config.avp.base_url
+    try:
+        agent.register()
+    except AVPValidationError as exc:
+        if getattr(exc, "status_code", 0) == 409:
+            # ``AVPAgent.register`` raises 409 before it gets to set its
+            # ``_is_registered`` / ``_is_verified`` flags, so the loaded
+            # agent's in-memory state still reads False. The backend has
+            # already accepted this DID, so reflect that locally before
+            # writing the identity file; otherwise the rewritten file
+            # would say ``registered: false`` while the CLI told the user
+            # the identity is already registered.
+            if hasattr(agent, "_is_registered"):
+                agent._is_registered = True
+            if hasattr(agent, "_is_verified"):
+                agent._is_verified = True
+            _rewrite_proxy_identity_after_register(
+                identity_path=identity_path,
+                agent=agent,
+                passphrase=identity_passphrase,
+            )
+            print(
+                f"OK: agent {agent.did} already registered at {base_url}",
+                file=out,
+            )
+            return 0
+        print(
+            f"FAIL: registration rejected at {base_url}: status {exc.status_code}",
+            file=out,
+        )
+        return 1
+    except AVPError as exc:
+        print(
+            f"FAIL: registration failed at {base_url}: status {exc.status_code}",
+            file=out,
+        )
+        return 1
+    except Exception as exc:
+        print(
+            f"FAIL: backend unreachable at {base_url}: {type(exc).__name__}",
+            file=out,
+        )
+        return 1
+
+    _rewrite_proxy_identity_after_register(
+        identity_path=identity_path,
+        agent=agent,
+        passphrase=identity_passphrase,
+    )
+    print(
+        f"OK: agent {agent.did} registered at {base_url}",
+        file=out,
+    )
+    return 0
 
 
 def _grant_scope_for_reissue(scope: Any) -> tuple[list[str], dict[str, Any] | None]:
@@ -1111,6 +1319,14 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = subparsers.add_parser("doctor", help="Validate local proxy config and files")
     _add_common_path_args(doctor)
     _add_passphrase_args(doctor)
+    doctor.add_argument(
+        "--check-backend",
+        action="store_true",
+        help=(
+            "Issue read-only GETs to verify the configured backend is "
+            "reachable and the proxy agent is registered."
+        ),
+    )
 
     run = subparsers.add_parser("run", help="Run stdio MCP passthrough")
     _add_common_path_args(run)
@@ -1118,6 +1334,13 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--headless", action="store_true", help="Disable browser and OS notification attempts")
     run.add_argument("--auto-deny", action="store_true", help="Deny every approval-required action")
     run.add_argument("--headless-policy", type=Path, default=None, help="Headless approval policy JSON path")
+
+    register = subparsers.add_parser(
+        "register",
+        help="Register the existing proxy identity with the configured backend",
+    )
+    _add_common_path_args(register)
+    _add_passphrase_args(register)
 
     reissue = subparsers.add_parser("reissue-grant", help="Issue a fresh local control grant")
     _add_common_path_args(reissue)
@@ -1184,6 +1407,7 @@ def main(argv: list[str] | None = None) -> int:
                 config_path=args.config,
                 passphrase=args.passphrase,
                 passphrase_file=args.passphrase_file,
+                check_backend=args.check_backend,
             )
         if args.command == "run":
             return run_proxy(
@@ -1194,6 +1418,13 @@ def main(argv: list[str] | None = None) -> int:
                 headless=args.headless,
                 auto_deny=args.auto_deny,
                 headless_policy_path=args.headless_policy,
+            )
+        if args.command == "register":
+            return register_proxy(
+                home=args.home,
+                config_path=args.config,
+                passphrase=args.passphrase,
+                passphrase_file=args.passphrase_file,
             )
         if args.command == "reissue-grant":
             reissue_grant(
