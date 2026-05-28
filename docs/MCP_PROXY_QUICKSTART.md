@@ -21,9 +21,19 @@ identity migration, see [`MCP_PROXY_OPERATIONS.md`](MCP_PROXY_OPERATIONS.md).
   `https://agentveil.dev` the trusted DIDs are bundled with the SDK; for any
   other base URL pass `--trusted-signer-did` to `init`.
 
+Fresh Ubuntu 24.04 images often have `python3` but not the packaging tools
+needed for a virtualenv install. Install them first:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y python3.12-venv python3-pip
+```
+
 ## Install
 
 ```bash
+python3 -m venv .venv
+. .venv/bin/activate
 pip install agentveil
 ```
 
@@ -34,6 +44,30 @@ This installs the core `agentveil` SDK and registers the
 
 ```bash
 agentveil-mcp-proxy init
+```
+
+For a zero-dependency local smoke path, use the built-in sandboxed filesystem
+downstream and filesystem policy pack instead of manually installing a
+downstream MCP server:
+
+```bash
+agentveil-mcp-proxy init --quickstart-filesystem ./sandbox
+```
+
+Agent/non-interactive equivalent:
+
+```bash
+printf '%s\n' 'replace-with-a-long-local-passphrase' > ./passphrase.txt
+chmod 600 ./passphrase.txt
+
+agentveil-mcp-proxy init \
+  --home ./avp-home \
+  --passphrase-file ./passphrase.txt \
+  --policy-pack filesystem \
+  --downstream-name filesystem \
+  --downstream-command /path/to/mcp-server \
+  --downstream-arg /workspace \
+  --json
 ```
 
 By default this creates an **encrypted local identity**, a self-issued
@@ -50,6 +84,9 @@ environment variable. See
   owner-only permissions (0o600).
 - Issues a local self-signed delegation receipt (issuer = subject = the new
   agent DID), scoped to the `mcp_proxy` category.
+- When `--quickstart-filesystem <path>` is passed, writes downstream config for
+  the built-in sandboxed filesystem MCP server and selects the filesystem
+  policy pack.
 
 ### What `init` does NOT do
 
@@ -91,6 +128,13 @@ set is non-empty, and the control grant has not expired.
 
 `doctor` exits non-zero on any of these failures, with a specific FAIL line.
 It is intentionally offline: it does not call the backend.
+
+If a downstream is already configured, add `--full` to launch it and verify MCP
+`initialize` plus `tools/list`:
+
+```bash
+agentveil-mcp-proxy doctor --full
+```
 
 ## Step 3 — `agentveil-mcp-proxy register`
 
@@ -186,18 +230,16 @@ failed.
 
 ## Step 5 — Configure the downstream MCP server
 
-Edit `~/.avp/mcp-proxy/config.json` and set `downstream.command` and
-`downstream.args` to the MCP server you want to wrap. Example for a
-filesystem MCP server:
+Use the helper to set `downstream.command` and `downstream.args` without
+hand-editing JSON. Example for a filesystem MCP server:
 
-```json
-{
-  "downstream": {
-    "name": "filesystem",
-    "command": "npx",
-    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/work"]
-  }
-}
+```bash
+agentveil-mcp-proxy downstream set \
+  --name filesystem \
+  --command npx \
+  --arg -y \
+  --arg @modelcontextprotocol/server-filesystem \
+  --arg /Users/me/work
 ```
 
 `name` is the server label the proxy uses internally and in evidence records.
@@ -205,6 +247,42 @@ filesystem MCP server:
 [`MCP_PROXY_OPERATIONS.md`](MCP_PROXY_OPERATIONS.md). The proxy refuses to
 forward any `AVP_*` environment variable to the downstream — those names are
 reserved for proxy-internal secrets.
+
+Then run:
+
+```bash
+agentveil-mcp-proxy doctor --full
+agentveil-mcp-proxy smoke
+```
+
+`doctor --full` and `smoke` both launch the configured downstream and require
+valid MCP `initialize` and `tools/list` responses. They do not call Runtime
+Gate and they do not execute any downstream tool.
+
+`agentveil-mcp-proxy configure-downstream` remains as a backward-compatible
+alias for `agentveil-mcp-proxy downstream set`.
+
+## Machine-readable setup checks
+
+Agents can request JSON output for setup and local checks:
+
+```bash
+agentveil-mcp-proxy doctor --full --json
+agentveil-mcp-proxy smoke --json
+agentveil-mcp-proxy events list --json
+```
+
+The JSON shape includes stable top-level fields:
+
+```json
+{
+  "ok": true,
+  "errors": [],
+  "warnings": [],
+  "downstream": {"configured": true, "name": "filesystem"},
+  "evidence_count": 0
+}
+```
 
 ## Step 6 — Point your MCP client at the proxy
 

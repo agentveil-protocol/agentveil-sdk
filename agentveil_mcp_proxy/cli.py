@@ -21,6 +21,7 @@ from pathlib import Path
 import signal
 import sys
 import threading
+import time
 from typing import Any, Iterable, Mapping, TextIO
 
 from nacl.signing import SigningKey
@@ -75,6 +76,10 @@ REISSUE_GRANT_FORCE_THRESHOLD_SECONDS = 24 * 60 * 60
 MIN_IDENTITY_PASSPHRASE_LENGTH = 12
 DEFAULT_ALLOWED_CATEGORIES = ("mcp_proxy",)
 DEFAULT_EVIDENCE_VACUUM_MAX_AGE_DAYS = 90
+DEFAULT_EVENTS_LIMIT = 20
+QUICKSTART_FILESYSTEM_MODULE = "agentveil_mcp_proxy.quickstart_filesystem"
+SMOKE_INITIALIZE_ID = "avp-smoke-initialize"
+SMOKE_TOOLS_LIST_ID = "avp-smoke-tools-list"
 DEFAULT_TRUST_FROM_BUNDLE_WARNING = (
     "default_trust_from_bundle: trusting bundle's embedded signer list; "
     "pass --trusted-signer-did to verify against your own pinned set"
@@ -167,6 +172,77 @@ class ReissueGrantResult:
     agent_did: str
     control_grant_path: Path
     control_grant_expires_at: str
+
+
+@dataclass(frozen=True)
+class ConfigureDownstreamResult:
+    """Result of `agentveil-mcp-proxy configure-downstream`."""
+
+    config_path: Path
+    downstream_name: str
+    downstream_command: str
+    downstream_args: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SmokeResult:
+    """Result of a downstream MCP smoke check."""
+
+    downstream_name: str
+    tool_count: int
+
+
+def _print_json(payload: Mapping[str, Any], out: TextIO | None = None) -> None:
+    print(json.dumps(dict(payload), sort_keys=True), file=out or sys.stdout)
+
+
+def _downstream_info(config: ProxyConfig) -> dict[str, Any]:
+    """Return a stable, machine-readable downstream summary."""
+
+    if not config.downstream:
+        return {"configured": False}
+    try:
+        downstream = DownstreamConfig.from_proxy_config(config)
+    except PassthroughError as exc:
+        return {
+            "configured": False,
+            "error": str(exc),
+        }
+    return {
+        "configured": True,
+        "name": downstream.name,
+        "command": downstream.command,
+        "args": list(downstream.args),
+        "response_timeout_seconds": downstream.response_timeout_seconds,
+    }
+
+
+def _evidence_count(paths: ProxyPaths) -> int:
+    evidence_path = paths.proxy_dir / "evidence.sqlite"
+    if not evidence_path.exists():
+        return 0
+    with ApprovalEvidenceStore(evidence_path) as store:
+        return len(store.list_records())
+
+
+def _downstream_info_if_available(config_path: Path) -> dict[str, Any] | None:
+    try:
+        return _downstream_info(load_proxy_config(config_path))
+    except ProxyCliError:
+        return None
+
+
+def _event_record_dict(record: Any) -> dict[str, Any]:
+    return {
+        "timestamp": _event_timestamp(record.created_at),
+        "server": record.downstream_server,
+        "tool": record.tool_name,
+        "risk_class": record.risk_class,
+        "status": record.status,
+        "policy_rule": record.policy_rule_id,
+        "receipt": _receipt_status(record),
+        "record_id": record.request_id,
+    }
 
 
 def default_home() -> Path:
@@ -433,6 +509,7 @@ def _build_config_payload(
     agent_name: str,
     trusted_signer_dids: Iterable[str],
     policy_pack: str,
+    downstream_config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     policy = builtin_policy_pack(policy_pack)
     payload = {
@@ -468,7 +545,7 @@ def _build_config_payload(
             "half_open_test_count": 1,
         },
         "policy": _policy_to_dict(policy),
-        "downstream": {},
+        "downstream": dict(downstream_config or {}),
     }
     ProxyConfig.from_dict(payload)
     return payload
@@ -484,6 +561,7 @@ def init_proxy(
     policy_pack: str = "default",
     ttl_days: int = DEFAULT_CONTROL_GRANT_TTL_DAYS,
     allowed_categories: Iterable[str] = DEFAULT_ALLOWED_CATEGORIES,
+    downstream_config: Mapping[str, Any] | None = None,
     passphrase: str | None = None,
     passphrase_file: Path | None = None,
     plaintext: bool = False,
@@ -544,6 +622,7 @@ def init_proxy(
         agent_name=agent_name,
         trusted_signer_dids=signers,
         policy_pack=policy_pack,
+        downstream_config=downstream_config,
     )
 
     _secure_write_json(identity_path, identity_payload, force=force)
@@ -557,6 +636,112 @@ def init_proxy(
         config_path=paths.config_path,
         control_grant_path=grant_path,
         control_grant_expires_at=expires_at,
+    )
+
+
+def _parse_env_assignment(value: str) -> tuple[str, str]:
+    key, separator, env_value = value.partition("=")
+    if not separator or not key:
+        raise ProxyCliError("--env entries must use KEY=VALUE")
+    if key.startswith("AVP_"):
+        raise ProxyCliError("downstream.env cannot set AVP_* variables")
+    return key, env_value
+
+
+def _downstream_config_payload(
+    *,
+    name: str,
+    command: str,
+    args: Iterable[str] = (),
+    env_entries: Iterable[str] = (),
+    env_passthrough: Iterable[str] = (),
+    response_timeout_seconds: float | None = None,
+) -> dict[str, Any]:
+    env = dict(_parse_env_assignment(item) for item in env_entries)
+    payload: dict[str, Any] = {
+        "name": name,
+        "command": command,
+        "args": list(args),
+    }
+    if env:
+        payload["env"] = env
+    passthrough = list(env_passthrough)
+    if passthrough:
+        payload["env_passthrough"] = passthrough
+    if response_timeout_seconds is not None:
+        payload["response_timeout_seconds"] = response_timeout_seconds
+    return payload
+
+
+def quickstart_filesystem_downstream(root: Path) -> dict[str, Any]:
+    """Return downstream config for the built-in quickstart filesystem server."""
+
+    sandbox = root.expanduser().resolve()
+    sandbox.mkdir(parents=True, exist_ok=True)
+    return _downstream_config_payload(
+        name="filesystem",
+        command=sys.executable,
+        args=("-m", QUICKSTART_FILESYSTEM_MODULE, str(sandbox)),
+        response_timeout_seconds=5.0,
+    )
+
+
+def _validate_downstream_payload(config_payload: Mapping[str, Any]) -> DownstreamConfig:
+    try:
+        return DownstreamConfig.from_proxy_config(ProxyConfig.from_dict(config_payload))
+    except (ProxyConfigError, PassthroughError) as exc:
+        raise ProxyCliError(str(exc), exit_code=1) from exc
+
+
+def configure_downstream(
+    *,
+    name: str,
+    command: str,
+    args: Iterable[str] = (),
+    env_entries: Iterable[str] = (),
+    env_passthrough: Iterable[str] = (),
+    response_timeout_seconds: float | None = None,
+    home: Path | None = None,
+    config_path: Path | None = None,
+    out: TextIO | None = None,
+    output_json: bool = False,
+) -> ConfigureDownstreamResult:
+    """Write downstream MCP server config into the proxy config file."""
+
+    out = out or sys.stdout
+    paths = proxy_paths(home, config_path)
+    config_payload = _read_json(paths.config_path, "proxy config")
+    downstream_payload = _downstream_config_payload(
+        name=name,
+        command=command,
+        args=args,
+        env_entries=env_entries,
+        env_passthrough=env_passthrough,
+        response_timeout_seconds=response_timeout_seconds,
+    )
+    config_payload["downstream"] = downstream_payload
+    downstream = _validate_downstream_payload(config_payload)
+    _secure_write_json(paths.config_path, config_payload, force=True)
+    downstream_info = _downstream_info(ProxyConfig.from_dict(config_payload))
+    if output_json:
+        _print_json({
+            "ok": True,
+            "errors": [],
+            "warnings": [],
+            "config_path": str(paths.config_path),
+            "downstream": downstream_info,
+            "evidence_count": _evidence_count(paths),
+        }, out)
+    else:
+        print(
+            f"OK: downstream {downstream.name} configured in {paths.config_path}",
+            file=out,
+        )
+    return ConfigureDownstreamResult(
+        config_path=paths.config_path,
+        downstream_name=downstream.name,
+        downstream_command=downstream.command,
+        downstream_args=downstream.args,
     )
 
 
@@ -698,6 +883,129 @@ def _check_backend_preflight(
     return None
 
 
+def _smoke_input() -> str:
+    initialize = {
+        "jsonrpc": "2.0",
+        "id": SMOKE_INITIALIZE_ID,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {
+                "name": "agentveil-mcp-proxy-smoke",
+                "version": "0",
+            },
+        },
+    }
+    initialized = {
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+        "params": {},
+    }
+    tools_list = {
+        "jsonrpc": "2.0",
+        "id": SMOKE_TOOLS_LIST_ID,
+        "method": "tools/list",
+        "params": {},
+    }
+    return "\n".join(json.dumps(item, separators=(",", ":")) for item in (
+        initialize,
+        initialized,
+        tools_list,
+    )) + "\n"
+
+
+def _parse_smoke_responses(raw_output: str) -> dict[str, Mapping[str, Any]]:
+    responses: dict[str, Mapping[str, Any]] = {}
+    for line in raw_output.splitlines():
+        if not line.strip():
+            continue
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ProxyCliError("downstream smoke returned invalid JSON-RPC", exit_code=1) from exc
+        if not isinstance(message, Mapping):
+            raise ProxyCliError("downstream smoke returned non-object JSON-RPC", exit_code=1)
+        request_id = message.get("id")
+        if request_id in {SMOKE_INITIALIZE_ID, SMOKE_TOOLS_LIST_ID}:
+            responses[str(request_id)] = message
+    return responses
+
+
+def _tool_count_from_smoke_response(response: Mapping[str, Any]) -> int:
+    result = response.get("result")
+    if not isinstance(result, Mapping):
+        raise ProxyCliError("downstream tools/list response missing result", exit_code=1)
+    tools = result.get("tools", [])
+    if not isinstance(tools, list):
+        raise ProxyCliError("downstream tools/list result.tools must be a list", exit_code=1)
+    return len(tools)
+
+
+def run_downstream_smoke(config: ProxyConfig) -> SmokeResult:
+    """Launch downstream and verify MCP initialize + tools/list responses."""
+
+    try:
+        downstream = DownstreamConfig.from_proxy_config(config)
+    except PassthroughError as exc:
+        raise ProxyCliError(str(exc), exit_code=1) from exc
+    passthrough = McpPassthrough(downstream)
+    client_out = io.StringIO()
+    try:
+        code = passthrough.run_stdio(io.StringIO(_smoke_input()), client_out)
+    except PassthroughError as exc:
+        raise ProxyCliError(f"downstream smoke failed: {exc}", exit_code=1) from exc
+    if code != 0:
+        raise ProxyCliError("downstream smoke failed", exit_code=1)
+    responses = _parse_smoke_responses(client_out.getvalue())
+    initialize_response = responses.get(SMOKE_INITIALIZE_ID)
+    if initialize_response is None:
+        raise ProxyCliError("downstream smoke missing initialize response", exit_code=1)
+    if "error" in initialize_response:
+        raise ProxyCliError("downstream initialize returned an error", exit_code=1)
+    tools_response = responses.get(SMOKE_TOOLS_LIST_ID)
+    if tools_response is None:
+        raise ProxyCliError("downstream smoke missing tools/list response", exit_code=1)
+    if "error" in tools_response:
+        raise ProxyCliError("downstream tools/list returned an error", exit_code=1)
+    return SmokeResult(
+        downstream_name=downstream.name,
+        tool_count=_tool_count_from_smoke_response(tools_response),
+    )
+
+
+def smoke_proxy(
+    *,
+    home: Path | None = None,
+    config_path: Path | None = None,
+    out: TextIO | None = None,
+    output_json: bool = False,
+) -> SmokeResult:
+    """Run the local downstream MCP smoke check and print an operator summary."""
+
+    out = out or sys.stdout
+    paths = proxy_paths(home, config_path)
+    config = load_proxy_config(paths.config_path)
+    result = run_downstream_smoke(config)
+    downstream = _downstream_info(config)
+    downstream["tool_count"] = result.tool_count
+    if output_json:
+        _print_json({
+            "ok": True,
+            "errors": [],
+            "warnings": [],
+            "downstream": downstream,
+            "evidence_count": _evidence_count(paths),
+        }, out)
+    else:
+        print(
+            f"OK: downstream {result.downstream_name} answered initialize/tools/list "
+            f"({result.tool_count} tools)",
+            file=out,
+        )
+    return result
+
+
 def doctor_proxy(
     *,
     home: Path | None = None,
@@ -706,6 +1014,8 @@ def doctor_proxy(
     passphrase_file: Path | None = None,
     out: TextIO | None = None,
     check_backend: bool = False,
+    full: bool = False,
+    output_json: bool = False,
 ) -> int:
     """Validate local proxy files without starting transport.
 
@@ -719,8 +1029,11 @@ def doctor_proxy(
     out = out or sys.stdout
     paths = proxy_paths(home, config_path)
     backend_ok = False
+    downstream_smoke: SmokeResult | None = None
+    downstream: dict[str, Any] = {"configured": False}
     try:
         config = load_proxy_config(paths.config_path)
+        downstream = _downstream_info(config)
         identity_path = paths.identity_path(config.avp.agent_name)
         grant_path = paths.control_grant_path(config.avp.agent_name)
         identity = _read_json(identity_path, "agent identity")
@@ -736,6 +1049,12 @@ def doctor_proxy(
             failures.append(f"control grant permissions must be 0600: {grant_path}")
         if identity.get("did") is None:
             failures.append("agent identity missing DID")
+        if config.downstream and downstream.get("error"):
+            failures.append(f"downstream config invalid: {downstream['error']}")
+        if not config.downstream:
+            warnings.append(
+                "downstream is not configured; run 'agentveil-mcp-proxy downstream set'"
+            )
         identity_passphrase = None
         try:
             identity_passphrase = _resolve_existing_identity_passphrase(
@@ -786,32 +1105,83 @@ def doctor_proxy(
             else:
                 backend_ok = True
 
+        if full and not failures:
+            try:
+                downstream_smoke = run_downstream_smoke(config)
+            except ProxyCliError as exc:
+                failures.append(str(exc))
+
         if failures:
-            for failure in failures:
-                print(f"FAIL: {failure}", file=out)
+            if output_json:
+                _print_json({
+                    "ok": False,
+                    "errors": failures,
+                    "warnings": warnings,
+                    "downstream": downstream,
+                    "backend": {"checked": check_backend, "ok": backend_ok},
+                    "evidence_count": _evidence_count(paths),
+                }, out)
+            else:
+                for failure in failures:
+                    print(f"FAIL: {failure}", file=out)
             return 1
 
-        print(f"OK: config {paths.config_path}", file=out)
-        print(f"OK: identity {identity_path}", file=out)
-        print(f"OK: control grant {grant_path}", file=out)
-        print(f"OK: trusted signers {len(config.avp.trusted_signer_dids)}", file=out)
-        print(
-            "OK: circuit breaker thresholds "
-            f"({config.circuit_breaker.failures_before_open} failures, "
-            f"{config.circuit_breaker.window_seconds}s window, "
-            f"{config.circuit_breaker.cooldown_seconds}s cooldown)",
-            file=out,
-        )
-        if backend_ok:
+        if downstream_smoke is not None:
+            downstream["tool_count"] = downstream_smoke.tool_count
+            downstream["smoke_ok"] = True
+        if output_json:
+            _print_json({
+                "ok": True,
+                "errors": [],
+                "warnings": warnings,
+                "downstream": downstream,
+                "backend": {"checked": check_backend, "ok": backend_ok},
+                "evidence_count": _evidence_count(paths),
+                "config_path": str(paths.config_path),
+                "identity_path": str(identity_path),
+                "control_grant_path": str(grant_path),
+                "trusted_signer_count": len(config.avp.trusted_signer_dids),
+            }, out)
+        else:
+            print(f"OK: config {paths.config_path}", file=out)
+            print(f"OK: identity {identity_path}", file=out)
+            print(f"OK: control grant {grant_path}", file=out)
+            print(f"OK: trusted signers {len(config.avp.trusted_signer_dids)}", file=out)
             print(
-                f"OK: backend reachable at {config.avp.base_url}, agent registered",
+                "OK: circuit breaker thresholds "
+                f"({config.circuit_breaker.failures_before_open} failures, "
+                f"{config.circuit_breaker.window_seconds}s window, "
+                f"{config.circuit_breaker.cooldown_seconds}s cooldown)",
                 file=out,
             )
-        for warning in warnings:
-            print(f"WARN: {warning}", file=out)
+            if downstream.get("configured"):
+                print(f"OK: downstream {downstream['name']} configured", file=out)
+            if backend_ok:
+                print(
+                    f"OK: backend reachable at {config.avp.base_url}, agent registered",
+                    file=out,
+                )
+            if downstream_smoke is not None:
+                print(
+                    f"OK: downstream {downstream_smoke.downstream_name} answered "
+                    f"initialize/tools/list ({downstream_smoke.tool_count} tools)",
+                    file=out,
+                )
+            for warning in warnings:
+                print(f"WARN: {warning}", file=out)
         return 0
     except ProxyCliError as exc:
-        print(f"FAIL: {exc}", file=out)
+        if output_json:
+            _print_json({
+                "ok": False,
+                "errors": [str(exc)],
+                "warnings": [],
+                "downstream": downstream,
+                "backend": {"checked": check_backend, "ok": False},
+                "evidence_count": _evidence_count(paths),
+            }, out)
+        else:
+            print(f"FAIL: {exc}", file=out)
         return 1
 
 
@@ -1167,6 +1537,168 @@ def verify_evidence(
     return 0
 
 
+def _event_timestamp(value: int) -> str:
+    return datetime.fromtimestamp(value, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _event_token(value: Any) -> str:
+    if value is None:
+        return "-"
+    rendered = str(value).replace("\r", " ").replace("\n", " ").strip()
+    return rendered[:120] if rendered else "-"
+
+
+def _receipt_status(record: Any) -> str:
+    if record.decision_receipt_sha256:
+        return "present"
+    if record.decision_audit_id:
+        return "missing"
+    return "none"
+
+
+def _format_event_record(record: Any) -> str:
+    return (
+        f"{_event_timestamp(record.created_at)} "
+        f"server={_event_token(record.downstream_server)} "
+        f"tool={_event_token(record.tool_name)} "
+        f"risk={_event_token(record.risk_class)} "
+        f"status={_event_token(record.status)} "
+        f"rule={_event_token(record.policy_rule_id)} "
+        f"receipt={_receipt_status(record)} "
+        f"id={_event_token(record.request_id)}"
+    )
+
+
+def list_events(
+    *,
+    home: Path | None = None,
+    config_path: Path | None = None,
+    limit: int = DEFAULT_EVENTS_LIMIT,
+    out: TextIO | None = None,
+    output_json: bool = False,
+) -> int:
+    """Print a privacy-safe view of recent local evidence records."""
+
+    if limit <= 0:
+        raise ProxyCliError("--limit must be positive")
+    out = out or sys.stdout
+    paths = proxy_paths(home, config_path)
+    with ApprovalEvidenceStore(paths.proxy_dir / "evidence.sqlite") as store:
+        records = store.list_records()
+    selected = records[-limit:]
+    if output_json:
+        _print_json({
+            "ok": True,
+            "errors": [],
+            "warnings": [],
+            "downstream": _downstream_info_if_available(paths.config_path),
+            "evidence_count": len(records),
+            "events": [_event_record_dict(record) for record in selected],
+        }, out)
+        return len(selected)
+    if not selected:
+        print("No evidence records", file=out)
+        return 0
+    for record in selected:
+        print(_format_event_record(record), file=out)
+    return len(selected)
+
+
+def tail_events(
+    *,
+    home: Path | None = None,
+    config_path: Path | None = None,
+    limit: int = DEFAULT_EVENTS_LIMIT,
+    follow: bool = False,
+    out: TextIO | None = None,
+    output_json: bool = False,
+) -> int:
+    """Print recent evidence records and optionally follow new records."""
+
+    if limit <= 0:
+        raise ProxyCliError("--limit must be positive")
+    out = out or sys.stdout
+    paths = proxy_paths(home, config_path)
+    printed: set[str] = set()
+
+    def print_new_records(*, initial: bool) -> int:
+        with ApprovalEvidenceStore(paths.proxy_dir / "evidence.sqlite") as store:
+            records = store.list_records()
+        selected = records[-limit:] if initial else [
+            record for record in records if record.request_id not in printed
+        ]
+        if output_json and not follow:
+            _print_json({
+                "ok": True,
+                "errors": [],
+                "warnings": [],
+                "downstream": _downstream_info_if_available(paths.config_path),
+                "evidence_count": len(records),
+                "events": [_event_record_dict(record) for record in selected],
+            }, out)
+            return len(selected)
+        for record in selected:
+            if output_json:
+                print(json.dumps(_event_record_dict(record), sort_keys=True), file=out)
+            else:
+                print(_format_event_record(record), file=out)
+            printed.add(record.request_id)
+        if hasattr(out, "flush"):
+            out.flush()
+        return len(selected)
+
+    count = print_new_records(initial=True)
+    if not follow:
+        if count == 0 and not output_json:
+            print("No evidence records", file=out)
+        return count
+    try:
+        while True:
+            time.sleep(1.0)
+            count += print_new_records(initial=False)
+    except KeyboardInterrupt:
+        return count
+
+
+def evidence_summary(
+    *,
+    home: Path | None = None,
+    config_path: Path | None = None,
+    out: TextIO | None = None,
+    output_json: bool = False,
+) -> dict[str, Any]:
+    """Print aggregate local evidence counts without raw payload details."""
+
+    out = out or sys.stdout
+    paths = proxy_paths(home, config_path)
+    with ApprovalEvidenceStore(paths.proxy_dir / "evidence.sqlite") as store:
+        records = store.list_records()
+    by_status: dict[str, int] = {}
+    receipt_present = 0
+    receipt_missing = 0
+    for record in records:
+        by_status[record.status] = by_status.get(record.status, 0) + 1
+        if record.decision_receipt_sha256:
+            receipt_present += 1
+        elif record.decision_audit_id:
+            receipt_missing += 1
+    latest = max((record.created_at for record in records), default=None)
+    summary = {
+        "ok": True,
+        "errors": [],
+        "warnings": [],
+        "downstream": _downstream_info_if_available(paths.config_path),
+        "record_count": len(records),
+        "evidence_count": len(records),
+        "by_status": by_status,
+        "receipt_present_count": receipt_present,
+        "receipt_missing_count": receipt_missing,
+        "latest_record_at": None if latest is None else _event_timestamp(latest),
+    }
+    print(json.dumps(summary, sort_keys=True), file=out)
+    return summary
+
+
 def vacuum_events(
     *,
     home: Path | None = None,
@@ -1232,9 +1764,8 @@ def run_proxy(
         out=doctor_out,
     )
     if health != 0:
-        err.write(doctor_out.getvalue())
-        err.flush()
-        return health
+        message = doctor_out.getvalue().strip() or "proxy readiness check failed"
+        raise ProxyCliError(message, exit_code=health)
     try:
         downstream = DownstreamConfig.from_proxy_config(config)
         classifier = ToolCallClassifier(config, server_name=downstream.name)
@@ -1300,6 +1831,34 @@ def _add_passphrase_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--passphrase-file", type=Path, default=None, help="Read passphrase from file")
 
 
+def _add_json_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--json", dest="json_output", action="store_true", help="Emit JSON output")
+
+
+def _add_downstream_set_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--name", required=True, help="Downstream MCP server name")
+    parser.add_argument(
+        "--command",
+        dest="downstream_command",
+        required=True,
+        help="Downstream MCP server command",
+    )
+    parser.add_argument("--arg", action="append", default=None, help="Downstream MCP server arg")
+    parser.add_argument("--env", action="append", default=None, help="Downstream env KEY=VALUE")
+    parser.add_argument(
+        "--env-passthrough",
+        action="append",
+        default=None,
+        help="Environment variable name to forward to downstream",
+    )
+    parser.add_argument(
+        "--response-timeout-seconds",
+        type=float,
+        default=None,
+        help="Downstream JSON-RPC response timeout",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agentveil-mcp-proxy")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1310,15 +1869,26 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--agent-name", default=DEFAULT_AGENT_NAME)
     init.add_argument("--trusted-signer-did", action="append", default=None)
     init.add_argument("--policy-pack", default="default", choices=["default", "github", "filesystem", "shell"])
+    init.add_argument(
+        "--quickstart-filesystem",
+        type=Path,
+        default=None,
+        help="Configure the built-in filesystem quickstart downstream rooted at this path",
+    )
+    init.add_argument("--downstream-name", default=None, help="Downstream MCP server name")
+    init.add_argument("--downstream-command", default=None, help="Downstream MCP server command")
+    init.add_argument("--downstream-arg", action="append", default=None, help="Downstream MCP server arg")
     init.add_argument("--ttl-days", type=int, default=DEFAULT_CONTROL_GRANT_TTL_DAYS)
     init.add_argument("--allowed-category", action="append", default=None)
     _add_passphrase_args(init)
+    _add_json_arg(init)
     init.add_argument("--plaintext", action="store_true", help="Store the proxy private key unencrypted")
     init.add_argument("--force", action="store_true")
 
     doctor = subparsers.add_parser("doctor", help="Validate local proxy config and files")
     _add_common_path_args(doctor)
     _add_passphrase_args(doctor)
+    _add_json_arg(doctor)
     doctor.add_argument(
         "--check-backend",
         action="store_true",
@@ -1326,6 +1896,11 @@ def build_parser() -> argparse.ArgumentParser:
             "Issue read-only GETs to verify the configured backend is "
             "reachable and the proxy agent is registered."
         ),
+    )
+    doctor.add_argument(
+        "--full",
+        action="store_true",
+        help="Also launch downstream and verify MCP initialize/tools/list",
     )
 
     run = subparsers.add_parser("run", help="Run stdio MCP passthrough")
@@ -1341,6 +1916,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common_path_args(register)
     _add_passphrase_args(register)
+
+    configure = subparsers.add_parser(
+        "configure-downstream",
+        help="Write downstream MCP server config into the proxy config",
+    )
+    _add_common_path_args(configure)
+    _add_downstream_set_args(configure)
+    _add_json_arg(configure)
+
+    downstream = subparsers.add_parser("downstream", help="Manage downstream MCP server config")
+    downstream_subparsers = downstream.add_subparsers(dest="downstream_action", required=True)
+    downstream_set = downstream_subparsers.add_parser(
+        "set",
+        help="Write downstream MCP server config into the proxy config",
+    )
+    _add_common_path_args(downstream_set)
+    _add_downstream_set_args(downstream_set)
+    _add_json_arg(downstream_set)
+
+    smoke = subparsers.add_parser("smoke", help="Launch downstream and verify MCP initialize/tools/list")
+    _add_common_path_args(smoke)
+    _add_json_arg(smoke)
 
     reissue = subparsers.add_parser("reissue-grant", help="Issue a fresh local control grant")
     _add_common_path_args(reissue)
@@ -1362,8 +1959,16 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--output", choices=["human", "json"], default="human")
     verify.add_argument("--trusted-signer-did", action="append", default=None)
 
+    summary = subparsers.add_parser("evidence-summary", help="Summarize local evidence records")
+    _add_common_path_args(summary)
+    _add_json_arg(summary)
+
     events = subparsers.add_parser("events", help="Manage local evidence records")
     _add_common_path_args(events)
+    _add_json_arg(events)
+    events.add_argument("events_action", nargs="?", choices=["list", "tail", "vacuum"])
+    events.add_argument("--limit", type=int, default=DEFAULT_EVENTS_LIMIT)
+    events.add_argument("--follow", action="store_true", help="Keep printing new records for events tail")
     events.add_argument("--vacuum", action="store_true", help="Prune old terminal evidence records")
     events.add_argument(
         "--max-age-days",
@@ -1375,31 +1980,85 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _normalize_downstream_arg_values(argv: list[str]) -> list[str]:
+    """Let downstream arg flags accept values that look like CLI options."""
+
+    normalized: list[str] = []
+    value_flags = {"--arg", "--downstream-arg"}
+    index = 0
+    while index < len(argv):
+        item = argv[index]
+        if item in value_flags and index + 1 < len(argv):
+            normalized.append(f"{item}={argv[index + 1]}")
+            index += 2
+            continue
+        normalized.append(item)
+        index += 1
+    return normalized
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    parse_argv = sys.argv[1:] if argv is None else argv
+    args = parser.parse_args(_normalize_downstream_arg_values(parse_argv))
     try:
         if args.command == "init":
+            downstream_config = None
+            policy_pack = args.policy_pack
+            if args.quickstart_filesystem is not None:
+                if args.downstream_name or args.downstream_command or args.downstream_arg:
+                    raise ProxyCliError(
+                        "--quickstart-filesystem cannot be combined with downstream options"
+                    )
+                downstream_config = quickstart_filesystem_downstream(args.quickstart_filesystem)
+                if policy_pack == "default":
+                    policy_pack = "filesystem"
+            elif args.downstream_command is not None:
+                downstream_config = _downstream_config_payload(
+                    name=args.downstream_name or "downstream",
+                    command=args.downstream_command,
+                    args=args.downstream_arg or (),
+                )
+            elif args.downstream_name or args.downstream_arg:
+                raise ProxyCliError("--downstream-command is required with downstream options")
+            json_warnings = [PLAINTEXT_WARNING] if args.json_output and args.plaintext else []
             result = init_proxy(
                 home=args.home,
                 config_path=args.config,
                 base_url=args.base_url,
                 agent_name=args.agent_name,
                 trusted_signer_dids=args.trusted_signer_did,
-                policy_pack=args.policy_pack,
+                policy_pack=policy_pack,
                 ttl_days=args.ttl_days,
                 allowed_categories=args.allowed_category or DEFAULT_ALLOWED_CATEGORIES,
+                downstream_config=downstream_config,
                 passphrase=args.passphrase,
                 passphrase_file=args.passphrase_file,
                 plaintext=args.plaintext,
-                err=sys.stderr,
+                err=io.StringIO() if args.json_output else sys.stderr,
                 force=args.force,
             )
-            print(f"Created MCP proxy identity: {result.agent_did}")
-            print(f"Identity: {result.identity_path}")
-            print(f"Config: {result.config_path}")
-            print(f"Control grant: {result.control_grant_path}")
-            print(f"Control grant expires: {result.control_grant_expires_at}")
+            if args.json_output:
+                config = load_proxy_config(result.config_path)
+                _print_json({
+                    "ok": True,
+                    "errors": [],
+                    "warnings": json_warnings,
+                    "agent_name": result.agent_name,
+                    "agent_did": result.agent_did,
+                    "identity_path": str(result.identity_path),
+                    "config_path": str(result.config_path),
+                    "control_grant_path": str(result.control_grant_path),
+                    "control_grant_expires_at": result.control_grant_expires_at,
+                    "downstream": _downstream_info(config),
+                    "evidence_count": _evidence_count(proxy_paths(args.home, args.config)),
+                })
+            else:
+                print(f"Created MCP proxy identity: {result.agent_did}")
+                print(f"Identity: {result.identity_path}")
+                print(f"Config: {result.config_path}")
+                print(f"Control grant: {result.control_grant_path}")
+                print(f"Control grant expires: {result.control_grant_expires_at}")
             return 0
         if args.command == "doctor":
             return doctor_proxy(
@@ -1408,6 +2067,8 @@ def main(argv: list[str] | None = None) -> int:
                 passphrase=args.passphrase,
                 passphrase_file=args.passphrase_file,
                 check_backend=args.check_backend,
+                full=args.full,
+                output_json=args.json_output,
             )
         if args.command == "run":
             return run_proxy(
@@ -1426,6 +2087,28 @@ def main(argv: list[str] | None = None) -> int:
                 passphrase=args.passphrase,
                 passphrase_file=args.passphrase_file,
             )
+        if args.command in {"configure-downstream", "downstream"}:
+            if args.command == "downstream" and args.downstream_action != "set":
+                raise ProxyCliError("downstream action must be set")
+            configure_downstream(
+                name=args.name,
+                command=args.downstream_command,
+                args=args.arg or (),
+                env_entries=args.env or (),
+                env_passthrough=args.env_passthrough or (),
+                response_timeout_seconds=args.response_timeout_seconds,
+                home=args.home,
+                config_path=args.config,
+                output_json=args.json_output,
+            )
+            return 0
+        if args.command == "smoke":
+            smoke_proxy(
+                home=args.home,
+                config_path=args.config,
+                output_json=args.json_output,
+            )
+            return 0
         if args.command == "reissue-grant":
             reissue_grant(
                 home=args.home,
@@ -1455,18 +2138,57 @@ def main(argv: list[str] | None = None) -> int:
                 output_format=args.output,
                 trusted_signer_dids=args.trusted_signer_did,
             )
-        if args.command == "events":
-            if not args.vacuum:
-                raise ProxyCliError("events requires --vacuum", exit_code=2)
-            vacuum_events(
+        if args.command == "evidence-summary":
+            evidence_summary(
                 home=args.home,
                 config_path=args.config,
-                max_age_days=args.max_age_days,
-                before=args.before,
+                output_json=args.json_output,
             )
             return 0
+        if args.command == "events":
+            action = args.events_action
+            if args.vacuum:
+                if action not in {None, "vacuum"}:
+                    raise ProxyCliError("--vacuum cannot be combined with events list/tail")
+                action = "vacuum"
+            if action is None:
+                action = "list"
+            if action == "list":
+                list_events(
+                    home=args.home,
+                    config_path=args.config,
+                    limit=args.limit,
+                    output_json=args.json_output,
+                )
+            elif action == "tail":
+                tail_events(
+                    home=args.home,
+                    config_path=args.config,
+                    limit=args.limit,
+                    follow=args.follow,
+                    output_json=args.json_output,
+                )
+            elif action == "vacuum":
+                vacuum_events(
+                    home=args.home,
+                    config_path=args.config,
+                    max_age_days=args.max_age_days,
+                    before=args.before,
+                )
+            else:
+                raise ProxyCliError("events action must be list, tail, or vacuum")
+            return 0
     except (ProxyCliError, ApprovalEvidenceError, EvidenceExportError, EvidenceVerificationError) as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        if getattr(args, "json_output", False):
+            _print_json({
+                "ok": False,
+                "errors": [str(exc)],
+                "warnings": [],
+                "downstream": None,
+                "evidence_count": None,
+            })
+        else:
+            print(f"ERROR: {exc}", file=sys.stderr)
         return exc.exit_code if isinstance(exc, ProxyCliError) else 1
     raise AssertionError(f"unhandled command: {args.command}")
 

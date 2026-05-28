@@ -100,16 +100,33 @@ consistency, but it does not prove the bundle's signer list is the auditor's
 trusted set. A malicious bundle can include an attacker-controlled signer DID
 and a matching attacker-signed receipt.
 
+For day-to-day operator visibility, use the privacy-safe event views:
+
+```bash
+agentveil-mcp-proxy events list --limit 20
+agentveil-mcp-proxy events list --json
+agentveil-mcp-proxy events tail
+agentveil-mcp-proxy events tail --follow
+agentveil-mcp-proxy evidence-summary
+```
+
+`events list` / `events tail` show timestamp, downstream server, tool, risk
+class, evidence status, policy rule, receipt presence, and evidence record ID.
+They do not print raw MCP arguments, prompts, outputs, tokens, source code,
+secrets, payload hashes, or result hashes. `evidence-summary` prints aggregate
+counts by status and receipt presence.
+
 To prune old terminal records and rebuild the local chain:
 
 ```bash
-agentveil-mcp-proxy events --vacuum --max-age-days 90
-agentveil-mcp-proxy events --vacuum --before 2026-05-01T00:00:00Z
+agentveil-mcp-proxy events vacuum --max-age-days 90
+agentveil-mcp-proxy events vacuum --before 2026-05-01T00:00:00Z
 ```
 
 Vacuum removes only terminal states (`executed`, `denied`, `expired`,
 `invalidated`, `error`, `blocked`) older than the cutoff. Pending and approved
-records are preserved regardless of age.
+records are preserved regardless of age. The legacy `events --vacuum` form is
+still accepted.
 
 ## Local Approval Surface
 

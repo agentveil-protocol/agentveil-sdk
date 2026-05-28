@@ -52,8 +52,28 @@ Validate the local setup:
 agentveil-mcp-proxy doctor
 ```
 
-Edit `~/.avp/mcp-proxy/config.json` to point `downstream.command` and
-`downstream.args` at the MCP server you want to wrap. Then run:
+For a local first-run without installing another MCP server, configure the
+built-in sandboxed filesystem downstream:
+
+```bash
+agentveil-mcp-proxy init --quickstart-filesystem ./sandbox
+agentveil-mcp-proxy doctor --full
+agentveil-mcp-proxy smoke
+```
+
+For a real downstream server, write `downstream.command` and `downstream.args`
+with the helper:
+
+```bash
+agentveil-mcp-proxy downstream set \
+  --name filesystem \
+  --command npx \
+  --arg -y \
+  --arg @modelcontextprotocol/server-filesystem \
+  --arg /Users/me/work
+```
+
+Then run:
 
 ```bash
 agentveil-mcp-proxy run
@@ -227,16 +247,33 @@ exhaustive; review patterns for your specific downstream server.
 | Command | Purpose |
 |---|---|
 | `init` | Create encrypted identity, config, and control grant. |
+| `init --quickstart-filesystem <path>` | Configure the built-in sandboxed filesystem downstream for local first-run. |
 | `doctor` | Validate local files and control grant. |
 | `doctor --check-backend` | Add a read-only preflight that the backend is reachable and the proxy identity is registered. |
+| `doctor --full` | Launch downstream and verify MCP `initialize` / `tools/list`. |
+| `downstream set` | Write downstream MCP server config without hand-editing JSON. |
+| `configure-downstream` | Backward-compatible alias for `downstream set`. |
 | `register` | Register the existing proxy identity with the configured backend. |
+| `smoke` | Launch downstream and run the local MCP smoke check. |
 | `run` | Run stdio passthrough, the proxy mode used by MCP clients. |
 | `reissue-grant` | Refresh the local control grant before expiry. |
 | `export-evidence <path>` | Export durable evidence bundle for offline verification. |
 | `verify <bundle.json>` | Verify a previously exported bundle. |
-| `events --vacuum` | Prune old terminal evidence records. |
+| `events list --limit 20` | Print recent privacy-safe evidence records. |
+| `events tail --follow` | Follow privacy-safe evidence records. |
+| `evidence-summary` | Print aggregate local evidence counts. |
+| `events vacuum` / `events --vacuum` | Prune old terminal evidence records. |
 
 See [Operations][ops] for full flag reference and headless/CI patterns.
+
+Setup, doctor, smoke, and event-list commands support machine-readable output:
+
+```bash
+agentveil-mcp-proxy init --quickstart-filesystem ./sandbox --json
+agentveil-mcp-proxy doctor --full --json
+agentveil-mcp-proxy smoke --json
+agentveil-mcp-proxy events list --json
+```
 
 ## Evidence And Proof
 

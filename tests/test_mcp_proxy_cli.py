@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import sys
 
 import pytest
 
@@ -18,14 +19,19 @@ from agentveil_mcp_proxy.cli import (
     AGENTVEIL_DEV_SIGNER_DIDS,
     MIN_IDENTITY_PASSPHRASE_LENGTH,
     ProxyCliError,
+    configure_downstream,
     doctor_proxy,
+    evidence_summary,
     export_evidence,
     init_proxy,
+    list_events,
     main,
     proxy_paths,
+    quickstart_filesystem_downstream,
     register_proxy,
     reissue_grant,
     run_proxy,
+    smoke_proxy,
 )
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore, PendingApproval
 from agentveil_mcp_proxy.identity import encrypted_identity_payload, load_agent_from_identity
@@ -993,6 +999,295 @@ def test_register_wired_through_main(tmp_path, monkeypatch, capsys):
 
     assert exit_code == 0
     assert "OK: agent " in out
+
+
+def test_configure_downstream_writes_valid_config(tmp_path):
+    home = tmp_path / "avp-home"
+    result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    sandbox = tmp_path / "sandbox"
+    out = io.StringIO()
+
+    configured = configure_downstream(
+        home=home,
+        name="filesystem",
+        command=sys.executable,
+        args=("-m", "agentveil_mcp_proxy.quickstart_filesystem", str(sandbox)),
+        response_timeout_seconds=5.0,
+        out=out,
+    )
+
+    config = _load(result.config_path)
+    assert configured.downstream_name == "filesystem"
+    assert config["downstream"]["command"] == sys.executable
+    assert config["downstream"]["args"][-1] == str(sandbox)
+    assert "OK: downstream filesystem configured" in out.getvalue()
+
+
+def test_downstream_set_wired_through_main_with_json(tmp_path, capsys):
+    home = tmp_path / "avp-home"
+    result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    sandbox = tmp_path / "sandbox"
+
+    exit_code = main([
+        "downstream",
+        "set",
+        "--home", str(home),
+        "--name", "filesystem",
+        "--command", sys.executable,
+        "--arg", "-m",
+        "--arg", "agentveil_mcp_proxy.quickstart_filesystem",
+        "--arg", str(sandbox),
+        "--json",
+    ])
+    out, err = capsys.readouterr()
+
+    assert exit_code == 0
+    assert err == ""
+    payload = json.loads(out)
+    assert payload["ok"] is True
+    assert payload["errors"] == []
+    assert payload["downstream"]["name"] == "filesystem"
+    assert payload["downstream"]["command"] == sys.executable
+    assert payload["evidence_count"] == 0
+    assert _load(result.config_path)["downstream"]["args"][-1] == str(sandbox)
+
+
+def test_configure_downstream_rejects_avp_env(tmp_path):
+    home = tmp_path / "avp-home"
+    init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+
+    with pytest.raises(ProxyCliError, match="AVP_\\*"):
+        configure_downstream(
+            home=home,
+            name="filesystem",
+            command=sys.executable,
+            env_entries=("AVP_PROXY_PASSPHRASE=secret",),
+        )
+
+
+def test_init_quickstart_filesystem_configures_downstream_and_filesystem_policy(tmp_path):
+    home = tmp_path / "avp-home"
+    sandbox = tmp_path / "sandbox"
+
+    result = init_proxy(
+        home=home,
+        agent_name="proxy",
+        plaintext=True,
+        policy_pack="filesystem",
+        downstream_config=quickstart_filesystem_downstream(sandbox),
+    )
+
+    config = _load(result.config_path)
+    assert sandbox.is_dir()
+    assert config["policy"]["id"] == "filesystem"
+    assert config["downstream"]["name"] == "filesystem"
+    assert config["downstream"]["command"] == sys.executable
+    assert "agentveil_mcp_proxy.quickstart_filesystem" in config["downstream"]["args"]
+
+
+def test_doctor_full_fails_without_downstream_config(tmp_path):
+    home = tmp_path / "avp-home"
+    init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    out = io.StringIO()
+
+    code = doctor_proxy(home=home, passphrase=TEST_PASSPHRASE, full=True, out=out)
+
+    assert code == 1
+    assert "downstream.command is required" in out.getvalue()
+
+
+def test_doctor_full_smokes_downstream(tmp_path):
+    home = tmp_path / "avp-home"
+    init_proxy(
+        home=home,
+        agent_name="proxy",
+        plaintext=True,
+        policy_pack="filesystem",
+        downstream_config=quickstart_filesystem_downstream(tmp_path / "sandbox"),
+    )
+    out = io.StringIO()
+
+    code = doctor_proxy(home=home, full=True, out=out)
+
+    assert code == 0
+    assert "OK: downstream filesystem configured" in out.getvalue()
+    assert "OK: downstream filesystem answered initialize/tools/list (2 tools)" in out.getvalue()
+
+
+def test_doctor_json_reports_downstream_and_evidence_count(tmp_path):
+    home = tmp_path / "avp-home"
+    init_proxy(
+        home=home,
+        agent_name="proxy",
+        plaintext=True,
+        policy_pack="filesystem",
+        downstream_config=quickstart_filesystem_downstream(tmp_path / "sandbox"),
+    )
+    paths = proxy_paths(home)
+    with ApprovalEvidenceStore(paths.proxy_dir / "evidence.sqlite") as store:
+        store.write_pending(_evidence_record("req-doctor-json"))
+    out = io.StringIO()
+
+    code = doctor_proxy(home=home, full=True, output_json=True, out=out)
+
+    payload = json.loads(out.getvalue())
+    assert code == 0
+    assert payload["ok"] is True
+    assert payload["errors"] == []
+    assert payload["downstream"]["name"] == "filesystem"
+    assert payload["downstream"]["tool_count"] == 2
+    assert payload["evidence_count"] == 1
+
+
+def test_doctor_json_reports_missing_downstream_as_warning(tmp_path):
+    home = tmp_path / "avp-home"
+    init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    out = io.StringIO()
+
+    code = doctor_proxy(
+        home=home,
+        passphrase=TEST_PASSPHRASE,
+        output_json=True,
+        out=out,
+    )
+
+    payload = json.loads(out.getvalue())
+    assert code == 0
+    assert payload["ok"] is True
+    assert payload["downstream"]["configured"] is False
+    assert "downstream is not configured" in payload["warnings"][0]
+
+
+def test_smoke_proxy_smokes_downstream(tmp_path):
+    home = tmp_path / "avp-home"
+    init_proxy(
+        home=home,
+        agent_name="proxy",
+        plaintext=True,
+        policy_pack="filesystem",
+        downstream_config=quickstart_filesystem_downstream(tmp_path / "sandbox"),
+    )
+    out = io.StringIO()
+
+    result = smoke_proxy(home=home, out=out)
+
+    assert result.downstream_name == "filesystem"
+    assert result.tool_count == 2
+    assert "OK: downstream filesystem answered initialize/tools/list" in out.getvalue()
+
+
+def test_smoke_json_reports_machine_readable_result(tmp_path):
+    home = tmp_path / "avp-home"
+    init_proxy(
+        home=home,
+        agent_name="proxy",
+        plaintext=True,
+        policy_pack="filesystem",
+        downstream_config=quickstart_filesystem_downstream(tmp_path / "sandbox"),
+    )
+    out = io.StringIO()
+
+    result = smoke_proxy(home=home, output_json=True, out=out)
+
+    payload = json.loads(out.getvalue())
+    assert result.tool_count == 2
+    assert payload["ok"] is True
+    assert payload["errors"] == []
+    assert payload["downstream"]["name"] == "filesystem"
+    assert payload["downstream"]["tool_count"] == 2
+    assert payload["evidence_count"] == 0
+
+
+def test_events_list_and_summary_are_privacy_safe(tmp_path):
+    home = tmp_path / "avp-home"
+    init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    paths = proxy_paths(home)
+    with ApprovalEvidenceStore(paths.proxy_dir / "evidence.sqlite") as store:
+        store.write_pending(_evidence_record("req-events"))
+
+    events_out = io.StringIO()
+    count = list_events(home=home, out=events_out)
+
+    assert count == 1
+    rendered = events_out.getvalue()
+    assert "server=github" in rendered
+    assert "tool=create_issue" in rendered
+    assert "risk=write" in rendered
+    assert "receipt=present" in rendered
+    assert "id=req-events" in rendered
+    assert "b" * 64 not in rendered
+
+    summary_out = io.StringIO()
+    summary = evidence_summary(home=home, out=summary_out)
+    assert summary["record_count"] == 1
+    assert summary["receipt_present_count"] == 1
+    assert "req-events" not in summary_out.getvalue()
+
+
+def test_events_list_json_is_machine_readable_and_privacy_safe(tmp_path):
+    home = tmp_path / "avp-home"
+    init_proxy(
+        home=home,
+        agent_name="proxy",
+        plaintext=True,
+        policy_pack="filesystem",
+        downstream_config=quickstart_filesystem_downstream(tmp_path / "sandbox"),
+    )
+    paths = proxy_paths(home)
+    with ApprovalEvidenceStore(paths.proxy_dir / "evidence.sqlite") as store:
+        store.write_pending(_evidence_record("req-events-json"))
+
+    events_out = io.StringIO()
+    count = list_events(home=home, output_json=True, out=events_out)
+
+    payload = json.loads(events_out.getvalue())
+    assert count == 1
+    assert payload["ok"] is True
+    assert payload["evidence_count"] == 1
+    assert payload["downstream"]["name"] == "filesystem"
+    assert payload["events"] == [{
+        "timestamp": "2023-11-14T22:13:20Z",
+        "server": "github",
+        "tool": "create_issue",
+        "risk_class": "write",
+        "status": "pending",
+        "policy_rule": "rule-write",
+        "receipt": "present",
+        "record_id": "req-events-json",
+    }]
+    assert "b" * 64 not in events_out.getvalue()
+
+
+def test_main_init_json_supports_noninteractive_downstream_flags(tmp_path, capsys):
+    home = tmp_path / "avp-home"
+    passphrase_file = tmp_path / "passphrase.txt"
+    passphrase_file.write_text(TEST_PASSPHRASE, encoding="utf-8")
+    os.chmod(passphrase_file, 0o600)
+    sandbox = tmp_path / "sandbox"
+
+    exit_code = main([
+        "init",
+        "--home", str(home),
+        "--agent-name", "proxy",
+        "--passphrase-file", str(passphrase_file),
+        "--policy-pack", "filesystem",
+        "--downstream-name", "filesystem",
+        "--downstream-command", sys.executable,
+        "--downstream-arg", "-m",
+        "--downstream-arg", "agentveil_mcp_proxy.quickstart_filesystem",
+        "--downstream-arg", str(sandbox),
+        "--json",
+    ])
+    out, err = capsys.readouterr()
+
+    payload = json.loads(out)
+    assert exit_code == 0
+    assert err == ""
+    assert payload["ok"] is True
+    assert payload["errors"] == []
+    assert payload["downstream"]["name"] == "filesystem"
+    assert payload["evidence_count"] == 0
+    assert _load(proxy_paths(home).config_path)["downstream"]["args"][-1] == str(sandbox)
 
 
 def test_reissue_grant_creates_new_grant_with_default_ttl(tmp_path):

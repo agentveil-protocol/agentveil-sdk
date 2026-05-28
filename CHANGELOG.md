@@ -9,6 +9,32 @@ All notable changes to the `agentveil` SDK.
   named while AgentVeil is described as an external trust and reputation
   integration.
 
+## [0.7.17] - 2026-05-28
+
+MCP Proxy first-run repair release. The published `0.7.16` wheel did not
+include the newer `register` and `doctor --check-backend` CLI path that the
+GitHub docs described; this patch version is the releasable package state for
+that customer path plus local downstream/operator visibility helpers.
+
+### Added
+- Added `agentveil-mcp-proxy configure-downstream` to write downstream MCP
+  server config without manual JSON edits, plus the preferred
+  `agentveil-mcp-proxy downstream set` command spelling.
+- Added `agentveil-mcp-proxy init --quickstart-filesystem <path>` with a
+  built-in sandboxed filesystem downstream for zero-dependency local smoke
+  testing.
+- Added `agentveil-mcp-proxy doctor --full` and `agentveil-mcp-proxy smoke` to
+  launch the configured downstream and verify MCP `initialize` / `tools/list`.
+- Added privacy-safe `events list`, `events tail`, and `evidence-summary`
+  operator views.
+- Added JSON output for non-interactive setup and checks (`init`, downstream
+  setup, `doctor`, `smoke`, and event views).
+
+### Changed
+- Updated MCP Proxy quickstart docs with Ubuntu packaging prerequisites,
+  virtualenv install commands, downstream helper usage, full doctor/smoke
+  checks, JSON output, and the new event views.
+
 ## [0.7.16] - 2026-05-26
 
 Paperclip MCP integration helper release. Adds read-only local helper commands

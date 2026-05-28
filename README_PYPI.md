@@ -90,9 +90,25 @@ replay defense. Point your IDE at `agentveil-mcp-proxy` instead of directly at
 the downstream server; the proxy applies AVP policy before forwarding.
 
 ```bash
-agentveil-mcp-proxy init
-agentveil-mcp-proxy doctor
+agentveil-mcp-proxy init --quickstart-filesystem ./sandbox
+agentveil-mcp-proxy doctor --full
+agentveil-mcp-proxy smoke
 agentveil-mcp-proxy run
+```
+
+For agent-driven setup, the same path supports non-interactive flags and JSON
+output:
+
+```bash
+agentveil-mcp-proxy init \
+  --home ./avp-home \
+  --passphrase-file ./passphrase.txt \
+  --policy-pack filesystem \
+  --downstream-name filesystem \
+  --downstream-command /path/to/server \
+  --downstream-arg /workspace \
+  --json
+agentveil-mcp-proxy doctor --home ./avp-home --full --json
 ```
 
 AVP approvals are capability tokens, not flat permissions. They are signed,
