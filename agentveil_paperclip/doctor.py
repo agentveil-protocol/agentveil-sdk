@@ -9,6 +9,7 @@ AgentVeil backend or any agent runtime.
 
 from __future__ import annotations
 
+import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,6 +39,12 @@ def _which(command: str) -> str | None:
     """Resolve `command` on PATH without executing it."""
 
     return shutil.which(command)
+
+
+def _default_home() -> Path:
+    """Resolve the user home, honoring explicit HOME overrides in tests."""
+
+    return Path(os.environ.get("HOME") or Path.home())
 
 
 def _claude_mcp_config_present(home: Path, cwd: Path) -> tuple[bool, str | None]:
@@ -80,7 +87,7 @@ def collect_doctor_report(
 ) -> DoctorReport:
     """Run the read-only diagnostic checks and return a structured report."""
 
-    home = home or Path.home()
+    home = home or _default_home()
     cwd = cwd or Path.cwd()
 
     proxy_path = _which("agentveil-mcp-proxy")

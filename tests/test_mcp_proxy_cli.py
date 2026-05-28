@@ -942,7 +942,8 @@ def test_register_already_registered_returns_ok(tmp_path, monkeypatch):
     assert "private_key_hex" not in identity_after
     assert identity_after.get("registered") is True
     assert identity_after.get("verified") is True
-    assert _mode(result.identity_path) == 0o600
+    if os.name != "nt":
+        assert _mode(result.identity_path) == 0o600
 
 
 def test_register_encrypted_identity_requires_passphrase(tmp_path, monkeypatch):
@@ -974,7 +975,8 @@ def test_register_does_not_downgrade_encrypted_identity_to_plaintext(tmp_path, m
     assert identity_after["encrypted"] is True
     # No plaintext private key should ever appear in the file after register.
     assert "private_key_hex" not in identity_after
-    assert _mode(result.identity_path) == 0o600
+    if os.name != "nt":
+        assert _mode(result.identity_path) == 0o600
 
 
 def test_register_wired_through_main(tmp_path, monkeypatch, capsys):
