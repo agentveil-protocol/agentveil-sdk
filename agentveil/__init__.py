@@ -13,6 +13,15 @@ Usage:
 """
 
 from agentveil.agent import AVPAgent
+from agentveil.egress import (
+    ControlledEgressOutcome,
+    EgressPolicyViolationError,
+    EgressReceiptProofError,
+    EgressReceiptVerificationError,
+    controlled_egress,
+    sign_egress_receipt,
+    verify_egress_receipt,
+)
 from agentveil.mock import AVPMockAgent
 from agentveil.proof import ProofVerificationError, verify_proof_packet, verify_signed_jcs
 from agentveil.results import ControlledActionOutcome, IntegrationPreflightReport, ProofPacket
@@ -32,9 +41,16 @@ __all__ = [
     "AVPAgent",
     "AVPMockAgent",
     "ControlledActionOutcome",
+    "ControlledEgressOutcome",
+    "EgressPolicyViolationError",
+    "EgressReceiptProofError",
+    "EgressReceiptVerificationError",
     "IntegrationPreflightReport",
     "ProofPacket",
     "ProofVerificationError",
+    "controlled_egress",
+    "sign_egress_receipt",
+    "verify_egress_receipt",
     "verify_proof_packet",
     "verify_signed_jcs",
     "avp_tracked",

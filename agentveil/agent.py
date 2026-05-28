@@ -19,7 +19,7 @@ import time
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from importlib.metadata import PackageNotFoundError, version
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 import httpx
 from nacl.signing import SigningKey, VerifyKey
@@ -1621,6 +1621,48 @@ class AVPAgent:
             status="blocked",
             decision=decision,
             reason=decision.get("reason", "runtime_gate_blocked"),
+        )
+
+    def controlled_egress(
+        self,
+        *,
+        host: str,
+        port: int,
+        method: str,
+        path: str,
+        headers: Optional[Mapping[str, str]],
+        body: bytes,
+        credential_or_principal_class: str,
+        policy_id: str,
+        delegation_receipt: Mapping[str, Any],
+        timeout_seconds: float = 30.0,
+    ) -> "ControlledEgressOutcome":
+        """Perform an HTTPS egress through the AVP-controlled boundary.
+
+        Returns a ``ControlledEgressOutcome`` carrying an **agent-signed**
+        ``egress_receipt/1`` for ALLOW/BLOCK/FAILED outcomes (no receipt
+        on ``WAITING_FOR_HUMAN_APPROVAL`` in v0.1). The helper performs
+        the HTTPS send itself; calls that bypass this method are not
+        recorded.
+
+        Receipts are signed by the agent's own identity, not by the AVP
+        backend. Verify with
+        ``verify_egress_receipt(receipt_jcs, trusted_signer_dids=[self.did])``.
+        """
+        from agentveil.egress import controlled_egress as _controlled_egress
+
+        return _controlled_egress(
+            agent=self,
+            host=host,
+            port=port,
+            method=method,
+            path=path,
+            headers=headers,
+            body=body,
+            credential_or_principal_class=credential_or_principal_class,
+            policy_id=policy_id,
+            delegation_receipt=delegation_receipt,
+            timeout_seconds=timeout_seconds,
         )
 
     def execute_after_approval(
