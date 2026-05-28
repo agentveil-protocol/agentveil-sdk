@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import hashlib
 import secrets
 import sys
+import threading
 import time
 from typing import Any, Callable, TextIO
 import uuid
@@ -42,6 +43,7 @@ class ApprovalOutcome:
     status: str
     reason: str
     approval_scope: str = APPROVAL_SCOPE_EXACT
+    approval_url: str | None = None
 
     @property
     def approved(self) -> bool:
@@ -66,6 +68,7 @@ class ApprovalManager:
         cli_out: TextIO | None = None,
         browser_open: Callable[[str], bool] | None = None,
         notifier: ApprovalNotifier | None = None,
+        wait_for_decision: bool = True,
     ):
         self.evidence_store = evidence_store
         self.approval_server = approval_server
@@ -79,6 +82,7 @@ class ApprovalManager:
         self.cli_out = cli_out or sys.stderr
         self.browser_open = browser_open or webbrowser.open
         self.notifier = notifier or ApprovalNotifier()
+        self.wait_for_decision = wait_for_decision
 
     def request_approval(
         self,
@@ -99,8 +103,17 @@ class ApprovalManager:
         )
         request_id = str(uuid.uuid4())
         scope_allowed = self._scope_expansion_allowed(classification)
+        active_exact_grant = self.evidence_store.find_active_exact_grant(
+            downstream_server=classification.server,
+            tool_name=classification.tool,
+            policy_rule_id=classification.policy_evaluation.policy_rule_id,
+            risk_class=classification.risk_class.value,
+            resource_hash=classification.resource_hash,
+            payload_hash=classification.payload_hash,
+            now_timestamp=now,
+        )
         active_similar_grant = None
-        if scope_allowed:
+        if active_exact_grant is None and scope_allowed:
             active_similar_grant = self.evidence_store.find_active_similar_grant(
                 downstream_server=classification.server,
                 tool_name=classification.tool,
@@ -109,6 +122,7 @@ class ApprovalManager:
                 resource_hash=classification.resource_hash,
                 now_timestamp=now,
             )
+        active_grant = active_exact_grant or active_similar_grant
         prompt = self._prompt_for(
             classification,
             request_id=request_id,
@@ -121,10 +135,10 @@ class ApprovalManager:
             request_id=request_id,
             created_at=now,
             expires_at=record_expires_at,
-            runtime_decision=None if active_similar_grant is not None else runtime_decision,
+            runtime_decision=None if active_grant is not None else runtime_decision,
             approval_token_hash=self.approval_server.token_hash,
             granted_by_request_id=(
-                None if active_similar_grant is None else active_similar_grant.request_id
+                None if active_grant is None else active_grant.request_id
             ),
         )
         try:
@@ -132,7 +146,7 @@ class ApprovalManager:
         except ApprovalEvidenceError as exc:
             raise ApprovalFlowError("approval evidence persistence failed") from exc
 
-        if active_similar_grant is not None:
+        if active_grant is not None:
             return self._approve(request_id, APPROVAL_SCOPE_EXACT, now, "scope_cache_hit")
 
         if self.auto_deny:
@@ -150,6 +164,37 @@ class ApprovalManager:
 
         url = self.approval_server.register(prompt)
         self._notify(prompt, url)
+        if not self.wait_for_decision:
+            self._watch_decision_in_background(request_id, timeout)
+            return ApprovalOutcome(
+                request_id,
+                ApprovalStatus.PENDING.value,
+                reason,
+                approval_url=url,
+            )
+        return self._await_decision(request_id, timeout)
+
+    def _watch_decision_in_background(self, request_id: str, timeout: int) -> None:
+        """Persist the eventual local approval decision without blocking MCP stdio."""
+
+        def worker() -> None:
+            try:
+                self._await_decision(request_id, timeout)
+            except Exception:
+                # The MCP response has already returned. Evidence best-effort
+                # failure here must not crash the proxy process.
+                return
+
+        thread = threading.Thread(
+            target=worker,
+            name=f"agentveil-mcp-proxy-approval-watch-{request_id[:8]}",
+            daemon=True,
+        )
+        thread.start()
+
+    def _await_decision(self, request_id: str, timeout: int) -> ApprovalOutcome:
+        """Wait for a local approval decision and persist the resulting state."""
+
         decision = None
         while decision is None:
             decision = self.approval_server.wait_for_decision(

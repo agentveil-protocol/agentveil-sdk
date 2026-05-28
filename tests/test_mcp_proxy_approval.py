@@ -155,6 +155,7 @@ def _manager(
     auto_deny: bool = False,
     headless_policy: HeadlessPolicy | None = None,
     cli_out: io.StringIO | None = None,
+    wait_for_decision: bool = True,
 ) -> tuple[ApprovalManager, ApprovalEvidenceStore, ApprovalServer, io.StringIO]:
     store = ApprovalEvidenceStore(tmp_path / "evidence.sqlite")
     server = server or ApprovalServer()
@@ -173,6 +174,7 @@ def _manager(
         cli_out=cli,
         browser_open=lambda _url: False,
         notifier=NoopNotifier(),
+        wait_for_decision=wait_for_decision,
     )
     return manager, store, server, cli
 
@@ -506,6 +508,12 @@ def test_token_rotates_on_proxy_restart():
 
 def test_pending_approval_persisted_before_ui_render(tmp_path):
     class FailingStore:
+        def find_active_exact_grant(self, **_kwargs):
+            return None
+
+        def find_active_similar_grant(self, **_kwargs):
+            return None
+
         def write_pending(self, _record):
             raise ApprovalEvidenceCapacityError("full")
 
@@ -595,6 +603,65 @@ def test_headless_policy_missing_match_denies_by_default(tmp_path):
         record = store.get_pending(outcome.request_id)
         assert outcome.status == ApprovalStatus.DENIED.value
         assert record.error_class == "headless_policy_no_match"
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_nonblocking_approval_returns_pending_url_and_records_later_decision(tmp_path):
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=_config(policy_rule=_write_rule(), approval_timeout_seconds=60),
+        wait_for_decision=False,
+    )
+    try:
+        outcome = manager.request_approval(_classification(), reason="local_approval_required")
+
+        assert outcome.status == ApprovalStatus.PENDING.value
+        assert outcome.reason == "local_approval_required"
+        assert outcome.approval_url == server.approval_url(outcome.request_id)
+        assert store.get_pending(outcome.request_id).status == ApprovalStatus.PENDING.value
+
+        with httpx.Client() as client:
+            csrf = _get_csrf(client, outcome.approval_url)
+            response = _post_decision(
+                client,
+                outcome.approval_url,
+                decision="approve",
+                csrf=csrf,
+            )
+        assert response.status_code == 200
+
+        deadline = time.monotonic() + 2
+        record = store.get_pending(outcome.request_id)
+        while record.status != ApprovalStatus.APPROVED.value and time.monotonic() < deadline:
+            time.sleep(0.01)
+            record = store.get_pending(outcome.request_id)
+
+        assert record.status == ApprovalStatus.APPROVED.value
+        assert record.approval_scope == "exact"
+        assert server.pending_prompts() == []
+
+        retry = manager.request_approval(_classification(), reason="local_approval_required")
+        retry_record = store.get_pending(retry.request_id)
+        assert retry.approved
+        assert retry.reason == "scope_cache_hit"
+        assert retry_record.status == ApprovalStatus.APPROVED.value
+        assert retry_record.granted_by_request_id == outcome.request_id
+        assert server.pending_prompts() == []
+
+        third = manager.request_approval(_classification(), reason="local_approval_required")
+        assert third.status == ApprovalStatus.PENDING.value
+        assert third.approval_url == server.approval_url(third.request_id)
+        with httpx.Client() as client:
+            csrf = _get_csrf(client, third.approval_url)
+            _post_decision(client, third.approval_url, decision="deny", csrf=csrf)
+        deadline = time.monotonic() + 2
+        third_record = store.get_pending(third.request_id)
+        while third_record.status != ApprovalStatus.DENIED.value and time.monotonic() < deadline:
+            time.sleep(0.01)
+            third_record = store.get_pending(third.request_id)
+        assert third_record.status == ApprovalStatus.DENIED.value
     finally:
         server.stop()
         store.close()

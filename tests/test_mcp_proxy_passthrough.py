@@ -20,6 +20,7 @@ import agentveil_mcp_proxy.cli as proxy_cli
 from agentveil_mcp_proxy.cli import ProxyCliError, init_proxy, run_proxy
 from agentveil_mcp_proxy.policy import ProxyConfig
 from agentveil_mcp_proxy.passthrough import (
+    JSONRPC_APPROVAL_REQUIRED,
     JSONRPC_DOWNSTREAM_TIMEOUT,
     JSONRPC_INVALID_REQUEST,
     MAX_PENDING_RESPONSES,
@@ -118,6 +119,26 @@ def _set_allow_policy(config_path: Path, *, server: str, tool: str) -> None:
                 "source": "user",
                 "decision": "allow",
                 "risk_class": "read",
+                "match": {"server": server, "tool": tool},
+            }
+        ],
+    }
+    _write_json(config_path, config)
+
+
+def _set_approval_policy(config_path: Path, *, server: str, tool: str) -> None:
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["policy"] = {
+        "id": "approval-test",
+        "policy_schema_version": 1,
+        "default_decision": "allow",
+        "default_risk_class": "read",
+        "rules": [
+            {
+                "id": "approval-tool",
+                "source": "user",
+                "decision": "approval",
+                "risk_class": "write",
                 "match": {"server": server, "tool": tool},
             }
         ],
@@ -556,6 +577,44 @@ def test_run_passthrough_forwards_local_allow_without_backend_or_gate(tmp_path, 
         "result": {"content": [{"type": "text", "text": "called"}]},
     }]
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/call"]
+
+
+def test_run_returns_approval_required_without_waiting_or_forwarding(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    _set_downstream(init.config_path, _normal_downstream(tmp_path), log_path=log_path)
+    _set_approval_policy(init.config_path, server="fake-downstream", tool="write_file")
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("local approval must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line({
+            "jsonrpc": "2.0",
+            "id": "call-1",
+            "method": "tools/call",
+            "params": {"name": "write_file", "arguments": {"path": "/tmp/a.txt"}},
+        })),
+        out=client_out,
+    ) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    assert response["error"]["code"] == JSONRPC_APPROVAL_REQUIRED
+    assert response["error"]["message"] == "approval required"
+    assert response["error"]["data"]["status"] == "approval_required"
+    assert response["error"]["data"]["reason"] == "local_approval_required"
+    assert response["error"]["data"]["record_status"] == "pending"
+    assert response["error"]["data"]["record_id"]
+    assert response["error"]["data"]["approval_url"].startswith("http://127.0.0.1:")
+    assert "retry" in response["error"]["data"]["instructions"]
+    assert not log_path.exists()
 
 
 def test_run_passthrough_does_not_construct_avp_agent_or_call_backend(tmp_path, monkeypatch):

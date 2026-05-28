@@ -9,6 +9,8 @@
 #
 # This script does NOT publish to PyPI. It does NOT run network-dependent
 # MCP server checks beyond `agentveil-mcp --help` (argparse-only).
+# For MCP Proxy behavior releases, run scripts/mcp_proxy_release_acceptance.py
+# against the release candidate wheel after this packaging smoke passes.
 
 set -euo pipefail
 

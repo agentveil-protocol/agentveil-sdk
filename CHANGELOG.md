@@ -4,10 +4,33 @@ All notable changes to the `agentveil` SDK.
 
 ## [Unreleased]
 
+## [0.7.18] - 2026-05-28
+
+MCP Proxy approval UX repair release. This patch closes the remaining 0.7.17
+customer-path gap where approval-required MCP tool calls could leave stdio
+clients waiting until timeout instead of receiving an actionable approval
+response.
+
+### Added
+- Added `--json` support to `agentveil-mcp-proxy register`.
+- Added an MCP Proxy release acceptance runner that builds or consumes a wheel,
+  installs it into a clean virtualenv, drives the quickstart filesystem MCP
+  server through the proxy, approves a risky action through the loopback UI,
+  retries the action, and verifies events/evidence export.
+
 ### Changed
 - Corrected Microsoft AGT / AgentMesh docs wording so `AVPProvider` remains
   named while AgentVeil is described as an external trust and reputation
   integration.
+- Changed MCP Proxy approval-required stdio calls to return an immediate
+  structured `approval_required` response with the local evidence record ID and
+  approval URL instead of holding the MCP request open until timeout.
+- Approved exact local approval records now authorize one identical retry, so
+  clients can complete the approved MCP tool call after the user approves it in
+  the local browser approval UI.
+- Documented the MCP Proxy release acceptance procedure as a release gate for
+  serious MCP Proxy setup, passthrough, approval, evidence, and Runtime Gate
+  changes.
 
 ## [0.7.17] - 2026-05-28
 

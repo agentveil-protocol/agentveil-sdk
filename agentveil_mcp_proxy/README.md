@@ -266,10 +266,18 @@ exhaustive; review patterns for your specific downstream server.
 
 See [Operations][ops] for full flag reference and headless/CI patterns.
 
-Setup, doctor, smoke, and event-list commands support machine-readable output:
+Before tagging or publishing MCP Proxy behavior changes, run the release
+acceptance path from [`docs/MCP_PROXY_RELEASE_ACCEPTANCE.md`][release-acceptance].
+It installs the wheel into a clean venv and verifies setup, backend
+registration, stdio passthrough, local approval/retry UX, events, export, and
+offline verification.
+
+Setup, registration, doctor, smoke, and event-list commands support
+machine-readable output:
 
 ```bash
 agentveil-mcp-proxy init --quickstart-filesystem ./sandbox --json
+agentveil-mcp-proxy register --json
 agentveil-mcp-proxy doctor --full --json
 agentveil-mcp-proxy smoke --json
 agentveil-mcp-proxy events list --json
@@ -344,3 +352,4 @@ v0.1 ships with these documented limitations targeted for v0.1.1:
 [ops-passphrase]: ../docs/MCP_PROXY_OPERATIONS.md#security-trade-offs-by-passphrase-source
 [ops-evidence]: ../docs/MCP_PROXY_OPERATIONS.md#local-evidence-storage
 [ops-headless]: ../docs/MCP_PROXY_OPERATIONS.md#headless-approval-mode
+[release-acceptance]: ../docs/MCP_PROXY_RELEASE_ACCEPTANCE.md

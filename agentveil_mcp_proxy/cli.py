@@ -1214,6 +1214,7 @@ def register_proxy(
     passphrase: str | None = None,
     passphrase_file: Path | None = None,
     out: TextIO | None = None,
+    output_json: bool = False,
 ) -> int:
     """Register the existing proxy identity with the configured backend.
 
@@ -1241,6 +1242,23 @@ def register_proxy(
         config=config,
         passphrase=identity_passphrase,
     )
+    base_url = config.avp.base_url
+
+    def emit_json(
+        *,
+        ok: bool,
+        registered: bool,
+        errors: Iterable[str] = (),
+        warnings: Iterable[str] = (),
+    ) -> None:
+        _print_json({
+            "ok": ok,
+            "errors": list(errors),
+            "warnings": list(warnings),
+            "agent_did": agent.did,
+            "base_url": base_url,
+            "registered": registered,
+        }, out)
 
     # ``AVPAgent.register`` calls ``self.save()`` internally which would
     # rewrite ~/.avp/agents/<name>.json in the SDK's plaintext format
@@ -1249,7 +1267,6 @@ def register_proxy(
     # the proxy's own payload helpers.
     agent.save = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
 
-    base_url = config.avp.base_url
     try:
         agent.register()
     except AVPValidationError as exc:
@@ -1270,27 +1287,37 @@ def register_proxy(
                 agent=agent,
                 passphrase=identity_passphrase,
             )
-            print(
-                f"OK: agent {agent.did} already registered at {base_url}",
-                file=out,
-            )
+            if output_json:
+                emit_json(
+                    ok=True,
+                    registered=True,
+                    warnings=("agent already registered",),
+                )
+            else:
+                print(
+                    f"OK: agent {agent.did} already registered at {base_url}",
+                    file=out,
+                )
             return 0
-        print(
-            f"FAIL: registration rejected at {base_url}: status {exc.status_code}",
-            file=out,
-        )
+        message = f"registration rejected at {base_url}: status {exc.status_code}"
+        if output_json:
+            emit_json(ok=False, registered=False, errors=(message,))
+        else:
+            print(f"FAIL: {message}", file=out)
         return 1
     except AVPError as exc:
-        print(
-            f"FAIL: registration failed at {base_url}: status {exc.status_code}",
-            file=out,
-        )
+        message = f"registration failed at {base_url}: status {exc.status_code}"
+        if output_json:
+            emit_json(ok=False, registered=False, errors=(message,))
+        else:
+            print(f"FAIL: {message}", file=out)
         return 1
     except Exception as exc:
-        print(
-            f"FAIL: backend unreachable at {base_url}: {type(exc).__name__}",
-            file=out,
-        )
+        message = f"backend unreachable at {base_url}: {type(exc).__name__}"
+        if output_json:
+            emit_json(ok=False, registered=False, errors=(message,))
+        else:
+            print(f"FAIL: {message}", file=out)
         return 1
 
     _rewrite_proxy_identity_after_register(
@@ -1298,10 +1325,13 @@ def register_proxy(
         agent=agent,
         passphrase=identity_passphrase,
     )
-    print(
-        f"OK: agent {agent.did} registered at {base_url}",
-        file=out,
-    )
+    if output_json:
+        emit_json(ok=True, registered=True)
+    else:
+        print(
+            f"OK: agent {agent.did} registered at {base_url}",
+            file=out,
+        )
     return 0
 
 
@@ -1788,6 +1818,7 @@ def run_proxy(
             auto_deny=auto_deny,
             headless_policy=headless_policy,
             cli_out=err,
+            wait_for_decision=False,
         )
         runtime_gate_factory = lambda: RuntimeGateClient.from_files(
             identity_path=identity_path,
@@ -1916,6 +1947,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common_path_args(register)
     _add_passphrase_args(register)
+    _add_json_arg(register)
 
     configure = subparsers.add_parser(
         "configure-downstream",
@@ -2086,6 +2118,7 @@ def main(argv: list[str] | None = None) -> int:
                 config_path=args.config,
                 passphrase=args.passphrase,
                 passphrase_file=args.passphrase_file,
+                output_json=args.json_output,
             )
         if args.command in {"configure-downstream", "downstream"}:
             if args.command == "downstream" and args.downstream_action != "set":

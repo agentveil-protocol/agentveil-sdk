@@ -377,6 +377,7 @@ def _approval_required_error(
     reason: str,
     message: str = "approval required",
     decision: RuntimeGateDecision | None = None,
+    approval_outcome: ApprovalOutcome | None = None,
 ) -> dict[str, Any]:
     data: dict[str, Any] = {"status": "approval_required", "reason": reason}
     if decision is not None:
@@ -385,6 +386,14 @@ def _approval_required_error(
             data["audit_id"] = decision.audit_id
         if decision.approval_id is not None:
             data["approval_id"] = decision.approval_id
+    if approval_outcome is not None:
+        data["record_id"] = approval_outcome.request_id
+        data["record_status"] = approval_outcome.status
+        if approval_outcome.approval_url is not None:
+            data["approval_url"] = approval_outcome.approval_url
+            data["instructions"] = (
+                "Open approval_url to approve or deny, then retry the MCP tool call if approved."
+            )
     return jsonrpc_error(request_id, JSONRPC_APPROVAL_REQUIRED, message, data=data)
 
 
@@ -840,6 +849,14 @@ class McpPassthrough:
             ), None
         if outcome.approved:
             return None, outcome
+        if outcome.status == "pending":
+            return _approval_required_error(
+                request_id,
+                reason=outcome.reason,
+                message=message,
+                decision=runtime_decision,
+                approval_outcome=outcome,
+            ), None
         if outcome.status == "expired":
             return jsonrpc_error(
                 request_id,

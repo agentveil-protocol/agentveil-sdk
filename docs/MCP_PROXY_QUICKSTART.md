@@ -142,6 +142,12 @@ agentveil-mcp-proxy doctor --full
 agentveil-mcp-proxy register
 ```
 
+Machine-readable equivalent:
+
+```bash
+agentveil-mcp-proxy register --json
+```
+
 Registers the exact identity created by `init` (same DID, same key) with
 the backend at the `base_url` from your proxy config. This is the bridge
 between local identity creation and the next step
@@ -313,7 +319,10 @@ classifies the call, applies local policy, and:
   recorded into the local SQLite evidence store **when an evidence store is
   configured for the run** (this is the default for `agentveil-mcp-proxy run`).
 - **APPROVAL** policy decisions open the local browser approval UI bound to
-  the exact payload hash and matched policy rule.
+  the exact payload hash and matched policy rule. The MCP client receives an
+  immediate JSON-RPC `approval_required` error with `record_id`,
+  `record_status`, and `approval_url`; after approving, retry the tool call
+  from the MCP client.
 - **BLOCK** policy decisions return a JSON-RPC error and never reach the
   downstream server. Runtime Gate BLOCK decisions taken on the `ASK_BACKEND`
   path are also recorded into the local evidence store with the backend's

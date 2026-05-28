@@ -882,6 +882,35 @@ def test_register_success_prints_sanitized_ok_and_no_secret(tmp_path, monkeypatc
     assert "encryption_salt" not in output
 
 
+def test_register_success_json_is_machine_readable_and_sanitized(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    identity = _load(result.identity_path)
+    secret = _secret_material(identity)
+    _install_fake_register(monkeypatch)
+
+    out = io.StringIO()
+    code = register_proxy(
+        home=home,
+        passphrase=TEST_PASSPHRASE,
+        output_json=True,
+        out=out,
+    )
+
+    payload = json.loads(out.getvalue())
+    assert code == 0
+    assert payload == {
+        "agent_did": identity["did"],
+        "base_url": "https://agentveil.dev",
+        "errors": [],
+        "ok": True,
+        "registered": True,
+        "warnings": [],
+    }
+    assert secret not in out.getvalue()
+    assert "private_key" not in out.getvalue()
+
+
 def test_register_backend_failure_prints_sanitized_fail(tmp_path, monkeypatch):
     home = tmp_path / "avp-home"
     result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
@@ -952,6 +981,32 @@ def test_register_already_registered_returns_ok(tmp_path, monkeypatch):
         assert _mode(result.identity_path) == 0o600
 
 
+def test_register_already_registered_json_reports_warning(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    identity = _load(result.identity_path)
+    _install_fake_register(
+        monkeypatch,
+        raises=AVPValidationError("agent already exists", 409, "conflict"),
+    )
+
+    out = io.StringIO()
+    code = register_proxy(
+        home=home,
+        passphrase=TEST_PASSPHRASE,
+        output_json=True,
+        out=out,
+    )
+
+    payload = json.loads(out.getvalue())
+    assert code == 0
+    assert payload["ok"] is True
+    assert payload["registered"] is True
+    assert payload["agent_did"] == identity["did"]
+    assert payload["errors"] == []
+    assert payload["warnings"] == ["agent already registered"]
+
+
 def test_register_encrypted_identity_requires_passphrase(tmp_path, monkeypatch):
     home = tmp_path / "avp-home"
     init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
@@ -999,6 +1054,28 @@ def test_register_wired_through_main(tmp_path, monkeypatch, capsys):
 
     assert exit_code == 0
     assert "OK: agent " in out
+
+
+def test_register_json_wired_through_main(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "avp-home"
+    result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    identity = _load(result.identity_path)
+    _install_fake_register(monkeypatch)
+
+    exit_code = main([
+        "register",
+        "--home", str(home),
+        "--passphrase", TEST_PASSPHRASE,
+        "--json",
+    ])
+    out, err = capsys.readouterr()
+
+    payload = json.loads(out)
+    assert exit_code == 0
+    assert err == ""
+    assert payload["ok"] is True
+    assert payload["registered"] is True
+    assert payload["agent_did"] == identity["did"]
 
 
 def test_configure_downstream_writes_valid_config(tmp_path):

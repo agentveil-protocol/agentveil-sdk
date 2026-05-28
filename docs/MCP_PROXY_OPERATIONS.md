@@ -146,6 +146,12 @@ The proxy writes the pending approval record before it renders the approval page
 or sends notifications. Approval, denial, and timeout decisions are written back
 to local evidence before the proxy acts on them.
 
+For MCP stdio clients, approval-required calls fail fast instead of holding the
+tool call open until a human acts. The JSON-RPC error uses code `-32011` and
+includes `status: "approval_required"`, `record_id`, `record_status`, and
+`approval_url`. Open the URL to approve or deny; if approved, retry the tool
+call so the new request can use the recorded approval grant.
+
 ## Multi-IDE Deployment
 
 For developers running multiple LLM IDE clients, the canonical pattern is one

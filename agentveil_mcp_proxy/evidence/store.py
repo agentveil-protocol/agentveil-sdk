@@ -497,6 +497,54 @@ class ApprovalEvidenceStore:
             ).fetchone()
         return None if row is None else _row_to_record(row)
 
+    def find_active_exact_grant(
+        self,
+        *,
+        downstream_server: str,
+        tool_name: str,
+        policy_rule_id: str | None,
+        risk_class: str,
+        resource_hash: str | None,
+        payload_hash: str,
+        now_timestamp: int,
+    ) -> PendingApproval | None:
+        """Return one unconsumed exact approval grant for an identical retry."""
+
+        with self._lock:
+            # SQL is safe: _COLUMNS is static and filters are bound.
+            row = self._conn.execute(
+                f"SELECT {', '.join('parent.' + column for column in _COLUMNS)} "  # nosec B608
+                "FROM pending_approvals parent "
+                "WHERE parent.status = ? "
+                "AND parent.approval_scope = ? "
+                "AND parent.granted_by_request_id IS NULL "
+                "AND (parent.expires_at IS NULL OR parent.expires_at > ?) "
+                "AND parent.downstream_server = ? "
+                "AND parent.tool_name = ? "
+                "AND parent.risk_class = ? "
+                "AND parent.policy_rule_id IS ? "
+                "AND parent.resource_hash IS ? "
+                "AND parent.payload_hash = ? "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM pending_approvals child "
+                "WHERE child.granted_by_request_id = parent.request_id"
+                ") "
+                "ORDER BY parent.created_at, parent.request_id "
+                "LIMIT 1",
+                (
+                    ApprovalStatus.APPROVED.value,
+                    "exact",
+                    int(now_timestamp),
+                    downstream_server,
+                    tool_name,
+                    risk_class,
+                    policy_rule_id,
+                    resource_hash,
+                    payload_hash,
+                ),
+            ).fetchone()
+        return None if row is None else _row_to_record(row)
+
     def vacuum_terminal_records(self, *, before_timestamp: int) -> int:
         """Delete old terminal records and reconstruct the remaining chain."""
 
