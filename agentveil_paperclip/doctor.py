@@ -34,11 +34,10 @@ class DoctorReport:
     codex_mcp_config: CheckResult
 
 
-def _which(command: str) -> Path | None:
+def _which(command: str) -> str | None:
     """Resolve `command` on PATH without executing it."""
 
-    resolved = shutil.which(command)
-    return Path(resolved) if resolved else None
+    return shutil.which(command)
 
 
 def _claude_mcp_config_present(home: Path, cwd: Path) -> tuple[bool, str | None]:
