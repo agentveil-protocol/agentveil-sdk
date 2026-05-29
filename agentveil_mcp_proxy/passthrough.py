@@ -442,6 +442,7 @@ class McpPassthrough:
         self._inflight_methods: dict[str, str] = {}
         self._timed_out_response_ids: dict[str, float] = {}
         self._tool_input_schemas: dict[str, Mapping[str, Any]] = {}
+        self._schema_request_counter = 0
         self._windows_job: _WindowsJobObject | None = None
 
     @property
@@ -638,6 +639,17 @@ class McpPassthrough:
             if schema_error is not None:
                 return [schema_error] if has_id else []
             classification = self._classify_for_local_metadata(message)
+            if (
+                isinstance(classification, ClassifiedToolCall)
+                and classification.policy_evaluation.decision is PolicyDecision.APPROVAL
+            ):
+                schema_error = self._tool_schema_error_response(
+                    message,
+                    request_id,
+                    refresh_schema=True,
+                )
+                if schema_error is not None:
+                    return [schema_error] if has_id else []
             policy_error, approval_outcome = self._policy_error_response(classification, request_id)
             if policy_error is not None:
                 return [policy_error] if has_id else []
@@ -681,6 +693,8 @@ class McpPassthrough:
         self,
         message: Mapping[str, Any],
         request_id: Any,
+        *,
+        refresh_schema: bool = False,
     ) -> dict[str, Any] | None:
         if message.get("method") != "tools/call":
             return None
@@ -691,6 +705,12 @@ class McpPassthrough:
         if not isinstance(tool, str) or not tool:
             return None
         schema = self._tool_input_schemas.get(tool)
+        if schema is None and refresh_schema and self._can_refresh_tool_input_schemas():
+            try:
+                self._refresh_tool_input_schemas()
+            except PassthroughError:
+                pass
+            schema = self._tool_input_schemas.get(tool)
         if schema is None:
             return None
         arguments = params.get("arguments", {})
@@ -1010,6 +1030,28 @@ class McpPassthrough:
 
     def _record_security_event(self, event: Mapping[str, Any]) -> None:
         self._security_events.append(dict(event))
+
+    def _can_refresh_tool_input_schemas(self) -> bool:
+        proc = self.process
+        return proc is not None and proc.poll() is None and proc.stdin is not None
+
+    def _refresh_tool_input_schemas(self) -> None:
+        request_id = self._internal_request_id("tools/list")
+        response_key = self._register_inflight_id(request_id, method="tools/list")
+        try:
+            self._send_downstream({
+                "jsonrpc": JSONRPC_VERSION,
+                "id": request_id,
+                "method": "tools/list",
+                "params": {},
+            })
+            self._wait_downstream_response(request_id)
+        finally:
+            self._unregister_inflight_id(response_key)
+
+    def _internal_request_id(self, purpose: str) -> str:
+        self._schema_request_counter += 1
+        return f"__agentveil_internal_{purpose}_{self._schema_request_counter}"
 
     def _send_downstream(self, message: Mapping[str, Any]) -> None:
         proc = self._require_process()

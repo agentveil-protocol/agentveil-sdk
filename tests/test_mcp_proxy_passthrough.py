@@ -680,7 +680,7 @@ def test_run_returns_approval_required_without_waiting_or_forwarding(tmp_path, m
     assert response["error"]["data"]["record_id"]
     assert response["error"]["data"]["approval_url"].startswith("http://127.0.0.1:")
     assert "retry" in response["error"]["data"]["instructions"]
-    assert not log_path.exists()
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
 
 
 def test_invalid_write_file_args_do_not_create_approval(tmp_path, monkeypatch):
@@ -726,6 +726,48 @@ def test_invalid_write_file_args_do_not_create_approval(tmp_path, monkeypatch):
     assert response["error"]["data"]["reason"] == "schema_validation_error"
     assert response["error"]["data"]["error_code"] == "schema_validation_error"
     assert response["error"]["data"]["tool"] == "write_file"
+    assert response["error"]["data"]["missing_required"] == ["path"]
+    assert response["error"]["data"]["unexpected_arguments"] == ["file_path"]
+    assert "approval_url" not in response["error"]["data"]
+    assert "record_id" not in response["error"]["data"]
+    assert _pending_approval_count(home) == 0
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
+
+
+def test_invalid_write_file_args_fetch_schema_before_approval(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    _set_downstream(init.config_path, _filesystem_schema_downstream(tmp_path), log_path=log_path)
+    _set_approval_policy(init.config_path, server="fake-downstream", tool="write_file")
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("schema validation must happen before AVPAgent construction")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line({
+            "jsonrpc": "2.0",
+            "id": "call-1",
+            "method": "tools/call",
+            "params": {
+                "name": "write_file",
+                "arguments": {
+                    "file_path": "agentveil-onboarding-friction-pack/evidence/schema-fix-user-retest.md",
+                    "content": "schema fix retest",
+                },
+            },
+        })),
+        out=client_out,
+    ) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    assert response["error"]["code"] == JSONRPC_INVALID_PARAMS
+    assert response["error"]["data"]["status"] == "schema_validation_error"
     assert response["error"]["data"]["missing_required"] == ["path"]
     assert response["error"]["data"]["unexpected_arguments"] == ["file_path"]
     assert "approval_url" not in response["error"]["data"]
