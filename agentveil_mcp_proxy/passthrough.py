@@ -38,6 +38,10 @@ from typing import Any, Callable, Deque, Mapping, TextIO
 from agentveil_mcp_proxy.approval import ApprovalFlowError, ApprovalOutcome
 from agentveil_mcp_proxy.classification import ClassifiedToolCall, ToolCallClassifier
 from agentveil_mcp_proxy.policy import PolicyDecision, ProxyConfig
+from agentveil_mcp_proxy.tool_schema_validation import (
+    ToolSchemaCache,
+    validate_arguments,
+)
 from agentveil_mcp_proxy.runtime_gate import (
     DECISION_ALLOW,
     DECISION_BLOCK,
@@ -58,6 +62,10 @@ JSONRPC_APPROVAL_REQUIRED = -32011
 JSONRPC_RUNTIME_GATE_UNAVAILABLE = -32012
 JSONRPC_RUNTIME_GATE_UNTRUSTED = -32013
 JSONRPC_DOWNSTREAM_TIMEOUT = -32014
+# Standard JSON-RPC "Invalid params" — used for MCP tools/call arguments that
+# fail validation against the tool's advertised inputSchema, BEFORE policy,
+# approval, or downstream execution.
+JSONRPC_INVALID_PARAMS = -32602
 DEFAULT_DOWNSTREAM_RESPONSE_TIMEOUT_SECONDS = 30.0
 MAX_DOWNSTREAM_MESSAGE_BYTES = 1 * 1024 * 1024
 MAX_CLIENT_MESSAGE_BYTES = 1 * 1024 * 1024
@@ -429,6 +437,9 @@ class McpPassthrough:
         self._unsolicited_downstream_responses = 0
         self._security_events: Deque[Mapping[str, Any]] = deque(maxlen=1000)
         self._inflight_ids: set[str] = set()
+        # Cache of advertised tool inputSchemas from downstream tools/list,
+        # used for pre-approval argument validation. Thread-safe internally.
+        self._tool_schemas = ToolSchemaCache()
         self._timed_out_response_ids: dict[str, float] = {}
         self._windows_job: _WindowsJobObject | None = None
 
@@ -623,6 +634,12 @@ class McpPassthrough:
 
         try:
             classification = self._classify_for_local_metadata(message)
+            # Pre-approval, pre-downstream: reject tools/call whose arguments
+            # violate the tool's advertised inputSchema. Returns before any
+            # policy/approval evaluation or downstream send.
+            invalid_error = self._invalid_arguments_error(message, request_id)
+            if invalid_error is not None:
+                return [invalid_error] if has_id else []
             policy_error, approval_outcome = self._policy_error_response(classification, request_id)
             if policy_error is not None:
                 return [policy_error] if has_id else []
@@ -674,6 +691,70 @@ class McpPassthrough:
             except Exception:
                 self._increment_classifier_errors()
         return classification
+
+    def _invalid_arguments_error(
+        self,
+        message: Mapping[str, Any],
+        request_id: Any,
+    ) -> dict[str, Any] | None:
+        """Reject a tools/call whose arguments violate the advertised schema.
+
+        Returns a JSON-RPC ``Invalid params`` error when the tool has a cached
+        ``inputSchema`` and the arguments fail validation; otherwise None
+        (proceed to policy/approval). When NO schema has been advertised for
+        the tool, returns None and preserves existing behavior — schemas are
+        never invented, and this path does not fail closed on absence.
+        """
+        if message.get("method") != "tools/call":
+            return None
+        params = message.get("params")
+        if not isinstance(params, Mapping):
+            return None
+        tool = params.get("name")
+        if not isinstance(tool, str) or not tool:
+            return None
+        schema = self._tool_schemas.get(tool)
+        if schema is None:
+            return None
+        details = validate_arguments(schema, params.get("arguments"))
+        if not details:
+            return None
+        self._record_invalid_arguments_event(tool, details)
+        return jsonrpc_error(
+            request_id,
+            JSONRPC_INVALID_PARAMS,
+            "invalid tool arguments",
+            data={
+                "status": "invalid_tool_arguments",
+                "tool": tool,
+                "details": details,
+            },
+        )
+
+    def _record_invalid_arguments_event(self, tool: str, details: list[str]) -> None:
+        """Record a bounded, privacy-safe security event for a blocked call.
+
+        Stores only the tool name and offending argument NAMES — never raw
+        argument values — and does not create any pending approval.
+        """
+        missing = sorted(
+            d[len("missing required argument: "):]
+            for d in details
+            if d.startswith("missing required argument: ")
+        )
+        unknown = sorted(
+            d[len("unknown argument: "):]
+            for d in details
+            if d.startswith("unknown argument: ")
+        )
+        self._record_security_event({
+            "type": "invalid_tool_arguments",
+            "action": "blocked_pre_approval",
+            "reason": "invalid_tool_arguments",
+            "tool": tool,
+            "missing_arguments": missing,
+            "unknown_arguments": unknown,
+        })
 
     def _policy_error_response(
         self,
@@ -1047,6 +1128,10 @@ class McpPassthrough:
     def _handle_downstream_message(self, response: Any) -> None:
         if not isinstance(response, dict):
             raise PassthroughError("downstream sent non-object JSON")
+        # Capture advertised tool inputSchemas from tools/list-shaped results
+        # for pre-approval argument validation. Structural + side-effect free
+        # on non-tools/list responses.
+        self._tool_schemas.update_from_response(response)
         if self._is_server_notification(response):
             if self._notification_writer is not None:
                 self._notification_writer(response)

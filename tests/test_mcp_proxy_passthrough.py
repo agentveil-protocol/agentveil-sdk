@@ -1273,3 +1273,201 @@ def test_in_flight_responses_protected_from_cap_drop():
 
     assert protected_key in passthrough._responses
     assert sum(len(items) for items in passthrough._responses.values()) == MAX_PENDING_RESPONSES
+
+
+# ---------------------------------------------------------------------------
+# P1: pre-approval tool-argument validation against advertised inputSchema
+# ---------------------------------------------------------------------------
+
+import types  # noqa: E402
+
+from agentveil_mcp_proxy.passthrough import JSONRPC_INVALID_PARAMS  # noqa: E402
+from agentveil_mcp_proxy.classification import ToolCallClassifier  # noqa: E402
+from agentveil_mcp_proxy.tool_schema_validation import (  # noqa: E402
+    ToolSchemaCache,
+    validate_arguments,
+)
+
+_WRITE_FILE_SCHEMA = {
+    "type": "object",
+    "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+    "required": ["path", "content"],
+    "additionalProperties": False,
+}
+_RAW_SECRET = "RAW_CONTENT_THAT_MUST_NOT_LEAK"
+
+
+class _RecordingApprovalManager:
+    """Minimal approval manager stub recording request_approval calls."""
+
+    def __init__(self) -> None:
+        self.requests: list[dict] = []
+
+    def request_approval(self, classification, *, runtime_decision=None, reason=None):
+        self.requests.append({"reason": reason})
+        return types.SimpleNamespace(approved=False, status="denied", reason="denied")
+
+    def record_runtime_allow(self, *a, **k):  # pragma: no cover - not reached here
+        return types.SimpleNamespace(approved=True, status="allow", reason="allow")
+
+    def record_execution_result(self, *a, **k):  # pragma: no cover
+        pass
+
+    def record_execution_error(self, *a, **k):  # pragma: no cover
+        pass
+
+
+def _approval_config(server: str, tool: str) -> ProxyConfig:
+    return ProxyConfig.from_dict({
+        "proxy_config_schema_version": 1,
+        "avp": {
+            "base_url": "https://agentveil.dev",
+            "agent_name": "agentveil-mcp-proxy",
+            "trusted_signer_dids": ["did:key:z6MktrustedSigner"],
+        },
+        "mode": "protect",
+        "privacy": {
+            "action": "redacted", "resource": "hash",
+            "payload": "hash_only", "evidence_upload": False,
+        },
+        "fallback": {
+            "read": "allow", "write": "approval", "destructive": "block",
+            "production": "block", "financial": "block", "unknown": "approval",
+        },
+        "approval": {"approval_timeout_seconds": 300, "on_timeout": "deny"},
+        "policy": {
+            "id": "preapproval-test",
+            "policy_schema_version": 1,
+            "default_decision": "approval",
+            "default_risk_class": "write",
+            "rules": [{
+                "id": "write-approval", "source": "user", "decision": "approval",
+                "risk_class": "write", "match": {"server": server, "tool": tool},
+            }],
+        },
+        "downstream": {},
+    })
+
+
+def _preapproval_passthrough(*, server="fs", tool="write_file", seed_schema=True):
+    config = _approval_config(server, tool)
+    classifier = ToolCallClassifier(config, server_name=server)
+    fake = _RecordingApprovalManager()
+    pt = McpPassthrough(
+        DownstreamConfig(command="true", name=server),
+        classifier=classifier,
+        approval_manager=fake,
+    )
+    sends: list[dict] = []
+    pt._send_downstream = lambda message: sends.append(message)  # type: ignore[assignment]
+    if seed_schema:
+        pt._handle_downstream_message({
+            "jsonrpc": "2.0", "id": 1,
+            "result": {"tools": [{"name": tool, "inputSchema": _WRITE_FILE_SCHEMA}]},
+        })
+    return pt, fake, sends
+
+
+def _tools_call(tool: str, arguments: dict, request_id="c1") -> str:
+    return _json_line({
+        "jsonrpc": "2.0", "id": request_id,
+        "method": "tools/call",
+        "params": {"name": tool, "arguments": arguments},
+    })
+
+
+# --- pure validator unit tests --------------------------------------------
+
+def test_validate_arguments_missing_and_unknown_deterministic_order():
+    details = validate_arguments(
+        _WRITE_FILE_SCHEMA,
+        {"file_path": "/tmp/x", "content": _RAW_SECRET},
+    )
+    assert details == [
+        "missing required argument: path",
+        "unknown argument: file_path",
+    ]
+    assert all(_RAW_SECRET not in d for d in details)
+
+
+def test_validate_arguments_valid_returns_empty():
+    assert validate_arguments(_WRITE_FILE_SCHEMA, {"path": "/tmp/x", "content": "ok"}) == []
+
+
+def test_validate_arguments_type_mismatch():
+    details = validate_arguments(_WRITE_FILE_SCHEMA, {"path": 123, "content": "ok"})
+    assert details == ["argument path must be of type string"]
+
+
+def test_validate_arguments_non_object_arguments():
+    assert validate_arguments(_WRITE_FILE_SCHEMA, ["not", "an", "object"]) == [
+        "arguments must be of type object",
+    ]
+
+
+def test_schema_cache_populated_from_tools_list_response():
+    cache = ToolSchemaCache()
+    assert cache.get("write_file") is None
+    cached = cache.update_from_response({
+        "jsonrpc": "2.0", "id": 7,
+        "result": {"tools": [{"name": "write_file", "inputSchema": _WRITE_FILE_SCHEMA}]},
+    })
+    assert cached == 1
+    assert cache.get("write_file") == _WRITE_FILE_SCHEMA
+    assert cache.update_from_response({"jsonrpc": "2.0", "id": 8, "result": {}}) == 0
+
+
+# --- behavioral tests through handle_client_line ---------------------------
+
+def test_invalid_tool_arguments_blocked_before_approval_and_downstream():
+    pt, fake, sends = _preapproval_passthrough()
+    responses = pt.handle_client_line(
+        _tools_call("write_file", {"file_path": "/tmp/x", "content": _RAW_SECRET})
+    )
+    assert len(responses) == 1
+    err = responses[0]["error"]
+    assert err["code"] == JSONRPC_INVALID_PARAMS
+    data = err["data"]
+    assert data["status"] == "invalid_tool_arguments"
+    assert data["tool"] == "write_file"
+    assert "missing required argument: path" in data["details"]
+    assert "unknown argument: file_path" in data["details"]
+    assert data["status"] != "approval_required"
+    assert fake.requests == []
+    assert sends == []
+    assert _RAW_SECRET not in json.dumps(responses)
+
+
+def test_invalid_tool_arguments_records_names_not_values_in_evidence():
+    pt, _fake, _sends = _preapproval_passthrough()
+    pt.handle_client_line(
+        _tools_call("write_file", {"file_path": "/tmp/x", "content": _RAW_SECRET})
+    )
+    events = [e for e in pt.security_events if e.get("type") == "invalid_tool_arguments"]
+    assert len(events) == 1
+    event = events[0]
+    assert event["tool"] == "write_file"
+    assert event["reason"] == "invalid_tool_arguments"
+    assert event["unknown_arguments"] == ["file_path"]
+    assert event["missing_arguments"] == ["path"]
+    assert _RAW_SECRET not in json.dumps(event)
+
+
+def test_valid_tool_arguments_proceed_to_existing_approval_flow():
+    pt, fake, sends = _preapproval_passthrough()
+    responses = pt.handle_client_line(
+        _tools_call("write_file", {"path": "/tmp/x", "content": "ok"})
+    )
+    assert responses and responses[0].get("error", {}).get("code") != JSONRPC_INVALID_PARAMS
+    assert len(fake.requests) == 1
+    assert sends == []
+
+
+def test_no_cached_schema_preserves_existing_behavior():
+    pt, fake, sends = _preapproval_passthrough(seed_schema=False)
+    responses = pt.handle_client_line(
+        _tools_call("write_file", {"file_path": "/tmp/x", "content": "ok"})
+    )
+    assert responses and responses[0].get("error", {}).get("code") != JSONRPC_INVALID_PARAMS
+    assert len(fake.requests) == 1
+    assert sends == []
