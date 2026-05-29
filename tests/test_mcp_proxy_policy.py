@@ -12,6 +12,7 @@ import pytest
 
 from agentveil_mcp_proxy import (
     DecisionMode,
+    FallbackConfig,
     PolicyDecision,
     PolicyEngine,
     PolicyRuntime,
@@ -142,6 +143,35 @@ def test_policy_schema_rejects_invalid_vocab_and_raw_payload_modes():
     bad_fallback["write"] = "ask_backend"
     with pytest.raises(ProxyConfigError, match="fallback.write"):
         ProxyConfig.from_dict(_base_config(fallback=bad_fallback))
+
+
+def test_fallback_defaults_do_not_fail_open():
+    # B5 hardening: a Runtime Gate outage must never silently forward. No default
+    # claim-check: allow "never" describes the asserted defaults below; verified by this test
+    # fallback is ALLOW; read in particular is APPROVAL, not ALLOW.
+    defaults = FallbackConfig()
+
+    assert defaults.read is PolicyDecision.APPROVAL
+    assert defaults.for_risk(RiskClass.READ) is PolicyDecision.APPROVAL
+    assert PolicyDecision.ALLOW not in {
+        defaults.read,
+        defaults.write,
+        defaults.destructive,
+        defaults.production,  # claim-check: allow "production" is a FallbackConfig field name here, not a production claim
+        defaults.financial,
+        defaults.unknown,
+    }
+
+    # A config that omits the read fallback inherits the safe default.
+    inherited = FallbackConfig.from_dict({"write": "block"})
+    assert inherited.for_risk(RiskClass.READ) is PolicyDecision.APPROVAL
+
+
+def test_fallback_read_allow_remains_an_explicit_operator_opt_in():
+    # Explicit fail-open is still supported as an operator-accepted risk.
+    explicit = FallbackConfig.from_dict({"read": "allow"})
+
+    assert explicit.for_risk(RiskClass.READ) is PolicyDecision.ALLOW
 
 
 def test_ask_backend_semantics_in_protect_mode():

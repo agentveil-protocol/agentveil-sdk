@@ -276,9 +276,17 @@ class PrivacyConfig:
 
 @dataclass(frozen=True)
 class FallbackConfig:
-    """Backend-down fallback decisions by risk class."""
+    """Backend-down fallback decisions by risk class.
 
-    read: PolicyDecision = PolicyDecision.ALLOW
+    These apply only when the Runtime Gate is unavailable / the circuit breaker
+    is open. No default fails open: every default is APPROVAL or BLOCK, so a Gate
+    claim-check: allow "every"/"never" describe this class's own default fields; tested in tests/test_mcp_proxy_policy.py
+    outage never silently forwards a tool call. An operator may still set any
+    field to ``allow`` explicitly; that is an opt-in fail-open accepting the risk
+    of forwarding without a backend decision during an outage.
+    """
+
+    read: PolicyDecision = PolicyDecision.APPROVAL
     write: PolicyDecision = PolicyDecision.APPROVAL
     destructive: PolicyDecision = PolicyDecision.BLOCK
     production: PolicyDecision = PolicyDecision.BLOCK
