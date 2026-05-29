@@ -1338,7 +1338,7 @@ def test_approve_resumes_downstream_call_and_records_evidence(tmp_path):
         assert responses[0]["result"]["content"][0]["text"] == "approved"
         record = store.get_pending(prompt.request_id)
         assert record.status == ApprovalStatus.EXECUTED.value
-        assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/call"]
+        assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list", "tools/call"]
     finally:
         passthrough.stop()
         server.stop()
@@ -1378,7 +1378,7 @@ def test_deny_blocks_downstream_call_and_records_evidence(tmp_path):
         assert responses[0]["error"]["data"]["reason"] == "user_denied"
         record = store.get_pending(prompt.request_id)
         assert record.status == ApprovalStatus.DENIED.value
-        assert not log_path.exists()
+        assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
     finally:
         passthrough.stop()
         server.stop()
