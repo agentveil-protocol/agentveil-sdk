@@ -106,10 +106,11 @@ The protected secrets are the correct trust anchors and private keys:
 - The local control grant scoped to that proxy identity.
 - The pinned AVP backend signer DID set used for DecisionReceipt verification.
 
-If an exported bundle includes an attacker-controlled signer DID, offline
-verification warns when no external signer pin is supplied. Operators can pass
-their own `--trusted-signer-did` values and avoid trusting a bundle's embedded
-signer list.
+If an exported bundle includes an attacker-controlled signer DID, strict offline
+verification rejects it: `verify` trusts only the operator-supplied
+`--trusted-signer-did` set and never the bundle's embedded signer list, so a
+receipt-bearing bundle fails closed when no external pin is supplied instead of
+falling back to a warning.
 
 ## 5. Separation Of Privilege
 

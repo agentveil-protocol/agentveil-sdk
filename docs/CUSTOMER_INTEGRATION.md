@@ -311,7 +311,7 @@ Current receipt schema versions:
 
 | Receipt | Current schema | Signer |
 | --- | --- | --- |
-| DecisionReceipt | `decision_receipt/2` | AVP backend decision/execution signer |
+| DecisionReceipt | `decision_receipt/3` | AVP backend decision/execution signer |
 | HumanApprovalReceipt | `human_approval_receipt/2` | AVP backend human approval signer |
 | ExecutionReceipt | `execution_receipt/2` | AVP backend decision/execution signer |
 | DelegationReceipt | delegation context v1 | Principal DID |
@@ -319,3 +319,11 @@ Current receipt schema versions:
 Legacy receipt versions can still be signature-verified. Semantic verification
 is version-aware and does not require fields that did not exist in older signed
 schemas.
+
+The Runtime Gate DecisionReceipt is now `decision_receipt/3`, a W3C Data
+Integrity `DataIntegrityProof` / `eddsa-jcs-2022` artifact. Verify a `/3`
+receipt with `verify_eddsa_jcs_2022(...)`, or — when embedded in an evidence
+bundle — through the strict bundle verifier with an externally pinned signer
+DID. The raw `verify_signed_jcs(...)` and `verify_proof_packet(...)` paths above
+cover the legacy `/1`,`/2` raw-JCS decision-receipt schema and do not accept
+`/3`.
