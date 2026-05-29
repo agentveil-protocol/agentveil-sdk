@@ -11,6 +11,7 @@ import jcs
 import pytest
 from nacl.signing import SigningKey
 
+from agentveil.data_integrity import DATA_INTEGRITY_CONTEXT, sign_eddsa_jcs_2022
 from agentveil.delegation import _public_key_to_did, issue_delegation
 from agentveil.proof import (
     ProofVerificationError,
@@ -414,3 +415,64 @@ def test_legacy_receipt_versions_verify_signature_without_v2_field_requirements(
 
     assert result["decision_receipt"]["schema_version"] == "decision_receipt/1"
     assert result["execution_receipt"]["schema_version"] == "execution_receipt/1"
+
+
+# --- decision_receipt/3 (W3C Data Integrity eddsa-jcs-2022) packet routing ---
+# claim-check: allow "W3C"/eddsa-jcs-2022 are literal cryptosuite identifiers in a test comment (no external-conformance claim)
+# The Runtime Gate emits /3 and build_proof_packet embeds it verbatim, so the
+# packet verifier must route /3 through the first-party verify_eddsa_jcs_2022
+# while /1,/2 stay on the legacy raw-JCS path. The cross-receipt digest is the
+# SHA256 of the full receipt text for both paths (see verify_signed_jcs and
+# runtime_gate._verify_decision_receipt).
+
+
+def _decision_body_v3(delegation: dict) -> dict:
+    return {
+        "@context": [DATA_INTEGRITY_CONTEXT],
+        **_base_decision_body(delegation),
+        "schema_version": "decision_receipt/3",
+    }
+
+
+def _v3_packet(*, decision_seed: bytes = BACKEND_SEED) -> dict:
+    delegation = _delegation_receipt()
+    decision_jcs = sign_eddsa_jcs_2022(
+        _decision_body_v3(delegation), decision_seed, created="2026-04-30T00:00:00Z"
+    )
+    execution_jcs = _sign_jcs(_execution_body(decision_jcs))
+    return {
+        "agent_did": AGENT_DID,
+        "base_url": "https://agentveil.dev",
+        "sdk_version": "0.7.4",
+        "generated_at": "2026-04-30T00:00:00Z",
+        "delegation_receipt": delegation,
+        "outcome_status": "executed",
+        "audit_id": "urn:uuid:11111111-1111-4111-8111-111111111111",
+        "decision_receipt_jcs": decision_jcs,
+        "execution_receipt_jcs": execution_jcs,
+        "approval_receipt_jcs": None,
+    }
+
+
+def test_verify_proof_packet_decision_receipt_v3_passes():
+    result = verify_proof_packet(_v3_packet(), trusted_backend_signer_dids=[BACKEND_DID])
+
+    assert result["valid"] is True
+    assert result["decision_receipt"]["schema_version"] == "decision_receipt/3"
+    assert result["decision_receipt"]["signer_did"] == BACKEND_DID
+    assert result["execution_receipt"]["body"]["status"] == "SUCCESS"
+
+
+def test_verify_proof_packet_decision_receipt_v3_untrusted_signer_fails():
+    with pytest.raises(ProofVerificationError, match="DecisionReceipt signer"):
+        verify_proof_packet(_v3_packet(), trusted_backend_signer_dids=[OTHER_BACKEND_DID])
+
+
+def test_verify_proof_packet_decision_receipt_v3_tamper_fails():
+    packet = _v3_packet()
+    secured = json.loads(packet["decision_receipt_jcs"])
+    secured["reason"] = "tampered_reason"
+    packet["decision_receipt_jcs"] = jcs.canonicalize(secured).decode("utf-8")
+
+    with pytest.raises(ProofVerificationError, match="signature"):
+        verify_proof_packet(packet, trusted_backend_signer_dids=[BACKEND_DID])
