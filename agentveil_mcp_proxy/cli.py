@@ -523,7 +523,7 @@ def _build_config_payload(
             "evidence_upload": False,
         },
         "fallback": {
-            "read": "allow",
+            "read": "approval",
             "write": "approval",
             "destructive": "block",
             "production": "block",
