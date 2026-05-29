@@ -65,6 +65,20 @@ MAX_CLIENT_MESSAGE_BYTES = 1 * 1024 * 1024
 MAX_PENDING_RESPONSES = 1000
 DEFAULT_TIMED_OUT_ID_RETENTION_SECONDS = 600.0
 _ENV_PASSTHROUGH_BLOCKED_PREFIXES = ("AVP_",)
+_FILE_PATH_TOOLS = frozenset({"read_file", "write_file"})
+_SECRET_PATH_FILENAMES = frozenset({
+    ".env",
+    "id_rsa",
+    "id_ed25519",
+    "credentials",
+    "credential",
+    "secret",
+    "secrets",
+    "token",
+    "tokens",
+})
+_SECRET_PATH_PREFIXES = (".env.", "credentials.", "credential.", "secret.", "secrets.", "token.", "tokens.")
+_SECRET_PATH_SUFFIXES = (".env", ".pem", ".key")
 SAFE_ENV_KEYS = (
     "PATH",
     "HOME",
@@ -398,6 +412,15 @@ def _approval_required_error(
     return jsonrpc_error(request_id, JSONRPC_APPROVAL_REQUIRED, message, data=data)
 
 
+def _policy_denied_error(request_id: Any, *, reason: str) -> dict[str, Any]:
+    return jsonrpc_error(
+        request_id,
+        JSONRPC_POLICY_BLOCKED,
+        "denied by MCP proxy policy",
+        data={"status": "policy_denied", "reason": reason},
+    )
+
+
 class McpPassthrough:
     """Synchronous stdio JSON-RPC pass-through to one downstream MCP server."""
 
@@ -650,6 +673,9 @@ class McpPassthrough:
                 )
                 if schema_error is not None:
                     return [schema_error] if has_id else []
+            path_error = self._unsafe_file_path_error_response(message, request_id)
+            if path_error is not None:
+                return [path_error] if has_id else []
             policy_error, approval_outcome = self._policy_error_response(classification, request_id)
             if policy_error is not None:
                 return [policy_error] if has_id else []
@@ -733,6 +759,47 @@ class McpPassthrough:
             f"Invalid arguments for {tool}",
             data=data,
         )
+
+    def _unsafe_file_path_error_response(
+        self,
+        message: Mapping[str, Any],
+        request_id: Any,
+    ) -> dict[str, Any] | None:
+        if message.get("method") != "tools/call":
+            return None
+        params = message.get("params")
+        if not isinstance(params, Mapping):
+            return None
+        tool = params.get("name")
+        if not isinstance(tool, str) or not tool:
+            return None
+        if tool.rsplit(".", 1)[-1] not in _FILE_PATH_TOOLS:
+            return None
+        arguments = params.get("arguments")
+        if not isinstance(arguments, Mapping):
+            return None
+        path = arguments.get("path")
+        if not isinstance(path, str) or not path:
+            return None
+        reason = self._unsafe_file_path_reason(path)
+        if reason is None:
+            return None
+        return _policy_denied_error(request_id, reason=reason)
+
+    def _unsafe_file_path_reason(self, path: str) -> str | None:
+        normalized = path.replace("\\", "/")
+        segments = [segment for segment in normalized.split("/") if segment]
+        if any(segment == ".." for segment in segments):
+            return "path_outside_workspace"
+        lowered_segments = [segment.lower() for segment in segments]
+        if "secrets" in lowered_segments:
+            return "secret_path_blocked"
+        basename = lowered_segments[-1] if lowered_segments else path.lower()
+        if basename in _SECRET_PATH_FILENAMES:
+            return "secret_path_blocked"
+        if basename.startswith(_SECRET_PATH_PREFIXES) or basename.endswith(_SECRET_PATH_SUFFIXES):
+            return "secret_path_blocked"
+        return None
 
     def _validate_tool_arguments(
         self,
