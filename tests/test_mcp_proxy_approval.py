@@ -1209,16 +1209,22 @@ import os
 import sys
 
 log_path = os.environ["DOWNSTREAM_LOG"]
+TOOLS = [{"name": "create_issue", "description": "Create an issue", "inputSchema": {"type": "object"}}]
 for line in sys.stdin:
     msg = json.loads(line)
+    method = msg.get("method", "")
     with open(log_path, "a", encoding="utf-8") as fh:
-        fh.write(msg.get("method", "") + "\\n")
+        fh.write(method + "\\n")
     if "id" not in msg:
         continue
+    if method == "tools/list":
+        result = {"tools": TOOLS}
+    else:
+        result = {"content": [{"type": "text", "text": "approved"}]}
     print(json.dumps({
         "jsonrpc": "2.0",
         "id": msg["id"],
-        "result": {"content": [{"type": "text", "text": "approved"}]},
+        "result": result,
     }), flush=True)
 """.lstrip(),
         encoding="utf-8",
@@ -1271,7 +1277,9 @@ def test_approve_resumes_downstream_call_and_records_evidence(tmp_path):
         assert responses[0]["result"]["content"][0]["text"] == "approved"
         record = store.get_pending(prompt.request_id)
         assert record.status == ApprovalStatus.EXECUTED.value
-        assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/call"]
+        # The proxy performs an internal tools/list schema probe (cold cache)
+        # before approval, then forwards the approved tools/call.
+        assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list", "tools/call"]
     finally:
         passthrough.stop()
         server.stop()
@@ -1311,7 +1319,9 @@ def test_deny_blocks_downstream_call_and_records_evidence(tmp_path):
         assert responses[0]["error"]["data"]["reason"] == "user_denied"
         record = store.get_pending(prompt.request_id)
         assert record.status == ApprovalStatus.DENIED.value
-        assert not log_path.exists()
+        # The internal tools/list schema probe reaches the downstream, but the
+        # denied tools/call is not forwarded.
+        assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
     finally:
         passthrough.stop()
         server.stop()
