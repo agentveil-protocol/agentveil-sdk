@@ -211,9 +211,13 @@ def verify_egress_receipt(
 ) -> dict[str, Any]:
     """Verify an agent-signed EgressReceipt offline.
 
-    The receipt is signed by the agent's identity (not the AVP backend).
-    Callers should pin the agent DID(s) they trust via
-    ``trusted_signer_dids``.
+    The receipt is signed by the agent's identity (not the AVP backend). This
+    is a proof/security API and fails closed: the caller MUST pin the agent
+    DID(s) they trust via ``trusted_signer_dids`` and the receipt signer DID
+    must be in that set. With no trust configuration the verifier raises
+    ``EgressReceiptVerificationError("trusted_signer_dids is required")`` rather
+    than accepting any valid did:key signer. An empty trust set also fails
+    closed.
     """
 
     if not isinstance(receipt_jcs, str) or not receipt_jcs:
@@ -243,7 +247,11 @@ def verify_egress_receipt(
         raise EgressReceiptVerificationError("receipt proof value invalid")
 
     signer_did = verification_method.split("#", 1)[0]
-    if trusted_signer_dids is not None and signer_did not in set(trusted_signer_dids):
+    if trusted_signer_dids is None:
+        # Boundary: proof verification requires an explicit trust set. Covered
+        # by test_no_trusted_signer_dids_fails_closed.
+        raise EgressReceiptVerificationError("trusted_signer_dids is required")
+    if signer_did not in set(trusted_signer_dids):
         raise EgressReceiptVerificationError("receipt signer is not trusted")
 
     public_key = _public_key_from_did(signer_did)
