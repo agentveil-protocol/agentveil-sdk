@@ -25,6 +25,8 @@ from agentveil_mcp_proxy.runtime_gate import (
     RuntimeGateUnavailableError,
 )
 
+from tests.mcp_fake_downstream import seed_tool_schemas, tool_entry
+
 
 def _json_line(message: dict[str, Any]) -> str:
     return json.dumps(message, separators=(",", ":")) + "\n"
@@ -174,6 +176,11 @@ class _CoordinatedApprovalPassthrough(McpPassthrough):
 def test_concurrent_handle_client_line_does_not_misattribute_approval_outcome() -> None:
     manager = _RecordingApprovalManager()
     passthrough = _CoordinatedApprovalPassthrough(manager)
+    # Subject is concurrent approval attribution, not schema discovery: model
+    # the steady state where tool schemas are already known so the internal
+    # tools/list probe is a cache hit and does not perturb the coordinated
+    # downstream-response sequencing this test asserts.
+    seed_tool_schemas(passthrough, [tool_entry("tool-a"), tool_entry("tool-b")])
     responses: dict[str, list[dict[str, Any]]] = {}
     errors: list[BaseException] = []
 
@@ -303,6 +310,10 @@ def test_concurrent_counter_increments_record_all_runtime_gate_errors(tmp_path: 
         classifier=_classifier(_config(default_decision="ask_backend")),
         runtime_gate_factory=lambda: gate,
     )
+    # Subject is runtime-gate error counting, not schema discovery: seed the
+    # schema cache so the idle downstream is not probed and each call reaches
+    # the runtime gate.
+    seed_tool_schemas(passthrough, [tool_entry("write_file")])
     try:
         passthrough.start()
         _run_threads(100, lambda index: passthrough.handle_client_line(_tool_call(f"call-{index}")))
@@ -316,6 +327,10 @@ def test_concurrent_counter_increments_record_all_downstream_timeouts() -> None:
     passthrough = _TimeoutPassthrough(
         DownstreamConfig(command=sys.executable, args=(), name="timeouts")
     )
+    # Subject is downstream-timeout counting on the forwarded tools/call, not
+    # schema discovery: seed the cache so the timeout is attributed to the
+    # tools/call wait rather than the internal schema probe.
+    seed_tool_schemas(passthrough, [tool_entry("write_file")])
 
     _run_threads(100, lambda index: passthrough.handle_client_line(_tool_call(f"call-{index}")))
 

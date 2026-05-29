@@ -33,6 +33,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from typing import Any, Callable, Deque, Mapping, TextIO
 
 from agentveil_mcp_proxy.approval import ApprovalFlowError, ApprovalOutcome
@@ -699,11 +700,19 @@ class McpPassthrough:
     ) -> dict[str, Any] | None:
         """Reject a tools/call whose arguments violate the advertised schema.
 
-        Returns a JSON-RPC ``Invalid params`` error when the tool has a cached
-        ``inputSchema`` and the arguments fail validation; otherwise None
-        (proceed to policy/approval). When NO schema has been advertised for
-        the tool, returns None and preserves existing behavior — schemas are
-        never invented, and this path does not fail closed on absence.
+        Resolves the tool's ``inputSchema`` from cache, performing one
+        on-demand ``tools/list`` refresh when the cache is cold so validation
+        also covers calls that arrive before any client-driven ``tools/list``.
+
+        Returns:
+          - ``Invalid params`` (``invalid_tool_arguments``) when arguments fail
+            validation;
+          - ``Invalid params`` (``tool_schema_unavailable``) when the schema
+            cannot be discovered after a refresh;
+          - ``None`` (proceed to policy/approval) when arguments are valid.
+
+        Schemas are not synthesized. Both error paths return before policy,
+        approval, or downstream forwarding of the original tool call.
         """
         if message.get("method") != "tools/call":
             return None
@@ -713,9 +722,17 @@ class McpPassthrough:
         tool = params.get("name")
         if not isinstance(tool, str) or not tool:
             return None
-        schema = self._tool_schemas.get(tool)
+        schema = self._ensure_tool_schema(tool)
         if schema is None:
-            return None
+            # An undiscoverable tool schema must not reach approval or
+            # downstream execution.
+            self._record_schema_unavailable_event(tool)
+            return jsonrpc_error(
+                request_id,
+                JSONRPC_INVALID_PARAMS,
+                "tool schema unavailable",
+                data={"status": "tool_schema_unavailable", "tool": tool},
+            )
         details = validate_arguments(schema, params.get("arguments"))
         if not details:
             return None
@@ -732,10 +749,10 @@ class McpPassthrough:
         )
 
     def _record_invalid_arguments_event(self, tool: str, details: list[str]) -> None:
-        """Record a bounded, privacy-safe security event for a blocked call.
+        """Record a bounded security event for a refused call.
 
-        Stores only the tool name and offending argument NAMES — never raw
-        argument values — and does not create any pending approval.
+        Stores the tool name and offending argument names without raw argument
+        values, and does not create any pending approval.
         """
         missing = sorted(
             d[len("missing required argument: "):]
@@ -755,6 +772,55 @@ class McpPassthrough:
             "missing_arguments": missing,
             "unknown_arguments": unknown,
         })
+
+    def _record_schema_unavailable_event(self, tool: str) -> None:
+        """Record a bounded security event for a schema-unavailable miss."""
+        self._record_security_event({
+            "type": "tool_schema_unavailable",
+            "action": "blocked_pre_approval",
+            "reason": "tool_schema_unavailable",
+            "tool": tool,
+        })
+
+    def _ensure_tool_schema(self, tool: str) -> dict[str, Any] | None:
+        """Return the cached inputSchema for ``tool``, performing one on-demand
+        ``tools/list`` refresh if the cache is cold. Returns None when the tool
+        schema is still not advertised after the refresh.
+        """
+        schema = self._tool_schemas.get(tool)
+        if schema is not None:
+            return schema
+        response = self._request_downstream_tools_list()
+        if response is not None:
+            self._tool_schemas.update_from_response(response)
+        return self._tool_schemas.get(tool)
+
+    def _request_downstream_tools_list(self) -> dict[str, Any] | None:
+        """Perform one internal ``tools/list`` round-trip to the downstream and
+        return the raw response, or None on unavailability/timeout.
+
+        Uses an internal request-id namespace (``uuid4``) so the probe does not
+        collide with or leak to client requests; the response is consumed
+        internally and is not written to the client. Inflight registration is
+        cleaned up in the ``finally`` block. This is a deliberate test seam:
+        tests override it to simulate downstream schema discovery without a live
+        subprocess.
+        """
+        probe_id = f"avp-internal-schema-probe:{uuid.uuid4()}"
+        request = {
+            "jsonrpc": JSONRPC_VERSION,
+            "id": probe_id,
+            "method": "tools/list",
+            "params": {},
+        }
+        response_key = self._register_inflight_id(probe_id)
+        try:
+            self._send_downstream(request)
+            return self._wait_downstream_response(probe_id)
+        except (PassthroughError, DownstreamTimeoutError):
+            return None
+        finally:
+            self._unregister_inflight_id(response_key)
 
     def _policy_error_response(
         self,

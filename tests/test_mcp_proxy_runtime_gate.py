@@ -43,6 +43,8 @@ from agentveil_mcp_proxy.runtime_gate import (
 )
 import agentveil_mcp_proxy.runtime_gate as runtime_gate_module
 
+from tests.mcp_fake_downstream import tool_entry, write_downstream
+
 
 BACKEND_SEED = bytes.fromhex("11" * 32)
 OTHER_BACKEND_SEED = bytes.fromhex("22" * 32)
@@ -265,29 +267,17 @@ class StaticGate:
 
 
 def _echo_downstream(tmp_path: Path, log_path: Path) -> Path:
-    script = tmp_path / "runtime_gate_echo.py"
-    script.write_text(
-        """
-import json
-import os
-import sys
-
-log_path = os.environ["DOWNSTREAM_LOG"]
-for line in sys.stdin:
-    msg = json.loads(line)
-    with open(log_path, "a", encoding="utf-8") as fh:
-        fh.write(msg.get("method", "") + "\\n")
-    if "id" not in msg:
-        continue
-    print(json.dumps({
-        "jsonrpc": "2.0",
-        "id": msg["id"],
-        "result": {"content": [{"type": "text", "text": "forwarded"}]},
-    }), flush=True)
-""".lstrip(),
-        encoding="utf-8",
+    # Schema-aware MCP downstream: answers tools/list with a permissive schema
+    # for create_issue so the proxy's pre-approval validation resolves it before
+    # runtime-gate evaluation, then echoes "forwarded" for tools/call. Each
+    # received method is logged to $DOWNSTREAM_LOG, so a forwarded call logs
+    # ["tools/list", "tools/call"] and a refused one logs ["tools/list"] only.
+    return write_downstream(
+        tmp_path,
+        filename="runtime_gate_echo.py",
+        tools=[tool_entry("create_issue")],
+        call_result_text="forwarded",
     )
-    return script
 
 
 def _passthrough(
@@ -577,7 +567,8 @@ def test_verified_allow_forwards_downstream(tmp_path):
         "id": "call-1",
         "result": {"content": [{"type": "text", "text": "forwarded"}]},
     }]
-    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/call"]
+    # tools/list schema probe (cold cache) precedes the forwarded tools/call.
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list", "tools/call"]
     assert len(gate.calls) == 1
 
 
@@ -616,7 +607,8 @@ def test_verified_allow_records_runtime_receipt_and_downstream_result(tmp_path):
         "id": "call-1",
         "result": {"content": [{"type": "text", "text": "forwarded"}]},
     }]
-    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/call"]
+    # tools/list schema probe (cold cache) precedes the forwarded tools/call.
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list", "tools/call"]
     assert len(records) == 1
     record = records[0]
     assert record.status == ApprovalStatus.EXECUTED.value
@@ -687,7 +679,8 @@ def test_block_does_not_forward_and_returns_sanitized_error(tmp_path):
     assert response["error"]["data"]["status"] == "blocked"
     assert response["error"]["data"]["audit_id"] == AUDIT_ID
     assert SECRET not in client_out.getvalue()
-    assert not log_path.exists()
+    # Schema probe (tools/list) reaches downstream; the refused tools/call does not.
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
 
 
 def test_verified_block_records_runtime_receipt_without_forwarding(tmp_path):
@@ -724,7 +717,8 @@ def test_verified_block_records_runtime_receipt_without_forwarding(tmp_path):
     assert response["error"]["code"] == JSONRPC_POLICY_BLOCKED
     assert response["error"]["data"]["reason"] == "runtime_gate_block"
     assert SECRET not in client_out.getvalue()
-    assert not log_path.exists()
+    # Schema probe (tools/list) reaches downstream; the refused tools/call does not.
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
     assert len(records) == 1
     record = records[0]
     assert record.status == ApprovalStatus.BLOCKED.value
@@ -761,7 +755,8 @@ def test_waiting_does_not_forward_and_returns_approval_required_shape(tmp_path):
         "approval_id": "urn:uuid:approval",
     }
     assert SECRET not in client_out.getvalue()
-    assert not log_path.exists()
+    # Schema probe (tools/list) reaches downstream; the waiting tools/call does not.
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
 
 
 def test_unverified_receipt_is_rejected_without_downstream_execution(tmp_path):
@@ -785,7 +780,8 @@ def test_unverified_receipt_is_rejected_without_downstream_execution(tmp_path):
         "reason": "untrusted_runtime_decision",
     }
     assert SECRET not in client_out.getvalue()
-    assert not log_path.exists()
+    # Schema probe (tools/list) reaches downstream; the rejected tools/call does not.
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
 
 
 @pytest.mark.parametrize(
@@ -828,4 +824,5 @@ def test_backend_timeout_error_is_sanitized_and_bounded(tmp_path):
         "reason": "runtime_gate_unavailable",
     }
     assert SECRET not in client_out.getvalue()
-    assert not log_path.exists()
+    # Schema probe (tools/list) reaches downstream; the tools/call does not.
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
