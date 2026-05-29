@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -22,6 +23,7 @@ from agentveil_mcp_proxy.policy import ProxyConfig
 from agentveil_mcp_proxy.passthrough import (
     JSONRPC_APPROVAL_REQUIRED,
     JSONRPC_DOWNSTREAM_TIMEOUT,
+    JSONRPC_INVALID_PARAMS,
     JSONRPC_INVALID_REQUEST,
     MAX_PENDING_RESPONSES,
     DownstreamConfig,
@@ -38,6 +40,15 @@ def _json_line(message: dict) -> str:
 
 def _responses(text: str) -> list[dict]:
     return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+def _pending_approval_count(home: Path) -> int:
+    evidence_path = home / "mcp-proxy" / "evidence.sqlite"
+    if not evidence_path.exists():
+        return 0
+    with sqlite3.connect(evidence_path) as conn:
+        row = conn.execute("SELECT COUNT(*) FROM pending_approvals").fetchone()
+    return int(row[0])
 
 
 def _padded_json_line(message: dict, target_bytes: int) -> str:
@@ -155,6 +166,61 @@ import os
 import sys
 
 TOOLS = [{"name": "read_file", "description": "Read a file", "inputSchema": {"type": "object"}}]
+log_path = os.environ.get("DOWNSTREAM_LOG")
+
+def log(method):
+    if log_path:
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(method + "\\n")
+
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method", "")
+    log(method)
+    if "id" not in msg:
+        continue
+    if method == "initialize":
+        result = {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "fake-downstream", "version": "1.0.0"},
+        }
+    elif method == "tools/list":
+        result = {"tools": TOOLS}
+    elif method == "tools/call":
+        result = {"content": [{"type": "text", "text": "called"}]}
+    else:
+        result = {"ok": True, "method": method}
+    print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": result}), flush=True)
+""".lstrip(),
+        encoding="utf-8",
+    )
+    return script
+
+
+def _filesystem_schema_downstream(tmp_path: Path) -> Path:
+    script = tmp_path / "fake_schema_downstream.py"
+    script.write_text(
+        """
+import json
+import os
+import sys
+
+TOOLS = [
+    {
+        "name": "write_file",
+        "description": "Write a file",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            "required": ["path", "content"],
+            "additionalProperties": False,
+        },
+    }
+]
 log_path = os.environ.get("DOWNSTREAM_LOG")
 
 def log(method):
@@ -615,6 +681,103 @@ def test_run_returns_approval_required_without_waiting_or_forwarding(tmp_path, m
     assert response["error"]["data"]["approval_url"].startswith("http://127.0.0.1:")
     assert "retry" in response["error"]["data"]["instructions"]
     assert not log_path.exists()
+
+
+def test_invalid_write_file_args_do_not_create_approval(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    _set_downstream(init.config_path, _filesystem_schema_downstream(tmp_path), log_path=log_path)
+    _set_approval_policy(init.config_path, server="fake-downstream", tool="write_file")
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("schema validation must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(
+            _json_line({"jsonrpc": "2.0", "id": "list-1", "method": "tools/list", "params": {}})
+            + _json_line({
+                "jsonrpc": "2.0",
+                "id": "call-1",
+                "method": "tools/call",
+                "params": {
+                    "name": "write_file",
+                    "arguments": {
+                        "file_path": "agentveil-onboarding-friction-pack/evidence/schema-fix-user-retest.md",
+                        "content": "schema fix retest",
+                    },
+                },
+            })
+        ),
+        out=client_out,
+    ) == 0
+
+    responses = _responses(client_out.getvalue())
+    assert responses[0]["result"]["tools"][0]["name"] == "write_file"
+    response = responses[1]
+    assert response["error"]["code"] == JSONRPC_INVALID_PARAMS
+    assert response["error"]["message"] == "Invalid arguments for write_file"
+    assert response["error"]["data"]["status"] == "schema_validation_error"
+    assert response["error"]["data"]["reason"] == "schema_validation_error"
+    assert response["error"]["data"]["error_code"] == "schema_validation_error"
+    assert response["error"]["data"]["tool"] == "write_file"
+    assert response["error"]["data"]["missing_required"] == ["path"]
+    assert response["error"]["data"]["unexpected_arguments"] == ["file_path"]
+    assert "approval_url" not in response["error"]["data"]
+    assert "record_id" not in response["error"]["data"]
+    assert _pending_approval_count(home) == 0
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
+
+
+def test_valid_write_file_args_still_create_approval(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    _set_downstream(init.config_path, _filesystem_schema_downstream(tmp_path), log_path=log_path)
+    _set_approval_policy(init.config_path, server="fake-downstream", tool="write_file")
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("local approval must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(
+            _json_line({"jsonrpc": "2.0", "id": "list-1", "method": "tools/list", "params": {}})
+            + _json_line({
+                "jsonrpc": "2.0",
+                "id": "call-1",
+                "method": "tools/call",
+                "params": {
+                    "name": "write_file",
+                    "arguments": {
+                        "path": "agentveil-onboarding-friction-pack/evidence/ok.md",
+                        "content": "ok",
+                    },
+                },
+            })
+        ),
+        out=client_out,
+    ) == 0
+
+    responses = _responses(client_out.getvalue())
+    response = responses[1]
+    assert response["error"]["code"] == JSONRPC_APPROVAL_REQUIRED
+    assert response["error"]["data"]["status"] == "approval_required"
+    assert response["error"]["data"]["reason"] == "local_approval_required"
+    assert response["error"]["data"]["record_status"] == "pending"
+    assert response["error"]["data"]["record_id"]
+    assert response["error"]["data"]["approval_url"].startswith("http://127.0.0.1:")
+    assert _pending_approval_count(home) == 1
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
 
 
 def test_run_passthrough_does_not_construct_avp_agent_or_call_backend(tmp_path, monkeypatch):

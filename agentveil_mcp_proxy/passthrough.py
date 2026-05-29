@@ -52,6 +52,7 @@ from agentveil_mcp_proxy.runtime_gate import (
 JSONRPC_VERSION = "2.0"
 JSONRPC_PARSE_ERROR = -32700
 JSONRPC_INVALID_REQUEST = -32600
+JSONRPC_INVALID_PARAMS = -32602
 JSONRPC_DOWNSTREAM_ERROR = -32000
 JSONRPC_POLICY_BLOCKED = -32010
 JSONRPC_APPROVAL_REQUIRED = -32011
@@ -438,7 +439,9 @@ class McpPassthrough:
         self._unsolicited_downstream_responses = 0
         self._security_events: Deque[Mapping[str, Any]] = deque(maxlen=1000)
         self._inflight_ids: set[str] = set()
+        self._inflight_methods: dict[str, str] = {}
         self._timed_out_response_ids: dict[str, float] = {}
+        self._tool_input_schemas: dict[str, Mapping[str, Any]] = {}
         self._windows_job: _WindowsJobObject | None = None
 
     @property
@@ -631,11 +634,18 @@ class McpPassthrough:
             return [jsonrpc_error(request_id, JSONRPC_INVALID_REQUEST, "invalid JSON-RPC request")]
 
         try:
+            schema_error = self._tool_schema_error_response(message, request_id)
+            if schema_error is not None:
+                return [schema_error] if has_id else []
             classification = self._classify_for_local_metadata(message)
             policy_error, approval_outcome = self._policy_error_response(classification, request_id)
             if policy_error is not None:
                 return [policy_error] if has_id else []
-            response_key = self._register_inflight_id(request_id) if has_id else None
+            response_key = (
+                self._register_inflight_id(request_id, method=message.get("method"))
+                if has_id
+                else None
+            )
             try:
                 self._send_downstream(message)
                 if not has_id:
@@ -666,6 +676,93 @@ class McpPassthrough:
                 JSONRPC_DOWNSTREAM_ERROR,
                 "downstream MCP server unavailable",
             )]
+
+    def _tool_schema_error_response(
+        self,
+        message: Mapping[str, Any],
+        request_id: Any,
+    ) -> dict[str, Any] | None:
+        if message.get("method") != "tools/call":
+            return None
+        params = message.get("params")
+        if not isinstance(params, Mapping):
+            return None
+        tool = params.get("name")
+        if not isinstance(tool, str) or not tool:
+            return None
+        schema = self._tool_input_schemas.get(tool)
+        if schema is None:
+            return None
+        arguments = params.get("arguments", {})
+        missing, unexpected, type_errors = self._validate_tool_arguments(arguments, schema)
+        if not missing and not unexpected and not type_errors:
+            return None
+        data: dict[str, Any] = {
+            "status": "schema_validation_error",
+            "reason": "schema_validation_error",
+            "error_code": "schema_validation_error",
+            "tool": tool,
+            "missing_required": missing,
+            "unexpected_arguments": unexpected,
+        }
+        if type_errors:
+            data["type_errors"] = type_errors
+        return jsonrpc_error(
+            request_id,
+            JSONRPC_INVALID_PARAMS,
+            f"Invalid arguments for {tool}",
+            data=data,
+        )
+
+    def _validate_tool_arguments(
+        self,
+        arguments: Any,
+        schema: Mapping[str, Any],
+    ) -> tuple[list[str], list[str], list[dict[str, str]]]:
+        if not isinstance(arguments, Mapping):
+            return [], [], [{"argument": "$", "expected": "object", "actual": type(arguments).__name__}]
+
+        properties = schema.get("properties")
+        property_names = set(properties) if isinstance(properties, Mapping) else set()
+        required = schema.get("required")
+        required_names = [name for name in required if isinstance(name, str)] if isinstance(required, list) else []
+
+        missing = [name for name in required_names if name not in arguments]
+        unexpected: list[str] = []
+        if schema.get("additionalProperties") is False:
+            unexpected = sorted(str(name) for name in arguments if name not in property_names)
+
+        type_errors: list[dict[str, str]] = []
+        if isinstance(properties, Mapping):
+            for name, value in arguments.items():
+                spec = properties.get(name)
+                if not isinstance(name, str) or not isinstance(spec, Mapping):
+                    continue
+                expected = spec.get("type")
+                if isinstance(expected, str) and not self._json_type_matches(value, expected):
+                    type_errors.append({
+                        "argument": name,
+                        "expected": expected,
+                        "actual": type(value).__name__,
+                    })
+        return missing, unexpected, type_errors
+
+    def _json_type_matches(self, value: Any, expected: str) -> bool:
+        if expected == "object":
+            return isinstance(value, Mapping)
+        if expected == "array":
+            return isinstance(value, list)
+        if expected == "string":
+            return isinstance(value, str)
+        if expected == "integer":
+            return isinstance(value, int) and not isinstance(value, bool)
+        if expected == "number":
+            return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+        if expected == "boolean":
+            return isinstance(value, bool)
+        if expected == "null":
+            return value is None
+        return True
 
     def _classify_for_local_metadata(self, message: Mapping[str, Any]) -> ClassifiedToolCall | None:
         if self.classifier is None:
@@ -946,15 +1043,18 @@ class McpPassthrough:
         with self._counters_lock:
             self._unsolicited_downstream_responses += 1
 
-    def _register_inflight_id(self, request_id: Any) -> str:
+    def _register_inflight_id(self, request_id: Any, *, method: Any = None) -> str:
         response_key = self._id_key(request_id)
         with self._stdout_condition:
             self._inflight_ids.add(response_key)
+            if isinstance(method, str):
+                self._inflight_methods[response_key] = method
         return response_key
 
     def _unregister_inflight_id(self, response_key: str) -> None:
         with self._stdout_condition:
             self._inflight_ids.discard(response_key)
+            self._inflight_methods.pop(response_key, None)
             self._prune_pending_responses_locked()
 
     def _wait_downstream_response(self, expected_id: Any) -> dict[str, Any]:
@@ -1065,6 +1165,8 @@ class McpPassthrough:
         if not isinstance(response, dict):
             raise PassthroughError("downstream sent non-object JSON")
         if self._is_server_notification(response):
+            if response.get("method") == "notifications/tools/list_changed":
+                self._tool_input_schemas.clear()
             if self._notification_writer is not None:
                 self._notification_writer(response)
             return
@@ -1074,13 +1176,34 @@ class McpPassthrough:
                 response_key = self._id_key(response.get("id"))
                 if response_key in self._timed_out_response_ids:
                     self._timed_out_response_ids.pop(response_key, None)
+                    self._inflight_methods.pop(response_key, None)
                     return
                 if response_key not in self._inflight_ids:
                     self._increment_unsolicited_downstream_responses()
                     return
+                if self._inflight_methods.get(response_key) == "tools/list":
+                    self._cache_tool_input_schemas(response)
                 self._responses.setdefault(response_key, []).append(response)
                 self._prune_pending_responses_locked()
                 self._stdout_condition.notify_all()
+
+    def _cache_tool_input_schemas(self, response: Mapping[str, Any]) -> None:
+        result = response.get("result")
+        if not isinstance(result, Mapping):
+            return
+        tools = result.get("tools")
+        if not isinstance(tools, list):
+            return
+        cached: dict[str, Mapping[str, Any]] = {}
+        for tool in tools:
+            if not isinstance(tool, Mapping):
+                continue
+            name = tool.get("name")
+            schema = tool.get("inputSchema", tool.get("input_schema"))
+            if isinstance(name, str) and name and isinstance(schema, Mapping):
+                cached[name] = schema
+        if cached:
+            self._tool_input_schemas.update(cached)
 
     def _prune_timed_out_ids_locked(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
@@ -1091,6 +1214,7 @@ class McpPassthrough:
         ]
         for response_key in expired:
             self._timed_out_response_ids.pop(response_key, None)
+            self._inflight_methods.pop(response_key, None)
 
     def _prune_pending_responses_locked(self) -> None:
         pending_count = sum(len(responses) for responses in self._responses.values())
@@ -1105,6 +1229,7 @@ class McpPassthrough:
                     dropped = True
                 if not responses:
                     self._responses.pop(response_key, None)
+                    self._inflight_methods.pop(response_key, None)
                 if pending_count <= MAX_PENDING_RESPONSES:
                     return
             if not dropped:
