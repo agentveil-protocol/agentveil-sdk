@@ -129,6 +129,25 @@ def run_cli_json(proxy: Path, args: list[str], *, env: dict[str, str] | None = N
     return parse_json_output(result, "agentveil-mcp-proxy " + " ".join(args))
 
 
+def trusted_signer_dids_for_base_url(
+    python: Path, base_url: str, *, env: dict[str, str] | None = None
+) -> list[str]:
+    """Resolve the SDK's pinned trusted signer DID(s) for a backend base URL.
+
+    Strict offline verification must pin the signer out of band, so the release
+    gate asks the installed package for the trusted signers of the backend it
+    registered against rather than trusting the signer list embedded in the
+    exported bundle.
+    """
+    code = (
+        "import json, sys; "
+        "from agentveil_mcp_proxy.cli import trusted_signers_for_base_url; "
+        "print(json.dumps(list(trusted_signers_for_base_url(sys.argv[1]))))"
+    )
+    result = run([str(python), "-c", code, base_url], env=env)
+    return list(json.loads(result.stdout.strip() or "[]"))
+
+
 class JsonRpcClient:
     def __init__(self, command: list[str], *, env: dict[str, str]) -> None:
         self.process = subprocess.Popen(
@@ -243,7 +262,7 @@ def run_acceptance(args: argparse.Namespace) -> None:
     try:
         wheel = Path(args.wheel).resolve() if args.wheel else build_wheel(work_root, args.python)
         log(f"wheel under test: {wheel}")
-        _install_python, proxy = install_wheel(work_root, wheel, args.python)
+        install_python, proxy = install_wheel(work_root, wheel, args.python)
 
         home = work_root / "avp-home"
         sandbox = work_root / "sandbox"
@@ -352,7 +371,14 @@ def run_acceptance(args: argparse.Namespace) -> None:
             raise AcceptanceError(f"events list did not include approved/executed records: {events_payload}")
 
         run([str(proxy), "export-evidence", *identity_args, str(bundle_path)], env=env)
-        verify_payload = run_cli_json(proxy, ["verify", str(bundle_path), "--output", "json"], env=env)
+        # Strict offline verification pins the signer out of band: ask the
+        # installed package for the trusted signer DID(s) of the backend we
+        # registered against, never the signer list embedded in the bundle.
+        signer_dids = trusted_signer_dids_for_base_url(install_python, args.base_url, env=env)
+        verify_args = ["verify", str(bundle_path), "--output", "json"]
+        for signer_did in signer_dids:
+            verify_args += ["--trusted-signer-did", signer_did]
+        verify_payload = run_cli_json(proxy, verify_args, env=env)
         if verify_payload.get("status") != "ok":
             raise AcceptanceError(f"verify did not return ok: {verify_payload}")
 

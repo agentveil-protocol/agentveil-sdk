@@ -10,6 +10,7 @@ through the existing local fallback policy.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 import threading
@@ -17,6 +18,7 @@ import time
 from typing import Any, Callable, Mapping
 
 from agentveil.agent import AVPAgent
+from agentveil.data_integrity import DataIntegrityError, verify_eddsa_jcs_2022
 from agentveil.delegation import DelegationInvalid, verify_delegation
 from agentveil.proof import ProofVerificationError, verify_signed_jcs
 from agentveil_mcp_proxy.circuit_breaker import (
@@ -40,7 +42,10 @@ DECISION_ALLOW = "ALLOW"
 DECISION_BLOCK = "BLOCK"
 DECISION_WAITING = "WAITING_FOR_HUMAN_APPROVAL"
 
-_DECISION_RECEIPT_SCHEMAS = {"decision_receipt/1", "decision_receipt/2"}
+_DECISION_RECEIPT_SCHEMAS = {"decision_receipt/1", "decision_receipt/2", "decision_receipt/3"}
+# decision_receipt/3 is verified with the W3C Data Integrity (eddsa-jcs-2022)
+# verifier; /1 and /2 keep the legacy raw-JCS verifier.
+_W3C_DI_DECISION_SCHEMAS = {"decision_receipt/3"}
 _RUNTIME_DECISIONS = {DECISION_ALLOW, DECISION_BLOCK, DECISION_WAITING}
 _REQUIRED_RECEIPT_FIELDS = {
     "action",
@@ -269,11 +274,26 @@ class RuntimeGateClient:
     def _verify_decision_receipt(self, receipt_jcs: str) -> dict[str, Any]:
         if not self.trusted_signer_dids:
             raise RuntimeGateUntrustedError("trusted signer DID set is empty")
-        last_error: ProofVerificationError | None = None
+        # Route by the signature-protected schema_version: decision_receipt/3 uses
+        # the W3C Data Integrity (eddsa-jcs-2022) verifier; /1 and /2 keep the
+        # legacy raw-JCS verifier. Both paths verify against the pinned signer.
+        try:
+            schema_version = json.loads(receipt_jcs).get("schema_version")
+        except (json.JSONDecodeError, AttributeError):
+            raise RuntimeGateUntrustedError("runtime decision receipt is not valid JSON")
+        is_w3c = schema_version in _W3C_DI_DECISION_SCHEMAS
+        last_error: Exception | None = None
         for signer_did in self.trusted_signer_dids:
             try:
+                if is_w3c:
+                    verified = verify_eddsa_jcs_2022(receipt_jcs, expected_signer_did=signer_did)
+                    return {
+                        "body": verified["document"],
+                        "signer_did": verified["signer_did"],
+                        "digest": hashlib.sha256(receipt_jcs.encode("utf-8")).hexdigest(),
+                    }
                 return verify_signed_jcs(receipt_jcs, expected_signer_did=signer_did)
-            except ProofVerificationError as exc:
+            except (ProofVerificationError, DataIntegrityError) as exc:
                 last_error = exc
         raise RuntimeGateUntrustedError("runtime decision receipt signer is not trusted") from last_error
 

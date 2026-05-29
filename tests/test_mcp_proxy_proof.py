@@ -27,6 +27,7 @@ from agentveil_mcp_proxy.evidence import (
     export_evidence_bundle,
     record_hash,
     verify_evidence_bundle,
+    verify_evidence_bundle_legacy,
 )
 from agentveil_mcp_proxy.evidence.proof import _bundle_records, verify_evidence_bundle_file
 
@@ -282,7 +283,7 @@ def test_export_evidence_creates_bundle_with_correct_schema_and_chain_root(tmp_p
     assert bundle["evidence_export_schema_version"] == 1
     assert len(bundle["records"]) == 2
     assert bundle["chain_root_hash"] == bundle["records"][-1]["record_hash"]
-    assert verify_evidence_bundle(bundle).valid is True
+    assert verify_evidence_bundle(bundle, trusted_signer_dids=[BACKEND_DID]).valid is True
 
 
 def test_bundle_records_uses_stored_prev_event_hash():
@@ -442,7 +443,7 @@ def test_atomic_write_json_calls_directory_fsync_on_posix(tmp_path, monkeypatch)
 def test_verify_passes_on_valid_bundle(tmp_path):
     bundle = _bundle_with_receipt(tmp_path)
 
-    result = verify_evidence_bundle(bundle)
+    result = verify_evidence_bundle(bundle, trusted_signer_dids=[BACKEND_DID])
 
     assert result.valid is True
     assert result.record_count == 1
@@ -457,7 +458,7 @@ def test_verify_rejects_receipt_with_missing_schema_version(tmp_path):
     bundle = _bundle_with_receipt(tmp_path, receipt_jcs=_sign_jcs(body))
 
     with pytest.raises(EvidenceVerificationError, match="schema unsupported"):
-        verify_evidence_bundle(bundle)
+        verify_evidence_bundle(bundle, trusted_signer_dids=[BACKEND_DID])
 
 
 def test_verify_rejects_receipt_with_missing_audit_id(tmp_path):
@@ -466,7 +467,7 @@ def test_verify_rejects_receipt_with_missing_audit_id(tmp_path):
     bundle = _bundle_with_receipt(tmp_path, receipt_jcs=_sign_jcs(body))
 
     with pytest.raises(EvidenceVerificationError, match="audit_id missing"):
-        verify_evidence_bundle(bundle)
+        verify_evidence_bundle(bundle, trusted_signer_dids=[BACKEND_DID])
 
 
 def test_verify_rejects_receipt_missing_audit_id_when_record_has_one(tmp_path):
@@ -476,7 +477,7 @@ def test_verify_rejects_receipt_missing_audit_id_when_record_has_one(tmp_path):
     assert bundle["records"][0]["decision_audit_id"] == "audit-1"
 
     with pytest.raises(EvidenceVerificationError, match="audit_id missing"):
-        verify_evidence_bundle(bundle)
+        verify_evidence_bundle(bundle, trusted_signer_dids=[BACKEND_DID])
 
 
 def test_verify_rejects_receipt_missing_payload_hash_when_referenced(tmp_path):
@@ -485,7 +486,7 @@ def test_verify_rejects_receipt_missing_payload_hash_when_referenced(tmp_path):
     bundle = _bundle_with_receipt(tmp_path, receipt_jcs=_sign_jcs(body))
 
     with pytest.raises(EvidenceVerificationError, match="payload_hash missing"):
-        verify_evidence_bundle(bundle)
+        verify_evidence_bundle(bundle, trusted_signer_dids=[BACKEND_DID])
 
 
 def test_verify_rejects_receipt_missing_client_risk_class_when_referenced(tmp_path):
@@ -494,7 +495,7 @@ def test_verify_rejects_receipt_missing_client_risk_class_when_referenced(tmp_pa
     bundle = _bundle_with_receipt(tmp_path, receipt_jcs=_sign_jcs(body))
 
     with pytest.raises(EvidenceVerificationError, match="client_risk_class missing"):
-        verify_evidence_bundle(bundle)
+        verify_evidence_bundle(bundle, trusted_signer_dids=[BACKEND_DID])
 
 
 def test_verify_rejects_receipt_missing_client_policy_context_hash_when_referenced(tmp_path):
@@ -503,7 +504,7 @@ def test_verify_rejects_receipt_missing_client_policy_context_hash_when_referenc
     bundle = _bundle_with_receipt(tmp_path, receipt_jcs=_sign_jcs(body))
 
     with pytest.raises(EvidenceVerificationError, match="client_policy_context_hash missing"):
-        verify_evidence_bundle(bundle)
+        verify_evidence_bundle(bundle, trusted_signer_dids=[BACKEND_DID])
 
 
 def test_verify_rejects_receipt_audit_id_mismatch_with_record(tmp_path):
@@ -511,7 +512,7 @@ def test_verify_rejects_receipt_audit_id_mismatch_with_record(tmp_path):
     bundle = _bundle_with_receipt(tmp_path, receipt_jcs=receipt_jcs)
 
     with pytest.raises(EvidenceVerificationError, match="audit_id mismatch"):
-        verify_evidence_bundle(bundle)
+        verify_evidence_bundle(bundle, trusted_signer_dids=[BACKEND_DID])
 
 
 def test_verify_accepts_matching_audit_id(tmp_path):
@@ -530,7 +531,7 @@ def test_verify_accepts_matching_audit_id(tmp_path):
             receipt_fetcher=lambda _audit_id: receipt_jcs,
         )
 
-    assert verify_evidence_bundle(bundle).valid is True
+    assert verify_evidence_bundle(bundle, trusted_signer_dids=[BACKEND_DID]).valid is True
 
 
 def test_verify_skips_audit_id_check_for_cache_hit_records(tmp_path):
@@ -546,7 +547,7 @@ def test_verify_skips_audit_id_check_for_cache_hit_records(tmp_path):
             trusted_signer_dids=[BACKEND_DID],
         )
 
-    assert verify_evidence_bundle(bundle).valid is True
+    assert verify_evidence_bundle(bundle, trusted_signer_dids=[BACKEND_DID]).valid is True
 
 
 def test_verify_rejects_bundle_with_duplicate_receipt_references(tmp_path):
@@ -573,7 +574,7 @@ def test_verify_rejects_bundle_with_duplicate_receipt_references(tmp_path):
         )
 
     with pytest.raises(EvidenceVerificationError, match="referenced by multiple records"):
-        verify_evidence_bundle(bundle)
+        verify_evidence_bundle(bundle, trusted_signer_dids=[BACKEND_DID])
 
 
 def test_verify_accepts_bundle_with_distinct_receipt_per_record(tmp_path):
@@ -600,7 +601,7 @@ def test_verify_accepts_bundle_with_distinct_receipt_per_record(tmp_path):
             receipt_fetcher=receipts.__getitem__,
         )
 
-    assert verify_evidence_bundle(bundle).valid is True
+    assert verify_evidence_bundle(bundle, trusted_signer_dids=[BACKEND_DID]).valid is True
 
 
 def test_verify_accepts_bundle_with_cache_hit_records_no_receipt_reference(tmp_path):
@@ -626,7 +627,7 @@ def test_verify_accepts_bundle_with_cache_hit_records_no_receipt_reference(tmp_p
             receipt_fetcher=lambda _audit_id: receipt_jcs,
         )
 
-    assert verify_evidence_bundle(bundle).valid is True
+    assert verify_evidence_bundle(bundle, trusted_signer_dids=[BACKEND_DID]).valid is True
 
 
 def test_verify_warns_on_orphan_signed_receipt_not_referenced(tmp_path):
@@ -641,7 +642,7 @@ def test_verify_warns_on_orphan_signed_receipt_not_referenced(tmp_path):
         )
     bundle["signed_receipts"] = {digest: receipt_jcs}
 
-    result = verify_evidence_bundle(bundle)
+    result = verify_evidence_bundle(bundle, trusted_signer_dids=[BACKEND_DID])
 
     assert result.valid is True
     assert result.warnings == (f"signed receipt {digest[:16]}... not referenced by any record",)
@@ -691,7 +692,9 @@ def test_export_surfaces_unverified_receipt_count_when_fetch_fails(tmp_path):
 
     assert bundle["signed_receipts"] == {}
     assert bundle["unverified_receipt_count"] == 1
-    result = verify_evidence_bundle(bundle)
+    # A missing referenced receipt is a hard failure in strict/proof-grade mode;
+    # surfacing it as a non-fatal count is the legacy (self-trusting) behavior.
+    result = verify_evidence_bundle_legacy(bundle)
     assert result.valid is True
     assert result.unverified_receipt_count == 1
     assert result.warnings == ()
@@ -717,7 +720,7 @@ def test_verify_bundle_warns_on_inflated_unverified_count(tmp_path):
     bundle = _bundle_with_unverified_records(tmp_path, count=2)
     bundle["unverified_receipt_count"] = 5
 
-    result = verify_evidence_bundle(bundle)
+    result = verify_evidence_bundle_legacy(bundle)
 
     assert result.unverified_receipt_count == 2
     assert result.warnings == (
@@ -729,7 +732,7 @@ def test_verify_bundle_warns_on_deflated_unverified_count(tmp_path):
     bundle = _bundle_with_unverified_records(tmp_path, count=3)
     bundle["unverified_receipt_count"] = 0
 
-    result = verify_evidence_bundle(bundle)
+    result = verify_evidence_bundle_legacy(bundle)
 
     assert result.unverified_receipt_count == 3
     assert result.warnings == (
@@ -740,7 +743,7 @@ def test_verify_bundle_warns_on_deflated_unverified_count(tmp_path):
 def test_verify_bundle_no_warning_on_matching_count(tmp_path):
     bundle = _bundle_with_unverified_records(tmp_path, count=2)
 
-    result = verify_evidence_bundle(bundle)
+    result = verify_evidence_bundle_legacy(bundle)
 
     assert result.unverified_receipt_count == 2
     assert result.warnings == ()
@@ -756,7 +759,7 @@ def test_verify_bundle_records_without_decision_audit_id_not_counted(tmp_path):
         )
     bundle["unverified_receipt_count"] = 0
 
-    result = verify_evidence_bundle(bundle)
+    result = verify_evidence_bundle(bundle, trusted_signer_dids=[BACKEND_DID])
 
     assert result.unverified_receipt_count == 0
     assert result.warnings == ()
@@ -767,7 +770,7 @@ def test_verify_fails_on_record_hash_mismatch(tmp_path):
     bundle["records"][0]["record_hash"] = "sha256:" + "0" * 64
 
     with pytest.raises(EvidenceVerificationError, match="record_hash"):
-        verify_evidence_bundle(bundle)
+        verify_evidence_bundle(bundle, trusted_signer_dids=[BACKEND_DID])
 
 
 def test_verify_fails_on_prev_event_hash_mismatch(tmp_path):
@@ -775,7 +778,7 @@ def test_verify_fails_on_prev_event_hash_mismatch(tmp_path):
     bundle["records"][0]["prev_event_hash"] = "sha256:" + "0" * 64
 
     with pytest.raises(EvidenceVerificationError, match="prev_event_hash"):
-        verify_evidence_bundle(bundle)
+        verify_evidence_bundle(bundle, trusted_signer_dids=[BACKEND_DID])
 
 
 def test_verify_fails_on_signed_receipt_signature_invalid(tmp_path):
@@ -788,7 +791,7 @@ def test_verify_fails_on_signed_receipt_signature_invalid(tmp_path):
     bundle["signed_receipts"] = {digest: tampered}
 
     with pytest.raises(EvidenceVerificationError, match="signer is not trusted"):
-        verify_evidence_bundle(bundle)
+        verify_evidence_bundle(bundle, trusted_signer_dids=[BACKEND_DID])
 
 
 def test_verify_fails_on_scope_mismatch_between_record_and_decision_receipt(tmp_path):
@@ -809,7 +812,7 @@ def test_verify_fails_on_scope_mismatch_between_record_and_decision_receipt(tmp_
         )
 
     with pytest.raises(EvidenceVerificationError, match="payload_hash"):
-        verify_evidence_bundle(bundle)
+        verify_evidence_bundle(bundle, trusted_signer_dids=[BACKEND_DID])
 
 
 def test_verify_bundle_rejects_risk_class_mismatch(tmp_path):
@@ -817,7 +820,7 @@ def test_verify_bundle_rejects_risk_class_mismatch(tmp_path):
     bundle = _bundle_with_receipt(tmp_path, receipt_jcs=receipt_jcs)
 
     with pytest.raises(EvidenceVerificationError, match="client_risk_class"):
-        verify_evidence_bundle(bundle)
+        verify_evidence_bundle(bundle, trusted_signer_dids=[BACKEND_DID])
 
 
 def test_verify_bundle_rejects_policy_context_hash_mismatch(tmp_path):
@@ -825,13 +828,13 @@ def test_verify_bundle_rejects_policy_context_hash_mismatch(tmp_path):
     bundle = _bundle_with_receipt(tmp_path, receipt_jcs=receipt_jcs)
 
     with pytest.raises(EvidenceVerificationError, match="client_policy_context_hash"):
-        verify_evidence_bundle(bundle)
+        verify_evidence_bundle(bundle, trusted_signer_dids=[BACKEND_DID])
 
 
 def test_verify_bundle_accepts_matching_expanded_fields(tmp_path):
     bundle = _bundle_with_receipt(tmp_path)
 
-    assert verify_evidence_bundle(bundle).valid is True
+    assert verify_evidence_bundle(bundle, trusted_signer_dids=[BACKEND_DID]).valid is True
 
 
 def test_verify_bundle_skips_expanded_cross_check_when_record_field_missing(tmp_path):
@@ -840,7 +843,7 @@ def test_verify_bundle_skips_expanded_cross_check_when_record_field_missing(tmp_
     bundle["records"][0]["record_hash"] = record_hash(bundle["records"][0])
     bundle["chain_root_hash"] = bundle["records"][0]["record_hash"]
 
-    assert verify_evidence_bundle(bundle).valid is True
+    assert verify_evidence_bundle(bundle, trusted_signer_dids=[BACKEND_DID]).valid is True
 
 
 def test_verify_uses_only_pinned_trusted_signer_dids(tmp_path):
@@ -852,7 +855,7 @@ def test_verify_uses_only_pinned_trusted_signer_dids(tmp_path):
     )
 
     with pytest.raises(EvidenceVerificationError, match="signer is not trusted"):
-        verify_evidence_bundle(bundle)
+        verify_evidence_bundle(bundle, trusted_signer_dids=[BACKEND_DID])
 
 
 def test_verify_exit_code_zero_on_success_one_on_failure(tmp_path):
@@ -866,11 +869,15 @@ def test_verify_exit_code_zero_on_success_one_on_failure(tmp_path):
     invalid["chain_root_hash"] = "sha256:" + "0" * 64
     invalid_path.write_text(json.dumps(invalid), encoding="utf-8")
 
-    assert verify_evidence_bundle_file(valid_path).valid is True
+    assert verify_evidence_bundle_file(
+        valid_path, trusted_signer_dids=[BACKEND_DID]
+    ).valid is True
     with pytest.raises(EvidenceVerificationError):
-        verify_evidence_bundle_file(invalid_path)
-    assert main(["verify", str(valid_path)]) == 0
-    assert main(["verify", str(invalid_path)]) == 1
+        verify_evidence_bundle_file(invalid_path, trusted_signer_dids=[BACKEND_DID])
+    # CLI verify is strict: proof-grade verification requires an externally
+    # pinned signer DID; the in-bundle signer list is not an accepted anchor.
+    assert main(["verify", str(valid_path), "--trusted-signer-did", BACKEND_DID]) == 0
+    assert main(["verify", str(invalid_path), "--trusted-signer-did", BACKEND_DID]) == 1
 
 
 def test_verify_human_and_json_output_formats(tmp_path):
@@ -882,7 +889,9 @@ def test_verify_human_and_json_output_formats(tmp_path):
     bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
 
     human = io.StringIO()
-    assert verify_evidence(bundle_path=bundle_path, out=human) == 0
+    assert verify_evidence(
+        bundle_path=bundle_path, trusted_signer_dids=[BACKEND_DID], out=human
+    ) == 0
     assert "OK: bundle integrity verified" in human.getvalue()
 
     structured = io.StringIO()
@@ -900,11 +909,31 @@ def test_verify_human_and_json_output_formats(tmp_path):
     bundle["unverified_receipt_count"] = 1
     bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
     warn = io.StringIO()
-    assert verify_evidence(bundle_path=bundle_path, out=warn) == 0
+    assert verify_evidence(
+        bundle_path=bundle_path, trusted_signer_dids=[BACKEND_DID], out=warn
+    ) == 0
     assert "WARN: unverified_receipt_count mismatch: bundle claims 1, computed 0" in warn.getvalue()
 
 
-def test_verify_cli_emits_warning_when_trusted_signer_did_absent_human(tmp_path):
+def test_verify_cli_fails_closed_when_trusted_signer_did_absent_human(tmp_path):
+    from agentveil_mcp_proxy.cli import verify_evidence
+    import io
+
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_text(json.dumps(_bundle_with_receipt(tmp_path)), encoding="utf-8")
+
+    # Strict CLI: a receipt-bearing bundle with no externally pinned signer must
+    # fail closed instead of self-trusting the bundle's embedded signer list.
+    out = io.StringIO()
+    assert verify_evidence(bundle_path=bundle_path, out=out) == 1
+
+    assert (
+        "FAIL: strict verification requires externally supplied trusted_signer_dids"
+        in out.getvalue()
+    )
+
+
+def test_verify_cli_fails_closed_when_trusted_signer_did_absent_json(tmp_path):
     from agentveil_mcp_proxy.cli import verify_evidence
     import io
 
@@ -912,23 +941,11 @@ def test_verify_cli_emits_warning_when_trusted_signer_did_absent_human(tmp_path)
     bundle_path.write_text(json.dumps(_bundle_with_receipt(tmp_path)), encoding="utf-8")
 
     out = io.StringIO()
-    assert verify_evidence(bundle_path=bundle_path, out=out) == 0
-
-    assert "WARN: default_trust_from_bundle:" in out.getvalue()
-
-
-def test_verify_cli_emits_warning_when_trusted_signer_did_absent_json(tmp_path):
-    from agentveil_mcp_proxy.cli import verify_evidence
-    import io
-
-    bundle_path = tmp_path / "bundle.json"
-    bundle_path.write_text(json.dumps(_bundle_with_receipt(tmp_path)), encoding="utf-8")
-
-    out = io.StringIO()
-    assert verify_evidence(bundle_path=bundle_path, output_format="json", out=out) == 0
+    assert verify_evidence(bundle_path=bundle_path, output_format="json", out=out) == 1
     payload = json.loads(out.getvalue())
 
-    assert any(warning.startswith("default_trust_from_bundle:") for warning in payload["warnings"])
+    assert payload["status"] == "invalid"
+    assert "trusted_signer_dids" in payload["error"]
 
 
 def test_verify_cli_no_warning_when_explicit_trusted_signer_did_provided(tmp_path):
@@ -948,28 +965,32 @@ def test_verify_cli_no_warning_when_explicit_trusted_signer_did_provided(tmp_pat
     assert "default_trust_from_bundle" not in out.getvalue()
 
 
-def test_verify_cli_surfaces_unverified_count_mismatch_warning_human(tmp_path):
+def test_verify_cli_fails_on_missing_referenced_receipt_human(tmp_path):
     from agentveil_mcp_proxy.cli import verify_evidence
     import io
 
+    # A record references a decision receipt that is absent from the bundle.
+    # Legacy mode downgrades this to a warning; strict CLI must fail closed.
     bundle = _bundle_with_unverified_records(tmp_path, count=1)
-    bundle["unverified_receipt_count"] = 0
     bundle_path = tmp_path / "bundle.json"
     bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
 
     out = io.StringIO()
-    assert verify_evidence(bundle_path=bundle_path, out=out) == 0
+    assert verify_evidence(
+        bundle_path=bundle_path,
+        trusted_signer_dids=[BACKEND_DID],
+        out=out,
+    ) == 1
 
-    assert "WARN: 1 records have decision_audit_id" in out.getvalue()
-    assert "WARN: unverified_receipt_count mismatch: bundle claims 0, computed 1" in out.getvalue()
+    assert "FAIL: strict verification failed:" in out.getvalue()
+    assert "missing from bundle" in out.getvalue()
 
 
-def test_verify_cli_surfaces_unverified_count_mismatch_warning_json(tmp_path):
+def test_verify_cli_fails_on_missing_referenced_receipt_json(tmp_path):
     from agentveil_mcp_proxy.cli import verify_evidence
     import io
 
     bundle = _bundle_with_unverified_records(tmp_path, count=1)
-    bundle["unverified_receipt_count"] = 0
     bundle_path = tmp_path / "bundle.json"
     bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
 
@@ -979,13 +1000,11 @@ def test_verify_cli_surfaces_unverified_count_mismatch_warning_json(tmp_path):
         output_format="json",
         trusted_signer_dids=[BACKEND_DID],
         out=out,
-    ) == 0
+    ) == 1
     payload = json.loads(out.getvalue())
 
-    assert payload["unverified_receipt_count"] == 1
-    assert payload["warnings"] == [
-        "unverified_receipt_count mismatch: bundle claims 0, computed 1"
-    ]
+    assert payload["status"] == "invalid"
+    assert "missing from bundle" in payload["error"]
 
 
 def test_verify_does_not_leak_payload_data_in_error_messages(tmp_path):
@@ -995,7 +1014,7 @@ def test_verify_does_not_leak_payload_data_in_error_messages(tmp_path):
     assert SECRET not in rendered
 
     with pytest.raises(EvidenceVerificationError) as exc:
-        verify_evidence_bundle(bundle)
+        verify_evidence_bundle(bundle, trusted_signer_dids=[BACKEND_DID])
 
     assert SECRET not in str(exc.value)
 
@@ -1046,7 +1065,7 @@ def test_vacuum_reconstructs_chain_after_deletion(tmp_path):
 
     assert [record["request_id"] for record in bundle["records"]] == ["kept"]
     assert bundle["records"][0]["prev_event_hash"] == GENESIS_PREV_EVENT_HASH
-    assert verify_evidence_bundle(bundle).valid is True
+    assert verify_evidence_bundle(bundle, trusted_signer_dids=[BACKEND_DID]).valid is True
 
 
 def test_vacuum_idempotent_repeated_runs_no_changes_after_first(tmp_path):
@@ -1080,7 +1099,7 @@ def test_proof_module_does_not_construct_avp_agent_or_call_backend_for_chain_ops
             proxy_identity_did="did:key:z6Mkproxy",
             trusted_signer_dids=[BACKEND_DID],
         )
-        assert verify_evidence_bundle(bundle).valid is True
+        assert verify_evidence_bundle(bundle, trusted_signer_dids=[BACKEND_DID]).valid is True
 
 
 def test_no_raw_args_or_secrets_in_any_bundle_field_or_log_path(tmp_path):

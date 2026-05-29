@@ -11,6 +11,7 @@ from pathlib import Path
 import tempfile
 from typing import Any, Callable, Iterable, Mapping
 
+from agentveil.data_integrity import DataIntegrityError, verify_eddsa_jcs_2022
 from agentveil.proof import ProofVerificationError, verify_signed_jcs
 from agentveil_mcp_proxy.evidence.store import (
     GENESIS_PREV_EVENT_HASH,
@@ -21,7 +22,12 @@ from agentveil_mcp_proxy.evidence.store import (
 
 
 EVIDENCE_EXPORT_SCHEMA_VERSION = 1
-_DECISION_RECEIPT_SCHEMAS = frozenset({"decision_receipt/1", "decision_receipt/2"})
+_DECISION_RECEIPT_SCHEMAS = frozenset(
+    {"decision_receipt/1", "decision_receipt/2", "decision_receipt/3"}
+)
+# decision_receipt/3 is verified via the W3C Data Integrity (eddsa-jcs-2022)
+# path; /1 and /2 stay on the legacy raw-JCS verifier.
+_W3C_DI_RECEIPT_SCHEMAS = frozenset({"decision_receipt/3"})
 _RECEIPT_RECORD_CROSS_CHECK_FIELDS = (
     ("payload_hash", "payload_hash"),
     ("risk_class", "client_risk_class"),
@@ -164,8 +170,35 @@ def verify_evidence_bundle(
     bundle: Mapping[str, Any],
     *,
     trusted_signer_dids: Iterable[str] | None = None,
+    strict: bool = True,
 ) -> EvidenceVerificationResult:
-    """Verify an evidence export bundle without calling the AVP backend."""
+    """Verify an evidence export bundle without calling the AVP backend.
+
+    ``strict`` selects the trust model and now defaults to ``True``
+    (proof-grade, fail-closed). Decision receipts are routed by
+    ``schema_version``: ``decision_receipt/3`` is verified with the W3C Data
+    Integrity ``eddsa-jcs-2022`` verifier; ``/1`` and ``/2`` keep the legacy
+    raw-JCS verifier.
+
+    Strict mode (proof-grade, the default):
+
+    1. Trust is established ONLY from the externally supplied
+       ``trusted_signer_dids``. The bundle's own ``trusted_signer_dids``
+       field is never used as a trust anchor, so a forged bundle cannot
+       vouch for itself (Conformance Pass finding F2).
+    2. If the bundle carries signed receipts but no external signer DID is
+       supplied, verification fails closed rather than self-trusting.
+    3. If a record references a signed receipt that is absent from the
+       bundle, verification fails instead of downgrading to a warning
+       (finding F3).
+
+    Legacy mode (``strict=False``) is the historical, NON-proof-grade
+    behavior: the in-bundle ``trusted_signer_dids`` is used as a fallback
+    trust anchor and a missing referenced receipt is only a warning. It is
+    reachable only by explicit opt-in — prefer the loudly named
+    :func:`verify_evidence_bundle_legacy`. Do not use legacy mode to back any
+    proof, security, or compliance claim.
+    """
 
     if bundle.get("evidence_export_schema_version") != EVIDENCE_EXPORT_SCHEMA_VERSION:
         raise EvidenceVerificationError("evidence export schema version unsupported")
@@ -211,9 +244,28 @@ def verify_evidence_bundle(
             f"bundle claims {unverified_receipt_count}, "
             f"computed {computed_unverified_receipt_count}"
         )
-    pinned_signers = tuple(trusted_signer_dids or bundle.get("trusted_signer_dids") or ())
-    if receipts and not pinned_signers:
-        raise EvidenceVerificationError("trusted signer DID(s) are required")
+    if strict and computed_unverified_receipt_count:
+        raise EvidenceVerificationError(
+            "strict verification failed: "
+            f"{computed_unverified_receipt_count} referenced signed receipt(s) "
+            "missing from bundle"
+        )
+    if strict:
+        # Proof-grade: trust only what the caller pinned out-of-band. The
+        # bundle's self-declared trusted_signer_dids is intentionally ignored
+        # so a re-signed forge cannot vouch for itself.
+        pinned_signers = tuple(
+            did for did in (trusted_signer_dids or ()) if isinstance(did, str) and did
+        )
+        if receipts and not pinned_signers:
+            raise EvidenceVerificationError(
+                "strict verification requires externally supplied trusted_signer_dids; "
+                "the in-bundle trusted_signer_dids field is not an accepted trust anchor"
+            )
+    else:
+        pinned_signers = tuple(trusted_signer_dids or bundle.get("trusted_signer_dids") or ())
+        if receipts and not pinned_signers:
+            raise EvidenceVerificationError("trusted signer DID(s) are required")
     verified_bodies: dict[str, dict[str, Any]] = {}
     for digest, receipt_jcs in receipts.items():
         if not isinstance(digest, str) or not isinstance(receipt_jcs, str):
@@ -275,8 +327,15 @@ def verify_evidence_bundle_file(
     bundle_path: Path,
     *,
     trusted_signer_dids: Iterable[str] | None = None,
+    strict: bool = True,
 ) -> EvidenceVerificationResult:
-    """Load and verify one evidence export bundle file."""
+    """Load and verify one evidence export bundle file.
+
+    See :func:`verify_evidence_bundle` for the meaning of ``strict`` (default
+    ``True``, proof-grade). Proof-claim callers pass externally pinned
+    ``trusted_signer_dids``; the historical self-trusting behavior is reachable
+    only via :func:`verify_evidence_bundle_legacy`.
+    """
 
     try:
         with bundle_path.open("r", encoding="utf-8") as fh:
@@ -285,7 +344,29 @@ def verify_evidence_bundle_file(
         raise EvidenceVerificationError("evidence bundle unavailable") from exc
     if not isinstance(bundle, dict):
         raise EvidenceVerificationError("evidence bundle must be a JSON object")
-    return verify_evidence_bundle(bundle, trusted_signer_dids=trusted_signer_dids)
+    return verify_evidence_bundle(
+        bundle, trusted_signer_dids=trusted_signer_dids, strict=strict
+    )
+
+
+def verify_evidence_bundle_legacy(
+    bundle: Mapping[str, Any],
+    *,
+    trusted_signer_dids: Iterable[str] | None = None,
+) -> EvidenceVerificationResult:
+    """NON-PROOF-GRADE, self-trusting verification (legacy compatibility only).
+
+    WARNING: this is the historical behavior that finding F2 flagged as unsafe.
+    With no external ``trusted_signer_dids`` it falls back to the signer list
+    embedded IN the bundle, so a re-signed forgery can vouch for itself, and a
+    referenced-but-missing receipt is only a warning. Use this ONLY for
+    backward-compatible inspection of old bundles, never to back a proof,
+    security, or compliance claim. For anything externally meaningful use
+    :func:`verify_evidence_bundle` (strict/proof-grade by default).
+    """
+    return verify_evidence_bundle(
+        bundle, trusted_signer_dids=trusted_signer_dids, strict=False
+    )
 
 
 def _bundle_records(records: list[PendingApproval], *, require_genesis: bool = True) -> list[dict[str, Any]]:
@@ -322,11 +403,28 @@ def _verify_receipt_with_pinned_signers(
     receipt_jcs: str,
     trusted_signer_dids: Iterable[str],
 ) -> dict[str, Any]:
-    last_error: ProofVerificationError | None = None
+    # Route by the signature-protected schema_version: decision_receipt/3 uses
+    # the W3C Data Integrity (eddsa-jcs-2022) verifier; /1 and /2 keep the legacy
+    # raw-JCS verifier. A receipt that claims one schema but was signed for the
+    # other fails closed because the signature does not reproduce under the wrong
+    # path (and schema_version is itself inside the signed body).
+    try:
+        parsed = json.loads(receipt_jcs)
+    except json.JSONDecodeError as exc:
+        raise EvidenceVerificationError("signed receipt is not valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise EvidenceVerificationError("signed receipt must be a JSON object")
+    is_w3c = parsed.get("schema_version") in _W3C_DI_RECEIPT_SCHEMAS
+
+    last_error: Exception | None = None
     for signer_did in trusted_signer_dids:
         try:
+            if is_w3c:
+                return verify_eddsa_jcs_2022(
+                    receipt_jcs, expected_signer_did=signer_did
+                )["document"]
             return verify_signed_jcs(receipt_jcs, expected_signer_did=signer_did)["body"]
-        except ProofVerificationError as exc:
+        except (ProofVerificationError, DataIntegrityError) as exc:
             last_error = exc
     raise EvidenceVerificationError("signed receipt signer is not trusted") from last_error
 
@@ -411,4 +509,5 @@ __all__ = [
     "utc_now_iso",
     "verify_evidence_bundle",
     "verify_evidence_bundle_file",
+    "verify_evidence_bundle_legacy",
 ]
