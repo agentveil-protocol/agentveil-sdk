@@ -419,6 +419,11 @@ with an externally pinned backend signer DID set (the default
 external signer DID is pinned — it never trusts the signer list embedded in the
 bundle.
 
+> Boundary: the SDK verifies the `decision_receipt/3` Data Integrity
+> (`eddsa-jcs-2022`) receipt with its own first-party verifier; this is not a
+> third-party standard-conformance certification. Only the decision receipt
+> uses Data Integrity — other receipt families remain legacy raw-JCS.
+
 ## What this quickstart does NOT prove
 
 This list is the honest counterpart to the section above. The bundle

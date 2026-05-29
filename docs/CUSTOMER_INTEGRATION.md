@@ -326,4 +326,7 @@ receipt with `verify_eddsa_jcs_2022(...)`, or — when embedded in an evidence
 bundle — through the strict bundle verifier with an externally pinned signer
 DID. The raw `verify_signed_jcs(...)` and `verify_proof_packet(...)` paths above
 cover the legacy `/1`,`/2` raw-JCS decision-receipt schema and do not accept
-`/3`.
+`/3`. `verify_eddsa_jcs_2022(...)` is the SDK's own first-party Data Integrity
+verifier; it is not a third-party standard-conformance certification, and only
+the decision receipt uses Data Integrity — the other receipt families remain
+legacy raw-JCS.

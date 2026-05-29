@@ -80,6 +80,13 @@ verification path.
 
 Offline verification does not require server access.
 
+> Caveat: the SDK verifies `decision_receipt/3` through its own first-party
+> Data Integrity (`eddsa-jcs-2022`) verifier. Proof-grade bundle verification
+> additionally requires strict mode with an externally pinned signer DID. Only
+> the Runtime DecisionReceipt uses the Data Integrity construction; the other
+> receipt families remain legacy raw-JCS. These docs do not assert third-party
+> standard conformance.
+
 ## Starter Floor Semantics (Reputation)
 
 Newly-registered agents start with a pinned displayed score of **0.25**

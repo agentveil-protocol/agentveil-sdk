@@ -240,7 +240,9 @@ The Runtime Gate DecisionReceipt is `decision_receipt/3` (W3C Data Integrity,
 when embedded in an evidence bundle, through the strict bundle verifier with an
 externally pinned signer DID. `verify_signed_jcs(...)` / `verify_proof_packet(...)`
 above cover the legacy `/1`,`/2` raw-JCS schema. HumanApprovalReceipt and
-ExecutionReceipt remain `/2` raw-JCS.
+ExecutionReceipt remain `/2` raw-JCS. `verify_eddsa_jcs_2022(...)` is the SDK's
+own first-party Data Integrity verifier, not a third-party standard-conformance
+certification.
 
 ## Go/No-Go Criteria
 
