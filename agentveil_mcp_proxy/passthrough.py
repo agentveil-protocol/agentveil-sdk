@@ -72,6 +72,11 @@ MAX_DOWNSTREAM_MESSAGE_BYTES = 1 * 1024 * 1024
 MAX_CLIENT_MESSAGE_BYTES = 1 * 1024 * 1024
 MAX_PENDING_RESPONSES = 1000
 DEFAULT_TIMED_OUT_ID_RETENTION_SECONDS = 600.0
+# Bounded set of in-flight tools/list request ids awaiting a response. Only
+# responses correlated to one of these ids are allowed to update the tool
+# schema cache, so a non-tools/list response shaped like result.tools cannot
+# poison it.
+MAX_TOOLS_LIST_REQUEST_IDS = 256
 _ENV_PASSTHROUGH_BLOCKED_PREFIXES = ("AVP_",)
 SAFE_ENV_KEYS = (
     "PATH",
@@ -441,6 +446,10 @@ class McpPassthrough:
         # Cache of advertised tool inputSchemas from downstream tools/list,
         # used for pre-approval argument validation. Thread-safe internally.
         self._tool_schemas = ToolSchemaCache()
+        # Ids of tools/list requests we sent (client-originated). Only their
+        # responses may update the schema cache via _handle_downstream_message.
+        self._tools_list_request_ids: set[str] = set()
+        self._tools_list_ids_lock = threading.Lock()
         self._timed_out_response_ids: dict[str, float] = {}
         self._windows_job: _WindowsJobObject | None = None
 
@@ -644,6 +653,10 @@ class McpPassthrough:
             policy_error, approval_outcome = self._policy_error_response(classification, request_id)
             if policy_error is not None:
                 return [policy_error] if has_id else []
+            # Correlate a client-originated tools/list so only its response may
+            # update the schema cache (poison-resistance, finding #2).
+            if has_id and message.get("method") == "tools/list":
+                self._note_tools_list_request(request_id)
             response_key = self._register_inflight_id(request_id) if has_id else None
             try:
                 self._send_downstream(message)
@@ -711,17 +724,33 @@ class McpPassthrough:
             cannot be discovered after a refresh;
           - ``None`` (proceed to policy/approval) when arguments are valid.
 
-        Schemas are not synthesized. Both error paths return before policy,
+        A tools/call whose ``params`` is not an object, or whose tool ``name``
+        is missing/non-string, is malformed and is itself rejected with
+        ``invalid_tool_call_params`` before policy/approval/downstream.
+
+        Schemas are not synthesized. These error paths return before policy,
         approval, or downstream forwarding of the original tool call.
         """
         if message.get("method") != "tools/call":
             return None
         params = message.get("params")
         if not isinstance(params, Mapping):
-            return None
+            self._record_malformed_params_event("params_not_object")
+            return jsonrpc_error(
+                request_id,
+                JSONRPC_INVALID_PARAMS,
+                "invalid tool call params",
+                data={"status": "invalid_tool_call_params", "reason": "params_not_object"},
+            )
         tool = params.get("name")
         if not isinstance(tool, str) or not tool:
-            return None
+            self._record_malformed_params_event("missing_tool_name")
+            return jsonrpc_error(
+                request_id,
+                JSONRPC_INVALID_PARAMS,
+                "invalid tool call params",
+                data={"status": "invalid_tool_call_params", "reason": "missing_tool_name"},
+            )
         schema = self._ensure_tool_schema(tool)
         if schema is None:
             # An undiscoverable tool schema must not reach approval or
@@ -780,6 +809,19 @@ class McpPassthrough:
             "action": "blocked_pre_approval",
             "reason": "tool_schema_unavailable",
             "tool": tool,
+        })
+
+    def _record_malformed_params_event(self, detail: str) -> None:
+        """Record a bounded security event for a malformed tools/call.params.
+
+        ``detail`` is a fixed reason code (``params_not_object`` /
+        ``missing_tool_name``); no raw params or argument values are stored.
+        """
+        self._record_security_event({
+            "type": "invalid_tool_call_params",
+            "action": "blocked_pre_approval",
+            "reason": "invalid_tool_call_params",
+            "detail": detail,
         })
 
     def _ensure_tool_schema(self, tool: str) -> dict[str, Any] | None:
@@ -1076,6 +1118,30 @@ class McpPassthrough:
         with self._counters_lock:
             self._unsolicited_downstream_responses += 1
 
+    def _note_tools_list_request(self, request_id: Any) -> None:
+        """Record that we sent a tools/list request with ``request_id`` so its
+        response may update the schema cache. Bounded to avoid unbounded growth
+        if a response is not received."""
+        key = self._id_key(request_id)
+        with self._tools_list_ids_lock:
+            if (
+                len(self._tools_list_request_ids) >= MAX_TOOLS_LIST_REQUEST_IDS
+                and key not in self._tools_list_request_ids
+            ):
+                self._tools_list_request_ids.pop()
+            self._tools_list_request_ids.add(key)
+
+    def _consume_tools_list_request(self, request_id: Any) -> bool:
+        """Return True (and forget the id) iff ``request_id`` was a tools/list
+        request we sent. One-shot: a response correlates to at most one
+        request."""
+        key = self._id_key(request_id)
+        with self._tools_list_ids_lock:
+            if key in self._tools_list_request_ids:
+                self._tools_list_request_ids.discard(key)
+                return True
+        return False
+
     def _register_inflight_id(self, request_id: Any) -> str:
         response_key = self._id_key(request_id)
         with self._stdout_condition:
@@ -1194,10 +1260,13 @@ class McpPassthrough:
     def _handle_downstream_message(self, response: Any) -> None:
         if not isinstance(response, dict):
             raise PassthroughError("downstream sent non-object JSON")
-        # Capture advertised tool inputSchemas from tools/list-shaped results
-        # for pre-approval argument validation. Structural + side-effect free
-        # on non-tools/list responses.
-        self._tool_schemas.update_from_response(response)
+        # Update the tool schema cache ONLY from a response correlated to a
+        # tools/list request we actually sent. A non-tools/list response shaped
+        # like result.tools must not poison the cache. (The internal cold-cache
+        # probe updates the cache directly in _ensure_tool_schema, so it does
+        # not rely on this path.)
+        if "id" in response and self._consume_tools_list_request(response.get("id")):
+            self._tool_schemas.update_from_response(response)
         if self._is_server_notification(response):
             if self._notification_writer is not None:
                 self._notification_writer(response)

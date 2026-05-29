@@ -1157,6 +1157,9 @@ def test_downstream_response_timeout_returns_sanitized_error_and_continues(tmp_p
         name="slow",
         response_timeout_seconds=0.5,
     ))
+    # Schema known (steady state) so the cold-cache probe does not run and the
+    # downstream-response timeout is exercised on the well-formed tools/call.
+    seed_tool_schemas(passthrough, [tool_entry("slow_tool")])
     try:
         passthrough.start()
         start = time.monotonic()
@@ -1164,7 +1167,7 @@ def test_downstream_response_timeout_returns_sanitized_error_and_continues(tmp_p
             "jsonrpc": "2.0",
             "id": "slow-1",
             "method": "tools/call",
-            "params": {"sleep": True, "arguments": {"token": SECRET}},
+            "params": {"name": "slow_tool", "sleep": True, "arguments": {"token": SECRET}},
         }))[0]
         elapsed = time.monotonic() - start
 
@@ -1204,6 +1207,9 @@ def test_downstream_response_timeout_does_not_leak_request_data(tmp_path):
         name="slow",
         response_timeout_seconds=0.5,
     ))
+    # Schema known (steady state) so the cold-cache probe does not run and the
+    # downstream-response timeout is exercised on the well-formed tools/call.
+    seed_tool_schemas(passthrough, [tool_entry("slow_tool")])
     try:
         passthrough.start()
         responses = passthrough.handle_client_line(_json_line({
@@ -1211,6 +1217,7 @@ def test_downstream_response_timeout_does_not_leak_request_data(tmp_path):
             "id": "secret-timeout",
             "method": "tools/call",
             "params": {
+                "name": "slow_tool",
                 "sleep": True,
                 "arguments": {
                     "prompt": f"never echo {SECRET}",
@@ -1336,7 +1343,7 @@ from agentveil_mcp_proxy.tool_schema_validation import (  # noqa: E402
     ToolSchemaCache,
     validate_arguments,
 )
-from tests.mcp_fake_downstream import tool_entry, write_downstream  # noqa: E402
+from tests.mcp_fake_downstream import seed_tool_schemas, tool_entry, write_downstream  # noqa: E402
 
 _WRITE_FILE_SCHEMA = {
     "type": "object",
@@ -1423,8 +1430,11 @@ def _preapproval_passthrough(*, server="fs", tool="write_file", seed_schema=True
     sends: list[dict] = []
     pt._send_downstream = lambda message: sends.append(message)  # type: ignore[assignment]
     if seed_schema:
-        pt._handle_downstream_message({
-            "jsonrpc": "2.0", "id": 1,
+        # Seed the cache directly (models "schema already known"). Not via
+        # _handle_downstream_message, which now only updates from responses
+        # correlated to a tools/list request we sent (poison-resistance).
+        pt._tool_schemas.update_from_response({
+            "jsonrpc": "2.0", "id": "seed",
             "result": {"tools": [{"name": tool, "inputSchema": _WRITE_FILE_SCHEMA}]},
         })
     pt.probe_calls = 0
@@ -1664,3 +1674,123 @@ def test_non_compliant_downstream_fails_closed_before_forward(tmp_path):
     # The schema probe reached downstream; the side-effecting tools/call did not.
     methods = log_path.read_text(encoding="utf-8").splitlines()
     assert "tools/call" not in methods
+
+
+# ---------------------------------------------------------------------------
+# PR #11 finding 1: malformed tools/call.params is rejected before approval
+# ---------------------------------------------------------------------------
+
+def _raw_tools_call(params, request_id="m1") -> str:
+    return _json_line({
+        "jsonrpc": "2.0", "id": request_id, "method": "tools/call", "params": params,
+    })
+
+
+def test_params_not_object_blocked_before_approval_and_downstream():
+    pt, fake, sends = _preapproval_passthrough()
+    responses = pt.handle_client_line(_raw_tools_call("not-an-object"))
+    err = responses[0]["error"]
+    assert err["code"] == JSONRPC_INVALID_PARAMS
+    assert err["data"]["status"] == "invalid_tool_call_params"
+    assert err["data"]["reason"] == "params_not_object"
+    assert fake.requests == []          # no approval created
+    assert sends == []                  # not forwarded downstream
+    events = [e for e in pt.security_events if e.get("type") == "invalid_tool_call_params"]
+    assert events and events[-1]["detail"] == "params_not_object"
+    # Bounded metadata only: the raw params value is not recorded.
+    assert "not-an-object" not in json.dumps(events)
+
+
+def test_missing_tool_name_blocked_before_approval_and_downstream():
+    pt, fake, sends = _preapproval_passthrough()
+    responses = pt.handle_client_line(_raw_tools_call({"arguments": {"path": "/tmp/x"}}))
+    err = responses[0]["error"]
+    assert err["code"] == JSONRPC_INVALID_PARAMS
+    assert err["data"]["status"] == "invalid_tool_call_params"
+    assert err["data"]["reason"] == "missing_tool_name"
+    assert fake.requests == []
+    assert sends == []
+
+
+def test_non_string_tool_name_blocked_before_approval_and_downstream():
+    pt, fake, sends = _preapproval_passthrough()
+    responses = pt.handle_client_line(_raw_tools_call({"name": 123, "arguments": {}}))
+    err = responses[0]["error"]
+    assert err["code"] == JSONRPC_INVALID_PARAMS
+    assert err["data"]["reason"] == "missing_tool_name"
+    assert fake.requests == []
+    assert sends == []
+
+
+def test_arguments_not_object_blocked_when_schema_available():
+    pt, fake, sends = _preapproval_passthrough()  # warm cache: write_file schema known
+    responses = pt.handle_client_line(
+        _raw_tools_call({"name": "write_file", "arguments": ["not", "an", "object"]})
+    )
+    err = responses[0]["error"]
+    assert err["code"] == JSONRPC_INVALID_PARAMS
+    assert err["data"]["status"] == "invalid_tool_arguments"
+    assert "arguments must be of type object" in err["data"]["details"]
+    assert fake.requests == []
+    assert sends == []
+
+
+def test_malformed_notification_not_forwarded():
+    # A no-id (notification) malformed tools/call yields no response but must
+    # still not be forwarded downstream.
+    pt, fake, sends = _preapproval_passthrough()
+    responses = pt.handle_client_line(_json_line({
+        "jsonrpc": "2.0", "method": "tools/call", "params": "not-an-object",
+    }))
+    assert responses == []
+    assert sends == []
+    assert fake.requests == []
+
+
+# ---------------------------------------------------------------------------
+# PR #11 finding 2: only correlated tools/list responses update schema cache
+# ---------------------------------------------------------------------------
+
+def test_non_tools_list_response_does_not_poison_schema_cache():
+    pt, _fake, _sends = _preapproval_passthrough(seed_schema=False)
+    # Response shaped like result.tools but NOT correlated to a tools/list we
+    # sent: must not update the cache.
+    pt._handle_downstream_message({
+        "jsonrpc": "2.0", "id": "unsolicited-evt",
+        "result": {"tools": [{"name": "write_file", "inputSchema": {"type": "object"}}]},
+    })
+    assert pt._tool_schemas.get("write_file") is None
+
+
+def test_poison_attempt_does_not_override_real_advertised_schema():
+    # Cold cache; the real probe returns the strict schema. A prior poison
+    # attempt (permissive schema via an uncorrelated response) must not take,
+    # so the subsequent invalid call is rejected by the REAL schema.
+    pt, fake, sends = _preapproval_passthrough(seed_schema=False, probe=_WRITE_FILE_TOOLS_LIST)
+    pt._handle_downstream_message({
+        "jsonrpc": "2.0", "id": "unsolicited-evt",
+        "result": {"tools": [{"name": "write_file", "inputSchema": {"type": "object"}}]},
+    })
+    assert pt._tool_schemas.get("write_file") is None  # poison rejected
+    responses = pt.handle_client_line(
+        _tools_call("write_file", {"file_path": "/tmp/x", "content": "y"})
+    )
+    err = responses[0]["error"]
+    assert err["code"] == JSONRPC_INVALID_PARAMS
+    assert err["data"]["status"] == "invalid_tool_arguments"  # real strict schema used
+    assert "unknown argument: file_path" in err["data"]["details"]
+    assert "missing required argument: path" in err["data"]["details"]
+    assert fake.requests == []
+    assert sends == []
+
+
+def test_correlated_tools_list_response_updates_schema_cache():
+    # Positive control: a response correlated to a tools/list request we noted
+    # DOES update the cache.
+    pt, _fake, _sends = _preapproval_passthrough(seed_schema=False)
+    pt._note_tools_list_request("tl-1")
+    pt._handle_downstream_message({
+        "jsonrpc": "2.0", "id": "tl-1",
+        "result": {"tools": [{"name": "write_file", "inputSchema": _WRITE_FILE_SCHEMA}]},
+    })
+    assert pt._tool_schemas.get("write_file") == _WRITE_FILE_SCHEMA
