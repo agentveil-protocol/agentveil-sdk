@@ -1,7 +1,8 @@
 # MCP Proxy Quickstart
 
 This is the cold customer path for wrapping one downstream MCP server with the
-AgentVeil MCP Proxy and producing an offline-verifiable evidence bundle. Every
+AgentVeil MCP Proxy and producing an evidence bundle that is verifiable offline
+in strict/proof-grade mode with an externally pinned signer DID. Every
 step describes behavior that is implemented and locally verifiable. Anything
 this quickstart does not cover yet is listed under
 [What this quickstart does NOT prove](#what-this-quickstart-does-not-prove).
@@ -17,7 +18,7 @@ identity migration, see [`MCP_PROXY_OPERATIONS.md`](MCP_PROXY_OPERATIONS.md).
   server: filesystem, GitHub, custom company server. You provide its launch
   command and arguments.
 - Backend access: the proxy verifies signed AgentVeil Runtime Gate
-  `decision_receipt/2` artifacts against a pinned signer-DID set. For
+  `decision_receipt/3` artifacts against a pinned signer-DID set. For
   `https://agentveil.dev` the trusted DIDs are bundled with the SDK; for any
   other base URL pass `--trusted-signer-did` to `init`.
 
@@ -315,7 +316,7 @@ classifies the call, applies local policy, and:
 
 - **ALLOW** policy decisions are forwarded to the downstream server. If the
   policy rule routes the call through Runtime Gate (`ASK_BACKEND`), the
-  verified backend `decision_receipt/2` and the downstream result hash are
+  verified backend `decision_receipt/3` and the downstream result hash are
   recorded into the local SQLite evidence store **when an evidence store is
   configured for the run** (this is the default for `agentveil-mcp-proxy run`).
 - **APPROVAL** policy decisions open the local browser approval UI bound to
@@ -350,7 +351,7 @@ Evidence exported: ./my-bundle.json (N records, M signed receipts)
 ```
 
 `N` is the count of local evidence records (one per gated tool call); `M` is
-the count of backend-signed `decision_receipt/2` artifacts the proxy was
+the count of backend-signed `decision_receipt/3` artifacts the proxy was
 able to fetch via `agent.get_decision_receipt(audit_id)` and embed in the
 bundle. If a record references an `audit_id` but the receipt could not be
 fetched or the digest did not match, the CLI prints a `WARN` and the
@@ -365,10 +366,12 @@ agentveil-mcp-proxy verify ./my-bundle.json \
   --trusted-signer-did did:key:zYourPinnedSignerDid
 ```
 
-Pass `--trusted-signer-did` to require an explicit pinned set. If you omit
-the flag the verifier will use the signer set embedded in the bundle and
-will emit a `WARN` about trusting bundle-embedded signers. For
-due-diligence verification, pass the flag.
+`verify` is strict and proof-grade: it trusts only the signer DID(s) you pin
+with `--trusted-signer-did` and never the signer set embedded in the bundle. A
+bundle that carries signed receipts fails closed (non-zero exit,
+`status: invalid`) unless you pass `--trusted-signer-did`, and a referenced
+signed receipt missing from the bundle is a hard failure rather than a warning.
+Always pass the signer DID you independently trust.
 
 Successful output:
 
@@ -386,7 +389,8 @@ The verifier checks, offline:
    - The DataIntegrityProof / `eddsa-jcs-2022` signature verifies against
      one of the pinned signer DIDs.
    - `schema_version` is in the accepted set (`decision_receipt/1`,
-     `decision_receipt/2`).
+     `decision_receipt/2`, `decision_receipt/3`). The current backend emits
+     `decision_receipt/3`; `/1`,`/2` are accepted as legacy.
    - `audit_id` is present and well-formed.
 4. Field cross-checks between record and embedded receipt:
    - `record.payload_hash` == `receipt.payload_hash`
@@ -404,13 +408,21 @@ tool call:
 
 - A privacy-preserving local evidence record describing the action class,
   risk class, payload hash, policy rule, and decision audit ID.
-- The backend-signed Runtime Gate `decision_receipt/2` artifact for every
+- The backend-signed Runtime Gate `decision_receipt/3` artifact for every
   `ASK_BACKEND` Runtime Gate decision (`ALLOW` / `BLOCK` /
   `WAITING_FOR_HUMAN_APPROVAL`) that the proxy issued.
 - The downstream result hash for forwarded calls that completed.
 
-These artifacts are independently verifiable offline against the pinned
-backend signer DID set.
+These artifacts are independently verifiable offline in strict/proof-grade mode
+with an externally pinned backend signer DID set (the default
+`verify_evidence_bundle` / CLI `verify` path). Verification fails closed when no
+external signer DID is pinned — it never trusts the signer list embedded in the
+bundle.
+
+> Boundary: the SDK verifies the `decision_receipt/3` Data Integrity
+> (`eddsa-jcs-2022`) receipt with its own first-party verifier; this is not a
+> third-party standard-conformance certification. Only the decision receipt
+> uses Data Integrity — other receipt families remain legacy raw-JCS.
 
 ## What this quickstart does NOT prove
 
@@ -449,9 +461,10 @@ This list is the honest counterpart to the section above. The bundle
 - `WARN: control grant expires in N days` — the local self-issued
   delegation is approaching expiry. Run
   `agentveil-mcp-proxy reissue-grant`.
-- `WARN: ... default_trust_from_bundle ...` from `verify` — you omitted
-  `--trusted-signer-did`. For due-diligence verification, always pass the
-  flag.
+- `FAIL: strict verification requires externally supplied trusted_signer_dids`
+  from `verify` — you omitted `--trusted-signer-did` on a receipt-bearing
+  bundle. Strict verify never trusts the bundle's embedded signer list; pass
+  the signer DID you independently trust.
 - `WARN: N records have decision_audit_id but no matching signed receipt
   in bundle` from `export-evidence` — the receipt fetch failed or the
   digest did not match. Check network reachability and that the agent

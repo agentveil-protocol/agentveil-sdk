@@ -4,6 +4,30 @@ All notable changes to the `agentveil` SDK.
 
 ## [Unreleased]
 
+> Status: shipped on branch `codex/proof-layer-strict-verifier`; backed by SDK +
+> backend tests and a third-party verifier on the exact receipt (exit code 0).
+> Boundary: SDK first-party verifier; local-dev evidence, not production.
+
+### Added
+- `decision_receipt/3` verification path built on the W3C Data Integrity
+  `eddsa-jcs-2022` construction, with exported helpers `sign_eddsa_jcs_2022` /
+  `verify_eddsa_jcs_2022`, accepted by a third-party verifier. The SDK verifies
+  `/3` through its own first-party Data Integrity verifier (not a third-party
+  conformance certification).
+
+### Changed
+- `verify_evidence_bundle` / `verify_evidence_bundle_file` now default to
+  strict, proof-grade verification (`strict=True`). Boundary: proof-grade
+  requires an externally pinned signer DID.
+- In proof-grade mode a receipt-bearing bundle requires an externally pinned
+  `trusted_signer_dids`; the bundle's own embedded signer list is not an
+  accepted trust anchor, and a referenced-but-missing signed receipt fails
+  closed. Boundary: pinned signer is mandatory.
+- `decision_receipt/1` and `/2` remain explicit legacy raw-JCS verification
+  paths. The historical self-asserted (in-bundle-trust) behavior is opt-in only
+  via `strict=False` / `verify_evidence_bundle_legacy(...)` and is not
+  proof-grade. Boundary: legacy mode is not proof-grade.
+
 ## [0.7.18] - 2026-05-28
 
 MCP Proxy approval UX repair release. This patch closes the remaining 0.7.17

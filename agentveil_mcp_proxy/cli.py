@@ -80,10 +80,6 @@ DEFAULT_EVENTS_LIMIT = 20
 QUICKSTART_FILESYSTEM_MODULE = "agentveil_mcp_proxy.quickstart_filesystem"
 SMOKE_INITIALIZE_ID = "avp-smoke-initialize"
 SMOKE_TOOLS_LIST_ID = "avp-smoke-tools-list"
-DEFAULT_TRUST_FROM_BUNDLE_WARNING = (
-    "default_trust_from_bundle: trusting bundle's embedded signer list; "
-    "pass --trusted-signer-did to verify against your own pinned set"
-)
 AGENTVEIL_DEV_SIGNER_DIDS = (
     "did:key:z6MkkvQQ9SxaNX9eEVHd5NtEamVY3YiZSpHZE567Vxs5jQQ3",
     "did:key:z6Mkjw22249tpNN4LJGLyq1oGSq1Skh3ks94fiMrgi4oqveo",
@@ -1529,17 +1525,33 @@ def verify_evidence(
     trusted_signer_dids: Iterable[str] | None = None,
     out: TextIO | None = None,
 ) -> int:
-    """Verify an evidence bundle offline."""
+    """Verify an evidence bundle offline (strict, proof-grade).
+
+    Strict verification trusts ONLY the externally pinned ``--trusted-signer-did``
+    set; it never falls back to the signer list embedded in the bundle. A bundle
+    that carries signed receipts fails closed unless at least one external signer
+    DID is supplied, and a referenced-but-missing signed receipt is a hard
+    failure rather than a warning.
+    """
 
     out = out or sys.stdout
     explicit_trusted_signers = tuple(trusted_signer_dids or ())
-    result = verify_evidence_bundle_file(
-        bundle_path,
-        trusted_signer_dids=explicit_trusted_signers,
-    )
+    try:
+        result = verify_evidence_bundle_file(
+            bundle_path,
+            trusted_signer_dids=explicit_trusted_signers,
+            strict=True,
+        )
+    except EvidenceVerificationError as exc:
+        if output_format == "json":
+            print(
+                json.dumps({"status": "invalid", "error": str(exc)}, sort_keys=True),
+                file=out,
+            )
+        else:
+            print(f"FAIL: {exc}", file=out)
+        return 1
     warnings = list(result.warnings)
-    if not explicit_trusted_signers:
-        warnings.append(DEFAULT_TRUST_FROM_BUNDLE_WARNING)
     if output_format == "json":
         print(json.dumps({
             "status": "ok",
@@ -1555,13 +1567,6 @@ def verify_evidence(
             f"{result.record_count} records, {result.signed_receipt_count} signed receipts",
             file=out,
         )
-        if result.unverified_receipt_count:
-            print(
-                "WARN: "
-                f"{result.unverified_receipt_count} records have decision_audit_id "
-                "but no matching signed receipt in bundle",
-                file=out,
-            )
         for warning in warnings:
             print(f"WARN: {warning}", file=out)
     return 0

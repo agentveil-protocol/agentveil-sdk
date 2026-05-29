@@ -74,11 +74,18 @@ verification path.
 | Reputation credential | AVP JSON | Ed25519-signed AVP JSON | `AVPAgent.verify_credential(...)` |
 | Reputation credential | W3C VC | W3C VC v2.0 Data Integrity (`eddsa-jcs-2022`) | `AVPAgent.verify_w3c_credential(...)` or compatible verifier |
 | DelegationReceipt v1 | W3C VC | W3C VC v2.0 Data Integrity (`eddsa-jcs-2022`) | `verify_delegation(...)` or standalone verifier |
-| Runtime DecisionReceipt | JCS JSON | Ed25519-signed JCS (`decision_receipt/2`) | `verify_signed_jcs(...)` or `verify_proof_packet(...)` |
+| Runtime DecisionReceipt | JCS JSON | W3C Data Integrity `DataIntegrityProof` / `eddsa-jcs-2022` (`decision_receipt/3`; legacy `/1`,`/2` were raw-JCS) | `verify_eddsa_jcs_2022(...)` for `/3`; legacy `/1`,`/2` via `verify_signed_jcs(...)` |
 | HumanApprovalReceipt | JCS JSON | Ed25519-signed JCS (`human_approval_receipt/2`) | `verify_signed_jcs(...)` or `verify_proof_packet(...)` |
 | ExecutionReceipt | JCS JSON | Ed25519-signed JCS (`execution_receipt/2`) | `verify_signed_jcs(...)` or `verify_proof_packet(...)` |
 
 Offline verification does not require server access.
+
+> Caveat: the SDK verifies `decision_receipt/3` through its own first-party
+> Data Integrity (`eddsa-jcs-2022`) verifier. Proof-grade bundle verification
+> additionally requires strict mode with an externally pinned signer DID. Only
+> the Runtime DecisionReceipt uses the Data Integrity construction; the other
+> receipt families remain legacy raw-JCS. These docs do not assert third-party
+> standard conformance.
 
 ## Starter Floor Semantics (Reputation)
 

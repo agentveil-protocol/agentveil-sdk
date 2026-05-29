@@ -29,6 +29,7 @@ from agentveil_mcp_proxy.evidence.proof import (
     utc_now_iso,
     verify_evidence_bundle,
     verify_evidence_bundle_file,
+    verify_evidence_bundle_legacy,
 )
 
 __all__ = [
@@ -58,4 +59,5 @@ __all__ = [
     "utc_now_iso",
     "verify_evidence_bundle",
     "verify_evidence_bundle_file",
+    "verify_evidence_bundle_legacy",
 ]

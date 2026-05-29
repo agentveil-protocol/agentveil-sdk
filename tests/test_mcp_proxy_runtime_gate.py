@@ -16,6 +16,7 @@ import pytest
 from nacl.signing import SigningKey
 
 from agentveil.agent import AVPAgent
+from agentveil.data_integrity import DATA_INTEGRITY_CONTEXT, sign_eddsa_jcs_2022
 from agentveil.delegation import _public_key_to_did
 from agentveil_mcp_proxy.approval import ApprovalManager, ApprovalServer
 from agentveil_mcp_proxy.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
@@ -23,6 +24,7 @@ from agentveil_mcp_proxy.classification import ToolCallClassifier
 from agentveil_mcp_proxy.evidence import (
     ApprovalEvidenceStore,
     ApprovalStatus,
+    EvidenceVerificationError,
     export_evidence_bundle,
     verify_evidence_bundle,
 )
@@ -250,6 +252,67 @@ class SequencedReceiptAgent:
 
     def get_decision_receipt(self, audit_id: str) -> str:
         raise AssertionError("inline decision_receipt_jcs should avoid a receipt fetch")
+
+
+def _decision_receipt_v3(
+    request: dict,
+    *,
+    decision: str = "ALLOW",
+    approval_id: str | None = None,
+    audit_id: str = AUDIT_ID,
+    seed: bytes = BACKEND_SEED,
+    backend_risk_class: str = "unknown",
+    backend_policy_context_hash: str = "b" * 64,
+) -> str:
+    """A W3C Data Integrity (eddsa-jcs-2022) decision_receipt/3, same fields as /2."""
+    body = {
+        "@context": [DATA_INTEGRITY_CONTEXT],
+        "schema_version": "decision_receipt/3",
+        "audit_id": audit_id,
+        "agent_did": AGENT_DID,
+        "action": request["action"],
+        "resource": request["resource"],
+        "environment": request["environment"],
+        "decision": decision,
+        "payload_hash": request["payload_hash"],
+        "risk_class": backend_risk_class,
+        "policy_context_hash": backend_policy_context_hash,
+        "client_risk_class": request["risk_class"],
+        "client_policy_context_hash": request["policy_context_hash"],
+    }
+    if approval_id is not None:
+        body["approval_id"] = approval_id
+    return sign_eddsa_jcs_2022(body, seed, created="2026-05-29T00:00:00Z")
+
+
+class FetchableRecordingAgentV3:
+    """Stub backend that emits decision_receipt/3 and supports receipt fetch."""
+
+    did = AGENT_DID
+
+    def __init__(self, *, decision: str = "ALLOW", seed: bytes = BACKEND_SEED):
+        self.decision = decision
+        self.seed = seed
+        self.calls: list[dict] = []
+        self.receipts: dict[str, str] = {}
+
+    def runtime_evaluate(self, **kwargs):
+        self.calls.append(kwargs)
+        receipt = _decision_receipt_v3(
+            kwargs,
+            decision=self.decision,
+            seed=self.seed,
+            approval_id=(
+                "urn:uuid:approval"
+                if self.decision == "WAITING_FOR_HUMAN_APPROVAL"
+                else None
+            ),
+        )
+        self.receipts[AUDIT_ID] = receipt
+        return {"audit_id": AUDIT_ID, "decision": self.decision, "decision_receipt_jcs": receipt}
+
+    def get_decision_receipt(self, audit_id: str) -> str:
+        return self.receipts[audit_id]
 
 
 class StaticGate:
@@ -829,3 +892,66 @@ def test_backend_timeout_error_is_sanitized_and_bounded(tmp_path):
     }
     assert SECRET not in client_out.getvalue()
     assert not log_path.exists()
+
+
+def test_evaluate_accepts_decision_receipt_v3():
+    config = _config()
+    agent = FetchableRecordingAgentV3()
+    client = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+
+    result = client.evaluate(_classification(config))
+
+    assert result.decision == "ALLOW"
+    assert result.receipt_body["schema_version"] == "decision_receipt/3"
+    assert result.receipt_body["@context"] == [DATA_INTEGRITY_CONTEXT]
+
+
+def test_decision_receipt_v3_signed_by_untrusted_key_is_rejected():
+    config = _config()
+    agent = FetchableRecordingAgentV3(seed=OTHER_BACKEND_SEED)
+    client = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+
+    with pytest.raises(RuntimeGateUntrustedError, match="not trusted"):
+        client.evaluate(_classification(config))
+
+
+def test_v3_export_bundle_embeds_and_strict_verifies(tmp_path):
+    config = _config()
+    agent = FetchableRecordingAgentV3(decision="ALLOW")
+    gate = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+    bundle_path = tmp_path / "evidence-bundle.json"
+    with ApprovalEvidenceStore(tmp_path / "evidence.sqlite") as store:
+        manager = ApprovalManager(
+            evidence_store=store,
+            approval_server=ApprovalServer(),
+            config=config,
+            client_id="pytest",
+            session_id="session-v3-bundle",
+        )
+        passthrough, _log_path = _passthrough(tmp_path, gate, config, approval_manager=manager)
+        client_out = io.StringIO()
+
+        assert passthrough.run_stdio(io.StringIO(_tool_call()), client_out) == 0
+
+        bundle = export_evidence_bundle(
+            store,
+            bundle_path,
+            proxy_identity_did=AGENT_DID,
+            trusted_signer_dids=[BACKEND_DID],
+            receipt_fetcher=agent.get_decision_receipt,
+        )
+
+    # The bundle embeds the exact /3 receipt.
+    embedded = next(iter(bundle["signed_receipts"].values()))
+    assert json.loads(embedded)["schema_version"] == "decision_receipt/3"
+
+    # Strict + externally pinned signer verifies the embedded /3 receipt.
+    result = verify_evidence_bundle(bundle, trusted_signer_dids=[BACKEND_DID])
+    assert result.valid is True
+    assert result.signed_receipt_count == 1
+    assert result.unverified_receipt_count == 0
+    assert result.warnings == ()
+
+    # Strict default with no external signer fails closed.
+    with pytest.raises(EvidenceVerificationError):
+        verify_evidence_bundle(bundle)
