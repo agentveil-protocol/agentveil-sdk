@@ -447,6 +447,11 @@ class ApprovalManager:
     def _scope_expansion_allowed(self, classification: ClassifiedToolCall) -> bool:
         if classification.risk_class is not RiskClass.WRITE:
             return False
+        if classification.resource_hash is None:
+            # Without a resource binding a similar_5m grant cannot constrain the
+            # target (payload is intentionally unbound), so it must be neither
+            # offered nor reused -- require a fresh approval instead.
+            return False
         rule = self._matched_policy_rule(classification.policy_evaluation.policy_rule_id)
         return rule is not None and rule.approval_scope_expansion == APPROVAL_SCOPE_SIMILAR_5M
 

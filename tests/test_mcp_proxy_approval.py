@@ -1527,3 +1527,99 @@ def test_signal_handlers_extend_to_approval_server_graceful_shutdown(tmp_path, m
 
     assert proxy_cli.run_proxy(home=home, client_in=io.StringIO(), out=io.StringIO()) == 0
     assert stopped == {"server": True, "store": True}
+
+
+# --- similar_5m resource-binding guard (Step 10) ---
+
+def _classification_no_resource(config: ProxyConfig):
+    # WRITE tool that matches the similar_5m rule but exposes no
+    # resource-extractable argument, so classification.resource_hash is None.
+    return ToolCallClassifier(config, server_name="github").classify(
+        tool="create_issue",
+        arguments={"title": "no-resource-target"},
+    )
+
+
+def test_scope_expansion_allowed_when_resource_hash_present(tmp_path):
+    config = _config(policy_rule=_write_rule(scope_expansion=True))
+    manager, store, server, _cli = _manager(tmp_path, config=config)
+    try:
+        classification = _classification(config)
+        assert classification.resource_hash is not None
+        assert classification.risk_class.value == "write"
+        assert manager._scope_expansion_allowed(classification) is True
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_scope_expansion_blocked_when_resource_hash_missing(tmp_path):
+    config = _config(policy_rule=_write_rule(scope_expansion=True))
+    manager, store, server, _cli = _manager(tmp_path, config=config)
+    try:
+        classification = _classification_no_resource(config)
+        # Still a WRITE call under the similar_5m rule -- only the missing
+        # resource binding should block expansion.
+        assert classification.resource_hash is None
+        assert classification.risk_class.value == "write"
+        assert manager._scope_expansion_allowed(classification) is False
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_missing_resource_hash_skips_similar_reuse_and_requires_fresh_approval(tmp_path, monkeypatch):
+    config = _config(policy_rule=_write_rule(scope_expansion=True))
+    manager, store, server, _cli = _manager(tmp_path, config=config, wait_for_decision=False)
+    try:
+        similar_lookups = {"count": 0}
+        original = store.find_active_similar_grant
+
+        def _spy(**kwargs):
+            similar_lookups["count"] += 1
+            return original(**kwargs)
+
+        monkeypatch.setattr(store, "find_active_similar_grant", _spy)
+
+        outcome = manager.request_approval(
+            _classification_no_resource(config),
+            reason="local_approval_required",
+        )
+
+        # No resource binding -> the similar-grant reuse lookup is never
+        # claim-check: allow "never" describes this negative reuse test.
+        # attempted, so no prior grant can be reused...
+        assert similar_lookups["count"] == 0
+        # ...and the call is not auto-approved via scope cache; a fresh approval
+        # prompt is created instead.
+        assert outcome.reason != "scope_cache_hit"
+        assert outcome.status == ApprovalStatus.PENDING.value
+        assert server.pending_prompts(), "missing resource_hash must require a fresh approval"
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_present_resource_hash_still_attempts_similar_reuse(tmp_path, monkeypatch):
+    config = _config(policy_rule=_write_rule(scope_expansion=True))
+    manager, store, server, _cli = _manager(tmp_path, config=config, wait_for_decision=False)
+    try:
+        similar_lookups = {"count": 0}
+        original = store.find_active_similar_grant
+
+        def _spy(**kwargs):
+            similar_lookups["count"] += 1
+            return original(**kwargs)
+
+        monkeypatch.setattr(store, "find_active_similar_grant", _spy)
+
+        manager.request_approval(
+            _classification(config),  # resource_hash present
+            reason="local_approval_required",
+        )
+
+        # Resource-bound similar_5m still consults the reuse cache (preserved).
+        assert similar_lookups["count"] == 1
+    finally:
+        server.stop()
+        store.close()
