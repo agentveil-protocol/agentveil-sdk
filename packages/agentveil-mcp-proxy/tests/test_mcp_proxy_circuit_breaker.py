@@ -36,6 +36,8 @@ from agentveil_mcp_proxy.runtime_gate import (
     RuntimeGateUntrustedError,
 )
 
+from mcp_fake_downstream import tool_entry, write_downstream
+
 
 BACKEND_SEED = bytes.fromhex("11" * 32)
 OTHER_BACKEND_SEED = bytes.fromhex("22" * 32)
@@ -273,25 +275,17 @@ def _tool_call() -> str:
 
 
 def _echo_downstream(tmp_path: Path, log_path: Path) -> Path:
-    script = tmp_path / "circuit_echo.py"
-    script.write_text(
-        """
-import json
-import os
-import sys
-
-log_path = os.environ["DOWNSTREAM_LOG"]
-for line in sys.stdin:
-    msg = json.loads(line)
-    with open(log_path, "a", encoding="utf-8") as fh:
-        fh.write(msg.get("method", "") + "\\n")
-    if "id" not in msg:
-        continue
-    print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"ok": True}}), flush=True)
-""".lstrip(),
-        encoding="utf-8",
+    # Schema-aware MCP downstream: answers tools/list with a permissive schema
+    # for create_issue so pre-approval validation resolves it before the
+    # circuit-breaker / runtime-gate path, then returns {"ok": True} for
+    # tools/call. A forwarded call logs ["tools/list", "tools/call"]; a
+    # fallback-refused call logs ["tools/list"] only.
+    return write_downstream(
+        tmp_path,
+        filename="circuit_echo.py",
+        tools=[tool_entry("create_issue"), tool_entry("get_file_contents")],
+        call_result={"ok": True},
     )
-    return script
 
 
 def _passthrough(tmp_path: Path, gate: object, config: ProxyConfig) -> tuple[McpPassthrough, Path]:
@@ -633,7 +627,8 @@ def test_open_circuit_cascades_to_existing_fallback_policy_per_risk_class(tmp_pa
     assert passthrough.run_stdio(io.StringIO(_tool_call()), client_out) == 0
 
     assert _responses(client_out.getvalue())[0]["result"] == {"ok": True}
-    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/call"]
+    # tools/list schema probe (cold cache) precedes the fallback-allowed tools/call.
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list", "tools/call"]
 
 
 def test_open_circuit_returns_sanitized_error_in_block_fallback(tmp_path):
@@ -658,7 +653,9 @@ def test_open_circuit_returns_sanitized_error_in_block_fallback(tmp_path):
         "reason": "runtime_gate_unavailable",
     }
     assert SECRET not in client_out.getvalue()
-    assert not log_path.exists()
+    # Schema probe (tools/list) reaches downstream; the fallback-refused
+    # tools/call is not forwarded.
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
 
 
 def _read_ask_backend_config(*, fallback: dict | None = None) -> ProxyConfig:
@@ -725,7 +722,7 @@ def test_open_circuit_read_fallback_defaults_to_approval_not_forwarded(tmp_path)
         "status": "approval_required",
         "reason": "runtime_gate_unavailable",
     }
-    assert not log_path.exists()
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
     assert SECRET not in client_out.getvalue()
 
 
@@ -747,7 +744,7 @@ def test_open_circuit_read_fallback_explicit_allow_forwards(tmp_path):
     assert passthrough.run_stdio(io.StringIO(_read_tool_call()), client_out) == 0
 
     assert _responses(client_out.getvalue())[0]["result"] == {"ok": True}
-    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/call"]
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list", "tools/call"]
 
 
 def test_circuit_state_change_emits_security_event_without_payload_data(tmp_path):

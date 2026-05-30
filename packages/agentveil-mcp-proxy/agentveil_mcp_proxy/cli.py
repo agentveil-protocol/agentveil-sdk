@@ -77,7 +77,6 @@ MIN_IDENTITY_PASSPHRASE_LENGTH = 12
 DEFAULT_ALLOWED_CATEGORIES = ("mcp_proxy",)
 DEFAULT_EVIDENCE_VACUUM_MAX_AGE_DAYS = 90
 DEFAULT_EVENTS_LIMIT = 20
-QUICKSTART_FILESYSTEM_MODULE = "agentveil_mcp_proxy.quickstart_filesystem"
 SMOKE_INITIALIZE_ID = "avp-smoke-initialize"
 SMOKE_TOOLS_LIST_ID = "avp-smoke-tools-list"
 AGENTVEIL_DEV_SIGNER_DIDS = (
@@ -675,10 +674,11 @@ def quickstart_filesystem_downstream(root: Path) -> dict[str, Any]:
 
     sandbox = root.expanduser().resolve()
     sandbox.mkdir(parents=True, exist_ok=True)
+    server_path = Path(__file__).with_name("quickstart_filesystem.py")
     return _downstream_config_payload(
         name="filesystem",
         command=sys.executable,
-        args=("-m", QUICKSTART_FILESYSTEM_MODULE, str(sandbox)),
+        args=(str(server_path), str(sandbox)),
         response_timeout_seconds=5.0,
     )
 

@@ -17,6 +17,8 @@ from agentveil_mcp_proxy.classification import (
 from agentveil_mcp_proxy.passthrough import DownstreamConfig, McpPassthrough
 from agentveil_mcp_proxy.policy import PolicyDecision, ProxyConfig, RiskClass, builtin_policy_pack
 
+from mcp_fake_downstream import tool_entry, write_downstream
+
 
 SECRET = "SECRET_PROJECT_INTERNAL"
 
@@ -83,25 +85,15 @@ def _config(*, privacy: dict | None = None, policy_pack: str = "github") -> Prox
 
 
 def _echo_downstream(tmp_path):
-    script = tmp_path / "echo_downstream.py"
-    script.write_text(
-        """
-import json
-import sys
-
-for line in sys.stdin:
-    msg = json.loads(line)
-    if "id" not in msg:
-        continue
-    print(json.dumps({
-        "jsonrpc": "2.0",
-        "id": msg["id"],
-        "result": {"content": [{"type": "text", "text": "forwarded"}]},
-    }), flush=True)
-""".lstrip(),
-        encoding="utf-8",
+    # Schema-aware MCP downstream: answers tools/list with a permissive schema
+    # for get_issue so the proxy's pre-approval validation can resolve it,
+    # then echoes "forwarded" for the tools/call. See mcp_fake_downstream.
+    return write_downstream(
+        tmp_path,
+        filename="echo_downstream.py",
+        tools=[tool_entry("get_issue")],
+        call_result_text="forwarded",
     )
-    return script
 
 
 def test_payload_hash_is_jcs_stable_and_default_metadata_is_privacy_safe():

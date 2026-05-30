@@ -1197,7 +1197,7 @@ def test_init_quickstart_filesystem_configures_downstream_and_filesystem_policy(
     assert config["policy"]["id"] == "filesystem"
     assert config["downstream"]["name"] == "filesystem"
     assert config["downstream"]["command"] == sys.executable
-    assert "agentveil_mcp_proxy.quickstart_filesystem" in config["downstream"]["args"]
+    assert any(str(arg).endswith("quickstart_filesystem.py") for arg in config["downstream"]["args"])
 
 
 def test_doctor_full_fails_without_downstream_config(tmp_path):

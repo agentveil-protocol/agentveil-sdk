@@ -309,6 +309,27 @@ def test_wrong_trusted_signer_did_fails_verification():
         verify_egress_receipt(outcome.receipt_jcs, trusted_signer_dids=[other_did])
 
 
+def _allow_receipt_jcs() -> str:
+    agent = _make_agent()
+    stub = _StubHttpClient(response=_StubHttpResponse(status_code=200))
+    with patch.object(agent, "runtime_evaluate", return_value=_allow_decision()):
+        outcome = _call_controlled_egress(agent, http_factory=_stub_factory(stub))
+    return outcome.receipt_jcs
+
+
+def test_no_trusted_signer_dids_fails_closed():
+    """Default (no trust config) must NOT accept any valid signer."""
+    receipt_jcs = _allow_receipt_jcs()
+    with pytest.raises(EgressReceiptVerificationError, match="trusted_signer_dids is required"):
+        verify_egress_receipt(receipt_jcs)
+
+
+def test_empty_trusted_signer_set_fails_closed():
+    receipt_jcs = _allow_receipt_jcs()
+    with pytest.raises(EgressReceiptVerificationError, match="not trusted"):
+        verify_egress_receipt(receipt_jcs, trusted_signer_dids=[])
+
+
 def test_runtime_gate_call_uses_network_egress_action_and_correct_kwargs():
     agent = _make_agent()
     stub = _StubHttpClient()

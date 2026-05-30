@@ -41,6 +41,8 @@ from agentveil_mcp_proxy.evidence import (
 from agentveil_mcp_proxy.passthrough import DownstreamConfig, McpPassthrough
 from agentveil_mcp_proxy.policy import ProxyConfig, ProxyConfigError
 
+from mcp_fake_downstream import tool_entry, write_downstream
+
 
 SECRET = "SECRET_APPROVAL_PAYLOAD"
 TOKEN_RE = re.compile(r'name="csrf_token" value="([^"]+)"')
@@ -1268,29 +1270,12 @@ def test_approval_flow_does_not_send_raw_args_to_evidence_store_or_ui_or_notific
 
 
 def _approval_downstream(tmp_path: Path, log_path: Path) -> Path:
-    script = tmp_path / "approval_downstream.py"
-    script.write_text(
-        """
-import json
-import os
-import sys
-
-log_path = os.environ["DOWNSTREAM_LOG"]
-for line in sys.stdin:
-    msg = json.loads(line)
-    with open(log_path, "a", encoding="utf-8") as fh:
-        fh.write(msg.get("method", "") + "\\n")
-    if "id" not in msg:
-        continue
-    print(json.dumps({
-        "jsonrpc": "2.0",
-        "id": msg["id"],
-        "result": {"content": [{"type": "text", "text": "approved"}]},
-    }), flush=True)
-""".lstrip(),
-        encoding="utf-8",
+    return write_downstream(
+        tmp_path,
+        filename="approval_downstream.py",
+        tools=[tool_entry("create_issue")],
+        call_result_text="approved",
     )
-    return script
 
 
 def _tool_call() -> str:

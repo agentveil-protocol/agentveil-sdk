@@ -31,6 +31,8 @@ from agentveil_mcp_proxy.passthrough import (
     McpPassthrough,
 )
 
+from mcp_fake_downstream import seed_tool_schemas, tool_entry
+
 
 SECRET = "SECRET_DOWNSTREAM_TOKEN"
 
@@ -166,7 +168,10 @@ import json
 import os
 import sys
 
-TOOLS = [{"name": "read_file", "description": "Read a file", "inputSchema": {"type": "object"}}]
+TOOLS = [
+    {"name": "read_file", "description": "Read a file", "inputSchema": {"type": "object"}},
+    {"name": "write_file", "description": "Write a file", "inputSchema": {"type": "object"}},
+]
 log_path = os.environ.get("DOWNSTREAM_LOG")
 
 def log(method):
@@ -598,7 +603,10 @@ def test_run_mirrors_initialize_initialized_and_tools_list(tmp_path):
     assert [response["id"] for response in responses] == [1, 2]
     assert responses[0]["result"]["serverInfo"] == {"name": "fake-downstream", "version": "1.0.0"}
     assert responses[1]["result"] == {
-        "tools": [{"name": "read_file", "description": "Read a file", "inputSchema": {"type": "object"}}]
+        "tools": [
+            {"name": "read_file", "description": "Read a file", "inputSchema": {"type": "object"}},
+            {"name": "write_file", "description": "Write a file", "inputSchema": {"type": "object"}},
+        ]
     }
     assert log_path.read_text(encoding="utf-8").splitlines() == [
         "initialize",
@@ -643,7 +651,7 @@ def test_run_passthrough_forwards_local_allow_without_backend_or_gate(tmp_path, 
         "id": "call-1",
         "result": {"content": [{"type": "text", "text": "called"}]},
     }]
-    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/call"]
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list", "tools/call"]
 
 
 def test_run_returns_approval_required_without_waiting_or_forwarding(tmp_path, monkeypatch):
@@ -722,13 +730,13 @@ def test_invalid_write_file_args_do_not_create_approval(tmp_path, monkeypatch):
     assert responses[0]["result"]["tools"][0]["name"] == "write_file"
     response = responses[1]
     assert response["error"]["code"] == JSONRPC_INVALID_PARAMS
-    assert response["error"]["message"] == "Invalid arguments for write_file"
-    assert response["error"]["data"]["status"] == "schema_validation_error"
-    assert response["error"]["data"]["reason"] == "schema_validation_error"
-    assert response["error"]["data"]["error_code"] == "schema_validation_error"
+    assert response["error"]["message"] == "invalid tool arguments"
+    assert response["error"]["data"]["status"] == "invalid_tool_arguments"
     assert response["error"]["data"]["tool"] == "write_file"
-    assert response["error"]["data"]["missing_required"] == ["path"]
-    assert response["error"]["data"]["unexpected_arguments"] == ["file_path"]
+    assert response["error"]["data"]["details"] == [
+        "missing required argument: path",
+        "unknown argument: file_path",
+    ]
     assert "approval_url" not in response["error"]["data"]
     assert "record_id" not in response["error"]["data"]
     assert _pending_approval_count(home) == 0
@@ -768,9 +776,11 @@ def test_invalid_write_file_args_fetch_schema_before_approval(tmp_path, monkeypa
 
     response = _responses(client_out.getvalue())[0]
     assert response["error"]["code"] == JSONRPC_INVALID_PARAMS
-    assert response["error"]["data"]["status"] == "schema_validation_error"
-    assert response["error"]["data"]["missing_required"] == ["path"]
-    assert response["error"]["data"]["unexpected_arguments"] == ["file_path"]
+    assert response["error"]["data"]["status"] == "invalid_tool_arguments"
+    assert response["error"]["data"]["details"] == [
+        "missing required argument: path",
+        "unknown argument: file_path",
+    ]
     assert "approval_url" not in response["error"]["data"]
     assert "record_id" not in response["error"]["data"]
     assert _pending_approval_count(home) == 0
@@ -897,7 +907,7 @@ def test_secret_read_file_path_fails_before_downstream_read(tmp_path, monkeypatc
     assert "approval_url" not in response["error"]["data"]
     assert "record_id" not in response["error"]["data"]
     assert _pending_approval_count(home) == 0
-    assert not log_path.exists()
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
 
 
 def test_run_passthrough_does_not_construct_avp_agent_or_call_backend(tmp_path, monkeypatch):
@@ -1054,6 +1064,7 @@ def test_classifier_exception_on_tool_call_fails_closed(tmp_path):
         ),
         classifier=ExplodingClassifier(),
     )
+    seed_tool_schemas(passthrough, [tool_entry("read_file")])
     client_out = io.StringIO()
 
     assert passthrough.run_stdio(
@@ -1102,6 +1113,7 @@ def test_classifier_callback_exception_does_not_break_passthrough(tmp_path):
         classifier=StaticClassifier(),
         on_tool_call=exploding_callback,
     )
+    seed_tool_schemas(passthrough, [tool_entry("read_file")])
     client_out = io.StringIO()
 
     assert passthrough.run_stdio(
@@ -1461,6 +1473,7 @@ def test_downstream_response_timeout_returns_sanitized_error_and_continues(tmp_p
         name="slow",
         response_timeout_seconds=0.5,
     ))
+    seed_tool_schemas(passthrough, [tool_entry("slow_tool")])
     try:
         passthrough.start()
         start = time.monotonic()
@@ -1468,7 +1481,7 @@ def test_downstream_response_timeout_returns_sanitized_error_and_continues(tmp_p
             "jsonrpc": "2.0",
             "id": "slow-1",
             "method": "tools/call",
-            "params": {"sleep": True, "arguments": {"token": SECRET}},
+            "params": {"name": "slow_tool", "sleep": True, "arguments": {"token": SECRET}},
         }))[0]
         elapsed = time.monotonic() - start
 
@@ -1508,6 +1521,7 @@ def test_downstream_response_timeout_does_not_leak_request_data(tmp_path):
         name="slow",
         response_timeout_seconds=0.5,
     ))
+    seed_tool_schemas(passthrough, [tool_entry("slow_tool")])
     try:
         passthrough.start()
         responses = passthrough.handle_client_line(_json_line({
@@ -1515,6 +1529,7 @@ def test_downstream_response_timeout_does_not_leak_request_data(tmp_path):
             "id": "secret-timeout",
             "method": "tools/call",
             "params": {
+                "name": "slow_tool",
                 "sleep": True,
                 "arguments": {
                     "prompt": f"never echo {SECRET}",

@@ -19,6 +19,8 @@ from agentveil_mcp_proxy.passthrough import (
 )
 from agentveil_mcp_proxy.policy import ProxyConfig
 
+from mcp_fake_downstream import seed_tool_schemas, tool_entry
+
 
 SECRET_ARG = "SUPER_SECRET_ARGUMENT_VALUE"
 
@@ -66,6 +68,14 @@ class _RecordingPassthrough(McpPassthrough):
             classifier=classifier,
         )
         self.forwarded: list[Mapping[str, Any]] = []
+        seed_tool_schemas(
+            self,
+            [
+                tool_entry("get_issue"),
+                tool_entry("delete_repo"),
+                tool_entry("exfiltrate"),
+            ],
+        )
 
     def _send_downstream(self, message: Mapping[str, Any]) -> None:
         self.forwarded.append(message)
