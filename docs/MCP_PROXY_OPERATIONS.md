@@ -94,22 +94,41 @@ agentveil-mcp-proxy verify /secure/path/evidence-bundle.json \
   --trusted-signer-did did:key:z6Mk...
 ```
 
-Without `--trusted-signer-did`, verification falls back to the signer list
-embedded in the bundle and prints a warning. That mode confirms internal bundle
-consistency, but it does not prove the bundle's signer list is the auditor's
-trusted set. A malicious bundle can include an attacker-controlled signer DID
-and a matching attacker-signed receipt.
+`verify` runs in strict, proof-grade mode: it trusts ONLY the signer DID(s) you
+pin with `--trusted-signer-did` and never the signer list embedded in the
+bundle. A receipt-bearing bundle therefore fails closed (non-zero exit,
+`status: invalid`) unless you pass `--trusted-signer-did`, and a referenced
+signed receipt that is missing from the bundle is a hard failure, not a warning.
+That is what stops a malicious bundle from vouching for itself with an
+attacker-controlled signer DID and a matching attacker-signed receipt.
+
+For day-to-day operator visibility, use the privacy-safe event views:
+
+```bash
+agentveil-mcp-proxy events list --limit 20
+agentveil-mcp-proxy events list --json
+agentveil-mcp-proxy events tail
+agentveil-mcp-proxy events tail --follow
+agentveil-mcp-proxy evidence-summary
+```
+
+`events list` / `events tail` show timestamp, downstream server, tool, risk
+class, evidence status, policy rule, receipt presence, and evidence record ID.
+They do not print raw MCP arguments, prompts, outputs, tokens, source code,
+secrets, payload hashes, or result hashes. `evidence-summary` prints aggregate
+counts by status and receipt presence.
 
 To prune old terminal records and rebuild the local chain:
 
 ```bash
-agentveil-mcp-proxy events --vacuum --max-age-days 90
-agentveil-mcp-proxy events --vacuum --before 2026-05-01T00:00:00Z
+agentveil-mcp-proxy events vacuum --max-age-days 90
+agentveil-mcp-proxy events vacuum --before 2026-05-01T00:00:00Z
 ```
 
 Vacuum removes only terminal states (`executed`, `denied`, `expired`,
 `invalidated`, `error`, `blocked`) older than the cutoff. Pending and approved
-records are preserved regardless of age.
+records are preserved regardless of age. The legacy `events --vacuum` form is
+still accepted.
 
 ## Local Approval Surface
 
@@ -128,6 +147,12 @@ private logs.
 The proxy writes the pending approval record before it renders the approval page
 or sends notifications. Approval, denial, and timeout decisions are written back
 to local evidence before the proxy acts on them.
+
+For MCP stdio clients, approval-required calls fail fast instead of holding the
+tool call open until a human acts. The JSON-RPC error uses code `-32011` and
+includes `status: "approval_required"`, `record_id`, `record_status`, and
+`approval_url`. Open the URL to approve or deny; if approved, retry the tool
+call so the new request can use the recorded approval grant.
 
 ## Multi-IDE Deployment
 

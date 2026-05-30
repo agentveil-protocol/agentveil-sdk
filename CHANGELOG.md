@@ -4,10 +4,112 @@ All notable changes to the `agentveil` SDK.
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## [0.7.18] - 2026-05-28
+
+MCP Proxy and proof verification hardening release. This release closes the
+0.7.17 approval-required stdio gap, moves the MCP Proxy into a separate
+source-available package, and tightens proof/evidence verification defaults.
+
+The root `agentveil` package still contains the public SDK, hosted MCP server,
+and Paperclip helper. The MCP Proxy is now packaged separately as
+`agentveil-mcp-proxy` under the Business Source License 1.1.
+
+### Added
+- Added `decision_receipt/3` signing and verification helpers. The SDK verifies
+  `/3` through its first-party Data Integrity verifier; this is not a
+  third-party conformance certification.
+- Added `decision_receipt/3` support to `verify_proof_packet` while preserving
+  legacy `/1` and `/2` raw-JCS receipt verification paths.
+- Added `--json` support to `agentveil-mcp-proxy register`.
+- Added an MCP Proxy release acceptance runner that builds or consumes a wheel,
+  installs it into a clean virtualenv, drives the quickstart filesystem MCP
+  server through the proxy, approves a risky action through the loopback UI,
+  retries the action, and verifies events/evidence export.
+- Added a declared tool-surface configuration for MCP Proxy
+  (`tool_surface.mode = off | observe | enforce`) with an operator-managed
+  allowlist.
+- Added a separate `agentveil-mcp-proxy` package under
+  `packages/agentveil-mcp-proxy/`. The `agentveil-mcp-proxy` console command is
+  preserved.
+
 ### Changed
+- `verify_evidence_bundle` / `verify_evidence_bundle_file` now default to
+  strict verification (`strict=True`). Proof-grade verification requires
+  externally pinned signer DIDs.
+- In proof-grade mode a receipt-bearing bundle requires externally pinned
+  `trusted_signer_dids`; the bundle's embedded signer list is not an accepted
+  trust anchor, and a referenced-but-missing signed receipt fails closed.
+- `decision_receipt/1` and `/2` remain explicit legacy raw-JCS verification
+  paths. The historical self-asserted in-bundle-trust behavior is available
+  only via `strict=False` / `verify_evidence_bundle_legacy(...)` and is not
+  proof-grade.
 - Corrected Microsoft AGT / AgentMesh docs wording so `AVPProvider` remains
   named while AgentVeil is described as an external trust and reputation
   integration.
+- Changed MCP Proxy approval-required stdio calls to return an immediate
+  structured `approval_required` response with the local evidence record ID and
+  approval URL instead of holding the MCP request open until timeout.
+- Approved exact local approval records now authorize one identical retry, so
+  clients can complete the approved MCP tool call after the user approves it in
+  the local browser approval UI.
+- Changed the default Runtime Gate unavailable fallback for read-class tool
+  calls from `allow` to `approval`. Operators may still explicitly configure
+  `read = "allow"` as an opt-in risk decision.
+- Changed `similar_5m` approval reuse so it requires an extracted
+  `resource_hash`. Calls without a resource binding require a fresh approval.
+- Changed the MCP Proxy packaging split: root `agentveil` wheels no longer ship
+  the proxy package or the `agentveil-mcp-proxy` console entry point. Install
+  the proxy with `pip install agentveil agentveil-mcp-proxy`.
+- Documented the MCP Proxy release acceptance procedure as a release gate for
+  serious MCP Proxy setup, passthrough, approval, evidence, and Runtime Gate
+  changes.
+
+### Fixed
+- Fixed MCP Proxy argument validation so tool-call arguments are checked before
+  approval when the downstream tool schema is available.
+- Fixed classifier exception handling so a classifier failure on `tools/call`
+  fails closed instead of forwarding without policy or Runtime Gate evaluation.
+- Fixed unsafe filesystem tool paths so path traversal and secret-like file
+  reads are rejected before approval and downstream forwarding.
+- Fixed the Runtime Gate unavailable fallback path so the default read-class
+  behavior is approval-required rather than silent allow.
+- Fixed the `ASK_BACKEND` library-embed path without a Runtime Gate factory so
+  it fails closed with `runtime_gate_not_configured` instead of forwarding.
+
+### Notes
+- The GitHub release workflow still publishes the root `agentveil` package
+  only. Publishing the separate `agentveil-mcp-proxy` package requires a
+  separate release/publishing decision.
+- The `agentveil-mcp-proxy` source is visible under
+  `packages/agentveil-mcp-proxy/` and is licensed separately from the root SDK.
+
+## [0.7.17] - 2026-05-28
+
+MCP Proxy first-run repair release. The published `0.7.16` wheel did not
+include the newer `register` and `doctor --check-backend` CLI path that the
+GitHub docs described; this patch version is the releasable package state for
+that customer path plus local downstream/operator visibility helpers.
+
+### Added
+- Added `agentveil-mcp-proxy configure-downstream` to write downstream MCP
+  server config without manual JSON edits, plus the preferred
+  `agentveil-mcp-proxy downstream set` command spelling.
+- Added `agentveil-mcp-proxy init --quickstart-filesystem <path>` with a
+  built-in sandboxed filesystem downstream for zero-dependency local smoke
+  testing.
+- Added `agentveil-mcp-proxy doctor --full` and `agentveil-mcp-proxy smoke` to
+  launch the configured downstream and verify MCP `initialize` / `tools/list`.
+- Added privacy-safe `events list`, `events tail`, and `evidence-summary`
+  operator views.
+- Added JSON output for non-interactive setup and checks (`init`, downstream
+  setup, `doctor`, `smoke`, and event views).
+
+### Changed
+- Updated MCP Proxy quickstart docs with Ubuntu packaging prerequisites,
+  virtualenv install commands, downstream helper usage, full doctor/smoke
+  checks, JSON output, and the new event views.
 
 ## [0.7.16] - 2026-05-26
 

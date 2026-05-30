@@ -24,6 +24,11 @@ from agentveil.egress import (
 )
 from agentveil.mock import AVPMockAgent
 from agentveil.proof import ProofVerificationError, verify_proof_packet, verify_signed_jcs
+from agentveil.data_integrity import (
+    DataIntegrityError,
+    sign_eddsa_jcs_2022,
+    verify_eddsa_jcs_2022,
+)
 from agentveil.results import ControlledActionOutcome, IntegrationPreflightReport, ProofPacket
 from agentveil.tracked import avp_tracked, clear_agent_cache
 from agentveil.exceptions import (
@@ -35,7 +40,7 @@ from agentveil.exceptions import (
     AVPServerError,
 )
 
-__version__ = "0.7.16"
+__version__ = "0.7.18"
 
 __all__ = [
     "AVPAgent",
@@ -48,6 +53,9 @@ __all__ = [
     "IntegrationPreflightReport",
     "ProofPacket",
     "ProofVerificationError",
+    "DataIntegrityError",
+    "sign_eddsa_jcs_2022",
+    "verify_eddsa_jcs_2022",
     "controlled_egress",
     "sign_egress_receipt",
     "verify_egress_receipt",

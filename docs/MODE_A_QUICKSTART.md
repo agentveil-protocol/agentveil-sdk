@@ -106,7 +106,7 @@ Relevant guides:
 | Mode A v0.1: Lurkr pre-runtime check as project entry point | Built; available as `lurkr` |
 | Mode A v0.8: local policy file and `evaluate_action(...)` | (planned for v0.8 / Phase 3) |
 | Mode A CLI: `agentveil policy init` and `agentveil check-action` | (planned for Phase 4) |
-| MCP Proxy and signed local receipts | Built; available through `agentveil-mcp-proxy` |
+| MCP Proxy and signed local receipts | Built; available through the separate `agentveil-mcp-proxy` package |
 | Managed or customer-hosted gateway enforcement | (planned for Phase 5) |
 
 Public claims should track this table. If a capability is listed as planned, do

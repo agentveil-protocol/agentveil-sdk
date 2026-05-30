@@ -12,6 +12,7 @@ import jcs
 from nacl.exceptions import BadSignatureError
 from nacl.signing import VerifyKey
 
+from agentveil.data_integrity import DataIntegrityError, verify_eddsa_jcs_2022
 from agentveil.delegation import DelegationInvalid, verify_delegation
 
 
@@ -168,6 +169,54 @@ def _normalize_trust_map(
     }
 
 
+# decision_receipt/3 is the W3C Data Integrity (eddsa-jcs-2022) decision-receipt
+# claim-check: allow "W3C"/eddsa-jcs-2022 are literal cryptosuite identifiers (no external-conformance claim); "all"-receipts routing is tested in tests/test_proof_verification.py
+# family; /1 and /2 (and all execution/approval receipts) stay on the legacy
+# raw-JCS verifier. The Runtime Gate currently emits /3, so a /3 decision receipt
+# embedded verbatim by build_proof_packet must verify here.
+_W3C_DI_RECEIPT_SCHEMAS = frozenset({"decision_receipt/3"})
+
+
+def _verify_backend_receipt(receipt_jcs: Any) -> dict[str, Any]:
+    """Verify one backend receipt JCS, routing decision_receipt/3 to the
+    claim-check: allow "W3C"/eddsa-jcs-2022 are literal cryptosuite identifiers (no external-conformance claim); "all"-receipts routing tested in tests/test_proof_verification.py
+    first-party W3C Data Integrity (eddsa-jcs-2022) verifier and /1,/2 (plus all
+    execution/approval receipts) to the legacy raw-JCS verifier.
+
+    Routing reads the signature-protected ``schema_version``: a receipt that
+    claims one schema but was signed for the other fails closed because the
+    signature does not reproduce under the wrong path (schema_version is itself
+    claim-check: allow "never raises" — the schema peek is guarded by isinstance + try/except json.JSONDecodeError; tested in tests/test_proof_verification.py
+    inside the signed body). The peek never raises — malformed or non-/3 input
+    falls through to ``verify_signed_jcs``, which performs its own structural
+    validation. Returns the same shape as ``verify_signed_jcs`` so the downstream
+    trust check and cross-receipt linkage are unchanged.
+    """
+    is_w3c = False
+    if isinstance(receipt_jcs, str):
+        try:
+            parsed = json.loads(receipt_jcs)
+        except json.JSONDecodeError:
+            parsed = None
+        is_w3c = (
+            isinstance(parsed, dict)
+            and parsed.get("schema_version") in _W3C_DI_RECEIPT_SCHEMAS
+        )
+    if not is_w3c:
+        return verify_signed_jcs(receipt_jcs)
+    try:
+        verified = verify_eddsa_jcs_2022(receipt_jcs)
+    except DataIntegrityError as exc:
+        raise ProofVerificationError(str(exc)) from exc
+    return {
+        "valid": True,
+        "body": verified["document"],
+        "signer_did": verified["signer_did"],
+        "schema_version": verified["schema_version"],
+        "digest": _sha256_text(receipt_jcs),
+    }
+
+
 def _verify_optional_backend_receipt(
     packet: dict[str, Any],
     key: str,
@@ -177,7 +226,7 @@ def _verify_optional_backend_receipt(
     receipt_jcs = packet.get(key)
     if receipt_jcs is None:
         return None
-    verified = verify_signed_jcs(receipt_jcs)
+    verified = _verify_backend_receipt(receipt_jcs)
     _require_backend_trust(verified, trusted_backend_signer_dids, label)
     return verified
 
@@ -260,7 +309,11 @@ def verify_proof_packet(
     if decision is None:
         raise ProofVerificationError("proof packet missing DecisionReceipt")
     decision_body = decision["body"]
-    _check_schema_version(decision_body, {"decision_receipt/1", "decision_receipt/2"}, "DecisionReceipt")
+    _check_schema_version(
+        decision_body,
+        {"decision_receipt/1", "decision_receipt/2", "decision_receipt/3"},
+        "DecisionReceipt",
+    )
     outcome_status = data.get("outcome_status")
     decision_value = decision_body.get("decision")
     if outcome_status == "executed" and execution is None:

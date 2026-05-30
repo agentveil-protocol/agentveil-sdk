@@ -1,7 +1,8 @@
 # MCP Proxy Quickstart
 
 This is the cold customer path for wrapping one downstream MCP server with the
-AgentVeil MCP Proxy and producing an offline-verifiable evidence bundle. Every
+AgentVeil MCP Proxy and producing an evidence bundle that is verifiable offline
+in strict/proof-grade mode with an externally pinned signer DID. Every
 step describes behavior that is implemented and locally verifiable. Anything
 this quickstart does not cover yet is listed under
 [What this quickstart does NOT prove](#what-this-quickstart-does-not-prove).
@@ -17,23 +18,57 @@ identity migration, see [`MCP_PROXY_OPERATIONS.md`](MCP_PROXY_OPERATIONS.md).
   server: filesystem, GitHub, custom company server. You provide its launch
   command and arguments.
 - Backend access: the proxy verifies signed AgentVeil Runtime Gate
-  `decision_receipt/2` artifacts against a pinned signer-DID set. For
+  `decision_receipt/3` artifacts against a pinned signer-DID set. For
   `https://agentveil.dev` the trusted DIDs are bundled with the SDK; for any
   other base URL pass `--trusted-signer-did` to `init`.
+
+Fresh Ubuntu 24.04 images often have `python3` but not the packaging tools
+needed for a virtualenv install. Install them first:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y python3.12-venv python3-pip
+```
 
 ## Install
 
 ```bash
-pip install agentveil
+python3 -m venv .venv
+. .venv/bin/activate
+pip install agentveil agentveil-mcp-proxy
 ```
 
-This installs the core `agentveil` SDK and registers the
+This installs the core `agentveil` SDK and the separately packaged
 `agentveil-mcp-proxy` console script.
 
 ## Step 1 — `agentveil-mcp-proxy init`
 
 ```bash
 agentveil-mcp-proxy init
+```
+
+For a zero-dependency local smoke path, use the built-in sandboxed filesystem
+downstream and filesystem policy pack instead of manually installing a
+downstream MCP server:
+
+```bash
+agentveil-mcp-proxy init --quickstart-filesystem ./sandbox
+```
+
+Agent/non-interactive equivalent:
+
+```bash
+printf '%s\n' 'replace-with-a-long-local-passphrase' > ./passphrase.txt
+chmod 600 ./passphrase.txt
+
+agentveil-mcp-proxy init \
+  --home ./avp-home \
+  --passphrase-file ./passphrase.txt \
+  --policy-pack filesystem \
+  --downstream-name filesystem \
+  --downstream-command /path/to/mcp-server \
+  --downstream-arg /workspace \
+  --json
 ```
 
 By default this creates an **encrypted local identity**, a self-issued
@@ -50,6 +85,9 @@ environment variable. See
   owner-only permissions (0o600).
 - Issues a local self-signed delegation receipt (issuer = subject = the new
   agent DID), scoped to the `mcp_proxy` category.
+- When `--quickstart-filesystem <path>` is passed, writes downstream config for
+  the built-in sandboxed filesystem MCP server and selects the filesystem
+  policy pack.
 
 ### What `init` does NOT do
 
@@ -92,10 +130,23 @@ set is non-empty, and the control grant has not expired.
 `doctor` exits non-zero on any of these failures, with a specific FAIL line.
 It is intentionally offline: it does not call the backend.
 
+If a downstream is already configured, add `--full` to launch it and verify MCP
+`initialize` plus `tools/list`:
+
+```bash
+agentveil-mcp-proxy doctor --full
+```
+
 ## Step 3 — `agentveil-mcp-proxy register`
 
 ```bash
 agentveil-mcp-proxy register
+```
+
+Machine-readable equivalent:
+
+```bash
+agentveil-mcp-proxy register --json
 ```
 
 Registers the exact identity created by `init` (same DID, same key) with
@@ -186,18 +237,16 @@ failed.
 
 ## Step 5 — Configure the downstream MCP server
 
-Edit `~/.avp/mcp-proxy/config.json` and set `downstream.command` and
-`downstream.args` to the MCP server you want to wrap. Example for a
-filesystem MCP server:
+Use the helper to set `downstream.command` and `downstream.args` without
+hand-editing JSON. Example for a filesystem MCP server:
 
-```json
-{
-  "downstream": {
-    "name": "filesystem",
-    "command": "npx",
-    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/work"]
-  }
-}
+```bash
+agentveil-mcp-proxy downstream set \
+  --name filesystem \
+  --command npx \
+  --arg -y \
+  --arg @modelcontextprotocol/server-filesystem \
+  --arg /Users/me/work
 ```
 
 `name` is the server label the proxy uses internally and in evidence records.
@@ -206,12 +255,48 @@ filesystem MCP server:
 forward any `AVP_*` environment variable to the downstream — those names are
 reserved for proxy-internal secrets.
 
+Then run:
+
+```bash
+agentveil-mcp-proxy doctor --full
+agentveil-mcp-proxy smoke
+```
+
+`doctor --full` and `smoke` both launch the configured downstream and require
+valid MCP `initialize` and `tools/list` responses. They do not call Runtime
+Gate and they do not execute any downstream tool.
+
+`agentveil-mcp-proxy configure-downstream` remains as a backward-compatible
+alias for `agentveil-mcp-proxy downstream set`.
+
+## Machine-readable setup checks
+
+Agents can request JSON output for setup and local checks:
+
+```bash
+agentveil-mcp-proxy doctor --full --json
+agentveil-mcp-proxy smoke --json
+agentveil-mcp-proxy events list --json
+```
+
+The JSON shape includes stable top-level fields:
+
+```json
+{
+  "ok": true,
+  "errors": [],
+  "warnings": [],
+  "downstream": {"configured": true, "name": "filesystem"},
+  "evidence_count": 0
+}
+```
+
 ## Step 6 — Point your MCP client at the proxy
 
 Configure your IDE / MCP client to run `agentveil-mcp-proxy run` as its
 server entry point. The MCP Proxy README documents wiring for Claude Desktop,
 Cursor, Windsurf, and VS Code:
-[`agentveil_mcp_proxy/README.md`](../agentveil_mcp_proxy/README.md).
+[`packages/agentveil-mcp-proxy/README.md`](../packages/agentveil-mcp-proxy/README.md).
 
 When the client starts the proxy:
 
@@ -231,11 +316,14 @@ classifies the call, applies local policy, and:
 
 - **ALLOW** policy decisions are forwarded to the downstream server. If the
   policy rule routes the call through Runtime Gate (`ASK_BACKEND`), the
-  verified backend `decision_receipt/2` and the downstream result hash are
+  verified backend `decision_receipt/3` and the downstream result hash are
   recorded into the local SQLite evidence store **when an evidence store is
   configured for the run** (this is the default for `agentveil-mcp-proxy run`).
 - **APPROVAL** policy decisions open the local browser approval UI bound to
-  the exact payload hash and matched policy rule.
+  the exact payload hash and matched policy rule. The MCP client receives an
+  immediate JSON-RPC `approval_required` error with `record_id`,
+  `record_status`, and `approval_url`; after approving, retry the tool call
+  from the MCP client.
 - **BLOCK** policy decisions return a JSON-RPC error and never reach the
   downstream server. Runtime Gate BLOCK decisions taken on the `ASK_BACKEND`
   path are also recorded into the local evidence store with the backend's
@@ -246,7 +334,58 @@ Slice-level note: recording verified Runtime Gate `ALLOW` and `BLOCK`
 decisions into the local evidence store is a recent change. Before it
 landed, only the approval-required path created proxy-side evidence
 records. See `agentveil_mcp_proxy/passthrough.py` and
-`agentveil_mcp_proxy/approval/manager.py` for the exact flow.
+`agentveil_mcp_proxy/approval/manager.py` in the source-available proxy package
+for the exact flow.
+
+## Optional — Declared tool surface (`tool_surface`)
+
+The proxy can enforce an operator-declared allowlist of tool names. It is
+configured under `tool_surface` in `~/.avp/mcp-proxy/config.json` and is **off
+by default**, so existing configs behave exactly as before until you opt in.
+
+- `tool_surface.mode`:
+  - `off` (default): no tool-surface check. Calls follow the normal
+    classification / local policy / Runtime Gate / approval path unchanged.
+  - `observe`: an undeclared tool call is still forwarded, but each one is
+    recorded as a sanitized security event (`type: undeclared_tool_call`,
+    `action: observed`, `reason: undeclared_tool`, and the tool name — never the
+    <!-- claim-check: allow "never" documents B9 sanitized event behavior verified by tests. -->
+    raw arguments).
+  - `enforce`: an undeclared tool call is blocked with a JSON-RPC policy error
+    <!-- claim-check: allow "blocked" is the JSON-RPC policy outcome for enforce mode. -->
+    (`reason: undeclared_tool`) and recorded as a sanitized security event
+    (`action: blocked`). The block happens **before** schema validation,
+    <!-- claim-check: allow "blocked" documents the sanitized event action for enforce mode. -->
+    classification, local policy, Runtime Gate, and any downstream forwarding —
+    the downstream server is never contacted for an undeclared tool.
+    <!-- claim-check: allow "never" documents pre-downstream enforcement verified by B9 tests. -->
+- `tool_surface.allow`: a list of shell-style patterns (exact names or globs,
+  matched case-sensitively against the MCP `params.name`). A tool is "declared"
+  only when its name matches at least one pattern.
+
+The allowlist is **operator-declared**: it is the set of names *you* list, not
+whatever the downstream server advertises through `tools/list`. An empty `allow`
+under `enforce` therefore declares nothing and blocks every tool call — populate
+<!-- claim-check: allow "every" documents tested empty-allow enforce semantics. -->
+`allow` with the tools you expect before switching to `enforce`.
+
+Minimal `config.json` excerpt:
+
+```json
+{
+  "tool_surface": {
+    "mode": "enforce",
+    "allow": ["get_*", "list_*", "read_file"]
+  }
+}
+```
+
+`tool_surface.mode` is independent of the proxy-wide `mode` field: the
+proxy-wide `mode: observe` is a monitor-only mode that forwards every call
+<!-- claim-check: allow "every" reflects documented proxy-wide observe-mode semantics. -->
+without gating, whereas `tool_surface.mode: observe` only records
+undeclared-tool events and leaves the rest of the normal policy / Runtime Gate /
+approval path in force.
 
 ## Step 8 — Export the evidence bundle
 
@@ -263,7 +402,7 @@ Evidence exported: ./my-bundle.json (N records, M signed receipts)
 ```
 
 `N` is the count of local evidence records (one per gated tool call); `M` is
-the count of backend-signed `decision_receipt/2` artifacts the proxy was
+the count of backend-signed `decision_receipt/3` artifacts the proxy was
 able to fetch via `agent.get_decision_receipt(audit_id)` and embed in the
 bundle. If a record references an `audit_id` but the receipt could not be
 fetched or the digest did not match, the CLI prints a `WARN` and the
@@ -278,10 +417,12 @@ agentveil-mcp-proxy verify ./my-bundle.json \
   --trusted-signer-did did:key:zYourPinnedSignerDid
 ```
 
-Pass `--trusted-signer-did` to require an explicit pinned set. If you omit
-the flag the verifier will use the signer set embedded in the bundle and
-will emit a `WARN` about trusting bundle-embedded signers. For
-due-diligence verification, pass the flag.
+`verify` is strict and proof-grade: it trusts only the signer DID(s) you pin
+with `--trusted-signer-did` and never the signer set embedded in the bundle. A
+bundle that carries signed receipts fails closed (non-zero exit,
+`status: invalid`) unless you pass `--trusted-signer-did`, and a referenced
+signed receipt missing from the bundle is a hard failure rather than a warning.
+Always pass the signer DID you independently trust.
 
 Successful output:
 
@@ -299,7 +440,8 @@ The verifier checks, offline:
    - The DataIntegrityProof / `eddsa-jcs-2022` signature verifies against
      one of the pinned signer DIDs.
    - `schema_version` is in the accepted set (`decision_receipt/1`,
-     `decision_receipt/2`).
+     `decision_receipt/2`, `decision_receipt/3`). The current backend emits
+     `decision_receipt/3`; `/1`,`/2` are accepted as legacy.
    - `audit_id` is present and well-formed.
 4. Field cross-checks between record and embedded receipt:
    - `record.payload_hash` == `receipt.payload_hash`
@@ -317,13 +459,21 @@ tool call:
 
 - A privacy-preserving local evidence record describing the action class,
   risk class, payload hash, policy rule, and decision audit ID.
-- The backend-signed Runtime Gate `decision_receipt/2` artifact for every
+- The backend-signed Runtime Gate `decision_receipt/3` artifact for every
   `ASK_BACKEND` Runtime Gate decision (`ALLOW` / `BLOCK` /
   `WAITING_FOR_HUMAN_APPROVAL`) that the proxy issued.
 - The downstream result hash for forwarded calls that completed.
 
-These artifacts are independently verifiable offline against the pinned
-backend signer DID set.
+These artifacts are independently verifiable offline in strict/proof-grade mode
+with an externally pinned backend signer DID set (the default
+`verify_evidence_bundle` / CLI `verify` path). Verification fails closed when no
+external signer DID is pinned — it never trusts the signer list embedded in the
+bundle.
+
+> Boundary: the SDK verifies the `decision_receipt/3` Data Integrity
+> (`eddsa-jcs-2022`) receipt with its own first-party verifier; this is not a
+> third-party standard-conformance certification. Only the decision receipt
+> uses Data Integrity — other receipt families remain legacy raw-JCS.
 
 ## What this quickstart does NOT prove
 
@@ -362,9 +512,10 @@ This list is the honest counterpart to the section above. The bundle
 - `WARN: control grant expires in N days` — the local self-issued
   delegation is approaching expiry. Run
   `agentveil-mcp-proxy reissue-grant`.
-- `WARN: ... default_trust_from_bundle ...` from `verify` — you omitted
-  `--trusted-signer-did`. For due-diligence verification, always pass the
-  flag.
+- `FAIL: strict verification requires externally supplied trusted_signer_dids`
+  from `verify` — you omitted `--trusted-signer-did` on a receipt-bearing
+  bundle. Strict verify never trusts the bundle's embedded signer list; pass
+  the signer DID you independently trust.
 - `WARN: N records have decision_audit_id but no matching signed receipt
   in bundle` from `export-evidence` — the receipt fetch failed or the
   digest did not match. Check network reachability and that the agent
@@ -375,7 +526,7 @@ This list is the honest counterpart to the section above. The bundle
 - Operations / day-2 reference:
   [`MCP_PROXY_OPERATIONS.md`](MCP_PROXY_OPERATIONS.md).
 - MCP Proxy README with IDE wiring examples:
-  [`agentveil_mcp_proxy/README.md`](../agentveil_mcp_proxy/README.md).
+  [`packages/agentveil-mcp-proxy/README.md`](../packages/agentveil-mcp-proxy/README.md).
 - Data handling boundaries:
   [`DATA_HANDLING.md`](DATA_HANDLING.md).
 - SDK / API surface:

@@ -95,10 +95,11 @@ deployment.
 Open design says protection should not depend on hiding the algorithm or
 protocol.
 
-The public SDK repository exposes the MCP Proxy source, policy DSL, receipt
-schema handling, JCS canonicalization choices, evidence-chain format, and
-offline verifier. Auditors can inspect the implementation instead of trusting a
-black-box statement that an action was controlled.
+The source-available MCP Proxy package exposes the proxy source, policy DSL,
+receipt schema handling, JCS canonicalization choices, evidence-chain format,
+and offline verifier under its own license. Auditors can inspect the
+implementation instead of trusting a black-box statement that an action was
+controlled.
 
 The protected secrets are the correct trust anchors and private keys:
 
@@ -106,10 +107,11 @@ The protected secrets are the correct trust anchors and private keys:
 - The local control grant scoped to that proxy identity.
 - The pinned AVP backend signer DID set used for DecisionReceipt verification.
 
-If an exported bundle includes an attacker-controlled signer DID, offline
-verification warns when no external signer pin is supplied. Operators can pass
-their own `--trusted-signer-did` values and avoid trusting a bundle's embedded
-signer list.
+If an exported bundle includes an attacker-controlled signer DID, strict offline
+verification rejects it: `verify` trusts only the operator-supplied
+`--trusted-signer-did` set and never the bundle's embedded signer list, so a
+receipt-bearing bundle fails closed when no external pin is supplied instead of
+falling back to a warning.
 
 ## 5. Separation Of Privilege
 
