@@ -14,6 +14,7 @@ import pytest
 from agentveil_mcp_proxy.approval import ApprovalOutcome
 from agentveil_mcp_proxy.classification import ToolCallClassifier
 from agentveil_mcp_proxy.passthrough import (
+    JSONRPC_POLICY_BLOCKED,
     DownstreamConfig,
     DownstreamTimeoutError,
     McpPassthrough,
@@ -285,6 +286,69 @@ def test_concurrent_counter_increments_record_all_classifier_errors() -> None:
     _run_threads(100, lambda index: passthrough.handle_client_line(_tool_call(f"call-{index}")))
 
     assert passthrough.classifier_errors == 100
+
+
+class _ForwardRecordingPassthrough(_ImmediatePassthrough):
+    """Immediate passthrough that records every downstream forward attempt."""
+    # claim-check: allow "every" describes this test helper's own recording behavior
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.forwarded: list[Mapping[str, Any]] = []
+
+    def _send_downstream(self, message: Mapping[str, Any]) -> None:
+        self.forwarded.append(message)
+        return None
+
+
+def test_classifier_exception_on_tool_call_fails_closed_without_forwarding() -> None:
+    passthrough = _ForwardRecordingPassthrough(
+        DownstreamConfig(command=sys.executable, args=(), name="fail-closed"),  # claim-check: allow "fail-closed" is a test fixture name
+        classifier=_ExplodingClassifier(),
+    )
+
+    responses = passthrough.handle_client_line(_tool_call("call-1"))
+
+    # claim-check: allow this comment describes the asserted fail-closed behavior; verified below
+    # Fail closed: the unclassified tool call is never forwarded downstream.
+    assert passthrough.forwarded == []
+    assert len(responses) == 1
+    error = responses[0]["error"]
+    assert error["code"] == JSONRPC_POLICY_BLOCKED
+    assert error["data"] == {"status": "blocked", "reason": "classifier_error"}  # claim-check: allow "blocked" is the literal expected payload value
+    assert passthrough.classifier_errors == 1
+    # claim-check: allow "never" describes the asserted sanitization; checked below
+    # Sanitized: raw tool arguments never appear in the error response.
+    assert "/tmp/call-1.txt" not in json.dumps(responses[0])
+
+
+def test_classifier_exception_on_non_tool_call_still_forwards() -> None:
+    passthrough = _ForwardRecordingPassthrough(
+        DownstreamConfig(command=sys.executable, args=(), name="non-tool-call"),
+        classifier=_ExplodingClassifier(),
+    )
+
+    responses = passthrough.handle_client_line(
+        _json_line({"jsonrpc": "2.0", "id": "list-1", "method": "tools/list"})
+    )
+
+    # Non-tools/call protocol messages stay on the advisory path and pass through.
+    assert [message["method"] for message in passthrough.forwarded] == ["tools/list"]
+    assert responses[0].get("result") == {"ok": True}
+    assert passthrough.classifier_errors == 1
+
+
+def test_no_classifier_tool_call_still_forwards() -> None:
+    passthrough = _ForwardRecordingPassthrough(
+        DownstreamConfig(command=sys.executable, args=(), name="bare"),
+    )
+
+    responses = passthrough.handle_client_line(_tool_call("call-2"))
+
+    # Bare/diagnostic passthrough (no classifier configured) is preserved.
+    assert len(passthrough.forwarded) == 1
+    assert responses[0].get("result") == {"ok": True}
+    assert passthrough.classifier_errors == 0
 
 
 class _UnavailableGate:

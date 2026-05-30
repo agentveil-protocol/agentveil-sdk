@@ -1041,7 +1041,7 @@ def test_downstream_async_notification_is_forwarded_without_pending_request(tmp_
     }]
 
 
-def test_classifier_exception_does_not_break_passthrough(tmp_path):
+def test_classifier_exception_on_tool_call_fails_closed(tmp_path):
     class ExplodingClassifier:
         def classify_jsonrpc(self, message):
             raise RuntimeError("boom")
@@ -1066,12 +1066,23 @@ def test_classifier_exception_does_not_break_passthrough(tmp_path):
         client_out,
     ) == 0
 
+    # claim-check: allow this comment describes the asserted fail-closed response; verified by this test
+    # Fail closed: an unclassified tool call is blocked, never forwarded
+    # downstream (the downstream "called" result is not returned).
     assert _responses(client_out.getvalue()) == [{
         "jsonrpc": "2.0",
         "id": "call-1",
-        "result": {"content": [{"type": "text", "text": "called"}]},
+        "error": {
+            "code": JSONRPC_POLICY_BLOCKED,
+            "message": "blocked by MCP proxy: tool call classification failed",
+            # claim-check: allow "blocked" appears in the literal expected JSON-RPC error payload
+            "data": {"status": "blocked", "reason": "classifier_error"},
+        },
     }]
     assert passthrough.classifier_errors == 1
+    # claim-check: allow "never"/"blocked" describe the sanitized expected response asserted below
+    # Sanitized: raw tool arguments never appear in the blocked response.
+    assert "/tmp/a.txt" not in client_out.getvalue()
 
 
 def test_classifier_callback_exception_does_not_break_passthrough(tmp_path):
