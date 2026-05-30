@@ -9,19 +9,20 @@ to the configured backend.
 Run this before tagging or publishing an MCP Proxy release:
 
 ```bash
-scripts/mcp_proxy_release_acceptance.py
+packages/agentveil-mcp-proxy/scripts/mcp_proxy_release_acceptance.py
 ```
 
 Use an already-built wheel:
 
 ```bash
-scripts/mcp_proxy_release_acceptance.py --wheel dist/agentveil-0.7.18-py3-none-any.whl
+packages/agentveil-mcp-proxy/scripts/mcp_proxy_release_acceptance.py \
+  --wheel packages/agentveil-mcp-proxy/dist/agentveil_mcp_proxy-0.7.18-py3-none-any.whl
 ```
 
 Keep artifacts for debugging:
 
 ```bash
-scripts/mcp_proxy_release_acceptance.py --keep-tmp
+packages/agentveil-mcp-proxy/scripts/mcp_proxy_release_acceptance.py --keep-tmp
 ```
 
 Fresh Ubuntu prerequisite:

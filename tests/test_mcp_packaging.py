@@ -168,8 +168,8 @@ def test_console_script_entrypoint(pyproject):
     assert scripts.get("agentveil-mcp") == "agentveil_mcp.server:main", (
         "console_script 'agentveil-mcp' must point to agentveil_mcp.server:main"
     )
-    assert scripts.get("agentveil-mcp-proxy") == "agentveil_mcp_proxy.cli:main", (
-        "console_script 'agentveil-mcp-proxy' must point to agentveil_mcp_proxy.cli:main"
+    assert "agentveil-mcp-proxy" not in scripts, (
+        "agentveil-mcp-proxy ships from the separate source-available proxy package"
     )
 
 
@@ -188,12 +188,15 @@ def test_mcp_optional_dependency_present(pyproject):
     )
 
 
-def test_packages_find_includes_both_packages(pyproject):
+def test_packages_find_includes_public_packages(pyproject):
     include = pyproject["tool"]["setuptools"]["packages"]["find"]["include"]
     assert "agentveil_mcp*" in include, "agentveil_mcp* must be in packages.find.include"
-    assert any(pattern.startswith("agentveil") for pattern in include), (
-        "agentveil_mcp_proxy must be included by the package finder"
+    assert "agentveil_mcp_proxy*" not in include, (
+        "agentveil_mcp_proxy ships from the separate source-available proxy package"
     )
+    exclude = pyproject["tool"]["setuptools"]["packages"]["find"].get("exclude", [])
+    assert "agentveil_mcp_proxy*" in exclude
+    assert "packages*" in exclude
     assert "mcp_server*" in include, (
         "mcp_server* must remain in packages.find.include so the shim ships"
     )

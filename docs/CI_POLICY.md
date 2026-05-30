@@ -9,9 +9,10 @@ This repository uses tiered CI so day-to-day agent work stays fast while release
 - Publish gate: package publication is allowed only after the compatibility gate has passed for the release candidate or tag.
 - MCP Proxy release acceptance: for releases that change MCP Proxy setup,
   passthrough, approval UX, evidence, or Runtime Gate behavior, run
-  `scripts/mcp_proxy_release_acceptance.py` against the release candidate wheel
+  `packages/agentveil-mcp-proxy/scripts/mcp_proxy_release_acceptance.py`
+  against the release candidate wheel
   before tagging or publishing. See
-  [`MCP_PROXY_RELEASE_ACCEPTANCE.md`](MCP_PROXY_RELEASE_ACCEPTANCE.md).
+  [`MCP_PROXY_RELEASE_ACCEPTANCE.md`](../packages/agentveil-mcp-proxy/docs/MCP_PROXY_RELEASE_ACCEPTANCE.md).
 
 ## Agent Rules
 

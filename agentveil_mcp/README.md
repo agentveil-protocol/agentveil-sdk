@@ -10,7 +10,7 @@ Cursor, Cline, or third-party MCP tool calls by itself; MCP clients call these
 AVP tools explicitly.
 
 For downstream MCP tool-call control, use
-[`agentveil-mcp-proxy`](../agentveil_mcp_proxy/README.md). The proxy sits
+[`agentveil-mcp-proxy`](../packages/agentveil-mcp-proxy/README.md). The proxy sits
 between an MCP client and a downstream MCP server so AVP policy can decide
 whether to forward, require approval, or block a tool call.
 

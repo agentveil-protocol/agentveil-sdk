@@ -9,8 +9,9 @@
 #
 # This script does NOT publish to PyPI. It does NOT run network-dependent
 # MCP server checks beyond `agentveil-mcp --help` (argparse-only).
-# For MCP Proxy behavior releases, run scripts/mcp_proxy_release_acceptance.py
-# against the release candidate wheel after this packaging smoke passes.
+# For MCP Proxy behavior releases, run
+# packages/agentveil-mcp-proxy/scripts/mcp_proxy_release_acceptance.py against
+# the release candidate proxy wheel after packaging smoke passes.
 
 set -euo pipefail
 
@@ -57,6 +58,21 @@ if not matches:
 print(z.read(matches[0]).decode())
 " "$WHEEL" \
     || echo "    (entry_points.txt not found)"
+
+echo "==> Root wheel must not ship MCP Proxy package or console script"
+python -c "
+import zipfile, sys
+z = zipfile.ZipFile(sys.argv[1])
+names = z.namelist()
+assert not any(n.startswith('agentveil_mcp_proxy/') for n in names), 'root wheel contains agentveil_mcp_proxy package'
+entry_points = ''
+for name in names:
+    if name.endswith('/entry_points.txt'):
+        entry_points = z.read(name).decode()
+        break
+assert 'agentveil-mcp-proxy' not in entry_points, 'root wheel contains agentveil-mcp-proxy entry point'
+print('    root wheel has no MCP Proxy package or entry point')
+" "$WHEEL"
 
 echo "==> Wheel METADATA (extras):"
 python -c "
