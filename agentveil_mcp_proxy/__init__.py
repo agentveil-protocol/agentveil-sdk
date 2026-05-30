@@ -89,6 +89,8 @@ from agentveil_mcp_proxy.policy import (
     RiskClass,
     TimeoutAction,
     ToolCallContext,
+    ToolSurfaceConfig,
+    ToolSurfaceMode,
     builtin_policy_pack,
     policy_context_hash,
 )
@@ -158,6 +160,8 @@ __all__ = [
     "TimeoutAction",
     "ToolCallClassifier",
     "ToolCallContext",
+    "ToolSurfaceConfig",
+    "ToolSurfaceMode",
     "builtin_policy_pack",
     "build_evidence_bundle",
     "export_evidence",
