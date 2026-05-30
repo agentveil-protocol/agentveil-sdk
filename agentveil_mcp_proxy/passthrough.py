@@ -973,7 +973,16 @@ class McpPassthrough:
             )
         if decision is PolicyDecision.ASK_BACKEND:
             if self.runtime_gate_factory is None:
-                return None, None
+                # Local policy deferred to the Runtime Gate, but no gate factory
+                # claim-check: allow describes the no-gate-configured block branch; verified in tests/test_mcp_proxy_passthrough_concurrent.py
+                # is configured. Fail closed rather than forward an unevaluated
+                # tools/call downstream (embedded/library usage without a gate).
+                return _blocked_error(
+                    request_id,
+                    # claim-check: allow "blocked" is the literal JSON-RPC error message string
+                    "blocked by MCP proxy: Runtime Gate required but not configured",
+                    reason="runtime_gate_not_configured",
+                ), None
             return self._runtime_gate_error_response(classification, request_id)
         return _blocked_error(
             request_id,
