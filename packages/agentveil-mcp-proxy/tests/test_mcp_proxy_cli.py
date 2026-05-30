@@ -379,11 +379,11 @@ def test_read_passphrase_file_accepts_0400_on_posix(tmp_path):
     assert proxy_cli._read_passphrase_file(passphrase_file) == TEST_PASSPHRASE
 
 
-def test_read_passphrase_file_skips_perm_check_on_windows(tmp_path, monkeypatch):
+def test_read_passphrase_file_accepts_when_owner_only_requirement_passes(tmp_path, monkeypatch):
     passphrase_file = tmp_path / "passphrase.txt"
     passphrase_file.write_text(TEST_PASSPHRASE, encoding="utf-8")
     os.chmod(passphrase_file, 0o644)
-    monkeypatch.setattr(proxy_cli.os, "name", "nt")
+    monkeypatch.setattr(proxy_cli, "_require_owner_only_passphrase_file", lambda path: None)
 
     assert proxy_cli._read_passphrase_file(passphrase_file) == TEST_PASSPHRASE
 
