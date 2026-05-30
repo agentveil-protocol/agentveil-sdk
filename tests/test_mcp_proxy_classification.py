@@ -282,7 +282,7 @@ def test_risk_inference_does_not_over_classify_substring_collisions():
     assert infer_risk_class("github.list_endpoints", tool="list_endpoints") is RiskClass.READ
 
 
-def test_passthrough_classifies_tools_call_without_changing_downstream_behavior(tmp_path):
+def test_passthrough_classifies_allowed_tools_call_without_changing_downstream_behavior(tmp_path):
     classifier = ToolCallClassifier(_config(), server_name="github")
     seen = []
     passthrough = McpPassthrough(
@@ -299,10 +299,10 @@ def test_passthrough_classifies_tools_call_without_changing_downstream_behavior(
         "jsonrpc": "2.0",
         "id": "call-1",
         "method": "tools/call",
-        "params": {
-            "name": "create_issue",
-            "arguments": {"owner": "acme", "repo": "private", "title": SECRET},
-        },
+            "params": {
+                "name": "get_issue",
+                "arguments": {"owner": "acme", "repo": "private", "title": SECRET},
+            },
     }))
 
     assert passthrough.run_stdio(client_in, client_out) == 0
@@ -313,7 +313,7 @@ def test_passthrough_classifies_tools_call_without_changing_downstream_behavior(
     }]
     assert len(seen) == 1
     metadata_text = json.dumps(seen[0].backend_metadata(), sort_keys=True)
-    assert seen[0].policy_evaluation.policy_rule_id == "github-write"
+    assert seen[0].policy_evaluation.policy_rule_id == "github-read"
     assert seen[0].payload_hash == sha256_jcs({"owner": "acme", "repo": "private", "title": SECRET})
     assert SECRET not in metadata_text
     assert "private" not in metadata_text

@@ -472,3 +472,72 @@ def test_eager_init_factory_exception_surfaces_lazily_on_evaluate(tmp_path: Path
         assert exc.value is error
     finally:
         passthrough.stop()
+
+
+# --- ASK_BACKEND without a Runtime Gate factory must fail closed (Step 11) ---
+# claim-check: allow section header naming the tested fail-closed behavior
+
+
+def test_ask_backend_without_gate_factory_fails_closed() -> None:
+    config = _config(default_decision="ask_backend")
+    passthrough = _ForwardRecordingPassthrough(
+        DownstreamConfig(command=sys.executable, args=(), name="no-gate"),
+        classifier=_classifier(config),
+        runtime_gate_factory=None,
+    )
+
+    responses = passthrough.handle_client_line(_tool_call("call-1", tool="fetch_data"))
+
+    # Local policy deferred to the Runtime Gate but none is configured: the call
+    # must be blocked, never forwarded downstream.
+    # claim-check: allow describes the asserted no-forward outcome; checked below
+    assert passthrough.forwarded == []
+    assert len(responses) == 1
+    error = responses[0]["error"]
+    assert error["code"] == JSONRPC_POLICY_BLOCKED
+    assert error["data"] == {"status": "blocked", "reason": "runtime_gate_not_configured"}
+    # claim-check: allow "blocked"/"never" describe the asserted sanitized error payload
+    # Sanitized: raw tool arguments never appear in the blocked response.
+    assert "/tmp/call-1.txt" not in json.dumps(responses[0])
+
+
+def test_ask_backend_without_gate_factory_notification_emits_no_response() -> None:
+    config = _config(default_decision="ask_backend")
+    passthrough = _ForwardRecordingPassthrough(
+        DownstreamConfig(command=sys.executable, args=(), name="no-gate-notify"),
+        classifier=_classifier(config),
+        runtime_gate_factory=None,
+    )
+
+    # claim-check: allow describes the asserted notification handling; checked below
+    # tools/call notification (no "id") is blocked (not forwarded) and, matching
+    # the existing handler pattern, produces no JSON-RPC response.
+    responses = passthrough.handle_client_line(_json_line({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {"name": "fetch_data", "arguments": {"path": "/tmp/n.txt"}},
+    }))
+
+    assert passthrough.forwarded == []
+    assert responses == []
+
+
+def test_ask_backend_with_gate_factory_uses_gate_not_fail_closed_branch() -> None:
+    # claim-check: allow "all" refers to the _config fallback default in a test comment
+    config = _config(default_decision="ask_backend")  # fallback defaults to all "block"
+    passthrough = _ForwardRecordingPassthrough(
+        DownstreamConfig(command=sys.executable, args=(), name="with-gate"),
+        classifier=_classifier(config),
+        runtime_gate_factory=lambda: _UnavailableGate(),
+    )
+    passthrough._initialize_runtime_gate()  # wire the gate without a subprocess
+
+    responses = passthrough.handle_client_line(_tool_call("call-1", tool="fetch_data"))
+
+    # A configured gate factory still takes the Runtime Gate path (unavailable ->
+    # fallback block), NOT the new runtime_gate_not_configured fail-closed branch.
+    # claim-check: allow describes the asserted gate-path outcome; checked below
+    assert passthrough.forwarded == []
+    reason = responses[0]["error"]["data"]["reason"]
+    assert reason != "runtime_gate_not_configured"
+    assert reason == "runtime_gate_unavailable"
