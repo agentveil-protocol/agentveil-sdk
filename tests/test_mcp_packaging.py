@@ -33,7 +33,6 @@ CANONICAL_README = REPO_ROOT / "agentveil_mcp" / "README.md"
 TOP_README = REPO_ROOT / "README.md"
 MCP_DOCKERFILE = REPO_ROOT / "mcp_server" / "Dockerfile"
 MCP_SERVER = REPO_ROOT / "agentveil_mcp" / "server.py"
-AGENTS_DOC = REPO_ROOT / "AGENTS.md"
 INTEGRATIONS_DOC = REPO_ROOT / "docs" / "INTEGRATIONS.md"
 CLAUDE_MCP_EXAMPLE = REPO_ROOT / "examples" / "claude_mcp_example.py"
 LEGACY_CLAUDE_MCP_MODULE = REPO_ROOT / "agentveil" / "tools" / "claude_mcp.py"
@@ -255,7 +254,6 @@ def test_mcp_protocol_info_advertises_mcp_extra_install():
 
 def test_public_mcp_docs_use_canonical_install_and_command_paths():
     docs = {
-        "AGENTS.md": AGENTS_DOC.read_text(encoding="utf-8"),
         "docs/INTEGRATIONS.md": INTEGRATIONS_DOC.read_text(encoding="utf-8"),
         "examples/claude_mcp_example.py": CLAUDE_MCP_EXAMPLE.read_text(encoding="utf-8"),
         "agentveil/tools/claude_mcp.py": LEGACY_CLAUDE_MCP_MODULE.read_text(encoding="utf-8"),
@@ -278,11 +276,9 @@ def test_public_mcp_docs_use_canonical_install_and_command_paths():
             f"{name} should not advertise deprecated mcp_server.server config"
         )
 
-    assert "pip install 'agentveil[mcp]'" in AGENTS_DOC.read_text(encoding="utf-8")
     assert "pip install 'agentveil[mcp]'" in INTEGRATIONS_DOC.read_text(encoding="utf-8")
     assert "pip install 'agentveil[mcp]'" in CLAUDE_MCP_EXAMPLE.read_text(encoding="utf-8")
     assert "pip install 'agentveil[mcp]'" in LEGACY_CLAUDE_MCP_MODULE.read_text(encoding="utf-8")
-    assert "agentveil-mcp" in AGENTS_DOC.read_text(encoding="utf-8")
     assert '"command": "agentveil-mcp"' in INTEGRATIONS_DOC.read_text(encoding="utf-8")
     assert '"command": "agentveil-mcp"' in CLAUDE_MCP_EXAMPLE.read_text(encoding="utf-8")
     assert '"command": "agentveil-mcp"' in LEGACY_CLAUDE_MCP_MODULE.read_text(encoding="utf-8")

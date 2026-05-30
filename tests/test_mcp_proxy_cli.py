@@ -184,6 +184,26 @@ def test_init_creates_identity_config_and_control_grant_with_0600(tmp_path):
     assert 29 * 24 * 60 * 60 < ttl_seconds <= 30 * 24 * 60 * 60
 
 
+def test_init_scaffold_fallback_is_not_fail_open(tmp_path):
+    # B5 hardening: an init-generated config must not silently forward on a
+    # Runtime Gate outage. read defaults to approval (not allow); destructive
+    # stays blocked.  claim-check: allow describes the destructive-fallback default asserted by this test
+    result = init_proxy(
+        home=tmp_path / "avp-home",
+        agent_name="proxy",
+        policy_pack="github",
+        passphrase=TEST_PASSPHRASE,
+    )
+
+    fallback = _load(result.config_path)["fallback"]
+    assert fallback["read"] == "approval"
+    assert fallback["write"] == "approval"
+    assert fallback["destructive"] == "block"
+    assert "allow" not in fallback.values()
+    # The hardened scaffold still loads as a valid config.
+    assert ProxyConfig.from_dict(_load(result.config_path)).fallback.read.value == "approval"
+
+
 def test_init_defaults_to_encrypted_storage_with_passphrase(tmp_path):
     result = init_proxy(
         home=tmp_path / "avp-home",

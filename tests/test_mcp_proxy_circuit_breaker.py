@@ -25,6 +25,7 @@ from agentveil_mcp_proxy.cli import doctor_proxy, init_proxy
 import agentveil_mcp_proxy.policy as policy_module
 from agentveil_mcp_proxy.passthrough import (
     DownstreamConfig,
+    JSONRPC_APPROVAL_REQUIRED,
     JSONRPC_RUNTIME_GATE_UNAVAILABLE,
     McpPassthrough,
 )
@@ -658,6 +659,95 @@ def test_open_circuit_returns_sanitized_error_in_block_fallback(tmp_path):
     }
     assert SECRET not in client_out.getvalue()
     assert not log_path.exists()
+
+
+def _read_ask_backend_config(*, fallback: dict | None = None) -> ProxyConfig:
+    """Config where any tool is read-risk and routes to ASK_BACKEND, so the
+    Runtime Gate unavailable-fallback is exercised for a read tool call."""
+    payload = {
+        "proxy_config_schema_version": 1,
+        "avp": {
+            "base_url": "https://agentveil.dev",
+            "agent_name": "agentveil-mcp-proxy",
+            "trusted_signer_dids": [BACKEND_DID],
+        },
+        "mode": "protect",
+        "privacy": {
+            "action": "redacted",
+            "resource": "hash",
+            "payload": "hash_only",
+            "evidence_upload": False,
+        },
+        "approval": {},
+        "policy": {
+            "id": "read-ask-backend",
+            "policy_schema_version": 1,
+            "default_decision": "ask_backend",
+            "default_risk_class": "read",
+            "rules": [],
+        },
+        "downstream": {},
+    }
+    if fallback is not None:
+        payload["fallback"] = fallback
+    return ProxyConfig.from_dict(payload)
+
+
+def _read_tool_call() -> str:
+    return _json_line({
+        "jsonrpc": "2.0",
+        "id": "call-1",
+        "method": "tools/call",
+        "params": {"name": "get_file_contents", "arguments": {"path": SECRET}},
+    })
+
+
+def test_open_circuit_read_fallback_defaults_to_approval_not_forwarded(tmp_path):
+    # B5 hardening: with the fallback omitted, a read tool call during a Gate
+    # outage requires approval instead of being silently forwarded.
+    config = _read_ask_backend_config()
+    breaker = CircuitBreaker(CircuitBreakerConfig(failures_before_open=1))
+    breaker.record_failure()
+    gate = RuntimeGateClient(
+        agent=RecordingAgent(),
+        config=config,
+        control_grant={"id": "grant"},
+        circuit_breaker=breaker,
+    )
+    passthrough, log_path = _passthrough(tmp_path, gate, config)
+    client_out = io.StringIO()
+
+    assert passthrough.run_stdio(io.StringIO(_read_tool_call()), client_out) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    assert response["error"]["code"] == JSONRPC_APPROVAL_REQUIRED
+    assert response["error"]["data"] == {
+        "status": "approval_required",
+        "reason": "runtime_gate_unavailable",
+    }
+    assert not log_path.exists()
+    assert SECRET not in client_out.getvalue()
+
+
+def test_open_circuit_read_fallback_explicit_allow_forwards(tmp_path):
+    # The remaining ALLOW path is an explicit operator-configured risk: when an
+    # operator opts into read: allow, a read is forwarded during a Gate outage.
+    config = _read_ask_backend_config(fallback={"read": "allow"})
+    breaker = CircuitBreaker(CircuitBreakerConfig(failures_before_open=1))
+    breaker.record_failure()
+    gate = RuntimeGateClient(
+        agent=RecordingAgent(),
+        config=config,
+        control_grant={"id": "grant"},
+        circuit_breaker=breaker,
+    )
+    passthrough, log_path = _passthrough(tmp_path, gate, config)
+    client_out = io.StringIO()
+
+    assert passthrough.run_stdio(io.StringIO(_read_tool_call()), client_out) == 0
+
+    assert _responses(client_out.getvalue())[0]["result"] == {"ok": True}
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/call"]
 
 
 def test_circuit_state_change_emits_security_event_without_payload_data(tmp_path):
