@@ -35,10 +35,10 @@ sudo apt-get install -y python3.12-venv python3-pip
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-pip install agentveil
+pip install agentveil agentveil-mcp-proxy
 ```
 
-This installs the core `agentveil` SDK and registers the
+This installs the core `agentveil` SDK and the separately packaged
 `agentveil-mcp-proxy` console script.
 
 ## Step 1 — `agentveil-mcp-proxy init`
@@ -296,7 +296,7 @@ The JSON shape includes stable top-level fields:
 Configure your IDE / MCP client to run `agentveil-mcp-proxy run` as its
 server entry point. The MCP Proxy README documents wiring for Claude Desktop,
 Cursor, Windsurf, and VS Code:
-[`agentveil_mcp_proxy/README.md`](../agentveil_mcp_proxy/README.md).
+[`packages/agentveil-mcp-proxy/README.md`](../packages/agentveil-mcp-proxy/README.md).
 
 When the client starts the proxy:
 
@@ -334,7 +334,8 @@ Slice-level note: recording verified Runtime Gate `ALLOW` and `BLOCK`
 decisions into the local evidence store is a recent change. Before it
 landed, only the approval-required path created proxy-side evidence
 records. See `agentveil_mcp_proxy/passthrough.py` and
-`agentveil_mcp_proxy/approval/manager.py` for the exact flow.
+`agentveil_mcp_proxy/approval/manager.py` in the source-available proxy package
+for the exact flow.
 
 ## Optional — Declared tool surface (`tool_surface`)
 
@@ -525,7 +526,7 @@ This list is the honest counterpart to the section above. The bundle
 - Operations / day-2 reference:
   [`MCP_PROXY_OPERATIONS.md`](MCP_PROXY_OPERATIONS.md).
 - MCP Proxy README with IDE wiring examples:
-  [`agentveil_mcp_proxy/README.md`](../agentveil_mcp_proxy/README.md).
+  [`packages/agentveil-mcp-proxy/README.md`](../packages/agentveil-mcp-proxy/README.md).
 - Data handling boundaries:
   [`DATA_HANDLING.md`](DATA_HANDLING.md).
 - SDK / API surface:

@@ -28,7 +28,7 @@ pip install agentveil
 
 > **Paper:** Boiko, O. (2026). *[Why AI Agent Reputation Needs Both Link Analysis and Flow-Based Gating](https://zenodo.org/records/19730525)*. Zenodo.
 
-> **MCP transport proxy ships in v0.7.15:** wrap downstream MCP servers (filesystem, github, shell) with AgentVeil Action Control Plane gating, approval routing, durable signed evidence, and replay defense. IDE-friendly adapter for Claude Desktop, Cursor, Cline, Windsurf, and VS Code. See [`agentveil_mcp_proxy/README.md`](agentveil_mcp_proxy/README.md).
+> **MCP transport proxy:** wrap downstream MCP servers (filesystem, github, shell) with AgentVeil Action Control Plane gating, approval routing, durable signed evidence, and replay defense. The proxy is a separately packaged source-available component under [`packages/agentveil-mcp-proxy/`](packages/agentveil-mcp-proxy/).
 
 <p align="center">
   <img src="docs/demo.gif" alt="AgentVeil SDK demo — preflight, runtime gate, approval, controlled execution, offline proof" width="720">
@@ -256,7 +256,7 @@ def review_code(pr_url: str) -> str:
 | **AutoGen** | `pip install agentveil autogen-core` | `avp_reputation_tools()` |
 | **OpenAI** | `pip install agentveil openai` | `avp_tool_definitions()` + `handle_avp_tool_call(...)` from `agentveil.tools.openai` |
 | **MCP clients** | `pip install 'agentveil[mcp]'` | `agentveil-mcp` toolbox for explicit Runtime Gate evaluation, approvals, receipts, reputation, identity lookup, and audit. It does not intercept or gate other MCP tools. ([docs](agentveil_mcp/README.md)) |
-| **MCP transport proxy** | `pip install agentveil` | `agentveil-mcp-proxy` wraps downstream MCP servers (filesystem, github, shell) with Action Control Plane gating, approval routing, durable signed evidence, and replay defense for Claude Desktop, Cursor, Cline, Windsurf, and VS Code ([docs](agentveil_mcp_proxy/README.md)) |
+| **MCP transport proxy** | `pip install agentveil-mcp-proxy` | `agentveil-mcp-proxy` wraps downstream MCP servers (filesystem, github, shell) with Action Control Plane gating, approval routing, durable signed evidence, and replay defense for Claude Desktop, Cursor, Cline, Windsurf, and VS Code ([docs](packages/agentveil-mcp-proxy/README.md)) |
 | **Gemini** | `pip install agentveil google-generativeai` | Function-calling example: [`examples/gemini_example.py`](examples/gemini_example.py) |
 | **PydanticAI** | `pip install agentveil pydantic-ai` | Tool example: [`examples/pydantic_ai_example.py`](examples/pydantic_ai_example.py) |
 | **Paperclip** | `pip install agentveil` | `avp_should_delegate(...)`, `avp_evaluate_team(...)`, `avp_plugin_tools()` |

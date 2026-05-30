@@ -41,7 +41,7 @@ For production setup, see the [Customer Integration guide](https://github.com/ag
 - **W3C VC v2.0 credentials** with `eddsa-jcs-2022` Data Integrity proofs.
 - **DID identity** with portable `did:key` Ed25519 keys.
 - **Framework integrations** for CrewAI, LangGraph, AutoGen, OpenAI, Claude MCP, Gemini, PydanticAI, Paperclip, and AWS Bedrock.
-- **MCP transport proxy** for IDE clients (Claude Desktop, Cursor, Cline, Windsurf, VS Code) - wrap downstream MCP servers with Action Control Plane gating via the `agentveil-mcp-proxy` console script.
+- **MCP transport proxy** for IDE clients (Claude Desktop, Cursor, Cline, Windsurf, VS Code) - available as the separately packaged `agentveil-mcp-proxy` source-available component.
 
 AgentVeil makes agent actions constrained, auditable, and reversible within a
 declared action vocabulary and policy subset. It does not claim to solve the
@@ -89,6 +89,12 @@ runtime decision gating, human approval routing, durable signed evidence, and
 replay defense. Point your IDE at `agentveil-mcp-proxy` instead of directly at
 the downstream server; the proxy applies AVP policy before forwarding.
 
+Install the proxy package alongside the SDK:
+
+```bash
+pip install agentveil agentveil-mcp-proxy
+```
+
 ```bash
 agentveil-mcp-proxy init --quickstart-filesystem ./sandbox
 agentveil-mcp-proxy doctor --full
@@ -116,7 +122,7 @@ scoped to action context and payload hash, time-bounded by expiry, guarded
 against replay at the proxy boundary, and attenuated when follow-on grants such
 as `similar_5m` narrow the original approval scope.
 
-See the [MCP Proxy README](https://github.com/agentveil-protocol/agentveil-sdk/blob/main/agentveil_mcp_proxy/README.md)
+See the [MCP Proxy README](https://github.com/agentveil-protocol/agentveil-sdk/blob/main/packages/agentveil-mcp-proxy/README.md)
 for the full quick start and IDE configuration examples.
 
 ## Resources

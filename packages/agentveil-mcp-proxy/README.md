@@ -13,25 +13,26 @@ MCP-transport adapter.
 - **Status:** stdio passthrough for one downstream MCP server per proxy
   instance. Encrypted identity by default, durable approval evidence, signed
   receipts, offline bundle verification.
-- **Package:** bundled inside `agentveil` on PyPI. Console script
-  `agentveil-mcp-proxy` registered automatically.
-- **License:** MIT.
+- **Package:** distributed separately as `agentveil-mcp-proxy`. Console script
+  `agentveil-mcp-proxy` is preserved.
+- **License:** source-available under the Business Source License 1.1. See
+  [`LICENSE`](LICENSE).
 
 ## Install
 
 ```bash
-pip install agentveil
+pip install agentveil agentveil-mcp-proxy
 ```
 
-This installs the core `agentveil` SDK plus the `agentveil-mcp-proxy` console
-script. No additional extras are required.
+This installs the core `agentveil` SDK plus the separately packaged
+`agentveil-mcp-proxy` console script.
 
 ## Quick Start
 
 For the full step-by-step customer cold path (install → init → doctor →
 configure downstream → run → export evidence → offline verify) and the
 honest list of what the bundle currently does and does not prove, see
-[`docs/MCP_PROXY_QUICKSTART.md`](../docs/MCP_PROXY_QUICKSTART.md).
+[`docs/MCP_PROXY_QUICKSTART.md`](../../docs/MCP_PROXY_QUICKSTART.md).
 
 The short form is:
 
@@ -85,7 +86,7 @@ when needed, persists durable signed evidence, and forwards approved calls to
 the downstream server. Raw MCP arguments, prompts, outputs, tokens, source code,
 secrets, and private logs remain local by default; Runtime Gate receives only
 privacy-filtered metadata and hashes needed for the decision. See
-[Data Handling](../docs/DATA_HANDLING.md).
+[Data Handling](../../docs/DATA_HANDLING.md).
 
 ### Supported invocation paths
 
@@ -325,11 +326,11 @@ trade-offs - see [`docs/MCP_PROXY_OPERATIONS.md`][ops].
 `agentveil-mcp-proxy` is one integration adapter for Agent Veil Protocol. The
 core trust/control/evidence primitives - Runtime Gate, DecisionReceipt
 verification, controlled-action flow, identity, and audit chain - live in the
-[`agentveil`](../README.md) SDK. This package is the MCP-transport adapter for
+[`agentveil`](../../README.md) SDK. This package is the MCP-transport adapter for
 IDE clients; other adapters exist for direct SDK use, framework integrations
 (CrewAI, LangGraph, AutoGen, OpenAI), AWS Bedrock, and Microsoft AgentMesh.
 
-See the top-level [README](../README.md) for the full integration matrix and
+See the top-level [README](../../README.md) for the full integration matrix and
 the [API docs](https://agentveil.dev/docs) for endpoint-level detail.
 
 ## Roadmap
@@ -348,8 +349,8 @@ v0.1 ships with these documented limitations targeted for v0.1.1:
   identity files. v0.1.1+ adds opt-in macOS Keychain, Linux Secret Service, and
   Windows Credential Manager integration.
 
-[ops]: ../docs/MCP_PROXY_OPERATIONS.md
-[ops-passphrase]: ../docs/MCP_PROXY_OPERATIONS.md#security-trade-offs-by-passphrase-source
-[ops-evidence]: ../docs/MCP_PROXY_OPERATIONS.md#local-evidence-storage
-[ops-headless]: ../docs/MCP_PROXY_OPERATIONS.md#headless-approval-mode
-[release-acceptance]: ../docs/MCP_PROXY_RELEASE_ACCEPTANCE.md
+[ops]: ../../docs/MCP_PROXY_OPERATIONS.md
+[ops-passphrase]: ../../docs/MCP_PROXY_OPERATIONS.md#security-trade-offs-by-passphrase-source
+[ops-evidence]: ../../docs/MCP_PROXY_OPERATIONS.md#local-evidence-storage
+[ops-headless]: ../../docs/MCP_PROXY_OPERATIONS.md#headless-approval-mode
+[release-acceptance]: docs/MCP_PROXY_RELEASE_ACCEPTANCE.md

@@ -548,7 +548,7 @@ flowchart TD
 
 Recommended order:
 
-1. P0: commit and polish this document as `docs/MCP_PROXY_V0_1_PLAN.md`.
+1. P0: commit and polish this document in the proxy package docs.
 2. P1: config schema and internal local policy engine.
 3. P2: minimal CLI: `init`, `run`, `doctor`.
 4. P3: MCP pass-through skeleton.

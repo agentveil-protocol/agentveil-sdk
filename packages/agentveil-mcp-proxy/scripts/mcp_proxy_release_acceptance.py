@@ -107,7 +107,7 @@ def build_wheel(work_dir: Path, python: str) -> Path:
     dist_dir = work_dir / "dist"
     dist_dir.mkdir()
     run([str(build_python), "-m", "build", "--wheel", "--outdir", str(dist_dir)], cwd=REPO_ROOT)
-    wheels = sorted(dist_dir.glob("agentveil-*-py3-none-any.whl"))
+    wheels = sorted(dist_dir.glob("agentveil_mcp_proxy-*-py3-none-any.whl"))
     if len(wheels) != 1:
         raise AcceptanceError(f"expected one built wheel, found {len(wheels)} in {dist_dir}")
     return wheels[0]

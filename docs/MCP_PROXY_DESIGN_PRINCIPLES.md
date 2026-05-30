@@ -95,10 +95,11 @@ deployment.
 Open design says protection should not depend on hiding the algorithm or
 protocol.
 
-The public SDK repository exposes the MCP Proxy source, policy DSL, receipt
-schema handling, JCS canonicalization choices, evidence-chain format, and
-offline verifier. Auditors can inspect the implementation instead of trusting a
-black-box statement that an action was controlled.
+The source-available MCP Proxy package exposes the proxy source, policy DSL,
+receipt schema handling, JCS canonicalization choices, evidence-chain format,
+and offline verifier under its own license. Auditors can inspect the
+implementation instead of trusting a black-box statement that an action was
+controlled.
 
 The protected secrets are the correct trust anchors and private keys:
 

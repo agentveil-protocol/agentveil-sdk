@@ -1,13 +1,14 @@
 [project]
-name = "agentveil"
+name = "agentveil-mcp-proxy"
 version = "0.7.18"
-description = "Python SDK for agent action control: posture checks, action gates, signed receipts, and proof packets"
-readme = {file = "README_PYPI.md", content-type = "text/markdown"}
+description = "Source-available MCP transport proxy for AgentVeil Runtime Gate, approval routing, and local evidence"
+readme = {file = "README.md", content-type = "text/markdown"}
 requires-python = ">=3.10"
-license = "MIT"
+license = "BUSL-1.1"
+license-files = ["LICENSE"]
 authors = [{name = "Oleg Boiko", email = "ob@agentveil.dev"}]
 maintainers = [{name = "Oleg Boiko", email = "ob@agentveil.dev"}]
-keywords = ["ai", "agents", "agent-control", "runtime-gate", "controlled-actions", "signed-receipts", "did", "identity", "mcp", "reputation"]
+keywords = ["ai", "agents", "agent-control", "runtime-gate", "mcp", "mcp-proxy", "approval", "evidence"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
@@ -20,18 +21,14 @@ classifiers = [
 ]
 
 dependencies = [
-    "httpx>=0.27.0",
-    "pynacl>=1.5.0",
-    "base58>=2.1.0",
-    "jcs>=0.2.1",
+    "agentveil>=0.7.18,<0.8",
     "mcp>=1.0.0",
 ]
 
 [project.urls]
 Homepage = "https://agentveil.dev"
-Documentation = "https://github.com/agentveil-protocol/agentveil-sdk#readme"
+Documentation = "https://github.com/agentveil-protocol/agentveil-sdk/tree/main/packages/agentveil-mcp-proxy#readme"
 Repository = "https://github.com/agentveil-protocol/agentveil-sdk"
-Changelog = "https://github.com/agentveil-protocol/agentveil-sdk/releases"
 Issues = "https://github.com/agentveil-protocol/agentveil-sdk/issues"
 
 [build-system]
@@ -40,20 +37,12 @@ build-backend = "setuptools.build_meta"
 
 [project.optional-dependencies]
 test = ["pytest>=8.0.0", "pytest-asyncio>=0.23.0"]
-mcp = ["mcp>=1.0.0"]
 
 [project.scripts]
-agentveil = "agentveil_paperclip.cli:agentveil_main"
-agentveil-mcp = "agentveil_mcp.server:main"
-agentveil-paperclip = "agentveil_paperclip.cli:main"
+agentveil-mcp-proxy = "agentveil_mcp_proxy.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["agentveil*", "agentveil_mcp*", "agentveil_paperclip*", "mcp_server*"]
-exclude = ["packages*", "agentveil_mcp_proxy*"]
-
-[tool.setuptools.package-data]
-agentveil_mcp = ["README.md"]
-mcp_server = ["README.md"]
+include = ["agentveil_mcp_proxy*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
