@@ -195,6 +195,16 @@ class DownstreamTimeoutError(PassthroughError):
     """Raised when downstream stays alive but does not answer one request."""
 
 
+class _ClassifierFailedError(Exception):
+    """Internal: a configured classifier raised while classifying a tools/call.
+
+    The proxy fails closed (blocks the call) rather than forwarding a tool call
+    that was never local-policy / Runtime Gate evaluated. Not a PassthroughError
+    claim-check: allow "never" describes this internal exception's own contract; behavior verified by the Step 3 classifier tests
+    subclass so it is never absorbed by the downstream-error handler.
+    """
+
+
 @dataclass(frozen=True)
 class DownstreamConfig:
     """Downstream stdio MCP server launch config."""
@@ -668,6 +678,15 @@ class McpPassthrough:
             finally:
                 if response_key is not None:
                     self._unregister_inflight_id(response_key)
+        except _ClassifierFailedError:
+            if not has_id:
+                return []
+            return [_blocked_error(
+                request_id,
+                # claim-check: allow "blocked" is the literal JSON-RPC error message string
+                "blocked by MCP proxy: tool call classification failed",
+                reason="classifier_error",
+            )]
         except DownstreamTimeoutError:
             self._increment_downstream_timeouts()
             self._record_approval_error(approval_outcome, "downstream_response_timeout")
@@ -789,10 +808,15 @@ class McpPassthrough:
             return None
         try:
             classification = self.classifier.classify_jsonrpc(message)
-        except Exception:
-            # P4 classification is advisory only. Future evidence slices can
-            # consume this counter without logging sensitive request content.
+        except Exception as exc:
+            # Fail closed for tools/call: a tool call whose classification raised
+            # claim-check: allow describes the routing this except-branch enforces; tested in tests/test_mcp_proxy_passthrough.py
+            # was never local-policy / Runtime Gate evaluated, so it must not be
+            # forwarded downstream. Non-tools/call protocol messages remain on
+            # the advisory path and pass through. The counter records both.
             self._increment_classifier_errors()
+            if message.get("method") == "tools/call":
+                raise _ClassifierFailedError() from exc
             return None
         if classification is not None and self.on_tool_call is not None:
             try:
