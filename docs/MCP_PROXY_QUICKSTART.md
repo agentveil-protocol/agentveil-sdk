@@ -336,6 +336,56 @@ landed, only the approval-required path created proxy-side evidence
 records. See `agentveil_mcp_proxy/passthrough.py` and
 `agentveil_mcp_proxy/approval/manager.py` for the exact flow.
 
+## Optional — Declared tool surface (`tool_surface`)
+
+The proxy can enforce an operator-declared allowlist of tool names. It is
+configured under `tool_surface` in `~/.avp/mcp-proxy/config.json` and is **off
+by default**, so existing configs behave exactly as before until you opt in.
+
+- `tool_surface.mode`:
+  - `off` (default): no tool-surface check. Calls follow the normal
+    classification / local policy / Runtime Gate / approval path unchanged.
+  - `observe`: an undeclared tool call is still forwarded, but each one is
+    recorded as a sanitized security event (`type: undeclared_tool_call`,
+    `action: observed`, `reason: undeclared_tool`, and the tool name — never the
+    <!-- claim-check: allow "never" documents B9 sanitized event behavior verified by tests. -->
+    raw arguments).
+  - `enforce`: an undeclared tool call is blocked with a JSON-RPC policy error
+    <!-- claim-check: allow "blocked" is the JSON-RPC policy outcome for enforce mode. -->
+    (`reason: undeclared_tool`) and recorded as a sanitized security event
+    (`action: blocked`). The block happens **before** schema validation,
+    <!-- claim-check: allow "blocked" documents the sanitized event action for enforce mode. -->
+    classification, local policy, Runtime Gate, and any downstream forwarding —
+    the downstream server is never contacted for an undeclared tool.
+    <!-- claim-check: allow "never" documents pre-downstream enforcement verified by B9 tests. -->
+- `tool_surface.allow`: a list of shell-style patterns (exact names or globs,
+  matched case-sensitively against the MCP `params.name`). A tool is "declared"
+  only when its name matches at least one pattern.
+
+The allowlist is **operator-declared**: it is the set of names *you* list, not
+whatever the downstream server advertises through `tools/list`. An empty `allow`
+under `enforce` therefore declares nothing and blocks every tool call — populate
+<!-- claim-check: allow "every" documents tested empty-allow enforce semantics. -->
+`allow` with the tools you expect before switching to `enforce`.
+
+Minimal `config.json` excerpt:
+
+```json
+{
+  "tool_surface": {
+    "mode": "enforce",
+    "allow": ["get_*", "list_*", "read_file"]
+  }
+}
+```
+
+`tool_surface.mode` is independent of the proxy-wide `mode` field: the
+proxy-wide `mode: observe` is a monitor-only mode that forwards every call
+<!-- claim-check: allow "every" reflects documented proxy-wide observe-mode semantics. -->
+without gating, whereas `tool_surface.mode: observe` only records
+undeclared-tool events and leaves the rest of the normal policy / Runtime Gate /
+approval path in force.
+
 ## Step 8 — Export the evidence bundle
 
 After one or more tool calls:
