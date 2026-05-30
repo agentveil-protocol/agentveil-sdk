@@ -37,6 +37,14 @@ class DecisionMode(str, Enum):
     STRICT = "strict"
 
 
+class ToolSurfaceMode(str, Enum):
+    """Declared tool surface enforcement mode (orthogonal to DecisionMode)."""
+
+    OFF = "off"
+    OBSERVE = "observe"
+    ENFORCE = "enforce"
+
+
 class PolicyDecision(str, Enum):
     """Internal local-policy decision vocabulary."""
 
@@ -518,6 +526,50 @@ class PolicyConfig:
 
 
 @dataclass(frozen=True)
+class ToolSurfaceConfig:
+    """Operator-declared tool surface enforcement config.
+
+    ``mode`` defaults to ``off`` for backward compatibility. ``allow`` holds
+    shell-style (fnmatchcase) patterns; a tool is declared only when its
+    JSON-RPC ``params.name`` matches at least one pattern. An empty allowlist
+    declares nothing, so under ``enforce`` every tool call is blocked and under
+    claim-check: allow "blocked/every" describes tested allowlist semantics.
+    ``observe`` every tool call is recorded -- operators opt in by listing the
+    tools they expect.
+    """
+
+    mode: ToolSurfaceMode = ToolSurfaceMode.OFF
+    allow: tuple[str, ...] = ()
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any] | None = None) -> "ToolSurfaceConfig":
+        # Default only for an omitted block (None). A present-but-non-object
+        # value (e.g. [], "", 0) must fail loudly rather than silently disable
+        # enforcement -- a typo'd tool_surface should never quietly become off.
+        # claim-check: allow "never" describes validation fail-closed intent.
+        if data is None:
+            data = {}
+        data = _require_mapping(data, "tool_surface")
+        _reject_unknown(data, {"mode", "allow"}, "tool_surface")
+        mode = _enum(ToolSurfaceMode, data.get("mode", "off"), "tool_surface.mode")
+        allow_raw = data.get("allow")
+        if allow_raw is None:
+            allow: tuple[str, ...] = ()
+        elif isinstance(allow_raw, str):
+            allow = (_non_empty_str(allow_raw, "tool_surface.allow"),)
+        elif isinstance(allow_raw, Sequence) and not isinstance(allow_raw, (str, bytes, bytearray)):
+            allow = tuple(_non_empty_str(item, "tool_surface.allow[]") for item in allow_raw)
+        else:
+            raise ProxyConfigError("tool_surface.allow must be a string or list of strings")
+        return cls(mode=mode, allow=allow)
+
+    def is_declared(self, tool_name: str) -> bool:
+        """Return True when ``tool_name`` matches at least one allow pattern."""
+
+        return any(fnmatch.fnmatchcase(tool_name, pattern) for pattern in self.allow)
+
+
+@dataclass(frozen=True)
 class ProxyConfig:
     """Top-level MCP proxy config schema."""
 
@@ -529,6 +581,7 @@ class ProxyConfig:
     approval: ApprovalConfig = field(default_factory=ApprovalConfig)
     circuit_breaker: ProxyCircuitBreakerConfig = field(default_factory=ProxyCircuitBreakerConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
+    tool_surface: ToolSurfaceConfig = field(default_factory=ToolSurfaceConfig)
     downstream: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
 
     @classmethod
@@ -545,6 +598,7 @@ class ProxyConfig:
                 "approval",
                 "circuit_breaker",
                 "policy",
+                "tool_surface",
                 "downstream",
             },
             "proxy config",
@@ -563,6 +617,7 @@ class ProxyConfig:
             approval=ApprovalConfig.from_dict(data.get("approval", {})),
             circuit_breaker=ProxyCircuitBreakerConfig.from_dict(data.get("circuit_breaker")),
             policy=PolicyConfig.from_dict(data.get("policy", {})),
+            tool_surface=ToolSurfaceConfig.from_dict(data.get("tool_surface", {})),
             downstream=MappingProxyType(dict(downstream)),
         )
 
@@ -864,6 +919,8 @@ __all__ = [
     "RiskClass",
     "TimeoutAction",
     "ToolCallContext",
+    "ToolSurfaceConfig",
+    "ToolSurfaceMode",
     "builtin_policy_pack",
     "policy_context_hash",
 ]

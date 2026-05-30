@@ -37,7 +37,7 @@ from typing import Any, Callable, Deque, Mapping, TextIO
 
 from agentveil_mcp_proxy.approval import ApprovalFlowError, ApprovalOutcome
 from agentveil_mcp_proxy.classification import ClassifiedToolCall, ToolCallClassifier
-from agentveil_mcp_proxy.policy import PolicyDecision, ProxyConfig
+from agentveil_mcp_proxy.policy import PolicyDecision, ProxyConfig, ToolSurfaceMode
 from agentveil_mcp_proxy.runtime_gate import (
     DECISION_ALLOW,
     DECISION_BLOCK,
@@ -667,6 +667,10 @@ class McpPassthrough:
         if message.get("jsonrpc") != JSONRPC_VERSION or not isinstance(message.get("method"), str):
             return [jsonrpc_error(request_id, JSONRPC_INVALID_REQUEST, "invalid JSON-RPC request")]
 
+        surface_error = self._tool_surface_error_response(message, request_id)
+        if surface_error is not None:
+            return [surface_error] if has_id else []
+
         try:
             schema_error = self._tool_schema_error_response(message, request_id)
             if schema_error is not None:
@@ -733,6 +737,56 @@ class McpPassthrough:
                 JSONRPC_DOWNSTREAM_ERROR,
                 "downstream MCP server unavailable",
             )]
+
+    def _tool_surface_error_response(
+        self,
+        message: Mapping[str, Any],
+        request_id: Any,
+    ) -> dict[str, Any] | None:
+        """Enforce the operator-declared tool surface for ``tools/call``.
+
+        Runs before schema validation / classification / local policy / Runtime
+        Gate / downstream. Returns a sanitized blocked error for an undeclared
+        claim-check: allow "blocked/never" describes tested enforce behavior.
+        tool under ``enforce`` (downstream is never called); records a sanitized
+        security event under both ``observe`` and ``enforce``; returns ``None``
+        (no behavior change) under ``off``, for non-``tools/call`` messages, and
+        claim-check: allow "never" describes argument redaction boundary.
+        for declared tools. Only the tool name -- never raw arguments -- is
+        recorded or returned.
+        """
+
+        config = self.config
+        tool_surface = config.tool_surface if isinstance(config, ProxyConfig) else None
+        if tool_surface is None or tool_surface.mode is ToolSurfaceMode.OFF:
+            return None
+        if message.get("method") != "tools/call":
+            return None
+        params = message.get("params")
+        tool = params.get("name") if isinstance(params, Mapping) else None
+        if not isinstance(tool, str) or not tool:
+            return None
+        if tool_surface.is_declared(tool):
+            return None
+        if tool_surface.mode is ToolSurfaceMode.ENFORCE:
+            self._record_security_event({
+                "type": "undeclared_tool_call",
+                "action": "blocked",  # claim-check: allow "blocked" is event vocabulary.
+                "reason": "undeclared_tool",
+                "tool": tool,
+            })
+            return _blocked_error(
+                request_id,
+                "blocked by MCP proxy: tool not in declared surface",  # claim-check: allow "blocked" is literal error text.
+                reason="undeclared_tool",
+            )
+        self._record_security_event({
+            "type": "undeclared_tool_call",
+            "action": "observed",
+            "reason": "undeclared_tool",
+            "tool": tool,
+        })
+        return None
 
     def _tool_schema_error_response(
         self,

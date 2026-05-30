@@ -20,6 +20,8 @@ from agentveil_mcp_proxy import (
     ProxyConfigError,
     RiskClass,
     ToolCallContext,
+    ToolSurfaceConfig,
+    ToolSurfaceMode,
     builtin_policy_pack,
     policy_context_hash,
 )
@@ -452,3 +454,82 @@ def test_github_pack_approval_required_for_drop_tools():
     result = _evaluate_builtin_pack("github", server="github", tool="drop_ref")
     assert result.decision is PolicyDecision.APPROVAL
     assert result.policy_rule_id == "github-destructive"
+
+
+# --- B9 declared tool surface config ---
+
+def test_tool_surface_dataclass_default_is_off_empty_allow():
+    surface = ToolSurfaceConfig()
+    assert surface.mode is ToolSurfaceMode.OFF
+    assert surface.allow == ()
+
+
+def test_proxy_config_without_tool_surface_defaults_off():
+    # Backward compatibility: omitting the block keeps enforcement off.
+    config = ProxyConfig.from_dict(_base_config())
+    assert config.tool_surface.mode is ToolSurfaceMode.OFF
+    assert config.tool_surface.allow == ()
+
+
+def test_tool_surface_parses_modes_and_allow_forms():
+    off = ToolSurfaceConfig.from_dict({"mode": "off"})
+    observe = ToolSurfaceConfig.from_dict({"mode": "observe", "allow": "get_*"})
+    enforce = ToolSurfaceConfig.from_dict({"mode": "enforce", "allow": ["get_*", "list_*"]})
+    assert off.mode is ToolSurfaceMode.OFF
+    assert observe.mode is ToolSurfaceMode.OBSERVE
+    assert observe.allow == ("get_*",)
+    assert enforce.mode is ToolSurfaceMode.ENFORCE
+    assert enforce.allow == ("get_*", "list_*")
+
+
+def test_tool_surface_empty_allow_list_is_accepted_as_no_patterns():
+    surface = ToolSurfaceConfig.from_dict({"mode": "enforce", "allow": []})
+    assert surface.allow == ()
+    # Empty allowlist declares nothing.
+    assert surface.is_declared("read_file") is False
+
+
+def test_tool_surface_is_declared_exact_and_glob():
+    surface = ToolSurfaceConfig.from_dict({"mode": "enforce", "allow": ["read_file", "list_*"]})
+    assert surface.is_declared("read_file") is True
+    assert surface.is_declared("list_dir") is True
+    assert surface.is_declared("write_file") is False
+    # fnmatchcase is case-sensitive.
+    assert surface.is_declared("READ_FILE") is False
+
+
+def test_tool_surface_rejects_invalid_mode():
+    with pytest.raises(ProxyConfigError, match="tool_surface.mode"):
+        ToolSurfaceConfig.from_dict({"mode": "blocklist"})
+
+
+def test_tool_surface_rejects_non_string_allow_and_unknown_field():
+    with pytest.raises(ProxyConfigError, match="tool_surface.allow"):
+        ToolSurfaceConfig.from_dict({"mode": "enforce", "allow": [123]})
+    with pytest.raises(ProxyConfigError, match="tool_surface.allow"):
+        ToolSurfaceConfig.from_dict({"mode": "enforce", "allow": 5})
+    with pytest.raises(ProxyConfigError, match="tool_surface"):
+        ToolSurfaceConfig.from_dict({"mode": "off", "deny": ["x"]})
+
+
+def test_proxy_config_wires_tool_surface_block():
+    config = ProxyConfig.from_dict(_base_config(tool_surface={"mode": "enforce", "allow": ["get_*"]}))
+    assert config.tool_surface.mode is ToolSurfaceMode.ENFORCE
+    assert config.tool_surface.is_declared("get_issue") is True
+    assert config.tool_surface.is_declared("delete_repo") is False
+
+
+def test_tool_surface_rejects_non_object_values():
+    # A present-but-non-object value must fail loudly, not silently disable
+    # enforcement. Only an omitted block (None) or empty object defaults to off.
+    for bad in ([], "", 0):
+        with pytest.raises(ProxyConfigError, match="tool_surface must be an object"):
+            ToolSurfaceConfig.from_dict(bad)
+    assert ToolSurfaceConfig.from_dict(None).mode is ToolSurfaceMode.OFF
+    assert ToolSurfaceConfig.from_dict({}).mode is ToolSurfaceMode.OFF
+
+
+def test_proxy_config_rejects_non_object_tool_surface():
+    for bad in ([], "", 0):
+        with pytest.raises(ProxyConfigError, match="tool_surface must be an object"):
+            ProxyConfig.from_dict(_base_config(tool_surface=bad))

@@ -204,6 +204,24 @@ def test_init_scaffold_fallback_is_not_fail_open(tmp_path):
     assert ProxyConfig.from_dict(_load(result.config_path)).fallback.read.value == "approval"
 
 
+def test_init_scaffold_tool_surface_defaults_off(tmp_path):
+    # B9: init scaffold ships tool_surface OFF (backward compatible). observe
+    # with an empty allowlist would flag every call as undeclared (noise), so
+    # claim-check: allow "every" describes scaffold noise tradeoff.
+    # operators opt in after declaring their allowlist.
+    result = init_proxy(
+        home=tmp_path / "avp-home",
+        agent_name="proxy",
+        policy_pack="github",
+        passphrase=TEST_PASSPHRASE,
+    )
+
+    tool_surface = _load(result.config_path)["tool_surface"]
+    assert tool_surface == {"mode": "off", "allow": []}
+    # The scaffold still loads and the parsed surface is OFF.
+    assert ProxyConfig.from_dict(_load(result.config_path)).tool_surface.mode.value == "off"
+
+
 def test_init_defaults_to_encrypted_storage_with_passphrase(tmp_path):
     result = init_proxy(
         home=tmp_path / "avp-home",

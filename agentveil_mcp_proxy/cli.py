@@ -541,6 +541,7 @@ def _build_config_payload(
             "half_open_test_count": 1,
         },
         "policy": _policy_to_dict(policy),
+        "tool_surface": {"mode": "off", "allow": []},
         "downstream": dict(downstream_config or {}),
     }
     ProxyConfig.from_dict(payload)
