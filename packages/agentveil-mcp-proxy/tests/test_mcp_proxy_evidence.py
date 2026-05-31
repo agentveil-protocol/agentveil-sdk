@@ -250,6 +250,42 @@ def test_find_active_similar_grant_rejects_policy_context_drift(tmp_path):
         assert drifted is None
 
 
+def test_find_active_exact_grant_rejects_policy_context_drift(tmp_path):
+    # An approved exact grant is reusable only within the same policy context.
+    # Policy drift (a hot-reload changing policy_id or decision_mode) shifts
+    # policy_context_hash, after which the stale exact grant must not match an
+    # identical retry.
+    lookup = dict(
+        downstream_server="github-mcp",
+        tool_name="github.create_issue",
+        policy_rule_id="rule-write",
+        risk_class="write",
+        resource_hash=RESOURCE_HASH,
+        payload_hash=PAYLOAD_HASH,
+        now_timestamp=1_700_000_000,
+    )
+    with _store(tmp_path) as store:
+        store.write_pending(_record("req-exact"))
+        store.transition(
+            "req-exact",
+            ApprovalStatus.APPROVED.value,
+            approval_token_hash=APPROVAL_TOKEN_HASH,
+            approval_decided_by="local-user",
+            approval_scope="exact",
+            user_decision_timestamp=1_700_000_000,
+        )
+
+        matched = store.find_active_exact_grant(
+            policy_context_hash=POLICY_CONTEXT_HASH, **lookup
+        )
+        assert matched is not None and matched.request_id == "req-exact"
+
+        drifted = store.find_active_exact_grant(
+            policy_context_hash="a" * 64, **lookup
+        )
+        assert drifted is None
+
+
 def test_write_pending_creates_durable_record_with_all_fields(tmp_path):
     db_path = tmp_path / "evidence.sqlite"
     record = _record("req-all")
