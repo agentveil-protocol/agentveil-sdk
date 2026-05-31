@@ -1,18 +1,48 @@
 """Tests for ergonomic SDK DelegationReceipt issuance."""
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
 from nacl.signing import SigningKey
 
 from agentveil.agent import AVPAgent
-from agentveil.delegation import verify_delegation
+from agentveil.delegation import issue_delegation, verify_delegation
+
+FIXED_FROM = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 
 
 def _make_agent(name: str) -> AVPAgent:
     sk = SigningKey.generate()
     return AVPAgent("http://localhost:8000", bytes(sk), name=name, timeout=1.0)
+
+
+def test_issue_delegation_emits_hashdata_proof_and_verifies():
+    principal_seed = bytes.fromhex("11" * 32)
+    agent = _make_agent("agent")
+
+    receipt = issue_delegation(
+        principal_private_key=principal_seed,
+        agent_did=agent.did,
+        scope=[{"predicate": "allowed_category", "value": "infrastructure"}],
+        purpose="direct issuance",
+        valid_for=timedelta(hours=1),
+        valid_from=FIXED_FROM,
+        receipt_id="urn:uuid:00000000-0000-4000-8000-000000000001",
+    )
+    proof = receipt["proof"]
+    verified = verify_delegation(receipt, now=FIXED_FROM)
+
+    assert isinstance(receipt, dict)
+    assert proof["proofPurpose"] == "assertionMethod"
+    assert proof["@context"] == receipt["@context"]
+    assert proof["verificationMethod"] == (
+        f"{receipt['issuer']}#{receipt['issuer'][len('did:key:'):]}"
+    )
+    assert proof["proofValue"].startswith("z")
+    assert verified["valid"] is True
+    assert verified["issuer"] == receipt["issuer"]
+    assert verified["subject"] == agent.did
 
 
 def test_issue_delegation_receipt_verifies_with_correct_issuer_and_subject():
@@ -24,8 +54,11 @@ def test_issue_delegation_receipt_verifies_with_correct_issuer_and_subject():
         allowed_categories=["infrastructure"],
         valid_for=timedelta(hours=1),
     )
+    proof = receipt["proof"]
     verified = verify_delegation(receipt)
 
+    assert proof["proofPurpose"] == "assertionMethod"
+    assert proof["@context"] == receipt["@context"]
     assert verified["issuer"] == principal.did
     assert verified["subject"] == agent.did
     assert verified["scope"] == [
@@ -44,6 +77,7 @@ def test_verify_delegation_receipt_helper_uses_existing_offline_verifier():
 
     verified = principal.verify_delegation_receipt(receipt)
 
+    assert receipt["proof"]["proofPurpose"] == "assertionMethod"
     assert verified["valid"] is True
     assert verified["issuer"] == principal.did
     assert verified["subject"] == agent.did

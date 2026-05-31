@@ -11,6 +11,8 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import base58
+import jcs
 import pytest
 from nacl.signing import SigningKey
 
@@ -18,7 +20,6 @@ from agentveil._did import _public_key_to_did
 from agentveil.data_integrity import DataIntegrityError, sign_eddsa_jcs_2022
 from agentveil.delegation import (
     DelegationInvalid,
-    issue_delegation,
     verify_delegation,
 )
 
@@ -39,15 +40,37 @@ SCOPE = [{"predicate": "allowed_category", "value": "infrastructure"}]
 SAMPLES_DIR = Path(__file__).resolve().parents[1] / "examples" / "delegation" / "samples"
 
 
+def _delegation_body() -> dict:
+    return {
+        "@context": [
+            "https://www.w3.org/ns/credentials/v2",
+            "https://agentveil.dev/contexts/delegation/v1.jsonld",
+        ],
+        "type": ["VerifiableCredential", "AgentDelegation"],
+        "id": "urn:uuid:00000000-0000-4000-8000-000000000001",
+        "issuer": PRINCIPAL_DID,
+        "validFrom": "2026-01-01T00:00:00Z",
+        "validUntil": "2026-01-01T01:00:00Z",
+        "credentialSubject": {
+            "id": AGENT_DID,
+            "scope": SCOPE,
+            "purpose": "dual-path test",
+        },
+    }
+
+
 def _legacy_receipt() -> dict:
-    return issue_delegation(
-        principal_private_key=PRINCIPAL_SEED,
-        agent_did=AGENT_DID,
-        scope=SCOPE,
-        purpose="dual-path test",
-        valid_for=VALID_FOR,
-        valid_from=FIXED_FROM,
-    )
+    body = _delegation_body()
+    signature = SigningKey(PRINCIPAL_SEED).sign(jcs.canonicalize(body)).signature
+    return {
+        **body,
+        "proof": {
+            "type": "DataIntegrityProof",  # claim-check: allow literal proof type in test fixture
+            "cryptosuite": "eddsa-jcs-2022",  # claim-check: allow literal cryptosuite in test fixture
+            "verificationMethod": f"{PRINCIPAL_DID}#{PRINCIPAL_DID[len('did:key:'):]}",
+            "proofValue": "z" + base58.b58encode(signature).decode("ascii"),
+        },
+    }
 
 
 def _new_receipt() -> dict:
@@ -57,8 +80,7 @@ def _new_receipt() -> dict:
     the signer DID), then signed with ``sign_eddsa_jcs_2022`` so the emitted
     proof carries ``proofPurpose`` and the document ``@context``.
     """
-    body = {k: v for k, v in _legacy_receipt().items() if k != "proof"}
-    secured = sign_eddsa_jcs_2022(body, PRINCIPAL_SEED)
+    secured = sign_eddsa_jcs_2022(_delegation_body(), PRINCIPAL_SEED)
     return json.loads(secured)
 
 

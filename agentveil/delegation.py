@@ -19,6 +19,7 @@ Any extension must add new optional predicates, never alter existing ones.
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -29,7 +30,11 @@ from nacl.exceptions import BadSignatureError
 from nacl.signing import SigningKey, VerifyKey
 
 from agentveil._did import _public_key_to_did
-from agentveil.data_integrity import DataIntegrityError, verify_eddsa_jcs_2022
+from agentveil.data_integrity import (
+    DataIntegrityError,
+    sign_eddsa_jcs_2022,
+    verify_eddsa_jcs_2022,
+)
 
 # ---------------------------------------------------------------------------
 # Constants — stable wire format. Do NOT change after publication.
@@ -183,18 +188,10 @@ def issue_delegation(
         },
     }
 
-    canonical = jcs.canonicalize(payload)
-    signature = signing_key.sign(canonical).signature
-    proof_value = "z" + base58.b58encode(signature).decode()
-    verification_method = f"{principal_did}#{principal_did[len('did:key:'):]}"
-
-    payload["proof"] = {
-        "type": PROOF_TYPE,
-        "cryptosuite": CRYPTOSUITE,
-        "verificationMethod": verification_method,
-        "proofValue": proof_value,
-    }
-    return payload
+    try:
+        return json.loads(sign_eddsa_jcs_2022(payload, bytes(principal_private_key)))
+    except DataIntegrityError as exc:
+        raise DelegationError(f"data integrity signing failed: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
