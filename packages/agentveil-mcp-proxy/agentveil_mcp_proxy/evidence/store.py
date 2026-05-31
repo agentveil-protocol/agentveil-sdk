@@ -465,10 +465,17 @@ class ApprovalEvidenceStore:
         tool_name: str,
         policy_rule_id: str | None,
         risk_class: str,
+        policy_context_hash: str,
         resource_hash: str | None,
         now_timestamp: int,
     ) -> PendingApproval | None:
-        """Return a still-active similar-scope approval grant for an exact match."""
+        """Return a still-active similar-scope approval grant for an exact match.
+
+        The match is bound to ``policy_context_hash`` (which folds in policy_id,
+        decision_mode, risk_class, policy_rule_id, and the policy schema version)
+        so a similar_5m grant cannot be reused across policy-context drift such as
+        a hot-reload that changes policy_id or decision_mode.
+        """
 
         reusable_statuses = (
             ApprovalStatus.APPROVED.value,
@@ -484,7 +491,7 @@ class ApprovalEvidenceStore:
                 f"WHERE status IN ({placeholders}) "
                 "AND approval_scope = ? AND granted_scope_expires_at > ? "
                 "AND downstream_server = ? AND tool_name = ? AND risk_class = ? "
-                "AND policy_rule_id IS ? AND resource_hash IS ? "
+                "AND policy_rule_id IS ? AND policy_context_hash = ? AND resource_hash IS ? "
                 "ORDER BY granted_scope_expires_at DESC, created_at DESC, request_id DESC "
                 "LIMIT 1",
                 (
@@ -495,6 +502,7 @@ class ApprovalEvidenceStore:
                     tool_name,
                     risk_class,
                     policy_rule_id,
+                    policy_context_hash,
                     resource_hash,
                 ),
             ).fetchone()

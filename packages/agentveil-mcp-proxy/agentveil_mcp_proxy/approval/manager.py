@@ -129,6 +129,7 @@ class ApprovalManager:
                 tool_name=classification.tool,
                 policy_rule_id=classification.policy_evaluation.policy_rule_id,
                 risk_class=classification.risk_class.value,
+                policy_context_hash=classification.policy_evaluation.policy_context_hash,
                 resource_hash=classification.resource_hash,
                 now_timestamp=now,
             )
