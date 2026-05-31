@@ -18,7 +18,9 @@ from urllib.parse import urlencode, urlsplit
 
 import httpx
 import pytest
+from nacl.signing import SigningKey
 
+from agentveil.delegation import _public_key_to_did
 import agentveil_mcp_proxy.approval.server as approval_server_module
 import agentveil_mcp_proxy.cli as proxy_cli
 from agentveil_mcp_proxy.approval import (
@@ -38,6 +40,10 @@ from agentveil_mcp_proxy.evidence import (
     ApprovalEvidenceStore,
     ApprovalStatus,
 )
+from agentveil_mcp_proxy.evidence.approval_grant import (
+    ApprovalGrantError,
+    verify_approval_grant,
+)
 from agentveil_mcp_proxy.passthrough import DownstreamConfig, McpPassthrough
 from agentveil_mcp_proxy.policy import ProxyConfig, ProxyConfigError
 
@@ -46,6 +52,8 @@ from mcp_fake_downstream import tool_entry, write_downstream
 
 SECRET = "SECRET_APPROVAL_PAYLOAD"
 TOKEN_RE = re.compile(r'name="csrf_token" value="([^"]+)"')
+APPROVAL_GRANT_SEED = bytes.fromhex("33" * 32)
+APPROVAL_GRANT_DID = _public_key_to_did(bytes(SigningKey(APPROVAL_GRANT_SEED).verify_key))
 
 
 class NoopNotifier:
@@ -158,6 +166,8 @@ def _manager(
     headless_policy: HeadlessPolicy | None = None,
     cli_out: io.StringIO | None = None,
     wait_for_decision: bool = True,
+    approval_grant_private_key_seed: bytes | None = None,
+    approval_grant_agent_did: str | None = None,
 ) -> tuple[ApprovalManager, ApprovalEvidenceStore, ApprovalServer, io.StringIO]:
     store = ApprovalEvidenceStore(tmp_path / "evidence.sqlite")
     server = server or ApprovalServer()
@@ -177,6 +187,8 @@ def _manager(
         browser_open=lambda _url: False,
         notifier=NoopNotifier(),
         wait_for_decision=wait_for_decision,
+        approval_grant_private_key_seed=approval_grant_private_key_seed,
+        approval_grant_agent_did=approval_grant_agent_did,
     )
     return manager, store, server, cli
 
@@ -589,6 +601,140 @@ def test_headless_policy_pre_approval_matches_exact_payload_for_destructive(tmp_
         assert outcome.approved
         assert record.status == ApprovalStatus.APPROVED.value
         assert record.approval_scope == "exact"
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_local_approval_mints_signed_approval_grant(tmp_path):
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        approval_grant_private_key_seed=APPROVAL_GRANT_SEED,
+        approval_grant_agent_did=APPROVAL_GRANT_DID,
+    )
+    try:
+        classification = _classification()
+        outcome, _prompt, response = _request_and_post(manager, server, classification)
+        record = store.get_pending(outcome.request_id)
+
+        assert response.status_code == 200
+        assert record.approval_grant_jcs is not None
+        grant = verify_approval_grant(
+            record.approval_grant_jcs,
+            expected_signer_dids=[APPROVAL_GRANT_DID],
+            now=record.user_decision_timestamp,
+        )
+
+        assert grant["agent_did"] == APPROVAL_GRANT_DID
+        assert grant["request_id"] == record.request_id
+        assert grant["downstream_server"] == record.downstream_server
+        assert grant["tool_name"] == record.tool_name
+        assert grant["action_class"] == record.action_class
+        assert grant["risk_class"] == record.risk_class
+        assert grant["resource_hash"] == record.resource_hash
+        assert grant["payload_hash"] == record.payload_hash
+        assert grant["policy_id"] == record.policy_id
+        assert grant["policy_rule_id"] == record.policy_rule_id
+        assert grant["policy_context_hash"] == record.policy_context_hash
+        assert grant["decision"] == "APPROVED"
+        assert grant["approval_scope"] == "exact"
+        assert grant["decided_by"] == "local-user"
+        assert grant["issued_at"] == record.user_decision_timestamp
+        assert grant["expires_at"] == record.expires_at
+        assert grant["decision_audit_id"] is None
+        assert grant["decision_receipt_sha256"] is None
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_approval_without_signer_records_no_grant(tmp_path):
+    manager, store, server, _cli = _manager(tmp_path)
+    try:
+        outcome, _prompt, response = _request_and_post(manager, server, _classification())
+        record = store.get_pending(outcome.request_id)
+
+        assert response.status_code == 200
+        assert record.status == ApprovalStatus.APPROVED.value
+        assert record.approval_grant_jcs is None
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_grant_mint_failure_is_signaled_but_fails_closed(tmp_path, monkeypatch):
+    cli = io.StringIO()
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        cli_out=cli,
+        approval_grant_private_key_seed=APPROVAL_GRANT_SEED,
+        approval_grant_agent_did=APPROVAL_GRANT_DID,
+    )
+
+    def _boom(_body, _seed):
+        raise ApprovalGrantError("forced mint failure for test")
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.approval.manager.build_approval_grant", _boom
+    )
+    try:
+        outcome, _prompt, response = _request_and_post(manager, server, _classification())
+        record = store.get_pending(outcome.request_id)
+
+        assert response.status_code == 200
+        # Boundary: signer + expiry were present but minting failed; the
+        # approval still records and the grant remains unset.
+        assert record.status == ApprovalStatus.APPROVED.value
+        assert record.approval_grant_jcs is None
+        # Sanitized observability signal fired (counter + cli_out line).
+        assert manager.approval_grant_mint_failures == 1
+        cli_output = cli.getvalue()
+        assert record.request_id in cli_output
+        assert "ApprovalGrantError" in cli_output
+        # Sanitized: no key/seed material and no raw error message body leaked.
+        assert APPROVAL_GRANT_SEED.hex() not in cli_output
+        assert "forced mint failure for test" not in cli_output
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_headless_policy_grant_records_headless_decider(tmp_path):
+    config = _config(policy_rule=_write_rule(risk_class="destructive"))
+    classification = _classification(config)
+    expires = (datetime.now(timezone.utc) + timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    policy = HeadlessPolicy.from_dict({
+        "headless_policy_schema_version": 1,
+        "pre_approvals": [{
+            "server": "github",
+            "tool": "create_issue",
+            "risk_class": "destructive",
+            "environment": "mcp_proxy",
+            "resource_hash": classification.resource_hash,
+            "max_payload_hash": classification.payload_hash,
+            "expires_at": expires,
+        }],
+    })
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        headless=True,
+        headless_policy=policy,
+        approval_grant_private_key_seed=APPROVAL_GRANT_SEED,
+        approval_grant_agent_did=APPROVAL_GRANT_DID,
+    )
+    try:
+        outcome = manager.request_approval(classification, reason="local_approval_required")
+        record = store.get_pending(outcome.request_id)
+
+        assert record.approval_decided_by == "headless-policy"
+        assert record.approval_grant_jcs is not None
+        grant = verify_approval_grant(
+            record.approval_grant_jcs,
+            expected_signer_dids=[APPROVAL_GRANT_DID],
+            now=record.user_decision_timestamp,
+        )
+        assert grant["decided_by"] == "headless-policy"
     finally:
         server.stop()
         store.close()
@@ -1040,7 +1186,12 @@ def test_write_approval_optional_5min_similar_only_when_policy_allows(tmp_path):
 
 def test_scope_expansion_choice_recorded_in_evidence_fields(tmp_path):
     config = _config(policy_rule=_write_rule(scope_expansion=True))
-    manager, store, server, _cli = _manager(tmp_path, config=config)
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        approval_grant_private_key_seed=APPROVAL_GRANT_SEED,
+        approval_grant_agent_did=APPROVAL_GRANT_DID,
+    )
     result_box = {}
     worker = threading.Thread(
         target=lambda: result_box.setdefault(
@@ -1066,6 +1217,16 @@ def test_scope_expansion_choice_recorded_in_evidence_fields(tmp_path):
         assert record.granted_scope_expires_at is not None
         assert record.matched_policy_rule == "write-approval"
         assert record.user_decision_timestamp is not None
+        assert record.approval_grant_jcs is not None
+        grant = verify_approval_grant(
+            record.approval_grant_jcs,
+            expected_signer_dids=[APPROVAL_GRANT_DID],
+            now=record.user_decision_timestamp,
+        )
+        assert grant["approval_scope"] == "similar_5m"
+        assert grant["resource_hash"] == record.resource_hash
+        assert grant["payload_hash"] is None
+        assert grant["expires_at"] == record.granted_scope_expires_at
     finally:
         server.stop()
         store.close()
@@ -1073,7 +1234,12 @@ def test_scope_expansion_choice_recorded_in_evidence_fields(tmp_path):
 
 def test_similar_scope_retry_within_five_minutes_skips_ui_and_links_evidence(tmp_path):
     config = _config(policy_rule=_write_rule(scope_expansion=True))
-    manager, store, server, _cli = _manager(tmp_path, config=config)
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        approval_grant_private_key_seed=APPROVAL_GRANT_SEED,
+        approval_grant_agent_did=APPROVAL_GRANT_DID,
+    )
     try:
         first_outcome, _prompt_seen, response = _request_and_post(
             manager,
@@ -1102,6 +1268,17 @@ def test_similar_scope_retry_within_five_minutes_skips_ui_and_links_evidence(tmp
         assert second_record.approval_scope == "exact"
         assert second_record.granted_by_request_id == first_outcome.request_id
         assert second_record.decision_audit_id is None
+        assert second_record.approval_decided_by == "scope-cache-hit"
+        assert second_record.approval_grant_jcs is not None
+        second_grant = verify_approval_grant(
+            second_record.approval_grant_jcs,
+            expected_signer_dids=[APPROVAL_GRANT_DID],
+            now=second_record.user_decision_timestamp,
+        )
+        assert second_grant["approval_scope"] == "exact"
+        assert second_grant["payload_hash"] == second_record.payload_hash
+        assert second_grant["granted_by_request_id"] == first_outcome.request_id
+        assert second_grant["decided_by"] == "scope-cache-hit"
         assert store.get_pending(first_outcome.request_id).status == ApprovalStatus.EXECUTED.value
         assert store.get_pending(first_outcome.request_id).approval_scope == "similar_5m"
         assert server.pending_prompts() == []
@@ -1512,6 +1689,34 @@ def test_signal_handlers_extend_to_approval_server_graceful_shutdown(tmp_path, m
 
     assert proxy_cli.run_proxy(home=home, client_in=io.StringIO(), out=io.StringIO()) == 0
     assert stopped == {"server": True, "store": True}
+
+
+def test_run_proxy_wires_identity_signer_into_approval_manager(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    result = proxy_cli.init_proxy(home=home, agent_name="proxy", plaintext=True)
+    identity = json.loads(result.identity_path.read_text(encoding="utf-8"))
+    config = json.loads(result.config_path.read_text(encoding="utf-8"))
+    config["downstream"] = {
+        "name": "fake",
+        "command": sys.executable,
+        "args": ["-c", "print('ready')"],
+    }
+    result.config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    captured: dict[str, Any] = {}
+
+    def fake_run_stdio(self, _client_in, _out):
+        captured["seed"] = self.approval_manager.approval_grant_private_key_seed
+        captured["did"] = self.approval_manager.approval_grant_agent_did
+        return 0
+
+    monkeypatch.setattr(McpPassthrough, "run_stdio", fake_run_stdio)
+
+    assert proxy_cli.run_proxy(home=home, client_in=io.StringIO(), out=io.StringIO()) == 0
+    assert captured == {
+        "seed": bytes.fromhex(identity["private_key_hex"]),
+        "did": identity["did"],
+    }
 
 
 # --- similar_5m resource-binding guard (Step 10) ---

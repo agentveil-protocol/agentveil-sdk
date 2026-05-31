@@ -192,6 +192,19 @@ def test_transition_rejects_update_with_malformed_decision_receipt_sha256(tmp_pa
             )
 
 
+def test_transition_persists_signed_approval_grant_jcs(tmp_path):
+    with _store(tmp_path) as store:
+        store.write_pending(_record("req-grant-jcs"))
+        updated = store.transition(
+            "req-grant-jcs",
+            ApprovalStatus.APPROVED.value,
+            approval_token_hash=APPROVAL_TOKEN_HASH,
+            approval_grant_jcs='{"schema_version":"proxy_approval_grant/1"}',
+        )
+
+    assert updated.approval_grant_jcs == '{"schema_version":"proxy_approval_grant/1"}'
+
+
 def test_write_pending_creates_durable_record_with_all_fields(tmp_path):
     db_path = tmp_path / "evidence.sqlite"
     record = _record("req-all")
@@ -758,11 +771,15 @@ def test_fresh_v4_schema_allows_null_expires_at(tmp_path):
     assert expires_at is None
 
 
-def test_schema_v2_migrates_to_v4_with_granted_by_column_without_data_loss(tmp_path):
+def test_schema_v2_migrates_to_v4_with_new_nullable_columns_without_data_loss(tmp_path):
     db_path = tmp_path / "evidence.sqlite"
     conn = sqlite3.connect(str(db_path))
     try:
-        columns = [column for column in asdict(_record()).keys() if column != "granted_by_request_id"]
+        columns = [
+            column
+            for column in asdict(_record()).keys()
+            if column not in {"granted_by_request_id", "approval_grant_jcs"}
+        ]
         conn.execute("CREATE TABLE evidence_schema_version (version INTEGER NOT NULL)")
         conn.execute("INSERT INTO evidence_schema_version (version) VALUES (2)")
         conn.execute(
@@ -772,6 +789,7 @@ def test_schema_v2_migrates_to_v4_with_granted_by_column_without_data_loss(tmp_p
         )
         values = asdict(_record("req-v2", created_at=10))
         values.pop("granted_by_request_id")
+        values.pop("approval_grant_jcs")
         conn.execute(
             f"INSERT INTO pending_approvals ({', '.join(columns)}) "
             f"VALUES ({', '.join('?' for _ in columns)})",
@@ -788,6 +806,7 @@ def test_schema_v2_migrates_to_v4_with_granted_by_column_without_data_loss(tmp_p
     assert migrated is not None
     assert migrated.payload_hash == PAYLOAD_HASH
     assert migrated.granted_by_request_id is None
+    assert migrated.approval_grant_jcs is None
     conn = sqlite3.connect(str(db_path))
     try:
         version = conn.execute("SELECT version FROM evidence_schema_version").fetchone()[0]
@@ -796,6 +815,7 @@ def test_schema_v2_migrates_to_v4_with_granted_by_column_without_data_loss(tmp_p
         conn.close()
     assert version == 4
     assert "granted_by_request_id" in columns
+    assert "approval_grant_jcs" in columns
 
 
 def test_no_backend_construction_during_evidence_operations(tmp_path, monkeypatch):

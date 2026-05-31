@@ -23,6 +23,11 @@ from agentveil_mcp_proxy.evidence import (
     ApprovalStatus,
     PendingApproval,
 )
+from agentveil_mcp_proxy.evidence.approval_grant import (
+    APPROVAL_GRANT_SCHEMA,
+    ApprovalGrantError,
+    build_approval_grant,
+)
 from agentveil_mcp_proxy.policy import PolicyRule, ProxyConfig, RiskClass, TimeoutAction
 from agentveil_mcp_proxy.runtime_gate import DEFAULT_RUNTIME_ENVIRONMENT, RuntimeGateDecision
 
@@ -69,6 +74,8 @@ class ApprovalManager:
         browser_open: Callable[[str], bool] | None = None,
         notifier: ApprovalNotifier | None = None,
         wait_for_decision: bool = True,
+        approval_grant_private_key_seed: bytes | None = None,
+        approval_grant_agent_did: str | None = None,
     ):
         self.evidence_store = evidence_store
         self.approval_server = approval_server
@@ -83,6 +90,9 @@ class ApprovalManager:
         self.browser_open = browser_open or webbrowser.open
         self.notifier = notifier or ApprovalNotifier()
         self.wait_for_decision = wait_for_decision
+        self.approval_grant_private_key_seed = approval_grant_private_key_seed
+        self.approval_grant_agent_did = approval_grant_agent_did
+        self.approval_grant_mint_failures = 0
 
     def request_approval(
         self,
@@ -147,7 +157,13 @@ class ApprovalManager:
             raise ApprovalFlowError("approval evidence persistence failed") from exc
 
         if active_grant is not None:
-            return self._approve(request_id, APPROVAL_SCOPE_EXACT, now, "scope_cache_hit")
+            return self._approve(
+                request_id,
+                APPROVAL_SCOPE_EXACT,
+                now,
+                "scope_cache_hit",
+                decided_by="scope-cache-hit",
+            )
 
         if self.auto_deny:
             return self._deny(request_id, "headless_auto_deny")
@@ -160,7 +176,13 @@ class ApprovalManager:
             )
             if match is None:
                 return self._deny(request_id, "headless_policy_no_match")
-            return self._approve(request_id, APPROVAL_SCOPE_EXACT, now, "headless_policy_match")
+            return self._approve(
+                request_id,
+                APPROVAL_SCOPE_EXACT,
+                now,
+                "headless_policy_match",
+                decided_by="headless-policy",
+            )
 
         url = self.approval_server.register(prompt)
         self._notify(prompt, url)
@@ -308,19 +330,86 @@ class ApprovalManager:
         approval_scope: str,
         decided_at: int,
         reason: str,
+        *,
+        decided_by: str = "local-user",
     ) -> ApprovalOutcome:
         granted_expires = decided_at + 300 if approval_scope == APPROVAL_SCOPE_SIMILAR_5M else None
+        current = self.evidence_store.get_pending(request_id)
+        if current is None:
+            raise ApprovalFlowError("approval evidence persistence failed")
+        approval_grant_jcs = self._approval_grant_jcs(
+            current,
+            approval_scope=approval_scope,
+            decided_at=decided_at,
+            decided_by=decided_by,
+            granted_expires_at=granted_expires,
+        )
         self.evidence_store.transition(
             request_id,
             ApprovalStatus.APPROVED.value,
             approval_token_hash=self.approval_server.token_hash,
-            approval_decided_by="local-user",
+            approval_decided_by=decided_by,
             approval_scope=approval_scope,
             granted_scope_expires_at=granted_expires,
             user_decision_timestamp=decided_at,
+            approval_grant_jcs=approval_grant_jcs,
         )
         self.approval_server.unregister(request_id)
         return ApprovalOutcome(request_id, ApprovalStatus.APPROVED.value, reason, approval_scope)
+
+    def _approval_grant_jcs(
+        self,
+        record: PendingApproval,
+        *,
+        approval_scope: str,
+        decided_at: int,
+        decided_by: str,
+        granted_expires_at: int | None,
+    ) -> str | None:
+        if self.approval_grant_private_key_seed is None or not self.approval_grant_agent_did:
+            return None
+        expires_at = (
+            granted_expires_at if approval_scope == APPROVAL_SCOPE_SIMILAR_5M else record.expires_at
+        )
+        if expires_at is None:
+            return None
+        body = {
+            "schema_version": APPROVAL_GRANT_SCHEMA,
+            "agent_did": self.approval_grant_agent_did,
+            "request_id": record.request_id,
+            "downstream_server": record.downstream_server,
+            "tool_name": record.tool_name,
+            "action_class": record.action_class,
+            "risk_class": record.risk_class,
+            "resource_hash": record.resource_hash,
+            "payload_hash": None
+            if approval_scope == APPROVAL_SCOPE_SIMILAR_5M
+            else record.payload_hash,
+            "policy_id": record.policy_id,
+            "policy_rule_id": record.policy_rule_id,
+            "policy_context_hash": record.policy_context_hash,
+            "decision": "APPROVED",
+            "approval_scope": approval_scope,
+            "decided_by": decided_by,
+            "issued_at": decided_at,
+            "expires_at": expires_at,
+            "decision_audit_id": record.decision_audit_id,
+            "decision_receipt_sha256": record.decision_receipt_sha256,
+            "granted_by_request_id": record.granted_by_request_id,
+        }
+        try:
+            return build_approval_grant(body, self.approval_grant_private_key_seed)
+        except ApprovalGrantError as exc:
+            # Boundary: leave approval_grant_jcs unset on mint errors, while the
+            # approval record still transitions. Signer + expiry were present, so
+            # this path is a systematic mint problem -- emit a sanitized signal
+            # with request_id + error class only.
+            self.approval_grant_mint_failures += 1
+            print(
+                f"approval grant mint failed for {record.request_id}: {type(exc).__name__}",
+                file=self.cli_out,
+            )
+            return None
 
     def _deny(self, request_id: str, reason: str) -> ApprovalOutcome:
         now = int(time.time())
