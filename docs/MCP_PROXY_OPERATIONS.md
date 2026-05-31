@@ -130,6 +130,68 @@ Vacuum removes only terminal states (`executed`, `denied`, `expired`,
 records are preserved regardless of age. The legacy `events --vacuum` form is
 still accepted.
 
+### Signed Approval Grants
+
+When the proxy identity is configured with a signing key and the approval record
+has a bounded expiry, approved local decisions are recorded with a signed approval
+grant (schema `proxy_approval_grant/1`) when minting succeeds. It is stored next to
+the approval record and verified during `verify`. The grant is signed by the
+**local proxy identity key** — the proxy's own DID, printed by `init` and recorded
+in the bundle's `proxy_identity_did` field — using the proxy's shipped Data
+Integrity signing primitive.
+
+**What a verified grant proves.** The pinned proxy identity recorded an
+`APPROVED` local approval decision bound to one specific action: request ID,
+downstream server, tool, action/risk class, resource hash, policy ID and rule,
+policy context hash, approval scope, the deciding-actor label, and an explicit
+expiry. `verify` cross-checks each of those fields against the approval record,
+so a valid grant cannot be transplanted onto a different call.
+
+**What a grant does NOT prove.** A grant is a *local* attestation only. By
+itself it does not establish backend authorization, a real human's identity,
+that the downstream tool call executed, or that the call was acceptable under policy. The
+`decided_by` label may be `local-user`, `headless-policy`, or `scope-cache-hit`;
+it is not an authenticated human identity. Execution outcome is separate
+evidence recorded on the record: whether the approved call ran, errored, or was rejected downstream, plus a result hash.
+
+**Trust model.** Grant trust is external-pinning only. `verify` accepts a grant
+only when its signer DID is in the `--trusted-signer-did` set you pin out of
+band, and it requires the grant's embedded `agent_did` to equal that signer.
+Neither the bundle's own `trusted_signer_dids` field nor any signer hint inside a
+grant is ever an accepted trust anchor, so a re-signed bundle cannot vouch for
+its own grants. Add the proxy's DID to the same `--trusted-signer-did` set you
+use for backend receipt signers; the bundle's `proxy_identity_did` is a value to
+confirm out of band, not a trust source.
+
+**Scope binding.** Grant binding follows the approval scope:
+
+- `exact` binds `payload_hash`, the approved call's exact payload.
+- `similar_5m` binds `resource_hash` and omits `payload_hash`, covering similar
+  calls on the same resource for a short window.
+- Either scope carries a **mandatory** `expires_at`, matched against the record's
+  exact-approval expiry or its 5-minute scope expiry. A grant requires an
+  explicit expiry.
+
+**Strict vs legacy verification.** `verify`, and the library default, run
+strict, proof-grade verification: every record that recorded a local `APPROVED`
+decision must carry a grant that verifies and matches the record — including
+records that were approved and then ran, were rejected downstream, or errored. A missing
+grant, or a present grant with no external signer pin, is a hard failure
+(`status: invalid`). Records that were denied, expired, or are still pending, and
+Runtime Gate / backend-only records that mint no local grant, are exempt. Legacy
+/ non-strict verification is a library-only path
+(`verify_evidence_bundle(..., strict=False)` or `verify_evidence_bundle_legacy`;
+there is no CLI flag) that downgrades those two failures to warnings.
+
+**Backward compatibility.** Signed grants were added on top of an existing
+evidence store, so bundles exported before grants shipped — and any record
+approved by a proxy that had no grant signing key, no bounded approval expiry, or
+a grant-mint failure — carry locally approved records with no grant. Strict
+`verify` fails closed on them; inspect
+such pre-grant bundles with legacy / non-strict library verification, which
+reports each missing grant as a warning. Those records remain valid chain
+evidence but do not provide signed approval-grant assurance for the approval decision itself.
+
 ## Local Approval Surface
 
 Approval-required tool calls are routed to a loopback approval server bound to
