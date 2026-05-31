@@ -195,3 +195,26 @@ def test_construction_a_independent():
     assert decoded[:2] == b"\xed\x01"
     VerifyKey(decoded[2:]).verify(expected_hash_data, signature)  # raises if invalid
     assert len(expected_hash_data) == 64
+
+
+# 10. A truncated proofValue signature (valid base58 but not 64 bytes) must fail
+#     closed via DataIntegrityError instead of leaking a raw nacl ValueError.
+def test_truncated_signature_fails_closed():
+    secured = json.loads(sign_eddsa_jcs_2022(_v3_doc(), SEED_A, created=CREATED))
+    full = base58.b58decode(secured["proof"]["proofValue"][1:])
+    assert len(full) == 64
+    secured["proof"]["proofValue"] = "z" + base58.b58encode(full[:32]).decode("ascii")
+    with pytest.raises(DataIntegrityError):
+        verify_eddsa_jcs_2022(jcs.canonicalize(secured).decode("utf-8"))
+
+
+# 11. A short (10-byte) proofValue signature must raise the project's
+#     DataIntegrityError type, not a raw nacl ValueError leaking from the verifier.
+def test_short_signature_raises_data_integrity_error_not_raw_valueerror():
+    secured = json.loads(sign_eddsa_jcs_2022(_v3_doc(), SEED_A, created=CREATED))
+    secured["proof"]["proofValue"] = "z" + base58.b58encode(b"\x00" * 10).decode("ascii")
+    with pytest.raises(DataIntegrityError) as excinfo:
+        verify_eddsa_jcs_2022(jcs.canonicalize(secured).decode("utf-8"))
+    # A raw leak would be type nacl.exceptions.ValueError; assert it is exactly the
+    # project's DataIntegrityError type instead.
+    assert type(excinfo.value) is DataIntegrityError
