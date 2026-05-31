@@ -21,11 +21,13 @@ MCP-transport adapter.
 ## Install
 
 ```bash
-pip install agentveil agentveil-mcp-proxy
+pip install agentveil-mcp-proxy
 ```
 
-This installs the core `agentveil` SDK plus the separately packaged
-`agentveil-mcp-proxy` console script.
+This installs the separately packaged `agentveil-mcp-proxy` console script.
+The core `agentveil` SDK is installed automatically as a dependency. If your
+environment already pins `agentveil`, keep that pin and install
+`agentveil-mcp-proxy` alongside it.
 
 ## Quick Start
 

@@ -1,6 +1,6 @@
 [project]
 name = "agentveil-mcp-proxy"
-version = "0.7.18"
+version = "0.7.19"
 description = "Source-available MCP transport proxy for AgentVeil Runtime Gate, approval routing, and local evidence"
 readme = {file = "README.md", content-type = "text/markdown"}
 requires-python = ">=3.10"
@@ -21,7 +21,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "agentveil>=0.7.18,<0.8",
+    "agentveil>=0.7.19,<0.8",
     "mcp>=1.0.0",
 ]
 
