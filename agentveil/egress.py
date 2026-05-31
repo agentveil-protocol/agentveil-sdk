@@ -1,6 +1,6 @@
-"""Agent-signed EgressReceipt v0 signer, verifier, and controlled-egress helper.
+"""Agent-signed ``egress_receipt/2`` signer, verifier, and controlled-egress helper.
 
-EgressReceipt v0 proves a network-egress attempt that the AVP-controlled
+An ``egress_receipt/2`` proves a network-egress attempt that the AVP-controlled
 boundary (this SDK helper) actually performed. Receipts are signed with the
 agent's own identity DID. They are **agent-signed**, not backend-signed.
 
@@ -11,7 +11,8 @@ Boundary:
   - Runtime Gate evaluates the egress; the helper does not open the
     connection on BLOCK or WAITING.
   - A future slice may add a backend ``/v1/egress/sign`` endpoint for
-    backend-attested EgressReceipts. v0 is local-signing only.
+    backend-attested EgressReceipts. The current SDK egress signer is
+    local-signing only.
 
 Dual hash convention:
   - ``payload_digest_hex = sha256(body).hex()`` — plain 64 hex chars,
@@ -20,10 +21,11 @@ Dual hash convention:
     form required by Runtime Gate's request schema (matches the pattern
     ``^sha256:[0-9a-f]{64}$``).
 
-Schema and signer/verifier here intentionally duplicate the v0 contract
-shipped in the AVP backend (``app/core/egress_control/proof.py``). The
-sibling lives in the AVP repo; future consolidation may extract a shared
-``agentveil-protocol`` package.
+This helper emits ``egress_receipt/2`` signed with the SDK's data-integrity
+signing path; the legacy raw-JCS receipt form remains verify-compatible. A
+sibling egress contract lives in the AVP backend repo
+(``app/core/egress_control/proof.py``); future consolidation may extract a
+shared ``agentveil-protocol`` package.
 """
 
 from __future__ import annotations
