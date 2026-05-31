@@ -57,11 +57,23 @@ jobs:
       - name: Install build tools
         run: pip install build twine
 
-      - name: Build package
-        run: python -m build
+      - name: Build SDK package
+        run: python -m build --outdir dist/sdk
 
-      - name: Publish to PyPI
+      - name: Build MCP Proxy package
+        run: python -m build --outdir dist/mcp-proxy packages/agentveil-mcp-proxy
+
+      - name: Check distributions
+        run: twine check dist/sdk/* dist/mcp-proxy/*
+
+      - name: Publish SDK to PyPI
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-        run: twine upload --skip-existing dist/*
+        run: twine upload --skip-existing dist/sdk/*
+
+      - name: Publish MCP Proxy to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: twine upload --skip-existing dist/mcp-proxy/*
