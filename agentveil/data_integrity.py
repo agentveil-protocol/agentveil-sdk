@@ -174,13 +174,17 @@ def verify_eddsa_jcs_2022(
     if "@context" in unsecured_document and proof.get("@context") != unsecured_document["@context"]:
         raise DataIntegrityError("proof @context does not match document @context")
     proof_config = proof_configuration(proof)
+    verify_key = VerifyKey(_did_to_public_key(signer_did))
+    message = hash_data(proof_config, unsecured_document)
     try:
-        VerifyKey(_did_to_public_key(signer_did)).verify(
-            hash_data(proof_config, unsecured_document),
-            signature,
-        )
+        verify_key.verify(message, signature)
     except BadSignatureError as exc:
         raise DataIntegrityError("eddsa-jcs-2022 signature verification failed") from exc
+    except ValueError as exc:
+        # A malformed/truncated proofValue (signature not exactly 64 bytes) makes
+        # PyNaCl raise a raw ValueError; re-raise it through the DataIntegrityError
+        # contract instead of leaking the lower-level nacl exception.
+        raise DataIntegrityError("signature is malformed") from exc
 
     return {
         "valid": True,
