@@ -30,7 +30,7 @@ import jcs
 from nacl.exceptions import BadSignatureError
 from nacl.signing import SigningKey, VerifyKey
 
-from agentveil.delegation import _public_key_to_did
+from agentveil._did import _public_key_to_did
 
 PROOF_TYPE = "DataIntegrityProof"
 CRYPTOSUITE = "eddsa-jcs-2022"
