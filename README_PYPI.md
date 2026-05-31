@@ -41,7 +41,7 @@ For production setup, see the [Customer Integration guide](https://github.com/ag
 - **W3C VC v2.0 credentials** with `eddsa-jcs-2022` Data Integrity proofs.
 - **DID identity** with portable `did:key` Ed25519 keys.
 - **Framework integrations** for CrewAI, LangGraph, AutoGen, OpenAI, Claude MCP, Gemini, PydanticAI, Paperclip, and AWS Bedrock.
-- **MCP transport proxy** for IDE clients (Claude Desktop, Cursor, Cline, Windsurf, VS Code) - available as the separately packaged `agentveil-mcp-proxy` source-available component.
+- **MCP transport proxy** for IDE clients (Claude Desktop, Cursor, Cline, Windsurf, VS Code) - available as the separately packaged `agentveil-mcp-proxy` source-available component under Business Source License 1.1.
 
 AgentVeil makes agent actions constrained, auditable, and reversible within a
 declared action vocabulary and policy subset. It does not claim to solve the
@@ -89,7 +89,8 @@ runtime decision gating, human approval routing, durable signed evidence, and
 replay defense. Point your IDE at `agentveil-mcp-proxy` instead of directly at
 the downstream server; the proxy applies AVP policy before forwarding.
 
-Install the proxy package alongside the SDK:
+Install the proxy package alongside the SDK. The SDK package is MIT licensed;
+the proxy package is separately licensed under Business Source License 1.1.
 
 ```bash
 pip install agentveil agentveil-mcp-proxy
@@ -138,4 +139,11 @@ for the full quick start and IDE configuration examples.
 
 ## License
 
-MIT. See the [license](https://github.com/agentveil-protocol/agentveil-sdk/blob/main/LICENSE).
+The `agentveil` PyPI package is MIT licensed. See the
+[root license](https://github.com/agentveil-protocol/agentveil-sdk/blob/main/LICENSE).
+
+The separate `agentveil-mcp-proxy` package is source-available under Business
+Source License 1.1, not MIT. See the
+[licensing boundary](https://github.com/agentveil-protocol/agentveil-sdk/blob/main/LICENSING.md)
+and the
+[proxy package license](https://github.com/agentveil-protocol/agentveil-sdk/blob/main/packages/agentveil-mcp-proxy/LICENSE).

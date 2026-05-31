@@ -7,7 +7,7 @@
 [![PyPI](https://img.shields.io/pypi/v/agentveil)](https://pypi.org/project/agentveil/)
 [![Python](https://img.shields.io/pypi/pyversions/agentveil)](https://pypi.org/project/agentveil/)
 [![Tests](https://github.com/agentveil-protocol/agentveil-sdk/actions/workflows/tests.yml/badge.svg)](https://github.com/agentveil-protocol/agentveil-sdk/actions)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-MIT%20%2B%20BUSL-informational)](LICENSING.md)
 [![Glama MCP Directory](https://img.shields.io/badge/Glama-MCP%20Directory-blue)](https://glama.ai/mcp/servers/agentveil-protocol/avp-sdk)
 
 **Action control for autonomous agents — check pre-runtime risk, gate risky actions, prove execution.**
@@ -28,7 +28,7 @@ pip install agentveil
 
 > **Paper:** Boiko, O. (2026). *[Why AI Agent Reputation Needs Both Link Analysis and Flow-Based Gating](https://zenodo.org/records/19730525)*. Zenodo.
 
-> **MCP transport proxy:** wrap downstream MCP servers (filesystem, github, shell) with AgentVeil Action Control Plane gating, approval routing, durable signed evidence, and replay defense. The proxy is a separately packaged source-available component under [`packages/agentveil-mcp-proxy/`](packages/agentveil-mcp-proxy/).
+> **MCP transport proxy:** wrap downstream MCP servers (filesystem, github, shell) with AgentVeil Action Control Plane gating, approval routing, durable signed evidence, and replay defense. The proxy is a separately packaged source-available component under [`packages/agentveil-mcp-proxy/`](packages/agentveil-mcp-proxy/) and is not covered by the root MIT license. See [Licensing](LICENSING.md).
 
 <p align="center">
   <img src="docs/demo.gif" alt="AgentVeil SDK demo — preflight, runtime gate, approval, controlled execution, offline proof" width="720">
@@ -361,4 +361,10 @@ Framework examples: [CrewAI](examples/crewai_example.py) · [LangGraph](examples
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+This is a multi-license repository.
+
+The public `agentveil` SDK package and explicit `agentveil-mcp` toolbox are MIT
+licensed under [LICENSE](LICENSE). The separately packaged MCP transport proxy
+under [`packages/agentveil-mcp-proxy/`](packages/agentveil-mcp-proxy/) is
+source-available under the Business Source License 1.1, not MIT. See
+[LICENSING.md](LICENSING.md) for the package boundary.
