@@ -15,8 +15,9 @@ delegation receipt.
 | `issue_and_verify_offline.py` | Minimal SDK example: issue and verify locally in mock mode. |
 | `persist_and_reload.py` | Save a receipt as JSON, reload it, and verify it offline. |
 | `multi_scope_delegation.py` | Issue one receipt with multiple categories and a spend cap. |
-| `verify.py` | Standalone verifier (~180 lines). No `agentveil` SDK dependency. |
-| `samples/valid.json` | Properly signed receipt, large validity window. |
+| `verify.py` | Standalone verifier. No `agentveil` SDK dependency. |
+| `samples/valid.json` | Legacy proof receipt, properly signed, large validity window. |
+| `samples/valid_hashdata.jsonld` | Current proof receipt, properly signed, large validity window. |
 | `samples/expired.json` | Properly signed receipt with `validUntil` in the past. |
 | `samples/tampered.json` | Receipt whose `scope` was altered after signing. |
 | `_generate_samples.py` | Helper that regenerates the samples above. |
@@ -62,7 +63,11 @@ Exit codes:
    `eddsa-jcs-2022`.
 8. `proof.verificationMethod` references the same DID as `issuer`.
 9. The Ed25519 signature in `proof.proofValue` (multibase-z / base58)
-   verifies against `jcs.canonicalize(receipt without proof)`.
+   verifies against the receipt's declared proof construction:
+   - legacy receipts without `proofPurpose` verify against
+     `jcs.canonicalize(receipt without proof)`;
+   - receipts with `proofPurpose` verify against the data-integrity `hashData`
+     message: `SHA256(JCS(proofConfig)) || SHA256(JCS(receipt without proof))`.
 
 Any failure raises `ValueError(reason)` and the script exits non-zero.
 

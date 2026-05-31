@@ -3,7 +3,8 @@
 Standalone delegation receipt verifier.
 
 Reads a JSON delegation receipt from a file or stdin, verifies it offline,
-and prints a structured result. No `agentveil` SDK dependency.
+and prints a structured result. Supports both legacy raw-JCS delegation proofs
+and newer hashData proofs. No `agentveil` SDK dependency.
 
 Dependencies (third-party):
   - pynacl       Ed25519 signature verification
@@ -29,6 +30,7 @@ can verify a receipt without trusting the AVP SDK or backend.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from datetime import datetime, timedelta, timezone
@@ -45,6 +47,7 @@ VC_TYPE = "VerifiableCredential"
 DELEGATION_TYPE = "AgentDelegation"
 CRYPTOSUITE = "eddsa-jcs-2022"
 PROOF_TYPE = "DataIntegrityProof"
+DEFAULT_PROOF_PURPOSE = "assertionMethod"
 SUPPORTED_PREDICATES = ("max_spend", "allowed_category")
 
 
@@ -89,6 +92,66 @@ def _validate_scope(scope: Any) -> None:
             value = entry.get("value")
             if not isinstance(value, str) or not value:
                 raise ValueError("allowed_category.value must be a non-empty string")
+
+
+def _proof_configuration(proof: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in proof.items() if key != "proofValue"}
+
+
+def _hash_data(proof_config: dict[str, Any], unsecured_document: dict[str, Any]) -> bytes:
+    proof_config_hash = hashlib.sha256(jcs.canonicalize(proof_config)).digest()
+    document_hash = hashlib.sha256(jcs.canonicalize(unsecured_document)).digest()
+    return proof_config_hash + document_hash
+
+
+def _verify_ed25519(
+    public_key: bytes,
+    message: bytes,
+    signature: bytes,
+    reason: str,
+) -> None:
+    try:
+        VerifyKey(public_key).verify(message, signature)
+    except BadSignatureError:
+        raise ValueError(reason)
+    except ValueError:
+        raise ValueError("signature is malformed")
+
+
+def _verify_legacy_raw_jcs(
+    receipt: dict[str, Any],
+    issuer_public_key: bytes,
+    signature: bytes,
+) -> None:
+    payload = {k: v for k, v in receipt.items() if k != "proof"}
+    canonical = jcs.canonicalize(payload)
+    _verify_ed25519(issuer_public_key, canonical, signature, "signature verification failed")
+
+
+def _verify_hashdata_proof(
+    receipt: dict[str, Any],
+    proof: dict[str, Any],
+    issuer_public_key: bytes,
+    signature: bytes,
+) -> None:
+    if proof.get("proofPurpose") != DEFAULT_PROOF_PURPOSE:
+        raise ValueError(f"proof.proofPurpose must be {DEFAULT_PROOF_PURPOSE!r}")
+
+    unsecured_document = {key: value for key, value in receipt.items() if key != "proof"}
+    if (
+        "@context" in unsecured_document
+        and proof.get("@context") != unsecured_document["@context"]
+    ):
+        raise ValueError("proof @context does not match document @context")
+
+    proof_config = _proof_configuration(proof)
+    message = _hash_data(proof_config, unsecured_document)
+    _verify_ed25519(
+        issuer_public_key,
+        message,
+        signature,
+        "data integrity signature verification failed",
+    )
 
 
 def verify_delegation(receipt: dict, now: datetime | None = None) -> dict:
@@ -148,15 +211,17 @@ def verify_delegation(receipt: dict, now: datetime | None = None) -> dict:
         raise ValueError("proofValue is not valid base58")
 
     verification_method = proof.get("verificationMethod", "")
-    if verification_method.split("#")[0] != issuer:
+    if not isinstance(verification_method, str):
+        raise ValueError("proof.verificationMethod must be a string")
+    if verification_method.split("#", 1)[0] != issuer:
         raise ValueError("verificationMethod does not match issuer")
 
-    payload = {k: v for k, v in receipt.items() if k != "proof"}
-    canonical = jcs.canonicalize(payload)
-    try:
-        VerifyKey(issuer_public_key).verify(canonical, signature)
-    except BadSignatureError:
-        raise ValueError("signature verification failed")
+    if "proofPurpose" in proof:
+        if "#" not in verification_method:
+            raise ValueError("proof.verificationMethod is invalid")
+        _verify_hashdata_proof(receipt, proof, issuer_public_key, signature)
+    else:
+        _verify_legacy_raw_jcs(receipt, issuer_public_key, signature)
 
     return {
         "valid": True,
