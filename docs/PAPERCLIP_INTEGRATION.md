@@ -110,10 +110,10 @@ The integration does not, and this guide does not claim that it does:
 
 For a local Paperclip deployment that already runs Claude or Codex:
 
-1. Install the AgentVeil package in the same environment that will run
-   the agent. The package ships the AgentVeil proxy as a published
-   console entry point; consult AgentVeil's own documentation for the
-   exact installation step.
+1. Install `agentveil-mcp-proxy` in the same environment that will run
+   the agent. The proxy is packaged separately from the core `agentveil`
+   SDK and installs the SDK as a dependency; consult AgentVeil's own
+   documentation for the exact installation step.
 2. Initialize and validate the proxy using its own bootstrap commands.
    Configure the proxy to wrap the downstream MCP server you want to
    gate.

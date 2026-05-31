@@ -35,11 +35,13 @@ sudo apt-get install -y python3.12-venv python3-pip
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-pip install agentveil agentveil-mcp-proxy
+pip install agentveil-mcp-proxy
 ```
 
-This installs the core `agentveil` SDK and the separately packaged
-`agentveil-mcp-proxy` console script.
+This installs the separately packaged `agentveil-mcp-proxy` console script.
+The core `agentveil` SDK is installed automatically as a dependency. If your
+environment already pins `agentveil`, keep that pin and install
+`agentveil-mcp-proxy` alongside it.
 
 ## Step 1 — `agentveil-mcp-proxy init`
 

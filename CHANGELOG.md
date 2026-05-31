@@ -6,6 +6,19 @@ All notable changes to the `agentveil` SDK.
 
 No unreleased changes.
 
+## [0.7.19] - 2026-05-31
+
+PyPI package alignment release for the MCP Proxy split.
+
+The public `agentveil` package is released as `0.7.19` because `agentveil==0.7.18`
+already exists on PyPI and cannot be overwritten. This release publishes the
+SDK code required by the separately packaged MCP Proxy, including the
+`agentveil.data_integrity` verifier module used by proxy receipt verification.
+
+The first public `agentveil-mcp-proxy` package is also versioned `0.7.19` and
+depends on `agentveil>=0.7.19,<0.8`. New proxy installs remain one command:
+`pip install agentveil-mcp-proxy`.
+
 ## [0.7.18] - 2026-05-28
 
 MCP Proxy and proof verification hardening release. This release closes the
@@ -61,7 +74,8 @@ and Paperclip helper. The MCP Proxy is now packaged separately as
   `resource_hash`. Calls without a resource binding require a fresh approval.
 - Changed the MCP Proxy packaging split: root `agentveil` wheels no longer ship
   the proxy package or the `agentveil-mcp-proxy` console entry point. Install
-  the proxy with `pip install agentveil agentveil-mcp-proxy`.
+  the proxy with `pip install agentveil-mcp-proxy`; it installs the core
+  `agentveil` SDK as a dependency.
 - Documented the MCP Proxy release acceptance procedure as a release gate for
   serious MCP Proxy setup, passthrough, approval, evidence, and Runtime Gate
   changes.
