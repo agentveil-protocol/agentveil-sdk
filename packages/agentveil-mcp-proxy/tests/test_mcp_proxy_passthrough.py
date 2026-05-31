@@ -31,7 +31,7 @@ from agentveil_mcp_proxy.passthrough import (
     McpPassthrough,
 )
 
-from mcp_fake_downstream import seed_tool_schemas, tool_entry
+from mcp_fake_downstream import seed_tool_schemas, tool_entry, write_downstream
 
 
 SECRET = "SECRET_DOWNSTREAM_TOKEN"
@@ -906,6 +906,252 @@ def test_secret_read_file_path_fails_before_downstream_read(tmp_path, monkeypatc
     }
     assert "approval_url" not in response["error"]["data"]
     assert "record_id" not in response["error"]["data"]
+    assert _pending_approval_count(home) == 0
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
+
+
+def test_secret_path_in_paths_list_blocks_broadened_tool(tmp_path):
+    # read_multiple_files carries paths in a list arg key; a secret entry must be
+    # denied before downstream, and the value must not appear in proxy output.
+    passthrough = McpPassthrough(
+        DownstreamConfig(
+            command=sys.executable,
+            args=("-u", str(_normal_downstream(tmp_path))),
+            name="fake-downstream",
+        ),
+    )
+    seed_tool_schemas(passthrough, [tool_entry("read_multiple_files")])
+    client_out = io.StringIO()
+
+    assert passthrough.run_stdio(
+        io.StringIO(_json_line({
+            "jsonrpc": "2.0",
+            "id": "call-1",
+            "method": "tools/call",
+            "params": {
+                "name": "read_multiple_files",
+                "arguments": {"paths": ["/tmp/ok.txt", "/home/user/.ssh/id_rsa"]},
+            },
+        })),
+        client_out,
+    ) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    assert response["error"]["code"] == JSONRPC_POLICY_BLOCKED
+    assert response["error"]["data"] == {
+        "status": "policy_denied",
+        "reason": "secret_path_blocked",
+    }
+    # Not forwarded downstream: the fake downstream "called" result is absent.
+    assert "called" not in client_out.getvalue()
+    # Sanitized: the raw secret path does not appear in proxy output.
+    assert "/home/user/.ssh/id_rsa" not in client_out.getvalue()
+    assert passthrough.security_events == (
+        {
+            "type": "unsafe_file_path",
+            "action": "blocked_pre_approval",
+            "reason": "secret_path_blocked",
+            "tool": "read_multiple_files",
+        },
+    )
+
+
+def test_secret_destination_blocks_move_file(tmp_path):
+    # move_file carries source/destination path keys; a secret destination
+    # (credential directory segment) is denied before downstream.
+    passthrough = McpPassthrough(
+        DownstreamConfig(
+            command=sys.executable,
+            args=("-u", str(_normal_downstream(tmp_path))),
+            name="fake-downstream",
+        ),
+    )
+    seed_tool_schemas(passthrough, [tool_entry("move_file")])
+    client_out = io.StringIO()
+
+    assert passthrough.run_stdio(
+        io.StringIO(_json_line({
+            "jsonrpc": "2.0",
+            "id": "call-1",
+            "method": "tools/call",
+            "params": {
+                "name": "move_file",
+                "arguments": {
+                    "source": "/tmp/ok.txt",
+                    "destination": "/home/user/.aws/config",
+                },
+            },
+        })),
+        client_out,
+    ) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    assert response["error"]["data"] == {
+        "status": "policy_denied",
+        "reason": "secret_path_blocked",
+    }
+    assert "called" not in client_out.getvalue()
+    assert passthrough.security_events == (
+        {
+            "type": "unsafe_file_path",
+            "action": "blocked_pre_approval",
+            "reason": "secret_path_blocked",
+            "tool": "move_file",
+        },
+    )
+
+
+def test_normal_paths_allowed_for_broadened_tool(tmp_path):
+    # Normal workspace paths on a broadened filesystem tool proceed downstream
+    # with no path security event recorded.
+    passthrough = McpPassthrough(
+        DownstreamConfig(
+            command=sys.executable,
+            args=("-u", str(_normal_downstream(tmp_path))),
+            name="fake-downstream",
+        ),
+    )
+    seed_tool_schemas(passthrough, [tool_entry("read_multiple_files")])
+    client_out = io.StringIO()
+
+    assert passthrough.run_stdio(
+        io.StringIO(_json_line({
+            "jsonrpc": "2.0",
+            "id": "call-1",
+            "method": "tools/call",
+            "params": {
+                "name": "read_multiple_files",
+                "arguments": {"paths": ["/tmp/a.txt", "workspace/notes.md"]},
+            },
+        })),
+        client_out,
+    ) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    assert response["result"] == {"content": [{"type": "text", "text": "called"}]}
+    assert passthrough.security_events == ()
+
+
+def test_secret_segment_write_file_fails_before_approval(tmp_path, monkeypatch):
+    # A path that descends into a credential directory (.aws) whose leaf name is
+    # not itself a secret is denied before approval and before downstream.
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    _set_downstream(init.config_path, _filesystem_schema_downstream(tmp_path), log_path=log_path)
+    _set_approval_policy(init.config_path, server="fake-downstream", tool="write_file")
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("path policy must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line({
+            "jsonrpc": "2.0",
+            "id": "call-1",
+            "method": "tools/call",
+            "params": {
+                "name": "write_file",
+                "arguments": {"path": ".aws/config", "content": "x"},
+            },
+        })),
+        out=client_out,
+    ) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    assert response["error"]["code"] == JSONRPC_POLICY_BLOCKED
+    assert response["error"]["data"] == {
+        "status": "policy_denied",
+        "reason": "secret_path_blocked",
+    }
+    assert _pending_approval_count(home) == 0
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
+
+
+@pytest.mark.parametrize("tool", ["delete_file", "rm", "unlink_file", "rmdir_recursive"])
+def test_secret_path_blocks_destructive_file_tools(tmp_path, tool):
+    # Destructive filesystem tools (exact name, prefix, and bare alias) carry a
+    # path; a secret target is denied before downstream with a sanitized event.
+    passthrough = McpPassthrough(
+        DownstreamConfig(
+            command=sys.executable,
+            args=("-u", str(_normal_downstream(tmp_path))),
+            name="fake-downstream",
+        ),
+    )
+    seed_tool_schemas(passthrough, [tool_entry(tool)])
+    client_out = io.StringIO()
+
+    assert passthrough.run_stdio(
+        io.StringIO(_json_line({
+            "jsonrpc": "2.0",
+            "id": "call-1",
+            "method": "tools/call",
+            "params": {"name": tool, "arguments": {"path": "/home/user/.ssh/id_rsa"}},
+        })),
+        client_out,
+    ) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    assert response["error"]["code"] == JSONRPC_POLICY_BLOCKED
+    assert response["error"]["data"] == {
+        "status": "policy_denied",
+        "reason": "secret_path_blocked",
+    }
+    assert "called" not in client_out.getvalue()
+    assert "/home/user/.ssh/id_rsa" not in client_out.getvalue()
+    assert passthrough.security_events == (
+        {
+            "type": "unsafe_file_path",
+            "action": "blocked_pre_approval",
+            "reason": "secret_path_blocked",
+            "tool": tool,
+        },
+    )
+
+
+def test_secret_delete_file_fails_before_approval(tmp_path, monkeypatch):
+    # A destructive filesystem tool (delete_file) targeting a secret path is
+    # denied before approval and before downstream, independent of policy config.
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    downstream = write_downstream(
+        tmp_path,
+        filename="delete_downstream.py",
+        tools=[tool_entry("delete_file")],
+    )
+    _set_downstream(init.config_path, downstream, log_path=log_path)
+    _set_approval_policy(init.config_path, server="fake-downstream", tool="delete_file")
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("path policy must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line({
+            "jsonrpc": "2.0",
+            "id": "call-1",
+            "method": "tools/call",
+            "params": {"name": "delete_file", "arguments": {"path": "/home/user/.ssh/id_rsa"}},
+        })),
+        out=client_out,
+    ) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    assert response["error"]["code"] == JSONRPC_POLICY_BLOCKED
+    assert response["error"]["data"] == {
+        "status": "policy_denied",
+        "reason": "secret_path_blocked",
+    }
     assert _pending_approval_count(home) == 0
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
 
