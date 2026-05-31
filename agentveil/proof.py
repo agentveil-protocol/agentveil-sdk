@@ -169,19 +169,30 @@ def _normalize_trust_map(
     }
 
 
-# decision_receipt/3 is the W3C Data Integrity (eddsa-jcs-2022) decision-receipt
+# The /3 receipt family (decision_receipt/3, execution_receipt/3, and
 # claim-check: allow "W3C"/eddsa-jcs-2022 are literal cryptosuite identifiers (no external-conformance claim); "all"-receipts routing is tested in tests/test_proof_verification.py
-# family; /1 and /2 (and all execution/approval receipts) stay on the legacy
-# raw-JCS verifier. The Runtime Gate currently emits /3, so a /3 decision receipt
-# embedded verbatim by build_proof_packet must verify here.
-_W3C_DI_RECEIPT_SCHEMAS = frozenset({"decision_receipt/3"})
+# human_approval_receipt/3) is verified with the data-integrity (eddsa-jcs-2022)
+# hashData path; /1 and /2 stay on the legacy raw-JCS verifier. The Runtime Gate
+# currently emits decision_receipt/3; execution_receipt/3 and
+# human_approval_receipt/3 are verifier-ready here for future backend emission.
+_W3C_DI_RECEIPT_SCHEMAS = frozenset({
+    "decision_receipt/3",
+    "execution_receipt/3",
+    "human_approval_receipt/3",
+})
+# execution_receipt/3 and human_approval_receipt/3 inherit /2 strictness: the
+# shared intent fields and decision_receipt_hash are mandatory (not optional as
+# for legacy /1).
+_STRICT_EXECUTION_SCHEMAS = frozenset({"execution_receipt/2", "execution_receipt/3"})
+_STRICT_APPROVAL_SCHEMAS = frozenset({"human_approval_receipt/2", "human_approval_receipt/3"})
+_STRICT_INTENT_SCHEMAS = _STRICT_EXECUTION_SCHEMAS | _STRICT_APPROVAL_SCHEMAS
 
 
 def _verify_backend_receipt(receipt_jcs: Any) -> dict[str, Any]:
-    """Verify one backend receipt JCS, routing decision_receipt/3 to the
+    """Verify one backend receipt JCS, routing the /3 receipt family to the
     claim-check: allow "W3C"/eddsa-jcs-2022 are literal cryptosuite identifiers (no external-conformance claim); "all"-receipts routing tested in tests/test_proof_verification.py
-    first-party W3C Data Integrity (eddsa-jcs-2022) verifier and /1,/2 (plus all
-    execution/approval receipts) to the legacy raw-JCS verifier.
+    first-party data-integrity (eddsa-jcs-2022) verifier and /1,/2 to the legacy
+    raw-JCS verifier.
 
     Routing reads the signature-protected ``schema_version``: a receipt that
     claims one schema but was signed for the other fails closed because the
@@ -242,10 +253,7 @@ def _check_shared_intent(
     other: dict[str, Any],
     other_label: str,
 ) -> None:
-    required = other.get("schema_version") in {
-        "execution_receipt/2",
-        "human_approval_receipt/2",
-    }
+    required = other.get("schema_version") in _STRICT_INTENT_SCHEMAS
     for field in ("agent_did", "action", "resource", "environment"):
         other_field = (
             "requester_agent_did"
@@ -269,8 +277,8 @@ def _check_schema_version(body: dict[str, Any], allowed: Iterable[str], label: s
         raise ProofVerificationError(f"{label} schema_version is unsupported")
 
 
-def _requires_field(body: dict[str, Any], current_schema: str, field: str) -> bool:
-    return body.get("schema_version") == current_schema or field in body
+def _requires_field(body: dict[str, Any], strict_schemas: Iterable[str], field: str) -> bool:
+    return body.get("schema_version") in set(strict_schemas) or field in body
 
 
 def verify_proof_packet(
@@ -339,8 +347,12 @@ def verify_proof_packet(
 
     if execution is not None:
         execution_body = execution["body"]
-        _check_schema_version(execution_body, {"execution_receipt/1", "execution_receipt/2"}, "ExecutionReceipt")
-        if _requires_field(execution_body, "execution_receipt/2", "decision_receipt_hash"):
+        _check_schema_version(
+            execution_body,
+            {"execution_receipt/1", "execution_receipt/2", "execution_receipt/3"},
+            "ExecutionReceipt",
+        )
+        if _requires_field(execution_body, _STRICT_EXECUTION_SCHEMAS, "decision_receipt_hash"):
             _assert_equal(
                 execution_body.get("decision_receipt_hash"),
                 decision["digest"],
@@ -361,12 +373,12 @@ def verify_proof_packet(
         approval_body = approval["body"]
         _check_schema_version(
             approval_body,
-            {"human_approval_receipt/1", "human_approval_receipt/2"},
+            {"human_approval_receipt/1", "human_approval_receipt/2", "human_approval_receipt/3"},
             "HumanApprovalReceipt",
         )
         if _requires_field(
             approval_body,
-            "human_approval_receipt/2",
+            _STRICT_APPROVAL_SCHEMAS,
             "decision_receipt_hash",
         ):
             _assert_equal(
