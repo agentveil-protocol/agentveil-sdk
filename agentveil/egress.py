@@ -15,7 +15,7 @@ Boundary:
 
 Dual hash convention:
   - ``payload_digest_hex = sha256(body).hex()`` — plain 64 hex chars,
-    used in ``egress_receipt/1.payload_hash``.
+    used in ``egress_receipt/2.payload_hash``.
   - ``runtime_payload_hash = "sha256:" + payload_digest_hex`` — prefixed
     form required by Runtime Gate's request schema (matches the pattern
     ``^sha256:[0-9a-f]{64}$``).
@@ -42,7 +42,17 @@ import httpx
 import jcs
 from nacl.signing import SigningKey, VerifyKey
 
-SCHEMA_VERSION = "egress_receipt/1"
+from agentveil.data_integrity import (
+    DataIntegrityError,
+    sign_eddsa_jcs_2022,
+    verify_eddsa_jcs_2022,
+)
+
+SCHEMA_VERSION = "egress_receipt/2"
+# Legacy verify-only egress schema (raw-JCS proof construction). New receipts
+# are issued as SCHEMA_VERSION; egress_receipt/1 is accepted only for verify.
+LEGACY_SCHEMA_VERSION = "egress_receipt/1"
+_SUPPORTED_SCHEMA_VERSIONS = frozenset({SCHEMA_VERSION, LEGACY_SCHEMA_VERSION})
 EVALUATOR_VERSION = "egress-control/0.1.0"
 ACTION_NETWORK_EGRESS = "network.egress"
 PROOF_TYPE = "DataIntegrityProof"
@@ -137,9 +147,9 @@ def _validate_body(body: dict[str, Any]) -> None:
         raise EgressReceiptProofError(
             "body must not include 'proof'; pass unsigned fields"
         )
-    if body.get("schema_version") != SCHEMA_VERSION:
+    if body.get("schema_version") not in _SUPPORTED_SCHEMA_VERSIONS:
         raise EgressReceiptProofError(
-            f"body must include schema_version={SCHEMA_VERSION!r}"
+            f"body schema_version must be one of {sorted(_SUPPORTED_SCHEMA_VERSIONS)}"
         )
     for field_name in _REQUIRED_STRING_FIELDS:
         if not isinstance(body.get(field_name), str) or not body[field_name]:
@@ -179,29 +189,22 @@ def sign_egress_receipt(*, body: dict[str, Any], signing_seed: bytes) -> str:
     """
 
     _validate_body(body)
+    if body["schema_version"] != SCHEMA_VERSION:
+        raise EgressReceiptProofError(
+            f"sign_egress_receipt issues {SCHEMA_VERSION!r}; "
+            f"{LEGACY_SCHEMA_VERSION!r} is verify-only"
+        )
     if not isinstance(signing_seed, (bytes, bytearray)) or len(signing_seed) != 32:
         raise EgressReceiptProofError("signing_seed must be 32 bytes")
-    signing_key = SigningKey(bytes(signing_seed))
-    issuer_pubkey = bytes(signing_key.verify_key)
-    issuer_did = _did_from_public_key(issuer_pubkey)
+    issuer_did = _did_from_public_key(bytes(SigningKey(bytes(signing_seed)).verify_key))
     if body["agent_did"] != issuer_did:
         raise EgressReceiptProofError(
             "body.agent_did must equal the DID derived from signing_seed"
         )
-    canonical_body = jcs.canonicalize(body)
-    signature = signing_key.sign(canonical_body).signature
-    proof_value = "z" + base58.b58encode(signature).decode("ascii")
-    verification_method = f"{issuer_did}#{issuer_did[len('did:key:'):]}"
-    signed: dict[str, Any] = {
-        **body,
-        "proof": {
-            "type": PROOF_TYPE,
-            "cryptosuite": CRYPTOSUITE,
-            "verificationMethod": verification_method,
-            "proofValue": proof_value,
-        },
-    }
-    return jcs.canonicalize(signed).decode("utf-8")
+    try:
+        return sign_eddsa_jcs_2022(body, bytes(signing_seed))
+    except DataIntegrityError as exc:
+        raise EgressReceiptProofError(str(exc)) from exc
 
 
 def verify_egress_receipt(
@@ -229,6 +232,10 @@ def verify_egress_receipt(
     if not isinstance(receipt, dict):
         raise EgressReceiptVerificationError("receipt must be a JSON object")
 
+    if receipt.get("schema_version") == SCHEMA_VERSION:
+        return _verify_egress_receipt_w3c(receipt_jcs, receipt, trusted_signer_dids)
+
+    # Legacy egress_receipt/1: raw-JCS proof envelope.
     proof = receipt.pop("proof", None)
     if not isinstance(proof, dict):
         raise EgressReceiptVerificationError("receipt proof missing")
@@ -275,6 +282,44 @@ def verify_egress_receipt(
     return receipt
 
 
+def _verify_egress_receipt_w3c(
+    receipt_jcs: str,
+    receipt: dict[str, Any],
+    trusted_signer_dids: Optional[Collection[str]],
+) -> dict[str, Any]:
+    """Verify an ``egress_receipt/2`` via the data-integrity hashData
+    construction. Trust pinning and agent_did binding match the legacy path; a
+    verification failure surfaces as ``EgressReceiptVerificationError`` rather
+    than a raw lower-level error.
+    """
+
+    proof = receipt.get("proof")
+    if not isinstance(proof, dict):
+        raise EgressReceiptVerificationError("receipt proof missing")
+    verification_method = proof.get("verificationMethod")
+    if not isinstance(verification_method, str) or "#" not in verification_method:
+        raise EgressReceiptVerificationError("receipt verification method invalid")
+    signer_did = verification_method.split("#", 1)[0]
+    if trusted_signer_dids is None:
+        raise EgressReceiptVerificationError("trusted_signer_dids is required")
+    if signer_did not in set(trusted_signer_dids):
+        raise EgressReceiptVerificationError("receipt signer is not trusted")
+    try:
+        verified = verify_eddsa_jcs_2022(receipt_jcs, expected_signer_did=signer_did)
+    except DataIntegrityError as exc:
+        raise EgressReceiptVerificationError("receipt signature invalid") from exc
+    body = verified["document"]
+    try:
+        _validate_body(body)
+    except EgressReceiptProofError as exc:
+        raise EgressReceiptVerificationError(str(exc)) from exc
+    if body.get("agent_did") != verified["signer_did"]:
+        raise EgressReceiptVerificationError(
+            "receipt agent_did does not match proof signer DID"
+        )
+    return body
+
+
 def _sanitize_error_class(exc: BaseException) -> str:
     """Return only the exception class name; never the message or traceback."""
     return type(exc).__name__
@@ -303,7 +348,7 @@ def _sign_outcome_receipt(
     outcome: str,
     signing_seed: bytes,
 ) -> str:
-    """Build and sign the agent-signed ``egress_receipt/1`` body."""
+    """Build and sign the agent-signed ``egress_receipt/2`` body."""
 
     body: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -344,14 +389,14 @@ def controlled_egress(
     The helper computes the payload digest in two forms:
 
     - ``payload_digest_hex`` (plain 64 hex chars) is recorded in the
-      ``egress_receipt/1`` body's ``payload_hash`` field.
+      ``egress_receipt/2`` body's ``payload_hash`` field.
     - ``runtime_payload_hash`` (``"sha256:" + payload_digest_hex``) is
       sent to ``/v1/runtime/evaluate`` per the Runtime Gate request
       schema.
 
     On ALLOW the helper performs the HTTPS request itself via an
     embedded ``httpx.Client`` and signs an **agent-signed**
-    ``egress_receipt/1`` with ``outcome=SENT`` (or ``FAILED`` on
+    ``egress_receipt/2`` with ``outcome=SENT`` (or ``FAILED`` on
     connection-class error). On BLOCK the helper signs ``outcome=BLOCKED``
     and does NOT open the connection. On ``WAITING_FOR_HUMAN_APPROVAL``
     the helper returns ``status="approval_required"`` with no receipt;
@@ -507,6 +552,7 @@ __all__ = [
     "ACTION_NETWORK_EGRESS",
     "CRYPTOSUITE",
     "EVALUATOR_VERSION",
+    "LEGACY_SCHEMA_VERSION",
     "PROOF_TYPE",
     "SCHEMA_VERSION",
     "ControlledEgressOutcome",

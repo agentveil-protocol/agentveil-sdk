@@ -1,5 +1,5 @@
 """Unit coverage for ``AVPAgent.controlled_egress`` and agent-signed
-``egress_receipt/1`` round-trip.
+``egress_receipt/2`` round-trip (plus legacy ``egress_receipt/1`` verify).
 
 Tests are stub-driven: ``AVPAgent.runtime_evaluate`` is patched per test
 to control the backend's response, and an in-process HTTP client factory
@@ -37,9 +37,11 @@ from agentveil.egress import (
     CRYPTOSUITE,
     ED25519_MULTICODEC,
     EVALUATOR_VERSION,
+    LEGACY_SCHEMA_VERSION,
     PROOF_TYPE,
     SCHEMA_VERSION,
 )
+from agentveil.data_integrity import sign_eddsa_jcs_2022
 
 
 _DELEGATION_RECEIPT = {"id": "urn:uuid:delegation"}
@@ -354,9 +356,9 @@ def test_runtime_gate_call_uses_network_egress_action_and_correct_kwargs():
 # ===========================================================================
 
 
-def _valid_egress_body(*, agent_did: str) -> dict:
+def _valid_egress_body(*, agent_did: str, schema_version: str = SCHEMA_VERSION) -> dict:
     return {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": schema_version,
         "receipt_id": "urn:uuid:00000000-0000-4000-8000-000000000abc",
         "agent_did": agent_did,
         "action": ACTION_NETWORK_EGRESS,
@@ -435,7 +437,58 @@ def test_verifier_rejects_receipt_with_agent_did_mismatching_signer_did():
 
     # Body declares ``other_did`` but is signed with ``actual_seed``.
     body = _valid_egress_body(agent_did=other_did)
-    forged_jcs = _sign_egress_body_bypassing_agent_binding(body, actual_seed)
+    forged_jcs = sign_eddsa_jcs_2022(body, actual_seed)
 
     with pytest.raises(EgressReceiptVerificationError, match="agent_did"):
         verify_egress_receipt(forged_jcs, trusted_signer_dids=[actual_did])
+
+
+# ===========================================================================
+# egress_receipt/2 data-integrity construction + legacy /1 verify
+# ===========================================================================
+
+
+def test_v2_round_trip_uses_data_integrity_construction():
+    # New egress receipts are egress_receipt/2 signed with the hashData
+    # construction (proof carries proofPurpose); they round-trip through verify.
+    agent = _make_agent()
+    stub = _StubHttpClient(response=_StubHttpResponse(status_code=200))
+    with patch.object(agent, "runtime_evaluate", return_value=_allow_decision()):
+        outcome = _call_controlled_egress(agent, http_factory=_stub_factory(stub))
+
+    assert SCHEMA_VERSION == "egress_receipt/2"
+    assert outcome.receipt["schema_version"] == SCHEMA_VERSION
+    assert outcome.receipt["proof"]["proofPurpose"] == "assertionMethod"
+    assert outcome.receipt["proof"]["cryptosuite"] == CRYPTOSUITE
+
+    verified = verify_egress_receipt(
+        outcome.receipt_jcs, trusted_signer_dids=[agent.did]
+    )
+    assert verified["schema_version"] == SCHEMA_VERSION
+    assert verified["agent_did"] == agent.did
+    assert verified["outcome"] == "SENT"
+
+
+def test_legacy_v1_receipt_still_verifies():
+    # A legacy raw-JCS egress_receipt/1 must keep verifying after the migration.
+    seed = bytes(SigningKey.generate())
+    did = _did_from_seed(seed)
+    body = _valid_egress_body(agent_did=did, schema_version=LEGACY_SCHEMA_VERSION)
+    legacy_jcs = _sign_egress_body_bypassing_agent_binding(body, seed)
+
+    verified = verify_egress_receipt(legacy_jcs, trusted_signer_dids=[did])
+    assert verified["schema_version"] == LEGACY_SCHEMA_VERSION
+    assert verified["agent_did"] == did
+    assert verified["outcome"] == "SENT"
+
+
+def test_legacy_v1_not_routed_through_data_integrity_path():
+    # A /1 receipt is verified only by the legacy raw-JCS path. A /1 body signed
+    # with the hashData construction must fail, so /1 stays on the legacy path.
+    seed = bytes(SigningKey.generate())
+    did = _did_from_seed(seed)
+    body = _valid_egress_body(agent_did=did, schema_version=LEGACY_SCHEMA_VERSION)
+    misbuilt = sign_eddsa_jcs_2022(body, seed)
+
+    with pytest.raises(EgressReceiptVerificationError, match="signature invalid"):
+        verify_egress_receipt(misbuilt, trusted_signer_dids=[did])
