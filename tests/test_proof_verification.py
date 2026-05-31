@@ -476,3 +476,248 @@ def test_verify_proof_packet_decision_receipt_v3_tamper_fails():
 
     with pytest.raises(ProofVerificationError, match="signature"):
         verify_proof_packet(packet, trusted_backend_signer_dids=[BACKEND_DID])
+
+
+# --- execution_receipt/3 + human_approval_receipt/3 (data-integrity routing) ---
+# execution_receipt/3 and human_approval_receipt/3 route through the data-integrity
+# hashData verifier and inherit /2 strictness (mandatory shared intent fields and
+# decision_receipt_hash). Legacy /1,/2 stay on the raw-JCS path (tests above).
+_V3_CREATED = "2026-04-30T00:00:00Z"
+
+
+def _execution_body_v3(decision_jcs: str) -> dict:
+    return {**_execution_body(decision_jcs), "schema_version": "execution_receipt/3"}
+
+
+def _approval_body_v3(decision_jcs: str, delegation: dict) -> dict:
+    return {
+        **_approval_body(decision_jcs, delegation),
+        "schema_version": "human_approval_receipt/3",
+    }
+
+
+def _sign_v3(body: dict, seed: bytes = BACKEND_SEED) -> str:
+    return sign_eddsa_jcs_2022(body, seed, created=_V3_CREATED)
+
+
+def _v3_parts() -> tuple[dict, str]:
+    delegation = _delegation_receipt()
+    decision_jcs = _sign_v3(_decision_body_v3(delegation))
+    return delegation, decision_jcs
+
+
+def _assemble_v3_packet(delegation, decision_jcs, execution_jcs, approval_jcs=None) -> dict:
+    return {
+        "agent_did": AGENT_DID,
+        "base_url": "https://agentveil.dev",
+        "sdk_version": "0.7.4",
+        "generated_at": _V3_CREATED,
+        "delegation_receipt": delegation,
+        "outcome_status": "executed",
+        "audit_id": "urn:uuid:11111111-1111-4111-8111-111111111111",
+        "decision_receipt_jcs": decision_jcs,
+        "execution_receipt_jcs": execution_jcs,
+        "approval_receipt_jcs": approval_jcs,
+    }
+
+
+def test_verify_proof_packet_execution_approval_v3_passes():
+    delegation, decision_jcs = _v3_parts()
+    approval_jcs = _sign_v3(_approval_body_v3(decision_jcs, delegation))
+    execution = _execution_body_v3(decision_jcs)
+    execution["approval_receipt_hash"] = hashlib.sha256(approval_jcs.encode("utf-8")).hexdigest()
+    packet = _assemble_v3_packet(delegation, decision_jcs, _sign_v3(execution), approval_jcs)
+
+    result = verify_proof_packet(packet, trusted_backend_signer_dids=[BACKEND_DID])
+
+    assert result["valid"] is True
+    assert result["execution_receipt"]["schema_version"] == "execution_receipt/3"
+    assert result["approval_receipt"]["schema_version"] == "human_approval_receipt/3"
+    assert result["execution_receipt"]["body"]["status"] == "SUCCESS"
+    assert result["approval_receipt"]["body"]["decision"] == "APPROVED"
+
+
+def test_execution_v3_signed_with_legacy_raw_jcs_rejected():
+    # schema_version /3 routes to the data-integrity verifier, which rejects a
+    # legacy raw-JCS proof (it carries no proofPurpose and would not reproduce
+    # the hashData signature).
+    delegation, decision_jcs = _v3_parts()
+    packet = _assemble_v3_packet(
+        delegation, decision_jcs, _sign_jcs(_execution_body_v3(decision_jcs))
+    )
+
+    with pytest.raises(ProofVerificationError):
+        verify_proof_packet(packet, trusted_backend_signer_dids=[BACKEND_DID])
+
+
+def test_execution_v2_signed_with_data_integrity_rejected():
+    # schema_version /2 routes to the legacy raw-JCS verifier; a hashData signature
+    # does not reproduce there, so it must be rejected.
+    delegation, decision_jcs = _v3_parts()
+    packet = _assemble_v3_packet(
+        delegation, decision_jcs, _sign_v3(_execution_body(decision_jcs))
+    )
+
+    with pytest.raises(ProofVerificationError, match="signature"):
+        verify_proof_packet(packet, trusted_backend_signer_dids=[BACKEND_DID])
+
+
+def test_execution_v3_tamper_rejected():
+    delegation, decision_jcs = _v3_parts()
+    packet = _assemble_v3_packet(delegation, decision_jcs, _sign_v3(_execution_body_v3(decision_jcs)))
+    secured = json.loads(packet["execution_receipt_jcs"])
+    secured["status"] = "FAILURE"
+    packet["execution_receipt_jcs"] = jcs.canonicalize(secured).decode("utf-8")
+
+    with pytest.raises(ProofVerificationError, match="signature"):
+        verify_proof_packet(packet, trusted_backend_signer_dids=[BACKEND_DID])
+
+
+def test_execution_v3_missing_decision_receipt_hash_fails():
+    delegation, decision_jcs = _v3_parts()
+    body = _execution_body_v3(decision_jcs)
+    del body["decision_receipt_hash"]
+    packet = _assemble_v3_packet(delegation, decision_jcs, _sign_v3(body))
+
+    with pytest.raises(ProofVerificationError, match="decision_receipt_hash"):
+        verify_proof_packet(packet, trusted_backend_signer_dids=[BACKEND_DID])
+
+
+def test_execution_v3_mismatched_decision_receipt_hash_fails():
+    delegation, decision_jcs = _v3_parts()
+    body = _execution_body_v3(decision_jcs)
+    body["decision_receipt_hash"] = "00" * 32
+    packet = _assemble_v3_packet(delegation, decision_jcs, _sign_v3(body))
+
+    with pytest.raises(ProofVerificationError, match="decision_receipt_hash"):
+        verify_proof_packet(packet, trusted_backend_signer_dids=[BACKEND_DID])
+
+
+@pytest.mark.parametrize("field", ["agent_did", "action", "resource", "environment"])
+def test_execution_v3_missing_shared_intent_field_fails(field):
+    delegation, decision_jcs = _v3_parts()
+    body = _execution_body_v3(decision_jcs)
+    del body[field]
+    packet = _assemble_v3_packet(delegation, decision_jcs, _sign_v3(body))
+
+    with pytest.raises(ProofVerificationError, match=f"execution.{field} is required"):
+        verify_proof_packet(packet, trusted_backend_signer_dids=[BACKEND_DID])
+
+
+def test_execution_v3_mismatched_intent_field_fails():
+    delegation, decision_jcs = _v3_parts()
+    body = _execution_body_v3(decision_jcs)
+    body["action"] = "infra.resource.delete"  # differs from the decision's action
+    packet = _assemble_v3_packet(delegation, decision_jcs, _sign_v3(body))
+
+    with pytest.raises(ProofVerificationError, match="execution.action"):
+        verify_proof_packet(packet, trusted_backend_signer_dids=[BACKEND_DID])
+
+
+@pytest.mark.parametrize("field", ["action", "requester_agent_did"])
+def test_approval_v3_missing_shared_intent_field_fails(field):
+    delegation, decision_jcs = _v3_parts()
+    approval = _approval_body_v3(decision_jcs, delegation)
+    del approval[field]
+    approval_jcs = _sign_v3(approval)
+    execution = _execution_body_v3(decision_jcs)
+    execution["approval_receipt_hash"] = hashlib.sha256(approval_jcs.encode("utf-8")).hexdigest()
+    packet = _assemble_v3_packet(delegation, decision_jcs, _sign_v3(execution), approval_jcs)
+
+    with pytest.raises(ProofVerificationError, match=f"approval.{field} is required"):
+        verify_proof_packet(packet, trusted_backend_signer_dids=[BACKEND_DID])
+
+
+def test_v3_execution_approval_receipt_hash_linkage_enforced():
+    delegation, decision_jcs = _v3_parts()
+    approval_jcs = _sign_v3(_approval_body_v3(decision_jcs, delegation))
+    execution = _execution_body_v3(decision_jcs)
+    execution["approval_receipt_hash"] = "00" * 32
+    packet = _assemble_v3_packet(delegation, decision_jcs, _sign_v3(execution), approval_jcs)
+
+    with pytest.raises(ProofVerificationError, match="approval_receipt_hash"):
+        verify_proof_packet(packet, trusted_backend_signer_dids=[BACKEND_DID])
+
+
+def _v3_packet_with_approval(approval_jcs: str, *, delegation: dict, decision_jcs: str) -> dict:
+    execution = _execution_body_v3(decision_jcs)
+    execution["approval_receipt_hash"] = hashlib.sha256(approval_jcs.encode("utf-8")).hexdigest()
+    return _assemble_v3_packet(delegation, decision_jcs, _sign_v3(execution), approval_jcs)
+
+
+def test_approval_v3_missing_decision_receipt_hash_fails():
+    delegation, decision_jcs = _v3_parts()
+    approval = _approval_body_v3(decision_jcs, delegation)
+    del approval["decision_receipt_hash"]
+    packet = _v3_packet_with_approval(
+        _sign_v3(approval), delegation=delegation, decision_jcs=decision_jcs
+    )
+
+    with pytest.raises(ProofVerificationError, match="HumanApprovalReceipt.decision_receipt_hash"):
+        verify_proof_packet(packet, trusted_backend_signer_dids=[BACKEND_DID])
+
+
+def test_approval_v3_mismatched_decision_receipt_hash_fails():
+    delegation, decision_jcs = _v3_parts()
+    approval = _approval_body_v3(decision_jcs, delegation)
+    approval["decision_receipt_hash"] = "00" * 32
+    packet = _v3_packet_with_approval(
+        _sign_v3(approval), delegation=delegation, decision_jcs=decision_jcs
+    )
+
+    with pytest.raises(ProofVerificationError, match="HumanApprovalReceipt.decision_receipt_hash"):
+        verify_proof_packet(packet, trusted_backend_signer_dids=[BACKEND_DID])
+
+
+def test_approval_v3_signed_with_legacy_raw_jcs_rejected():
+    # human_approval_receipt/3 routes to the data-integrity verifier, which rejects
+    # a legacy raw-JCS proof (no proofPurpose; would not reproduce the hashData).
+    delegation, decision_jcs = _v3_parts()
+    packet = _v3_packet_with_approval(
+        _sign_jcs(_approval_body_v3(decision_jcs, delegation)),
+        delegation=delegation,
+        decision_jcs=decision_jcs,
+    )
+
+    with pytest.raises(ProofVerificationError):
+        verify_proof_packet(packet, trusted_backend_signer_dids=[BACKEND_DID])
+
+
+def test_approval_v2_signed_with_data_integrity_rejected():
+    # schema_version /2 routes to the legacy raw-JCS verifier; a hashData signature
+    # does not reproduce there, so it must be rejected.
+    delegation, decision_jcs = _v3_parts()
+    packet = _v3_packet_with_approval(
+        _sign_v3(_approval_body(decision_jcs, delegation)),
+        delegation=delegation,
+        decision_jcs=decision_jcs,
+    )
+
+    with pytest.raises(ProofVerificationError, match="signature"):
+        verify_proof_packet(packet, trusted_backend_signer_dids=[BACKEND_DID])
+
+
+def test_approval_v3_tamper_rejected():
+    delegation, decision_jcs = _v3_parts()
+    approval_jcs = _sign_v3(_approval_body_v3(decision_jcs, delegation))
+    packet = _v3_packet_with_approval(
+        approval_jcs, delegation=delegation, decision_jcs=decision_jcs
+    )
+    secured = json.loads(packet["approval_receipt_jcs"])
+    secured["decision"] = "DENIED"
+    packet["approval_receipt_jcs"] = jcs.canonicalize(secured).decode("utf-8")
+
+    with pytest.raises(ProofVerificationError, match="signature"):
+        verify_proof_packet(packet, trusted_backend_signer_dids=[BACKEND_DID])
+
+
+def test_approval_v3_non_approved_decision_rejected():
+    delegation, decision_jcs = _v3_parts()
+    approval = _approval_body_v3(decision_jcs, delegation)
+    approval["decision"] = "DENIED"
+    packet = _v3_packet_with_approval(
+        _sign_v3(approval), delegation=delegation, decision_jcs=decision_jcs
+    )
+
+    with pytest.raises(ProofVerificationError, match="not APPROVED"):
+        verify_proof_packet(packet, trusted_backend_signer_dids=[BACKEND_DID])
