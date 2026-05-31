@@ -515,11 +515,18 @@ class ApprovalEvidenceStore:
         tool_name: str,
         policy_rule_id: str | None,
         risk_class: str,
+        policy_context_hash: str,
         resource_hash: str | None,
         payload_hash: str,
         now_timestamp: int,
     ) -> PendingApproval | None:
-        """Return one unconsumed exact approval grant for an identical retry."""
+        """Return one unconsumed exact approval grant for an identical retry.
+
+        The match is bound to ``policy_context_hash`` (which folds in policy_id,
+        decision_mode, risk_class, policy_rule_id, and the policy schema version)
+        so an exact grant cannot be reused across policy-context drift such as a
+        hot-reload that changes policy_id or decision_mode.
+        """
 
         with self._lock:
             # SQL is safe: _COLUMNS is static and filters are bound.
@@ -534,6 +541,7 @@ class ApprovalEvidenceStore:
                 "AND parent.tool_name = ? "
                 "AND parent.risk_class = ? "
                 "AND parent.policy_rule_id IS ? "
+                "AND parent.policy_context_hash = ? "
                 "AND parent.resource_hash IS ? "
                 "AND parent.payload_hash = ? "
                 "AND NOT EXISTS ("
@@ -550,6 +558,7 @@ class ApprovalEvidenceStore:
                     tool_name,
                     risk_class,
                     policy_rule_id,
+                    policy_context_hash,
                     resource_hash,
                     payload_hash,
                 ),

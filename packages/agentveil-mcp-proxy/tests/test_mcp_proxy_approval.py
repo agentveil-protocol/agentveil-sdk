@@ -1427,6 +1427,57 @@ def test_similar_scope_policy_context_drift_triggers_ui(tmp_path):
         store.close()
 
 
+def test_exact_scope_policy_context_drift_triggers_ui(tmp_path):
+    # An exact approval grant (identical-payload retry) is reusable only within
+    # the same policy context. A hot-reload changing policy_id or decision_mode
+    # recomputes policy_context_hash, after which the live exact grant must not
+    # be reused, yet it stays reusable while the context is unchanged.
+    config = _config(policy_rule=_write_rule(scope_expansion=True))
+    drifted_config = _config(
+        policy_rule=_write_rule(scope_expansion=True),
+        policy_id="approval-test-reloaded",
+    )
+    manager, store, server, _cli = _manager(tmp_path, config=config)
+    try:
+        _request_and_post(manager, server, _classification(config), scope="exact")
+        drifted = _classification(drifted_config)
+        # Identical payload; only policy_id (and therefore policy_context_hash)
+        # changed.
+        assert (
+            drifted.policy_evaluation.policy_context_hash
+            != _classification(config).policy_evaluation.policy_context_hash
+        )
+        worker = threading.Thread(
+            target=lambda: manager.request_approval(
+                drifted,
+                reason="local_approval_required",
+            ),
+            daemon=True,
+        )
+        worker.start()
+        deadline = time.monotonic() + 2
+        while not server.pending_prompts() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert server.pending_prompts(), "policy-context drift must not reuse exact grant"
+        prompt = server.pending_prompts()[0]
+        with httpx.Client() as client:
+            csrf = _get_csrf(client, server.approval_url(prompt.request_id))
+            _post_decision(client, server.approval_url(prompt.request_id), decision="deny", csrf=csrf)
+        worker.join(timeout=3)
+
+        # Positive control: under the unchanged policy context the same exact
+        # grant is still live and is reused without a prompt.
+        reused = manager.request_approval(
+            _classification(config),
+            reason="local_approval_required",
+        )
+        assert reused.approved
+        assert reused.reason == "scope_cache_hit"
+    finally:
+        server.stop()
+        store.close()
+
+
 def test_pending_list_shows_correlation_fields_for_multiple_clients():
     server = ApprovalServer()
     server.start()
