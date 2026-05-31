@@ -70,7 +70,40 @@ MAX_CLIENT_MESSAGE_BYTES = 1 * 1024 * 1024
 MAX_PENDING_RESPONSES = 1000
 DEFAULT_TIMED_OUT_ID_RETENTION_SECONDS = 600.0
 _ENV_PASSTHROUGH_BLOCKED_PREFIXES = ("AVP_",)
-_FILE_PATH_TOOLS = frozenset({"read_file", "write_file"})
+_FILE_PATH_TOOLS = frozenset({
+    "read_file",
+    "read_text_file",
+    "read_media_file",
+    "read_multiple_files",
+    "write_file",
+    "edit_file",
+    "create_directory",
+    "list_directory",
+    "list_directory_with_sizes",
+    "directory_tree",
+    "move_file",
+    "search_files",
+    "get_file_info",
+})
+# Destructive filesystem tool name prefixes whose path arguments must be guarded
+# too. Mirrors the repo's recognized destructive filesystem surface (the builtin
+# "filesystem-delete" pack in policy.py and classification._DESTRUCTIVE_PREFIXES),
+# kept local so the guard stays unconditional and independent of policy config.
+_DESTRUCTIVE_FILE_PATH_TOOL_PREFIXES = (
+    "delete",
+    "remove",
+    "purge",
+    "truncate",
+    "wipe",
+    "format",
+    "rm",
+    "rmdir",
+    "unlink",
+    "clean",
+)
+# Argument keys that can carry a filesystem path reaching downstream. ``paths``
+# is a list (read_multiple_files); ``source``/``destination`` are move_file.
+_PATH_ARG_KEYS = ("path", "paths", "source", "destination")
 _SECRET_PATH_FILENAMES = frozenset({
     ".env",
     "id_rsa",
@@ -82,6 +115,9 @@ _SECRET_PATH_FILENAMES = frozenset({
     "token",
     "tokens",
 })
+# Sensitive directory segments: a path that descends into one of these is denied
+# even when its leaf name is innocuous (e.g. ~/.ssh/known_hosts, ~/.aws/config).
+_SECRET_PATH_SEGMENTS = frozenset({"secrets", ".ssh", ".aws", ".gnupg"})
 _SECRET_PATH_PREFIXES = (".env.", "credentials.", "credential.", "secret.", "secrets.", "token.", "tokens.")
 _SECRET_PATH_SUFFIXES = (".env", ".pem", ".key")
 SAFE_ENV_KEYS = (
@@ -908,18 +944,45 @@ class McpPassthrough:
         tool = params.get("name")
         if not isinstance(tool, str) or not tool:
             return None
-        if tool.rsplit(".", 1)[-1] not in _FILE_PATH_TOOLS:
+        if not self._is_file_path_tool(tool):
             return None
         arguments = params.get("arguments")
         if not isinstance(arguments, Mapping):
             return None
-        path = arguments.get("path")
-        if not isinstance(path, str) or not path:
-            return None
-        reason = self._unsafe_file_path_reason(path)
-        if reason is None:
-            return None
-        return _policy_denied_error(request_id, reason=reason)
+        for candidate in self._candidate_file_paths(arguments):
+            reason = self._unsafe_file_path_reason(candidate)
+            if reason is None:
+                continue
+            self._record_security_event({
+                "type": "unsafe_file_path",
+                "action": "blocked_pre_approval",
+                "reason": reason,
+                "tool": tool,
+            })
+            return _policy_denied_error(request_id, reason=reason)
+        return None
+
+    def _candidate_file_paths(self, arguments: Mapping[str, Any]) -> list[str]:
+        candidates: list[str] = []
+        for key in _PATH_ARG_KEYS:
+            value = arguments.get(key)
+            if isinstance(value, str):
+                if value:
+                    candidates.append(value)
+            elif isinstance(value, list):
+                candidates.extend(
+                    item for item in value if isinstance(item, str) and item
+                )
+        return candidates
+
+    def _is_file_path_tool(self, tool: str) -> bool:
+        leaf = tool.rsplit(".", 1)[-1]
+        if leaf in _FILE_PATH_TOOLS:
+            return True
+        return any(
+            leaf == prefix or leaf.startswith(f"{prefix}_")
+            for prefix in _DESTRUCTIVE_FILE_PATH_TOOL_PREFIXES
+        )
 
     def _unsafe_file_path_reason(self, path: str) -> str | None:
         normalized = path.replace("\\", "/")
@@ -927,7 +990,7 @@ class McpPassthrough:
         if any(segment == ".." for segment in segments):
             return "path_outside_workspace"
         lowered_segments = [segment.lower() for segment in segments]
-        if "secrets" in lowered_segments:
+        if any(segment in _SECRET_PATH_SEGMENTS for segment in lowered_segments):
             return "secret_path_blocked"
         basename = lowered_segments[-1] if lowered_segments else path.lower()
         if basename in _SECRET_PATH_FILENAMES:
