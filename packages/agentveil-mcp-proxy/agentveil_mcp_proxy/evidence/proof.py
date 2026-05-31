@@ -13,9 +13,15 @@ from typing import Any, Callable, Iterable, Mapping
 
 from agentveil.data_integrity import DataIntegrityError, verify_eddsa_jcs_2022
 from agentveil.proof import ProofVerificationError, verify_signed_jcs
+from agentveil_mcp_proxy.evidence.approval_grant import (
+    APPROVAL_SCOPE_SIMILAR_5M,
+    ApprovalGrantError,
+    verify_approval_grant,
+)
 from agentveil_mcp_proxy.evidence.store import (
     GENESIS_PREV_EVENT_HASH,
     ApprovalEvidenceStore,
+    ApprovalStatus,
     PendingApproval,
     record_hash,
 )
@@ -57,6 +63,7 @@ class EvidenceVerificationResult:
     signed_receipt_count: int
     chain_root_hash: str
     unverified_receipt_count: int = 0
+    verified_approval_grant_count: int = 0
     warnings: tuple[str, ...] = ()
 
 
@@ -171,6 +178,7 @@ def verify_evidence_bundle(
     *,
     trusted_signer_dids: Iterable[str] | None = None,
     strict: bool = True,
+    now: int | None = None,
 ) -> EvidenceVerificationResult:
     """Verify an evidence export bundle without calling the AVP backend.
 
@@ -313,12 +321,27 @@ def verify_evidence_bundle(
     for digest in sorted(set(verified_bodies) - referenced_receipt_digests):
         warnings.append(f"signed receipt {digest[:16]}... not referenced by any record")
 
+    # Approval-grant trust is external-pinning only and does not consult the
+    # in-bundle trusted_signer_dids fallback (or any signer field embedded in a
+    # grant), regardless of strict/legacy mode.
+    external_pins = tuple(
+        did for did in (trusted_signer_dids or ()) if isinstance(did, str) and did
+    )
+    verified_approval_grant_count = _verify_approval_grants(
+        records,
+        external_pins=external_pins,
+        strict=strict,
+        now=now,
+        warnings=warnings,
+    )
+
     return EvidenceVerificationResult(
         valid=True,
         record_count=len(records),
         signed_receipt_count=len(receipts),
         chain_root_hash=str(bundle.get("chain_root_hash")),
         unverified_receipt_count=computed_unverified_receipt_count,
+        verified_approval_grant_count=verified_approval_grant_count,
         warnings=tuple(warnings),
     )
 
@@ -328,6 +351,7 @@ def verify_evidence_bundle_file(
     *,
     trusted_signer_dids: Iterable[str] | None = None,
     strict: bool = True,
+    now: int | None = None,
 ) -> EvidenceVerificationResult:
     """Load and verify one evidence export bundle file.
 
@@ -345,7 +369,7 @@ def verify_evidence_bundle_file(
     if not isinstance(bundle, dict):
         raise EvidenceVerificationError("evidence bundle must be a JSON object")
     return verify_evidence_bundle(
-        bundle, trusted_signer_dids=trusted_signer_dids, strict=strict
+        bundle, trusted_signer_dids=trusted_signer_dids, strict=strict, now=now
     )
 
 
@@ -495,6 +519,173 @@ def _record_label(record: Mapping[str, Any], index: int) -> str:
     if isinstance(request_id, str) and request_id:
         return request_id
     return f"record[{index}]"
+
+
+# Grant-body fields that must equal their same-named approval-record field.
+_GRANT_RECORD_EQUAL_FIELDS = (
+    "request_id",
+    "downstream_server",
+    "tool_name",
+    "action_class",
+    "risk_class",
+    "resource_hash",
+    "policy_id",
+    "policy_rule_id",
+    "policy_context_hash",
+    "decision_audit_id",
+    "decision_receipt_sha256",
+)
+
+# Statuses that do not carry a locally minted approval grant. A record that was
+# denied, timed out (expired), or is still pending was not granted, so strict
+# mode does not require approval_grant_jcs for it. Runtime Gate ALLOW / backend
+# decision records are exempted separately by the absence of a local approval
+# decision (see _record_requires_approval_grant).
+_GRANT_EXEMPT_STATUSES = frozenset(
+    {
+        ApprovalStatus.DENIED.value,
+        ApprovalStatus.EXPIRED.value,
+        ApprovalStatus.PENDING.value,
+    }
+)
+
+
+def _record_requires_approval_grant(record: Mapping[str, Any]) -> bool:
+    """Return True when a record reflects a local approval decision that should
+    carry a signed approval grant.
+
+    A grant is minted only for a local APPROVED decision, which stamps both
+    ``approval_decided_by`` and ``approval_scope`` on the record. Later
+    execution outcomes are written on top of that decision without re-stamping
+    those fields, so an approved-then-executed
+    record keeps them while its ``status`` moves past ``approved``. The grant
+    requirement therefore tracks the original local decision rather than the
+    current status -- otherwise a grant-less approval that executed would slip
+    past strict verification.
+
+    Runtime Gate ALLOW / backend-only records leave ``approval_decided_by`` and
+    ``approval_scope`` unset (they mint no local grant) and are exempt;
+    denied/expired/pending records are exempt by status.
+    """
+
+    if record.get("approval_decided_by") is None:
+        return False
+    if record.get("approval_scope") is None:
+        return False
+    return record.get("status") not in _GRANT_EXEMPT_STATUSES
+
+
+def _verify_approval_grants(
+    records: Iterable[Any],
+    *,
+    external_pins: tuple[str, ...],
+    strict: bool,
+    now: int | None,
+    warnings: list[str],
+) -> int:
+    """Verify each persisted ``approval_grant_jcs`` against the SG-2 primitive.
+
+    Trust is external-pinning only: neither the bundle's ``trusted_signer_dids``
+    nor any signer field embedded in a grant is consulted. Strict mode rejects a
+    local-approval record (in ``approved`` or any later execution status) that is
+    missing a grant, and requires external pins to verify a
+    present grant; legacy mode records both situations as warnings. A present
+    grant on any record status is verified and cross-checked against the record.
+    """
+
+    verified = 0
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            continue
+        request_id = _record_label(record, index)
+        grant_jcs = record.get("approval_grant_jcs")
+        requires_grant = _record_requires_approval_grant(record)
+        if grant_jcs is None:
+            if requires_grant:
+                if strict:
+                    raise EvidenceVerificationError(
+                        f"strict verification: locally approved record {request_id} "
+                        "is missing approval_grant_jcs"
+                    )
+                warnings.append(
+                    f"locally approved record {request_id} has no signed approval grant"
+                )
+            continue
+        if not isinstance(grant_jcs, str) or not grant_jcs:
+            raise EvidenceVerificationError(
+                f"approval_grant_jcs must be a non-empty string for {request_id}"
+            )
+        if not external_pins:
+            if strict:
+                raise EvidenceVerificationError(
+                    "strict verification of approval grants requires externally "
+                    "supplied trusted_signer_dids; the in-bundle and in-grant signer "
+                    "fields are not accepted trust anchors"
+                )
+            warnings.append(
+                f"approval grant for {request_id} not verified: "
+                "no external signer pins supplied"
+            )
+            continue
+        try:
+            grant_body = verify_approval_grant(
+                grant_jcs, expected_signer_dids=external_pins, now=now
+            )
+        except (ApprovalGrantError, ValueError) as exc:
+            # Any grant verification failure is converted to a bundle
+            # verification error. ValueError covers malformed signatures (e.g. a
+            # truncated/oversized proofValue) that the underlying verifier surfaces
+            # as a raw value error rather than a domain error.
+            raise EvidenceVerificationError(
+                f"approval grant verification failed for {request_id}: {type(exc).__name__}"
+            ) from exc
+        _cross_check_grant_against_record(grant_body, record, request_id)
+        verified += 1
+    return verified
+
+
+def _cross_check_grant_against_record(
+    grant_body: Mapping[str, Any],
+    record: Mapping[str, Any],
+    request_id: str,
+) -> None:
+    """Confirm the signed grant body binds the same approval as the record."""
+
+    if grant_body.get("decision") != "APPROVED":
+        raise EvidenceVerificationError(
+            f"approval grant decision is not APPROVED for {request_id}"
+        )
+    for field in _GRANT_RECORD_EQUAL_FIELDS:
+        if grant_body.get(field) != record.get(field):
+            raise EvidenceVerificationError(
+                f"approval grant {field} mismatch with record for {request_id}"
+            )
+    scope = grant_body.get("approval_scope")
+    if scope != record.get("approval_scope"):
+        raise EvidenceVerificationError(
+            f"approval grant approval_scope mismatch with record for {request_id}"
+        )
+    if grant_body.get("decided_by") != record.get("approval_decided_by"):
+        raise EvidenceVerificationError(
+            f"approval grant decided_by does not match record approval_decided_by "
+            f"for {request_id}"
+        )
+    if scope == APPROVAL_SCOPE_SIMILAR_5M:
+        if grant_body.get("payload_hash") is not None:
+            raise EvidenceVerificationError(
+                f"similar_5m approval grant must not bind payload_hash for {request_id}"
+            )
+        expected_expiry = record.get("granted_scope_expires_at")
+    else:
+        if grant_body.get("payload_hash") != record.get("payload_hash"):
+            raise EvidenceVerificationError(
+                f"approval grant payload_hash mismatch with record for {request_id}"
+            )
+        expected_expiry = record.get("expires_at")
+    if grant_body.get("expires_at") != expected_expiry:
+        raise EvidenceVerificationError(
+            f"approval grant expires_at mismatch with record for {request_id}"
+        )
 
 
 __all__ = [

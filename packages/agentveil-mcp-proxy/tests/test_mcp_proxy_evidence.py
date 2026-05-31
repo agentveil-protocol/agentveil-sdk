@@ -26,6 +26,17 @@ from agentveil_mcp_proxy.evidence import (
     PendingApproval,
     record_hash,
 )
+from agentveil.delegation import _public_key_to_did
+from agentveil_mcp_proxy.evidence.approval_grant import (
+    APPROVAL_GRANT_SCHEMA,
+    build_approval_grant,
+)
+from agentveil_mcp_proxy.evidence.proof import (
+    EvidenceVerificationError,
+    build_evidence_bundle,
+    verify_evidence_bundle,
+)
+from nacl.signing import SigningKey
 
 
 PAYLOAD_HASH = "sha256:" + "a" * 64
@@ -853,3 +864,286 @@ def test_max_records_cap_refuses_new_writes_with_explicit_error(tmp_path):
             store.write_pending(_record("req-2"))
 
     assert "record cap reached" in str(exc.value)
+
+
+# --- SG-4: signed approval grant export / verification ---
+
+GRANT_SEED = bytes.fromhex("33" * 32)
+GRANT_DID = _public_key_to_did(bytes(SigningKey(GRANT_SEED).verify_key))
+OTHER_GRANT_DID = _public_key_to_did(bytes(SigningKey(bytes.fromhex("44" * 32)).verify_key))
+
+
+def _grant_body_for(record, *, scope="exact", decided_by="local-user", did=GRANT_DID, expires_at, **overrides):
+    body = {
+        "schema_version": APPROVAL_GRANT_SCHEMA,
+        "agent_did": did,
+        "request_id": record.request_id,
+        "downstream_server": record.downstream_server,
+        "tool_name": record.tool_name,
+        "action_class": record.action_class,
+        "risk_class": record.risk_class,
+        "resource_hash": record.resource_hash,
+        "payload_hash": None if scope == "similar_5m" else record.payload_hash,
+        "policy_id": record.policy_id,
+        "policy_rule_id": record.policy_rule_id,
+        "policy_context_hash": record.policy_context_hash,
+        "decision": "APPROVED",
+        "approval_scope": scope,
+        "decided_by": decided_by,
+        "issued_at": record.created_at,
+        "expires_at": expires_at,
+        "decision_audit_id": record.decision_audit_id,
+        "decision_receipt_sha256": record.decision_receipt_sha256,
+        "granted_by_request_id": record.granted_by_request_id,
+    }
+    body.update(overrides)
+    return body
+
+
+def _approve_with_grant(
+    store,
+    *,
+    request_id="req-grant",
+    scope="exact",
+    grant_jcs=None,
+    decided_by="local-user",
+    seed=GRANT_SEED,
+    did=GRANT_DID,
+):
+    record = _record(request_id)
+    store.write_pending(record)
+    granted = record.expires_at if scope == "similar_5m" else None
+    grant_expiry = granted if scope == "similar_5m" else record.expires_at
+    if grant_jcs is None:
+        grant_jcs = build_approval_grant(
+            _grant_body_for(record, scope=scope, decided_by=decided_by, did=did, expires_at=grant_expiry),
+            seed,
+        )
+    return store.transition(
+        request_id,
+        ApprovalStatus.APPROVED.value,
+        approval_token_hash=APPROVAL_TOKEN_HASH,
+        approval_decided_by=decided_by,
+        approval_scope=scope,
+        granted_scope_expires_at=granted,
+        user_decision_timestamp=record.created_at,
+        approval_grant_jcs=grant_jcs,
+    )
+
+
+def _approve_without_grant(store, *, request_id="req-no-grant"):
+    record = _record(request_id)
+    store.write_pending(record)
+    store.transition(
+        request_id,
+        ApprovalStatus.APPROVED.value,
+        approval_token_hash=APPROVAL_TOKEN_HASH,
+        approval_decided_by="local-user",
+        approval_scope="exact",
+        user_decision_timestamp=record.created_at,
+    )
+    return record
+
+
+def _bundle(store):
+    return build_evidence_bundle(store, proxy_identity_did=GRANT_DID, trusted_signer_dids=[GRANT_DID])
+
+
+def test_bundle_exports_and_verifies_signed_approval_grant(tmp_path):
+    with _store(tmp_path) as store:
+        _approve_with_grant(store, request_id="req-grant")
+        bundle = _bundle(store)
+        # Export is automatic: the persisted grant rides inside the record.
+        assert bundle["records"][0]["approval_grant_jcs"] is not None
+        result = verify_evidence_bundle(bundle, trusted_signer_dids=[GRANT_DID], strict=True)
+        assert result.valid
+        assert result.verified_approval_grant_count == 1
+
+
+def test_similar_5m_grant_exports_and_verifies(tmp_path):
+    with _store(tmp_path) as store:
+        _approve_with_grant(
+            store, request_id="req-similar", scope="similar_5m", decided_by="scope-cache-hit"
+        )
+        bundle = _bundle(store)
+        result = verify_evidence_bundle(bundle, trusted_signer_dids=[GRANT_DID], strict=True)
+        assert result.valid
+        assert result.verified_approval_grant_count == 1
+
+
+def test_strict_rejects_approved_record_missing_grant(tmp_path):
+    with _store(tmp_path) as store:
+        _approve_without_grant(store)
+        bundle = _bundle(store)
+        with pytest.raises(EvidenceVerificationError, match="missing approval_grant_jcs"):
+            verify_evidence_bundle(bundle, trusted_signer_dids=[GRANT_DID], strict=True)
+
+
+def test_legacy_tolerates_approved_record_missing_grant(tmp_path):
+    with _store(tmp_path) as store:
+        _approve_without_grant(store)
+        bundle = _bundle(store)
+        result = verify_evidence_bundle(bundle, trusted_signer_dids=[GRANT_DID], strict=False)
+        assert result.valid
+        assert result.verified_approval_grant_count == 0
+        assert any("no signed approval grant" in warning for warning in result.warnings)
+
+
+def test_strict_grant_requires_external_signer_pins(tmp_path):
+    with _store(tmp_path) as store:
+        _approve_with_grant(store, request_id="req-grant")
+        bundle = _bundle(store)  # carries an in-bundle trusted_signer_dids list
+        # The in-bundle signer list must NOT be trusted for grant verification.
+        with pytest.raises(EvidenceVerificationError, match="externally supplied trusted_signer_dids"):
+            verify_evidence_bundle(bundle, trusted_signer_dids=None, strict=True)
+
+
+def test_grant_wrong_signer_rejected(tmp_path):
+    with _store(tmp_path) as store:
+        _approve_with_grant(store, request_id="req-grant")
+        bundle = _bundle(store)
+        with pytest.raises(EvidenceVerificationError, match="approval grant verification failed"):
+            verify_evidence_bundle(bundle, trusted_signer_dids=[OTHER_GRANT_DID], strict=True)
+
+
+def test_grant_body_record_mismatch_rejected(tmp_path):
+    with _store(tmp_path) as store:
+        record = _record("req-grant")
+        store.write_pending(record)
+        # Validly signed grant, but it binds a different tool than the record.
+        grant_jcs = build_approval_grant(
+            _grant_body_for(record, expires_at=record.expires_at, tool_name="github.evil_tool"),
+            GRANT_SEED,
+        )
+        store.transition(
+            "req-grant",
+            ApprovalStatus.APPROVED.value,
+            approval_token_hash=APPROVAL_TOKEN_HASH,
+            approval_decided_by="local-user",
+            approval_scope="exact",
+            user_decision_timestamp=record.created_at,
+            approval_grant_jcs=grant_jcs,
+        )
+        bundle = _bundle(store)
+        with pytest.raises(EvidenceVerificationError, match="tool_name mismatch with record"):
+            verify_evidence_bundle(bundle, trusted_signer_dids=[GRANT_DID], strict=True)
+
+
+def _transition_with_grant(store, request_id, record, grant_jcs):
+    store.transition(
+        request_id,
+        ApprovalStatus.APPROVED.value,
+        approval_token_hash=APPROVAL_TOKEN_HASH,
+        approval_decided_by="local-user",
+        approval_scope="exact",
+        user_decision_timestamp=record.created_at,
+        approval_grant_jcs=grant_jcs,
+    )
+
+
+def test_tampered_grant_body_rejected(tmp_path):
+    with _store(tmp_path) as store:
+        record = _record("req-grant")
+        store.write_pending(record)
+        grant_jcs = build_approval_grant(_grant_body_for(record, expires_at=record.expires_at), GRANT_SEED)
+        # Mutate a signed body field after signing: the 64-byte signature no
+        # longer matches the document. record_hash is recomputed over this stored
+        # value so the chain stays consistent -- the failure is the grant signature.
+        doc = json.loads(grant_jcs)
+        doc["tool_name"] = "github.mutated_tool"
+        tampered = json.dumps(doc)
+        _transition_with_grant(store, "req-grant", record, tampered)
+        bundle = _bundle(store)
+        with pytest.raises(EvidenceVerificationError, match="approval grant verification failed"):
+            verify_evidence_bundle(bundle, trusted_signer_dids=[GRANT_DID], strict=True)
+
+
+def test_malformed_grant_signature_fails_closed(tmp_path):
+    with _store(tmp_path) as store:
+        record = _record("req-grant")
+        store.write_pending(record)
+        grant_jcs = build_approval_grant(_grant_body_for(record, expires_at=record.expires_at), GRANT_SEED)
+        # Corrupt the proofValue length; the verifier must reject with a clean
+        # EvidenceVerificationError, not leak a raw ValueError.
+        malformed = grant_jcs.replace('"proofValue":"z', '"proofValue":"zA', 1)
+        assert malformed != grant_jcs
+        _transition_with_grant(store, "req-grant", record, malformed)
+        bundle = _bundle(store)
+        with pytest.raises(EvidenceVerificationError, match="approval grant verification failed"):
+            verify_evidence_bundle(bundle, trusted_signer_dids=[GRANT_DID], strict=True)
+
+
+def test_expired_grant_rejected_when_now_supplied(tmp_path):
+    with _store(tmp_path) as store:
+        _approve_with_grant(store, request_id="req-grant")  # expires_at == created_at + 300
+        bundle = _bundle(store)
+        # Historical audit (no `now`) accepts the grant.
+        assert verify_evidence_bundle(bundle, trusted_signer_dids=[GRANT_DID], strict=True).valid
+        # With a clock past expiry, the grant is rejected.
+        with pytest.raises(EvidenceVerificationError, match="approval grant verification failed"):
+            verify_evidence_bundle(
+                bundle, trusted_signer_dids=[GRANT_DID], strict=True, now=1_700_001_000
+            )
+
+
+def _execute(store, request_id):
+    """Carry a record into terminal EXECUTED without re-stamping approval fields,
+    mirroring ApprovalManager.record_execution_result."""
+    return store.transition(
+        request_id,
+        ApprovalStatus.EXECUTED.value,
+        result_status="executed",
+        result_hash=RESULT_HASH,
+    )
+
+
+def test_strict_rejects_executed_record_missing_grant(tmp_path):
+    # SG-3a mint-failure path: a local approval persisted without a grant, then
+    # actually executed. status is no longer "approved", but the local decision
+    # (approval_decided_by/approval_scope) is retained, so strict must still
+    # require the grant -- otherwise an executed grant-less approval slips past.
+    with _store(tmp_path) as store:
+        _approve_without_grant(store, request_id="req-exec-no-grant")
+        _execute(store, "req-exec-no-grant")
+        bundle = _bundle(store)
+        exported = bundle["records"][0]
+        assert exported["status"] == ApprovalStatus.EXECUTED.value
+        assert exported["approval_decided_by"] is not None
+        assert exported["approval_grant_jcs"] is None
+        with pytest.raises(EvidenceVerificationError, match="missing approval_grant_jcs"):
+            verify_evidence_bundle(bundle, trusted_signer_dids=[GRANT_DID], strict=True)
+
+
+def test_executed_record_with_grant_verifies(tmp_path):
+    # The same approved-then-executed path, but the grant was minted at approval
+    # and carried through execution: strict verification passes and counts it.
+    with _store(tmp_path) as store:
+        _approve_with_grant(store, request_id="req-exec-grant")
+        _execute(store, "req-exec-grant")
+        bundle = _bundle(store)
+        exported = bundle["records"][0]
+        assert exported["status"] == ApprovalStatus.EXECUTED.value
+        assert exported["approval_grant_jcs"] is not None
+        result = verify_evidence_bundle(bundle, trusted_signer_dids=[GRANT_DID], strict=True)
+        assert result.valid
+        assert result.verified_approval_grant_count == 1
+
+
+def test_runtime_gate_executed_record_without_local_grant_not_required(tmp_path):
+    # Runtime Gate ALLOW / backend-only records mint no local approval grant:
+    # _write_runtime_decision_record leaves approval_decided_by/approval_scope
+    # unset. Such a record executing must NOT be required to carry a grant, even
+    # in strict mode.
+    with _store(tmp_path) as store:
+        store.write_pending(_record("req-runtime-allow"))
+        # No approval_decided_by / approval_scope: not a local approval decision.
+        _execute(store, "req-runtime-allow")
+        bundle = _bundle(store)
+        exported = bundle["records"][0]
+        assert exported["status"] == ApprovalStatus.EXECUTED.value
+        assert exported["approval_decided_by"] is None
+        assert exported["approval_scope"] is None
+        assert exported["approval_grant_jcs"] is None
+        result = verify_evidence_bundle(bundle, trusted_signer_dids=[GRANT_DID], strict=True)
+        assert result.valid
+        assert result.verified_approval_grant_count == 0
