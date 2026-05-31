@@ -28,6 +28,8 @@ import jcs
 from nacl.exceptions import BadSignatureError
 from nacl.signing import SigningKey, VerifyKey
 
+from agentveil._did import _public_key_to_did
+
 # ---------------------------------------------------------------------------
 # Constants — stable wire format. Do NOT change after publication.
 # ---------------------------------------------------------------------------
@@ -40,8 +42,6 @@ DELEGATION_TYPE = "AgentDelegation"
 
 CRYPTOSUITE = "eddsa-jcs-2022"
 PROOF_TYPE = "DataIntegrityProof"
-
-ED25519_MULTICODEC = b"\xed\x01"
 
 SUPPORTED_PREDICATES = ("max_spend", "allowed_category")
 
@@ -63,15 +63,10 @@ class DelegationInvalid(Exception):
 
 
 # ---------------------------------------------------------------------------
-# did:key helpers (mirrors agent.py to keep this module self-contained)
+# did:key helpers. ``_public_key_to_did`` lives in ``agentveil._did`` (imported
+# above and re-exported here for backward-compatible imports); the decode-side
+# helper below stays module-local because it raises ``DelegationInvalid``.
 # ---------------------------------------------------------------------------
-
-def _public_key_to_did(public_key: bytes) -> str:
-    """Encode a 32-byte Ed25519 public key as a did:key string."""
-    multicodec_key = ED25519_MULTICODEC + public_key
-    encoded = base58.b58encode(multicodec_key).decode()
-    return f"did:key:z{encoded}"
-
 
 def _did_to_public_key(did: str) -> bytes:
     """Decode a did:key string to its 32-byte Ed25519 public key.
