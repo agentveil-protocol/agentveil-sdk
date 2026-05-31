@@ -40,7 +40,10 @@ from agentveil_mcp_proxy.evidence import (
     ApprovalEvidenceStore,
     ApprovalStatus,
 )
-from agentveil_mcp_proxy.evidence.approval_grant import verify_approval_grant
+from agentveil_mcp_proxy.evidence.approval_grant import (
+    ApprovalGrantError,
+    verify_approval_grant,
+)
 from agentveil_mcp_proxy.passthrough import DownstreamConfig, McpPassthrough
 from agentveil_mcp_proxy.policy import ProxyConfig, ProxyConfigError
 
@@ -654,6 +657,43 @@ def test_approval_without_signer_records_no_grant(tmp_path):
         assert response.status_code == 200
         assert record.status == ApprovalStatus.APPROVED.value
         assert record.approval_grant_jcs is None
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_grant_mint_failure_is_signaled_but_fails_closed(tmp_path, monkeypatch):
+    cli = io.StringIO()
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        cli_out=cli,
+        approval_grant_private_key_seed=APPROVAL_GRANT_SEED,
+        approval_grant_agent_did=APPROVAL_GRANT_DID,
+    )
+
+    def _boom(_body, _seed):
+        raise ApprovalGrantError("forced mint failure for test")
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.approval.manager.build_approval_grant", _boom
+    )
+    try:
+        outcome, _prompt, response = _request_and_post(manager, server, _classification())
+        record = store.get_pending(outcome.request_id)
+
+        assert response.status_code == 200
+        # Boundary: signer + expiry were present but minting failed; the
+        # approval still records and the grant remains unset.
+        assert record.status == ApprovalStatus.APPROVED.value
+        assert record.approval_grant_jcs is None
+        # Sanitized observability signal fired (counter + cli_out line).
+        assert manager.approval_grant_mint_failures == 1
+        cli_output = cli.getvalue()
+        assert record.request_id in cli_output
+        assert "ApprovalGrantError" in cli_output
+        # Sanitized: no key/seed material and no raw error message body leaked.
+        assert APPROVAL_GRANT_SEED.hex() not in cli_output
+        assert "forced mint failure for test" not in cli_output
     finally:
         server.stop()
         store.close()

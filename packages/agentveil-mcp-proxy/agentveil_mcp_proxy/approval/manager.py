@@ -92,6 +92,7 @@ class ApprovalManager:
         self.wait_for_decision = wait_for_decision
         self.approval_grant_private_key_seed = approval_grant_private_key_seed
         self.approval_grant_agent_did = approval_grant_agent_did
+        self.approval_grant_mint_failures = 0
 
     def request_approval(
         self,
@@ -398,7 +399,16 @@ class ApprovalManager:
         }
         try:
             return build_approval_grant(body, self.approval_grant_private_key_seed)
-        except ApprovalGrantError:
+        except ApprovalGrantError as exc:
+            # Boundary: leave approval_grant_jcs unset on mint errors, while the
+            # approval record still transitions. Signer + expiry were present, so
+            # this path is a systematic mint problem -- emit a sanitized signal
+            # with request_id + error class only.
+            self.approval_grant_mint_failures += 1
+            print(
+                f"approval grant mint failed for {record.request_id}: {type(exc).__name__}",
+                file=self.cli_out,
+            )
             return None
 
     def _deny(self, request_id: str, reason: str) -> ApprovalOutcome:
