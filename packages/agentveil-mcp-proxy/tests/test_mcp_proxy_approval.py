@@ -71,6 +71,7 @@ def _config(
     policy_rule: dict[str, Any] | None = None,
     approval_timeout_seconds: int = 300,
     on_timeout: str = "deny",
+    policy_id: str = "approval-test",
 ) -> ProxyConfig:
     return ProxyConfig.from_dict({
         "proxy_config_schema_version": 1,
@@ -99,7 +100,7 @@ def _config(
             "on_timeout": on_timeout,
         },
         "policy": {
-            "id": "approval-test",
+            "id": policy_id,
             "policy_schema_version": 1,
             "default_decision": "approval",
             "default_risk_class": "write",
@@ -1369,6 +1370,58 @@ def test_similar_scope_different_resource_hash_triggers_ui(tmp_path):
             csrf = _get_csrf(client, server.approval_url(prompt.request_id))
             _post_decision(client, server.approval_url(prompt.request_id), decision="deny", csrf=csrf)
         worker.join(timeout=3)
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_similar_scope_policy_context_drift_triggers_ui(tmp_path):
+    # A hot-reload that changes policy_id (or decision_mode) recomputes
+    # policy_context_hash. A live similar_5m grant minted under the previous
+    # policy context must not be reused once the context drifts, yet it stays
+    # reusable while the context is unchanged.
+    config = _config(policy_rule=_write_rule(scope_expansion=True))
+    drifted_config = _config(
+        policy_rule=_write_rule(scope_expansion=True),
+        policy_id="approval-test-reloaded",
+    )
+    manager, store, server, _cli = _manager(tmp_path, config=config)
+    try:
+        _request_and_post(manager, server, _classification(config), scope="similar_5m")
+        drifted = _classification(drifted_config)
+        # Same server/tool/rule/risk/resource; only policy_id (and therefore
+        # policy_context_hash) changed.
+        assert drifted.policy_evaluation.policy_rule_id == "write-approval"
+        assert (
+            drifted.policy_evaluation.policy_context_hash
+            != _classification(config).policy_evaluation.policy_context_hash
+        )
+        worker = threading.Thread(
+            target=lambda: manager.request_approval(
+                drifted,
+                reason="local_approval_required",
+            ),
+            daemon=True,
+        )
+        worker.start()
+        deadline = time.monotonic() + 2
+        while not server.pending_prompts() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert server.pending_prompts(), "policy-context drift must not match similar grant"
+        prompt = server.pending_prompts()[0]
+        with httpx.Client() as client:
+            csrf = _get_csrf(client, server.approval_url(prompt.request_id))
+            _post_decision(client, server.approval_url(prompt.request_id), decision="deny", csrf=csrf)
+        worker.join(timeout=3)
+
+        # Positive control: under the unchanged policy context the same grant is
+        # still live and is reused without a prompt.
+        reused = manager.request_approval(
+            _classification(config),
+            reason="local_approval_required",
+        )
+        assert reused.approved
+        assert reused.reason == "scope_cache_hit"
     finally:
         server.stop()
         store.close()

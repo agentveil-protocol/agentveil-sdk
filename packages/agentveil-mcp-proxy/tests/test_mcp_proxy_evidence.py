@@ -216,6 +216,40 @@ def test_transition_persists_signed_approval_grant_jcs(tmp_path):
     assert updated.approval_grant_jcs == '{"schema_version":"proxy_approval_grant/1"}'
 
 
+def test_find_active_similar_grant_rejects_policy_context_drift(tmp_path):
+    # A live similar_5m grant is reusable only within the same policy context.
+    # A hot-reload that changes policy_id or decision_mode shifts
+    # policy_context_hash, after which the stale grant must no longer match.
+    lookup = dict(
+        downstream_server="github-mcp",
+        tool_name="github.create_issue",
+        policy_rule_id="rule-write",
+        risk_class="write",
+        resource_hash=RESOURCE_HASH,
+        now_timestamp=1_700_000_000,
+    )
+    with _store(tmp_path) as store:
+        store.write_pending(_record("req-similar"))
+        store.transition(
+            "req-similar",
+            ApprovalStatus.APPROVED.value,
+            approval_token_hash=APPROVAL_TOKEN_HASH,
+            approval_decided_by="local-user",
+            approval_scope="similar_5m",
+            granted_scope_expires_at=1_700_000_300,
+        )
+
+        matched = store.find_active_similar_grant(
+            policy_context_hash=POLICY_CONTEXT_HASH, **lookup
+        )
+        assert matched is not None and matched.request_id == "req-similar"
+
+        drifted = store.find_active_similar_grant(
+            policy_context_hash="a" * 64, **lookup
+        )
+        assert drifted is None
+
+
 def test_write_pending_creates_durable_record_with_all_fields(tmp_path):
     db_path = tmp_path / "evidence.sqlite"
     record = _record("req-all")
