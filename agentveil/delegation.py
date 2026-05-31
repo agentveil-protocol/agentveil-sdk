@@ -29,6 +29,7 @@ from nacl.exceptions import BadSignatureError
 from nacl.signing import SigningKey, VerifyKey
 
 from agentveil._did import _public_key_to_did
+from agentveil.data_integrity import DataIntegrityError, verify_eddsa_jcs_2022
 
 # ---------------------------------------------------------------------------
 # Constants — stable wire format. Do NOT change after publication.
@@ -284,12 +285,27 @@ def verify_delegation(receipt: dict, *, now: Optional[datetime] = None) -> dict:
     if signer_did != issuer:
         raise DelegationInvalid("verificationMethod does not match issuer")
 
-    payload = {k: v for k, v in receipt.items() if k != "proof"}
-    canonical = jcs.canonicalize(payload)
-    try:
-        VerifyKey(issuer_public_key).verify(canonical, signature)
-    except BadSignatureError as exc:
-        raise DelegationInvalid("signature verification failed") from exc
+    if "proofPurpose" in proof:
+        # New path: the signature covers the hashData (proof config + document)
+        # rather than the raw document JCS. Reuse the shared verifier and bind
+        # the signer to the VC issuer. Any failure here — including a present but
+        # invalid proofPurpose — is reported as DelegationInvalid with no
+        # fallback to the legacy path.
+        try:
+            verify_eddsa_jcs_2022(
+                jcs.canonicalize(receipt).decode("utf-8"),
+                expected_signer_did=issuer,
+            )
+        except DataIntegrityError as exc:
+            raise DelegationInvalid(f"data integrity verification failed: {exc}") from exc
+    else:
+        # Legacy raw-JCS path: signature covers JCS(receipt without proof).
+        payload = {k: v for k, v in receipt.items() if k != "proof"}
+        canonical = jcs.canonicalize(payload)
+        try:
+            VerifyKey(issuer_public_key).verify(canonical, signature)
+        except BadSignatureError as exc:
+            raise DelegationInvalid("signature verification failed") from exc
 
     return {
         "valid": True,
