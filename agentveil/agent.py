@@ -1640,7 +1640,7 @@ class AVPAgent:
         """Perform an HTTPS egress through the AVP-controlled boundary.
 
         Returns a ``ControlledEgressOutcome`` carrying an **agent-signed**
-        ``egress_receipt/1`` for ALLOW/BLOCK/FAILED outcomes (no receipt
+        ``egress_receipt/2`` for ALLOW/BLOCK/FAILED outcomes (no receipt
         on ``WAITING_FOR_HUMAN_APPROVAL`` in v0.1). The helper performs
         the HTTPS send itself; calls that bypass this method are not
         recorded.
