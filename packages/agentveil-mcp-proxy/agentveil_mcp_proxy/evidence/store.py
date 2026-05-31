@@ -130,6 +130,7 @@ class PendingApproval:
     matched_policy_rule: str | None = None
     user_decision_timestamp: int | None = None
     granted_by_request_id: str | None = None
+    approval_grant_jcs: str | None = None
 
 
 @dataclass(frozen=True)
@@ -163,6 +164,7 @@ _OPTIONAL_COLUMNS = {
     "matched_policy_rule",
     "user_decision_timestamp",
     "granted_by_request_id",
+    "approval_grant_jcs",
 }
 _TRANSITION_FIELDS = {
     "decision_audit_id",
@@ -178,6 +180,7 @@ _TRANSITION_FIELDS = {
     "matched_policy_rule",
     "user_decision_timestamp",
     "granted_by_request_id",
+    "approval_grant_jcs",
 }
 _HASH_COLUMNS = {
     "resource_hash",
@@ -649,6 +652,7 @@ class ApprovalEvidenceStore:
             "user_decision_timestamp": "INTEGER NULL",
             "prev_event_hash": "TEXT NULL",
             "granted_by_request_id": "TEXT NULL",
+            "approval_grant_jcs": "TEXT NULL",
         }.items():
             if column not in existing:
                 self._conn.execute(f"ALTER TABLE pending_approvals ADD COLUMN {column} {column_type}")
@@ -867,7 +871,8 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
     granted_scope_expires_at INTEGER NULL,
     matched_policy_rule TEXT NULL,
     user_decision_timestamp INTEGER NULL,
-    granted_by_request_id TEXT NULL
+    granted_by_request_id TEXT NULL,
+    approval_grant_jcs TEXT NULL
 )
 """
 

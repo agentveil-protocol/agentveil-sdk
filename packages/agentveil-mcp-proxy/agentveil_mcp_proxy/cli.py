@@ -1791,7 +1791,11 @@ def run_proxy(
         passphrase=passphrase,
         passphrase_file=passphrase_file,
     )
-    _load_proxy_agent(identity=identity, config=config, passphrase=identity_passphrase)
+    proxy_agent = _load_proxy_agent(
+        identity=identity,
+        config=config,
+        passphrase=identity_passphrase,
+    )
     doctor_out = io.StringIO()
     health = doctor_proxy(
         home=paths.home,
@@ -1815,6 +1819,13 @@ def run_proxy(
         evidence_store = ApprovalEvidenceStore(paths.proxy_dir / "evidence.sqlite")
         approval_server = ApprovalServer()
         approval_server.start()
+        try:
+            approval_grant_private_key_seed = bytes.fromhex(proxy_agent.private_key_hex)
+        except (AttributeError, TypeError, ValueError):
+            approval_grant_private_key_seed = None
+        approval_grant_agent_did = getattr(proxy_agent, "did", None)
+        if not isinstance(approval_grant_agent_did, str):
+            approval_grant_agent_did = None
         approval_manager = ApprovalManager(
             evidence_store=evidence_store,
             approval_server=approval_server,
@@ -1825,6 +1836,8 @@ def run_proxy(
             headless_policy=headless_policy,
             cli_out=err,
             wait_for_decision=False,
+            approval_grant_private_key_seed=approval_grant_private_key_seed,
+            approval_grant_agent_did=approval_grant_agent_did,
         )
         runtime_gate_factory = lambda: RuntimeGateClient.from_files(
             identity_path=identity_path,
