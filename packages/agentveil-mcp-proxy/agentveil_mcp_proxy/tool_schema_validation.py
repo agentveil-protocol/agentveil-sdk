@@ -104,15 +104,20 @@ class ToolSchemaCache:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._schemas: dict[str, dict[str, Any]] = {}
+        self._advertised_names: set[str] = set()
 
     def update_from_response(self, response: Any) -> int:
         """Cache ``inputSchema`` for each tool in a ``tools/list``-shaped
         downstream response. Returns the number of schemas cached.
 
         Detection is structural: a JSON-RPC result whose ``tools`` is a list
-        of objects with a string ``name`` and a dict ``inputSchema``. This is
-        the standard MCP ``tools/list`` result shape; other responses are
-        ignored.
+        of objects with a string ``name``. Each valid ``name`` is recorded in
+        the advertised-name set so callers can distinguish a tool the
+        downstream advertised but emitted without an ``inputSchema`` from a
+        tool absent from that advertisement. Evidence: callers use this split
+        for the unknown-tool regression tests. When the entry also has
+        a dict ``inputSchema``, the schema itself is cached and counted.
+        Other responses are ignored.
         """
         if not isinstance(response, Mapping):
             return 0
@@ -128,8 +133,11 @@ class ToolSchemaCache:
                 if not isinstance(tool, Mapping):
                     continue
                 name = tool.get("name")
+                if not (isinstance(name, str) and name):
+                    continue
+                self._advertised_names.add(name)
                 schema = tool.get("inputSchema")
-                if isinstance(name, str) and name and isinstance(schema, Mapping):
+                if isinstance(schema, Mapping):
                     self._schemas[name] = dict(schema)
                     cached += 1
         return cached
@@ -138,6 +146,14 @@ class ToolSchemaCache:
         with self._lock:
             schema = self._schemas.get(tool_name)
             return dict(schema) if schema is not None else None
+
+    def is_advertised(self, tool_name: str) -> bool:
+        """Return True iff ``tool_name`` was seen in a prior ``tools/list``
+        advertisement. Used by the proxy to deny ``tools/call`` for absent
+        tool names before approval is requested.
+        """
+        with self._lock:
+            return tool_name in self._advertised_names
 
 
 __all__ = ["ToolSchemaCache", "validate_arguments"]

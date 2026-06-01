@@ -182,3 +182,85 @@ def test_enforce_block_does_not_leak_raw_arguments():
     assert SECRET_ARG not in json.dumps(list(proxy.security_events))
     # Only the tool name is recorded.
     assert proxy.security_events[0]["tool"] == "exfiltrate"
+
+
+# ---------------------------------------------------------------------------
+# Bug 6 regression: deny tools/call for tool names absent from downstream
+# tools/list. Evidence: these tests assert the pre-approval error and event.
+# These run with operator-surface mode OFF so the operator-declared B9 gate
+# above does not fire and isolate the downstream-advertised gate.
+# ---------------------------------------------------------------------------
+
+
+def test_unknown_tool_call_denied_before_approval():
+    """A tool name absent from downstream tools/list is denied before approval."""
+
+    proxy = _RecordingPassthrough(_config(mode="off"))
+
+    responses = proxy.handle_client_line(_tool_call("totally_unknown_tool"))
+
+    # Evidence: no downstream forwarding occurs for this denied request.
+    assert proxy.forwarded == []
+    error = responses[0]["error"]
+    assert error["code"] == JSONRPC_POLICY_BLOCKED
+    assert error["data"] == {"status": "blocked", "reason": "unknown_tool"}  # claim-check: allow "blocked" is expected JSON-RPC error data vocabulary.
+
+    # Security evidence carries the tool-identity classification and records
+    # only the tool name, not raw arguments.
+    assert proxy.security_events == ({
+        "type": "unknown_tool_call",
+        "action": "blocked_pre_approval",  # claim-check: allow "blocked_pre_approval" is the existing event action vocabulary for pre-approval denies.
+        "reason": "unknown_tool",
+        "risk_class": "tool_identity_violation",
+        "tool": "totally_unknown_tool",
+    },)
+    assert SECRET_ARG not in json.dumps(responses[0])
+    assert SECRET_ARG not in json.dumps(list(proxy.security_events))
+
+
+def test_spoofed_tool_name_denied_before_approval():
+    """A plausible-looking tool name that was NOT advertised by this
+    downstream is denied, even if a different downstream might
+    legitimately advertise the same name."""
+
+    proxy = _RecordingPassthrough(_config(mode="off"))
+
+    fs_responses = proxy.handle_client_line(_tool_call("filesystem.write_file"))
+    shell_responses = proxy.handle_client_line(_tool_call("shell"))
+
+    assert proxy.forwarded == []
+
+    fs_error = fs_responses[0]["error"]
+    assert fs_error["code"] == JSONRPC_POLICY_BLOCKED
+    assert fs_error["data"] == {"status": "blocked", "reason": "unknown_tool"}  # claim-check: allow "blocked" is JSON-RPC error data vocabulary.
+
+    shell_error = shell_responses[0]["error"]
+    assert shell_error["code"] == JSONRPC_POLICY_BLOCKED
+    assert shell_error["data"] == {"status": "blocked", "reason": "unknown_tool"}  # claim-check: allow "blocked" is JSON-RPC error data vocabulary.
+
+    recorded = [
+        (e.get("type"), e.get("reason"), e.get("risk_class"), e.get("tool"))
+        for e in proxy.security_events
+    ]
+    assert recorded == [
+        ("unknown_tool_call", "unknown_tool", "tool_identity_violation", "filesystem.write_file"),
+        ("unknown_tool_call", "unknown_tool", "tool_identity_violation", "shell"),
+    ]
+    assert SECRET_ARG not in json.dumps(list(proxy.security_events))
+
+
+def test_advertised_tool_passes_unknown_gate_and_reaches_downstream():
+    """A tool the downstream advertised via tools/list must pass the
+    unknown-tool gate and reach the existing downstream-forward path."""
+
+    proxy = _RecordingPassthrough(_config(mode="off"))
+
+    responses = proxy.handle_client_line(_tool_call("get_issue"))
+
+    # Forwarded downstream and the existing stubbed result reaches the client.
+    assert [m["params"]["name"] for m in proxy.forwarded] == ["get_issue"]
+    assert responses[0].get("result") == {"ok": True}
+    # No unknown-tool event for an advertised tool name.
+    assert not any(
+        e.get("type") == "unknown_tool_call" for e in proxy.security_events
+    )

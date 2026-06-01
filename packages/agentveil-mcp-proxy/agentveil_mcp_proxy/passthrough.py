@@ -712,6 +712,10 @@ class McpPassthrough:
         if surface_error is not None:
             return [surface_error] if has_id else []
 
+        unknown_error = self._unknown_tool_error_response(message, request_id)
+        if unknown_error is not None:
+            return [unknown_error] if has_id else []
+
         try:
             invalid_error = self._invalid_arguments_error(message, request_id)
             if invalid_error is not None:
@@ -817,6 +821,63 @@ class McpPassthrough:
             "tool": tool,
         })
         return None
+
+    def _unknown_tool_error_response(
+        self,
+        message: Mapping[str, Any],
+        request_id: Any,
+    ) -> dict[str, Any] | None:
+        """Deny ``tools/call`` for a tool name absent from downstream
+        ``tools/list``.
+
+        Runs before schema validation, classification, local policy, Runtime
+        Gate, approval, and downstream forwarding. Evidence: this guard runs
+        before approval in tests/test_mcp_proxy_tool_surface.py.
+        The downstream-advertised
+        tool set is the source of truth for what the proxy will ever
+        forward; if a requested tool name is not in that set, the call is
+        blocked and a sanitized security event is recorded with reason
+        claim-check: allow "blocked" is event vocabulary, not a safety claim.
+        ``unknown_tool`` and risk class ``tool_identity_violation``. No
+        approval is requested. Only the tool name, not raw arguments,
+        is recorded or returned.
+
+        On a cache miss the proxy lazily refreshes the cache by issuing a
+        downstream ``tools/list`` probe before deciding; if the refresh
+        cannot run (downstream not ready) or the tool is still absent, the
+        call is denied. Malformed params and missing tool names are left to
+        ``_invalid_arguments_error`` so the existing INVALID_PARAMS surface
+        keeps its semantics.
+        """
+        if message.get("method") != "tools/call":
+            return None
+        params = message.get("params")
+        if not isinstance(params, Mapping):
+            return None
+        tool = params.get("name")
+        if not isinstance(tool, str) or not tool:
+            return None
+        if self._tool_schemas.is_advertised(tool):
+            return None
+        response = self._request_downstream_tools_list()
+        if response is not None:
+            self._tool_schemas.update_from_response(response)
+        if self._tool_schemas.is_advertised(tool):
+            return None
+        self._record_security_event({
+            "type": "unknown_tool_call",
+            "action": "blocked_pre_approval",
+            "reason": "unknown_tool",
+            "risk_class": "tool_identity_violation",
+            "tool": tool,
+        })
+        return _blocked_error(
+            request_id,
+            # claim-check: allow "blocked" is the literal JSON-RPC error
+            # message string and matches the existing _blocked_error vocabulary.
+            "blocked by MCP proxy: tool not advertised by downstream",  # claim-check: allow "blocked" is existing JSON-RPC error vocabulary.
+            reason="unknown_tool",
+        )
 
     def _invalid_arguments_error(
         self,
