@@ -74,6 +74,26 @@ _DESTRUCTIVE_PREFIXES = (
 _PRODUCTION_WORDS = ("prod", "production", "deploy", "release", "rollback", "infra", "cluster")
 _FINANCIAL_WORDS = ("payment", "transfer", "invoice", "billing", "payroll", "purchase", "refund")
 
+# Official Model Context Protocol Git server tool catalog. Source-control verbs
+# such as "status", "log", "diff", "show", and "reset" do not match the generic
+# _READ/_WRITE/_DESTRUCTIVE prefix lists, so without this explicit table the
+# evidence pipeline records them as UNKNOWN. Tool list verified against
+# https://github.com/modelcontextprotocol/servers/tree/main/src/git (Bug 1).
+_GIT_TOOL_RISK_CLASSES: Mapping[str, RiskClass] = {
+    "git_status": RiskClass.READ,
+    "git_log": RiskClass.READ,
+    "git_diff": RiskClass.READ,
+    "git_diff_staged": RiskClass.READ,
+    "git_diff_unstaged": RiskClass.READ,
+    "git_show": RiskClass.READ,
+    "git_branch": RiskClass.READ,
+    "git_add": RiskClass.WRITE,
+    "git_commit": RiskClass.WRITE,
+    "git_checkout": RiskClass.WRITE,
+    "git_create_branch": RiskClass.WRITE,
+    "git_reset": RiskClass.DESTRUCTIVE,
+}
+
 
 def sha256_jcs(value: Any) -> str:
     """Return a prefixed SHA-256 digest over JCS-canonicalized JSON data."""
@@ -221,6 +241,10 @@ def infer_risk_class(
     arguments: Mapping[str, Any] | None = None,
 ) -> RiskClass:
     """Best-effort local risk inference before policy rules are applied."""
+
+    git_risk = _GIT_TOOL_RISK_CLASSES.get(tool)
+    if git_risk is not None:
+        return git_risk
 
     text_parts = [action, tool, resource or ""]
     if arguments:

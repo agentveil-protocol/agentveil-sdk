@@ -1918,7 +1918,11 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--base-url", default=DEFAULT_BASE_URL)
     init.add_argument("--agent-name", default=DEFAULT_AGENT_NAME)
     init.add_argument("--trusted-signer-did", action="append", default=None)
-    init.add_argument("--policy-pack", default="default", choices=["default", "github", "filesystem", "shell"])
+    init.add_argument(
+        "--policy-pack",
+        default="default",
+        choices=["default", "github", "filesystem", "shell", "git"],
+    )
     init.add_argument(
         "--quickstart-filesystem",
         type=Path,
