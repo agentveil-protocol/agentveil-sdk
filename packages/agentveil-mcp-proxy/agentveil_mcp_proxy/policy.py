@@ -882,6 +882,54 @@ def builtin_policy_pack(name: str) -> PolicyConfig:
                 },
             },
         ],
+        # Official MCP Git server tool surface. Server-name globs are kept narrow
+        # so this pack does not shadow the github pack (negative test covers
+        # server "github" not matching "git" / "git-*" / "git_*").
+        "git": [
+            {
+                "id": "git-read",
+                "source": "builtin",
+                "decision": "allow",
+                "risk_class": "read",
+                "match": {
+                    "server": ["git", "git-*", "git_*"],
+                    "tool": [
+                        "git_status",
+                        "git_log",
+                        "git_diff",
+                        "git_diff_staged",
+                        "git_diff_unstaged",
+                        "git_show",
+                        "git_branch",
+                    ],
+                },
+            },
+            {
+                "id": "git-write",
+                "source": "builtin",
+                "decision": "ask_backend",
+                "risk_class": "write",
+                "match": {
+                    "server": ["git", "git-*", "git_*"],
+                    "tool": [
+                        "git_add",
+                        "git_commit",
+                        "git_checkout",
+                        "git_create_branch",
+                    ],
+                },
+            },
+            {
+                "id": "git-destructive",
+                "source": "builtin",
+                "decision": "approval",
+                "risk_class": "destructive",
+                "match": {
+                    "server": ["git", "git-*", "git_*"],
+                    "tool": ["git_reset"],
+                },
+            },
+        ],
     }
 
     if name not in packs:

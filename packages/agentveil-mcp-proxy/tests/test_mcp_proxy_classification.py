@@ -274,6 +274,47 @@ def test_risk_inference_does_not_over_classify_substring_collisions():
     assert infer_risk_class("github.list_endpoints", tool="list_endpoints") is RiskClass.READ
 
 
+def test_infer_risk_class_recognizes_git_status_as_read():
+    assert infer_risk_class("git.git_status", tool="git_status") is RiskClass.READ
+
+
+def test_infer_risk_class_recognizes_git_log_as_read():
+    assert infer_risk_class("git.git_log", tool="git_log") is RiskClass.READ
+
+
+def test_infer_risk_class_recognizes_git_add_as_write():
+    assert infer_risk_class("git.git_add", tool="git_add") is RiskClass.WRITE
+
+
+def test_infer_risk_class_recognizes_git_commit_as_write():
+    assert infer_risk_class("git.git_commit", tool="git_commit") is RiskClass.WRITE
+
+
+def test_infer_risk_class_recognizes_git_reset_as_destructive():
+    assert infer_risk_class("git.git_reset", tool="git_reset") is RiskClass.DESTRUCTIVE
+
+
+def test_no_official_mcp_git_tool_falls_back_to_unknown():
+    # Tool list from https://github.com/modelcontextprotocol/servers/tree/main/src/git
+    official_git_tools = (
+        "git_status",
+        "git_log",
+        "git_diff",
+        "git_diff_staged",
+        "git_diff_unstaged",
+        "git_show",
+        "git_branch",
+        "git_add",
+        "git_commit",
+        "git_checkout",
+        "git_create_branch",
+        "git_reset",
+    )
+    for tool in official_git_tools:
+        risk = infer_risk_class(f"git.{tool}", tool=tool)
+        assert risk is not RiskClass.UNKNOWN, f"{tool} fell back to UNKNOWN"
+
+
 def test_passthrough_classifies_allowed_tools_call_without_changing_downstream_behavior(tmp_path):
     classifier = ToolCallClassifier(_config(), server_name="github")
     seen = []

@@ -456,6 +456,36 @@ def test_github_pack_approval_required_for_drop_tools():
     assert result.policy_rule_id == "github-destructive"
 
 
+def test_git_pack_allows_status_and_log_read_tools():
+    for tool in ("git_status", "git_log", "git_diff", "git_show", "git_branch"):
+        result = _evaluate_builtin_pack("git", server="git", tool=tool)
+        assert result.decision is PolicyDecision.ALLOW, tool
+        assert result.risk_class is RiskClass.READ, tool
+        assert result.policy_rule_id == "git-read", tool
+
+
+def test_git_pack_ask_backend_for_add_and_commit_write_tools():
+    for tool in ("git_add", "git_commit", "git_checkout", "git_create_branch"):
+        result = _evaluate_builtin_pack("git", server="git", tool=tool)
+        assert result.decision is PolicyDecision.ASK_BACKEND, tool
+        assert result.risk_class is RiskClass.WRITE, tool
+        assert result.policy_rule_id == "git-write", tool
+
+
+def test_git_pack_approval_required_for_reset_destructive_tool():
+    result = _evaluate_builtin_pack("git", server="git", tool="git_reset")
+    assert result.decision is PolicyDecision.APPROVAL
+    assert result.risk_class is RiskClass.DESTRUCTIVE
+    assert result.policy_rule_id == "git-destructive"
+
+
+def test_git_pack_server_glob_does_not_shadow_github_pack():
+    # Negative test: the git pack's server matchers must not match the
+    # "github" server name.
+    result = _evaluate_builtin_pack("git", server="github", tool="git_status")
+    assert result.policy_rule_id != "git-read"
+
+
 # --- B9 declared tool surface config ---
 
 def test_tool_surface_dataclass_default_is_off_empty_allow():

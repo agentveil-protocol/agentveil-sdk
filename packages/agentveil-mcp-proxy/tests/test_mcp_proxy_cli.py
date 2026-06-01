@@ -1405,6 +1405,49 @@ def test_main_init_json_supports_noninteractive_downstream_flags(tmp_path, capsy
     assert _load(proxy_paths(home).config_path)["downstream"]["args"][-1] == str(sandbox)
 
 
+def test_main_init_policy_pack_git_writes_git_policy_id(tmp_path):
+    # Real product path (Bug 1 follow-up): the git pack must be reachable through
+    # the CLI argv parser, not only via builtin_policy_pack("git").
+    home = tmp_path / "avp-home"
+
+    exit_code = main([
+        "init",
+        "--home", str(home),
+        "--agent-name", "proxy",
+        "--policy-pack", "git",
+        "--plaintext",
+    ])
+
+    assert exit_code == 0
+    assert _load(proxy_paths(home).config_path)["policy"]["id"] == "git"
+
+
+def test_configure_downstream_named_git_preserves_explicit_git_policy(tmp_path):
+    # configure-downstream writes only the downstream block; it does not infer or
+    # override the policy pack from the downstream name. The git policy chosen at
+    # init survives, confirming explicit --policy-pack git is the supported path
+    # (the product has no name-based auto-policy-selection for any pack).
+    home = tmp_path / "avp-home"
+    assert main([
+        "init",
+        "--home", str(home),
+        "--agent-name", "proxy",
+        "--policy-pack", "git",
+        "--plaintext",
+    ]) == 0
+
+    result = configure_downstream(
+        name="git",
+        command=sys.executable,
+        args=("-m", "example_git_mcp_server"),
+        home=home,
+    )
+
+    config = _load(result.config_path)
+    assert config["policy"]["id"] == "git"
+    assert config["downstream"]["name"] == "git"
+
+
 def test_reissue_grant_creates_new_grant_with_default_ttl(tmp_path):
     home = tmp_path / "avp-home"
     result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
