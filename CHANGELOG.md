@@ -6,6 +6,31 @@ All notable changes to the `agentveil` SDK.
 
 No unreleased changes.
 
+## [0.7.20] - 2026-06-01
+
+Verifier-readiness release for `execution_receipt/3` and
+`human_approval_receipt/3`. `agentveil.proof.verify_proof_packet` now accepts
+the full `/3` receipt family (decision, execution, human approval) routed
+through the first-party data-integrity (`eddsa-jcs-2022`) hashData verifier.
+<!-- claim-check: allow release note names the implemented local verifier path, not third-party certification -->
+This is not a third-party conformance certification.
+
+### Added
+- Added `execution_receipt/3` and `human_approval_receipt/3` to the
+  data-integrity verifier routing set alongside `decision_receipt/3`.
+- Added `_STRICT_EXECUTION_SCHEMAS` and `_STRICT_APPROVAL_SCHEMAS` so `/3`
+  inherits `/2` strictness for shared intent fields and `decision_receipt_hash`
+  mandatory-field checks.
+- Added focused tests covering happy path, tamper rejection, role separation,
+  missing/mismatched `decision_receipt_hash`, missing/mismatched shared intent
+  fields, `proofPurpose` stripped/changed, and proof `@context` mismatch for
+  both new receipt families.
+
+### Unchanged
+- Legacy `/1` and `/2` receipt verification stays on the raw-JCS path
+  (`verify_signed_jcs`).
+- `decision_receipt/3` verification behavior is unchanged from 0.7.19.
+
 ## [0.7.19] - 2026-05-31
 
 PyPI package alignment release for the MCP Proxy split.
