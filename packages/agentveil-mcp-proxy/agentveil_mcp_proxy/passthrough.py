@@ -28,6 +28,7 @@ import json
 import math
 import os
 from pathlib import Path
+import posixpath
 import signal
 import subprocess
 import sys
@@ -1103,18 +1104,49 @@ class McpPassthrough:
 
     def _unsafe_file_path_reason(self, path: str) -> str | None:
         normalized = path.replace("\\", "/")
-        segments = [segment for segment in normalized.split("/") if segment]
-        if any(segment == ".." for segment in segments):
-            return "path_outside_workspace"
+        # Resolve "." and ".." lexically (no filesystem access). A relative path
+        # that uses ".." but normalizes back inside the workspace must still
+        # proceed (Bug 5), so the deny is driven by the normalized result rather
+        # than the mere presence of a ".." segment.
+        resolved = posixpath.normpath(normalized)
+        segments = [
+            segment for segment in resolved.split("/") if segment and segment != "."
+        ]
         lowered_segments = [segment.lower() for segment in segments]
+        # Secret check first: a secret target keeps the more specific
+        # secret_path_blocked reason even when the path is also absolute or
+        # escaping, so existing secret-path hard-deny evidence is preserved.
         if any(segment in _SECRET_PATH_SEGMENTS for segment in lowered_segments):
             return "secret_path_blocked"
-        basename = lowered_segments[-1] if lowered_segments else path.lower()
+        basename = lowered_segments[-1] if lowered_segments else ""
         if basename in _SECRET_PATH_FILENAMES:
             return "secret_path_blocked"
         if basename.startswith(_SECRET_PATH_PREFIXES) or basename.endswith(_SECRET_PATH_SUFFIXES):
             return "secret_path_blocked"
+        # Bug 4: an absolute path escapes the workspace boundary the proxy
+        # enforces for relative filesystem tool arguments; hard-deny locally.
+        if self._is_absolute_path(normalized):
+            return "path_outside_workspace"
+        # Bug 5: only deny a relative path that still escapes after normalization.
+        if resolved == ".." or resolved.startswith("../"):
+            return "path_outside_workspace"
         return None
+
+    @staticmethod
+    def _is_absolute_path(normalized: str) -> bool:
+        """Return True for POSIX-absolute (``/...``), UNC (``//...``), or
+        Windows drive-qualified (``C:/...``, or ``C:foo`` after backslash
+        normalization) paths.
+
+        ``normalized`` already has backslashes folded to ``/``.
+        ``posixpath.isabs`` would miss Windows drive paths on a POSIX host, so
+        the drive case is detected explicitly to keep the guard
+        platform-independent.
+        """
+
+        if normalized.startswith("/"):
+            return True
+        return len(normalized) >= 2 and normalized[1] == ":" and normalized[0].isalpha()
 
     def _classify_for_local_metadata(self, message: Mapping[str, Any]) -> ClassifiedToolCall | None:
         if self.classifier is None:

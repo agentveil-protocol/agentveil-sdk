@@ -652,7 +652,7 @@ def test_run_passthrough_forwards_local_allow_without_backend_or_gate(tmp_path, 
             "jsonrpc": "2.0",
             "id": "call-1",
             "method": "tools/call",
-            "params": {"name": "read_file", "arguments": {"path": "/tmp/a.txt"}},
+            "params": {"name": "read_file", "arguments": {"path": "a.txt"}},
         })
     )
     client_out = io.StringIO()
@@ -693,7 +693,7 @@ def test_run_returns_approval_required_without_waiting_or_forwarding(tmp_path, m
             "jsonrpc": "2.0",
             "id": "call-1",
             "method": "tools/call",
-            "params": {"name": "write_file", "arguments": {"path": "/tmp/a.txt"}},
+            "params": {"name": "write_file", "arguments": {"path": "a.txt"}},
         })),
         out=client_out,
     ) == 0
@@ -891,6 +891,97 @@ def test_path_traversal_write_file_fails_before_approval(tmp_path, monkeypatch):
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
 
 
+def test_absolute_outside_path_hard_denies_before_approval(tmp_path, monkeypatch):
+    # Bug 4: an absolute path escapes the workspace boundary the proxy enforces
+    # for relative filesystem tool arguments. It must hard-deny locally before
+    # any approval flow. The assertions below cover response fields, pending
+    # count, and downstream log shape under an approval policy.
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    _set_downstream(init.config_path, _filesystem_schema_downstream(tmp_path), log_path=log_path)
+    _set_approval_policy(init.config_path, server="fake-downstream", tool="write_file")
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("path policy must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line({
+            "jsonrpc": "2.0",
+            "id": "call-1",
+            "method": "tools/call",
+            "params": {
+                "name": "write_file",
+                "arguments": {"path": "/etc/outside-abs-regression.txt", "content": "x"},
+            },
+        })),
+        out=client_out,
+    ) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    assert response["error"]["code"] == JSONRPC_POLICY_BLOCKED
+    assert response["error"]["data"] == {
+        "status": "policy_denied",
+        "reason": "path_outside_workspace",
+    }
+    assert "approval_url" not in response["error"]["data"]
+    assert "record_id" not in response["error"]["data"]
+    assert _pending_approval_count(home) == 0
+    # Downstream log contains only the schema-probe tools/list.
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
+
+
+def test_normalized_inside_path_is_not_falsely_denied(tmp_path, monkeypatch):
+    # Bug 5: a relative path that uses ".." but normalizes back inside the
+    # workspace must NOT be hard denied as path_outside_workspace. It proceeds to
+    # the existing policy path -- here an approval policy -- reaching the approval
+    # flow rather than a local hard-deny.
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    _set_downstream(init.config_path, _filesystem_schema_downstream(tmp_path), log_path=log_path)
+    _set_approval_policy(init.config_path, server="fake-downstream", tool="write_file")
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("local approval must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line({
+            "jsonrpc": "2.0",
+            "id": "call-1",
+            "method": "tools/call",
+            "params": {
+                "name": "write_file",
+                "arguments": {
+                    "path": "subdir/../notes-inside-regression.md",
+                    "content": "x",
+                },
+            },
+        })),
+        out=client_out,
+    ) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    # Reaches the approval policy path instead of a local hard-deny.
+    assert response["error"]["code"] == JSONRPC_APPROVAL_REQUIRED
+    assert response["error"]["data"]["status"] == "approval_required"
+    assert response["error"]["data"]["reason"] == "local_approval_required"
+    assert response["error"]["data"]["record_status"] == "pending"
+    assert response["error"]["data"]["approval_url"].startswith("http://127.0.0.1:")
+    # And it was not falsely classified as escaping the workspace.
+    assert response["error"]["data"].get("reason") != "path_outside_workspace"
+
+
 def test_secret_read_file_path_fails_before_downstream_read(tmp_path, monkeypatch):
     home = tmp_path / "avp-home"
     init = init_proxy(home=home, agent_name="proxy", plaintext=True)
@@ -948,7 +1039,7 @@ def test_secret_path_in_paths_list_blocks_broadened_tool(tmp_path):
             "method": "tools/call",
             "params": {
                 "name": "read_multiple_files",
-                "arguments": {"paths": ["/tmp/ok.txt", "/home/user/.ssh/id_rsa"]},
+                "arguments": {"paths": ["ok.txt", "/home/user/.ssh/id_rsa"]},
             },
         })),
         client_out,
@@ -995,7 +1086,7 @@ def test_secret_destination_blocks_move_file(tmp_path):
             "params": {
                 "name": "move_file",
                 "arguments": {
-                    "source": "/tmp/ok.txt",
+                    "source": "ok.txt",
                     "destination": "/home/user/.aws/config",
                 },
             },
@@ -1039,7 +1130,7 @@ def test_normal_paths_allowed_for_broadened_tool(tmp_path):
             "method": "tools/call",
             "params": {
                 "name": "read_multiple_files",
-                "arguments": {"paths": ["/tmp/a.txt", "workspace/notes.md"]},
+                "arguments": {"paths": ["docs/a.txt", "workspace/notes.md"]},
             },
         })),
         client_out,
@@ -1498,7 +1589,7 @@ def test_classifier_callback_exception_does_not_break_passthrough(tmp_path):
             "jsonrpc": "2.0",
             "id": "call-1",
             "method": "tools/call",
-            "params": {"name": "read_file", "arguments": {"path": "/tmp/a.txt"}},
+            "params": {"name": "read_file", "arguments": {"path": "a.txt"}},
         })),
         client_out,
     ) == 0
