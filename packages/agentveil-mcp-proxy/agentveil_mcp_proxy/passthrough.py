@@ -38,6 +38,7 @@ from typing import Any, Callable, Deque, Mapping, TextIO
 
 from agentveil_mcp_proxy.approval import ApprovalFlowError, ApprovalOutcome
 from agentveil_mcp_proxy.classification import ClassifiedToolCall, ToolCallClassifier
+from agentveil_mcp_proxy.evidence import ApprovalEvidenceError
 from agentveil_mcp_proxy.policy import PolicyDecision, ProxyConfig, ToolSurfaceMode
 from agentveil_mcp_proxy.tool_schema_validation import (
     ToolSchemaCache,
@@ -721,7 +722,9 @@ class McpPassthrough:
             if invalid_error is not None:
                 return [invalid_error] if has_id else []
             classification = self._classify_for_local_metadata(message)
-            path_error = self._unsafe_file_path_error_response(message, request_id)
+            path_error = self._unsafe_file_path_error_response(
+                message, request_id, classification
+            )
             if path_error is not None:
                 return [path_error] if has_id else []
             policy_error, approval_outcome = self._policy_error_response(classification, request_id)
@@ -996,6 +999,7 @@ class McpPassthrough:
         self,
         message: Mapping[str, Any],
         request_id: Any,
+        classification: ClassifiedToolCall | None = None,
     ) -> dict[str, Any] | None:
         if message.get("method") != "tools/call":
             return None
@@ -1020,8 +1024,60 @@ class McpPassthrough:
                 "reason": reason,
                 "tool": tool,
             })
+            self._record_pre_approval_deny_evidence(classification, reason)
             return _policy_denied_error(request_id, reason=reason)
         return None
+
+    def _record_pre_approval_deny_evidence(
+        self,
+        classification: ClassifiedToolCall | None,
+        reason: str,
+    ) -> None:
+        """Persist terminal evidence for a pre-approval hard-deny.
+
+        Best-effort: the call is already being denied, so an evidence-store
+        failure must not change the deny outcome. Only the privacy-preserving
+        hashes already present on the local classification are recorded, without
+        raw arguments, file paths, or secrets. Requires both a
+        successful local classification and a configured approval manager (which
+        owns the evidence store); without either, the in-memory security event
+        remains the only record.
+        """
+
+        manager = self.approval_manager
+        if manager is None or not isinstance(classification, ClassifiedToolCall):
+            return
+        store = getattr(manager, "evidence_store", None)
+        if store is None:
+            return
+        evaluation = classification.policy_evaluation
+        try:
+            store.record_terminal_deny(
+                request_id=str(uuid.uuid4()),
+                session_id=getattr(manager, "session_id", None) or str(uuid.uuid4()),
+                client_id=getattr(manager, "client_id", None),
+                downstream_server=classification.server,
+                tool_name=classification.tool,
+                risk_class=classification.risk_class.value,
+                resource_hash=classification.resource_hash,
+                payload_hash=classification.payload_hash,
+                policy_id=evaluation.policy_id,
+                policy_rule_id=evaluation.policy_rule_id,
+                policy_context_hash=evaluation.policy_context_hash,
+                created_at=int(time.time()),
+                reason=reason,
+            )
+        except ApprovalEvidenceError:
+            # Evidence persistence is best-effort: the deny response has already
+            # been selected. Record a sanitized signal and let the policy_denied
+            # response proceed. record_terminal_deny raises ApprovalEvidenceError
+            # for store write / transition failures.
+            self._record_security_event({
+                "type": "deny_evidence_persistence_failed",
+                "action": "blocked_pre_approval",
+                "reason": reason,
+                "tool": classification.tool,
+            })
 
     def _candidate_file_paths(self, arguments: Mapping[str, Any]) -> list[str]:
         candidates: list[str] = []
