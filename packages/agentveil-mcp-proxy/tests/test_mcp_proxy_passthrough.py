@@ -46,12 +46,30 @@ def _responses(text: str) -> list[dict]:
 
 
 def _pending_approval_count(home: Path) -> int:
+    # Counts records still awaiting a decision (status='pending'), matching this
+    # helper's approval-prompt call sites. Terminal evidence rows live in the
+    # same table but are not pending approvals.
     evidence_path = home / "mcp-proxy" / "evidence.sqlite"
     if not evidence_path.exists():
         return 0
     with sqlite3.connect(evidence_path) as conn:
-        row = conn.execute("SELECT COUNT(*) FROM pending_approvals").fetchone()
+        row = conn.execute(
+            "SELECT COUNT(*) FROM pending_approvals WHERE status = 'pending'"
+        ).fetchone()
     return int(row[0])
+
+
+def _evidence_records(home: Path) -> list[dict[str, object]]:
+    # Read evidence rows for terminal-record assertions.
+    evidence_path = home / "mcp-proxy" / "evidence.sqlite"
+    if not evidence_path.exists():
+        return []
+    with sqlite3.connect(evidence_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM pending_approvals ORDER BY created_at, request_id"
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def _padded_json_line(message: dict, target_bytes: int) -> str:
@@ -1154,6 +1172,119 @@ def test_secret_delete_file_fails_before_approval(tmp_path, monkeypatch):
     }
     assert _pending_approval_count(home) == 0
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
+
+
+def test_secret_path_hard_deny_writes_terminal_blocked_evidence(tmp_path, monkeypatch):
+    # Bug 3 regression coverage: hard-deny evidence, approval fields, and raw
+    # path privacy. claim-check: allow tested terminal/policy block assertions
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    _set_downstream(init.config_path, _normal_downstream(tmp_path), log_path=log_path)
+    _set_allow_policy(init.config_path, server="fake-downstream", tool="read_file")
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("path policy must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line({
+            "jsonrpc": "2.0",
+            "id": "call-1",
+            "method": "tools/call",
+            "params": {"name": "read_file", "arguments": {"path": ".env.local"}},
+        })),
+        out=client_out,
+    ) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    assert response["error"]["code"] == JSONRPC_POLICY_BLOCKED
+    assert response["error"]["data"] == {
+        "status": "policy_denied",
+        "reason": "secret_path_blocked",
+    }
+    # Approval prompt fields stay absent for the hard-deny response.
+    assert "approval_url" not in response["error"]["data"]
+    assert "record_id" not in response["error"]["data"]
+    assert _pending_approval_count(home) == 0
+
+    # Terminal evidence record carrying the deny reason.
+    records = _evidence_records(home)
+    assert len(records) == 1
+    record = records[0]
+    assert record["status"] == "blocked"  # claim-check: allow tested status
+    assert record["error_class"] == "secret_path_blocked"
+    assert record["result_status"] == "blocked"  # claim-check: allow tested status
+    assert record["tool_name"] == "read_file"
+    assert record["expires_at"] is None
+    assert record["approval_token_hash"] is None
+    assert record["decision_audit_id"] is None
+    # Privacy check: persisted record omits the raw secret path.
+    assert ".env.local" not in json.dumps(record)
+    assert str(record["resource_hash"]).startswith("sha256:")
+    # Downstream receives no file-read call.
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
+
+
+def test_schema_deny_records_documented_validation_event(tmp_path):
+    # Bug 3: a schema-deny (write_file called with file_path instead of path)
+    # records a documented validation event: argument NAMES only, no values.
+    # claim-check: allow tested validation-event privacy assertions
+    passthrough = McpPassthrough(
+        DownstreamConfig(
+            command=sys.executable,
+            args=("-u", str(_normal_downstream(tmp_path))),
+            name="fake-downstream",
+        ),
+    )
+    write_file_schema = {
+        "type": "object",
+        "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+        "required": ["path"],
+        "additionalProperties": False,
+    }
+    seed_tool_schemas(passthrough, [tool_entry("write_file", write_file_schema)])
+    client_out = io.StringIO()
+
+    assert passthrough.run_stdio(
+        io.StringIO(_json_line({
+            "jsonrpc": "2.0",
+            "id": "call-1",
+            "method": "tools/call",
+            "params": {
+                "name": "write_file",
+                "arguments": {
+                    "file_path": "config/prod.txt",
+                    "content": "deadbeef-secret-value",
+                },
+            },
+        })),
+        client_out,
+    ) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    assert response["error"]["code"] == JSONRPC_INVALID_PARAMS
+    assert response["error"]["data"]["status"] == "invalid_tool_arguments"
+    assert "approval_url" not in response["error"]["data"]
+    # Documented validation event: terminal pre-approval block, arg NAMES only.
+    assert passthrough.security_events == (
+        {
+            "type": "invalid_tool_arguments",
+            "action": "blocked_pre_approval",
+            "reason": "invalid_tool_arguments",
+            "tool": "write_file",
+            "missing_arguments": ["path"],
+            "unknown_arguments": ["file_path"],
+        },
+    )
+    # Privacy check: the raw argument VALUE is absent from the event stream.
+    assert "deadbeef-secret-value" not in json.dumps(passthrough.security_events)
+    # Not forwarded downstream.
+    assert "called" not in client_out.getvalue()
 
 
 def test_run_passthrough_does_not_construct_avp_agent_or_call_backend(tmp_path, monkeypatch):

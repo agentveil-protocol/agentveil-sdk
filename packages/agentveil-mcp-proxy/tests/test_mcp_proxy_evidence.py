@@ -333,6 +333,79 @@ def test_write_pending_rejects_non_null_expires_at_before_created_at(tmp_path):
             store.write_pending(_record("req-invalid-expiry", created_at=100, expires_at=100))
 
 
+def test_record_terminal_deny_writes_single_blocked_record(tmp_path):
+    # Bug 3 regression coverage for terminal deny evidence and approval fields.
+    # claim-check: allow tested terminal status and pending-count assertions
+    with _store(tmp_path) as store:
+        returned = store.record_terminal_deny(
+            request_id="deny-1",
+            session_id="session-1",
+            client_id="cursor:session-7",
+            downstream_server="filesystem",
+            tool_name="read_file",
+            risk_class="read",
+            resource_hash=RESOURCE_HASH,
+            payload_hash=PAYLOAD_HASH,
+            policy_id="filesystem-read",
+            policy_rule_id="filesystem-read",
+            policy_context_hash=POLICY_CONTEXT_HASH,
+            created_at=1_700_000_000,
+            reason="secret_path_blocked",
+        )
+
+        assert returned.status == ApprovalStatus.BLOCKED.value  # claim-check: allow tested status
+        assert returned.error_class == "secret_path_blocked"
+        assert returned.result_status == ApprovalStatus.BLOCKED.value  # claim-check: allow tested status
+        assert returned.expires_at is None
+        # A hard-deny sets no approval-prompt fields.
+        assert returned.approval_token_hash is None
+        assert returned.approval_decided_by is None
+        assert returned.decision_audit_id is None
+
+        persisted = store.get_pending("deny-1")
+        assert persisted is not None
+        assert persisted.status == ApprovalStatus.BLOCKED.value  # claim-check: allow tested status
+
+    with sqlite3.connect(tmp_path / "evidence.sqlite") as conn:
+        total = conn.execute("SELECT COUNT(*) FROM pending_approvals").fetchone()[0]
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM pending_approvals WHERE status = 'pending'"
+        ).fetchone()[0]
+    assert total == 1
+    assert pending == 0
+
+
+def test_record_terminal_deny_rolls_back_on_transition_error(tmp_path, monkeypatch):
+    # Regression coverage: transition failure rolls the evidence write back.
+    # claim-check: allow pending-count assertion for rollback test
+    with _store(tmp_path) as store:
+        def fail_transition_fields(_updates):
+            raise ApprovalEvidenceTransitionError("forced transition failure")
+
+        monkeypatch.setattr(store, "_validate_transition_fields", fail_transition_fields)
+
+        with pytest.raises(ApprovalEvidenceTransitionError, match="forced transition failure"):
+            store.record_terminal_deny(
+                request_id="deny-rollback",
+                session_id="session-1",
+                client_id="cursor:session-7",
+                downstream_server="filesystem",
+                tool_name="read_file",
+                risk_class="read",
+                resource_hash=RESOURCE_HASH,
+                payload_hash=PAYLOAD_HASH,
+                policy_id="filesystem-read",
+                policy_rule_id="filesystem-read",
+                policy_context_hash=POLICY_CONTEXT_HASH,
+                created_at=1_700_000_000,
+                reason="secret_path_blocked",
+            )
+
+    with sqlite3.connect(tmp_path / "evidence.sqlite") as conn:
+        total = conn.execute("SELECT COUNT(*) FROM pending_approvals").fetchone()[0]
+    assert total == 0
+
+
 def test_write_pending_is_durable_before_return(tmp_path):
     db_path = tmp_path / "evidence.sqlite"
     script_path = tmp_path / "write_and_die.py"
