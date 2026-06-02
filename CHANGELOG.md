@@ -31,6 +31,55 @@ This is not a third-party conformance certification.
   (`verify_signed_jcs`).
 - `decision_receipt/3` verification behavior is unchanged from 0.7.19.
 
+### MCP Proxy package
+
+The separately packaged `agentveil-mcp-proxy` package is also released as
+`0.7.20` on PyPI. This proxy release focuses on safer pre-approval handling,
+local evidence records for denied tool calls, and policy-pack coverage for
+common MCP server families.
+
+### MCP Proxy fixed
+- Fixed the non-blocking approval retry path so an approved tool call can be
+  retried immediately without creating a second pending approval.
+- Fixed unknown or non-advertised MCP tools so the negative-test path returns a
+  pre-approval policy denial.
+- Fixed invalid tool arguments so schema-denied calls are rejected before
+  approval.
+- Added terminal, privacy-preserving evidence records for unknown-tool,
+  schema-deny, and filesystem path hard-deny paths.
+- Fixed filesystem path handling so absolute paths and traversal paths are
+  hard-denied before approval, while lexically normalized inside paths such as
+  `subdir/../notes.md` are no longer falsely denied.
+- Added Git MCP tool classification and a `git` policy pack, including CLI
+  `--policy-pack git` selection.
+- Added a `fetch` policy pack and CLI `--policy-pack fetch` selection. Fetch
+  calls to cloud metadata/link-local targets such as `169.254.169.254` are
+  classified for local policy blocking.
+
+### MCP Proxy verification
+- Verified a clean PyPI install of `agentveil-mcp-proxy==0.7.20` with
+  `agentveil==0.7.20`.
+- Verified a persistent product-path smoke using the PyPI package: filesystem
+  `tools/list`, valid relative `write_file` approval and immediate retry,
+  unknown-tool deny, schema-deny, absolute path deny, traversal deny, and
+  normalized-inside approval each exercised the live proxy process.
+- Verified final local evidence counts from the smoke evidence summary:
+  deny records `4`, approved records `2`, executed records `2`, and pending
+  records `0`.
+- Verified strict evidence bundle verification with the proxy agent DID as the
+  trusted signer DID. The smoke bundle did not contain signed runtime receipts
+  (`signed_receipt_count=0`).
+- Verified direct product gates for the Git and Fetch policy packs. The live
+  console smoke used a filesystem downstream only, so Git and Fetch were not
+  re-verified through that console path.
+
+### MCP Proxy follow-ups
+- If a future smoke bundle contains signed runtime receipts, strict verification
+  should also include the backend signer DIDs or configured trust anchors.
+- Fetch metadata-IP blocking was verified through the direct policy gate. If
+  operators require terminal evidence parity for metadata local-policy blocks,
+  that should be handled as a separate follow-up.
+
 ## [0.7.19] - 2026-05-31
 
 PyPI package alignment release for the MCP Proxy split.
