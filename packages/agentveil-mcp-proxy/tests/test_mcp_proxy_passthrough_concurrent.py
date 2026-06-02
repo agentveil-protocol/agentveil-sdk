@@ -38,7 +38,7 @@ def _tool_call(request_id: str, tool: str = "write_file") -> str:
         "jsonrpc": "2.0",
         "id": request_id,
         "method": "tools/call",
-        "params": {"name": tool, "arguments": {"path": f"/tmp/{request_id}.txt"}},
+        "params": {"name": tool, "arguments": {"path": f"{request_id}.txt"}},
     })
 
 
@@ -328,7 +328,7 @@ def test_classifier_exception_on_tool_call_fails_closed_without_forwarding() -> 
     assert passthrough.classifier_errors == 1
     # claim-check: allow "never" describes the asserted sanitization; checked below
     # Sanitized: raw tool arguments never appear in the error response.
-    assert "/tmp/call-1.txt" not in json.dumps(responses[0])
+    assert "call-1.txt" not in json.dumps(responses[0])
 
 
 def test_classifier_exception_on_non_tool_call_still_forwards() -> None:
@@ -517,7 +517,7 @@ def test_ask_backend_without_gate_factory_fails_closed() -> None:
     assert error["data"] == {"status": "blocked", "reason": "runtime_gate_not_configured"}
     # claim-check: allow "blocked"/"never" describe the asserted sanitized error payload
     # Sanitized: raw tool arguments never appear in the blocked response.
-    assert "/tmp/call-1.txt" not in json.dumps(responses[0])
+    assert "call-1.txt" not in json.dumps(responses[0])
 
 
 def test_ask_backend_without_gate_factory_notification_emits_no_response() -> None:
