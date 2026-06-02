@@ -448,8 +448,9 @@ def test_post_after_approve_returns_410_gone():
     try:
         url = server.register(_prompt())
         with httpx.Client() as client:
-            csrf = _get_csrf(client, url)
+            csrf, cookie = _get_csrf_and_cookie(client, url)
             assert _post_decision(client, url, decision="approve", csrf=csrf).status_code == 200
+        with httpx.Client(headers={"Cookie": cookie}) as client:
             assert _post_decision(client, url, decision="deny", csrf=csrf).status_code == 410
     finally:
         server.stop()
@@ -461,8 +462,9 @@ def test_post_after_deny_returns_410_gone():
     try:
         url = server.register(_prompt())
         with httpx.Client() as client:
-            csrf = _get_csrf(client, url)
+            csrf, cookie = _get_csrf_and_cookie(client, url)
             assert _post_decision(client, url, decision="deny", csrf=csrf).status_code == 200
+        with httpx.Client(headers={"Cookie": cookie}) as client:
             assert _post_decision(client, url, decision="approve", csrf=csrf).status_code == 410
     finally:
         server.stop()
