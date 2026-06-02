@@ -1378,6 +1378,136 @@ def test_schema_deny_records_documented_validation_event(tmp_path):
     assert "called" not in client_out.getvalue()
 
 
+def test_unknown_tool_hard_deny_writes_terminal_blocked_evidence(tmp_path, monkeypatch):
+    # Pre-approval deny evidence: a tool name absent from the downstream
+    # tools/list surface is blocked before approval AND records exactly one
+    # terminal evidence row, without storing raw arguments.
+    # claim-check: allow tested terminal/policy block assertions
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    _set_downstream(init.config_path, _normal_downstream(tmp_path), log_path=log_path)
+    # An allow policy isolates the unknown-tool gate: a known tool would forward.
+    _set_allow_policy(init.config_path, server="fake-downstream", tool="read_file")
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("unknown-tool deny must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line({
+            "jsonrpc": "2.0",
+            "id": "call-1",
+            "method": "tools/call",
+            "params": {
+                "name": "totally_unknown_tool",
+                "arguments": {"secret": "deadbeef-secret-value"},
+            },
+        })),
+        out=client_out,
+    ) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    assert response["error"]["code"] == JSONRPC_POLICY_BLOCKED
+    assert response["error"]["data"] == {"status": "blocked", "reason": "unknown_tool"}  # claim-check: allow "blocked" is expected JSON-RPC error data vocabulary.
+    # No approval surface is offered for the hard-deny.
+    assert "approval_url" not in response["error"]["data"]
+    assert "record_id" not in response["error"]["data"]
+    assert _pending_approval_count(home) == 0
+
+    # Exactly one terminal evidence record carrying the deny reason.
+    records = _evidence_records(home)
+    assert len(records) == 1
+    record = records[0]
+    assert record["status"] == "blocked"  # claim-check: allow tested status
+    assert record["error_class"] == "unknown_tool"
+    assert record["result_status"] == "blocked"  # claim-check: allow tested status
+    assert record["tool_name"] == "totally_unknown_tool"
+    assert record["downstream_server"] == "fake-downstream"
+    assert record["expires_at"] is None
+    assert record["approval_token_hash"] is None
+    assert record["decision_audit_id"] is None
+    # No resource is extracted before classification.
+    assert record["resource_hash"] is None
+    assert str(record["payload_hash"]).startswith("sha256:")
+    # Privacy assertion: the representative raw argument value is absent.
+    assert "deadbeef-secret-value" not in json.dumps(record)
+    # Negative-path assertion: downstream receives only the schema-probe tools/list.
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
+
+
+def test_schema_deny_writes_terminal_blocked_evidence(tmp_path, monkeypatch):
+    # Pre-approval deny evidence: arguments that fail the downstream tool schema
+    # are blocked before approval AND record exactly one terminal evidence row,
+    # without storing raw argument values.
+    # claim-check: allow tested terminal/policy block assertions
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    _set_downstream(
+        init.config_path,
+        _filesystem_schema_downstream(tmp_path),
+        log_path=log_path,
+    )
+    # An allow policy isolates the schema gate: valid arguments would forward.
+    _set_allow_policy(init.config_path, server="fake-downstream", tool="write_file")
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("schema deny must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line({
+            "jsonrpc": "2.0",
+            "id": "call-1",
+            "method": "tools/call",
+            "params": {
+                "name": "write_file",
+                "arguments": {
+                    "file_path": "config/prod.txt",
+                    "content": "deadbeef-secret-value",
+                },
+            },
+        })),
+        out=client_out,
+    ) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    assert response["error"]["code"] == JSONRPC_INVALID_PARAMS
+    assert response["error"]["data"]["status"] == "invalid_tool_arguments"
+    # No approval surface is offered for the schema deny.
+    assert "approval_url" not in response["error"]["data"]
+    assert "record_id" not in response["error"]["data"]
+    assert _pending_approval_count(home) == 0
+
+    # Exactly one terminal evidence record carrying the deny reason.
+    records = _evidence_records(home)
+    assert len(records) == 1
+    record = records[0]
+    assert record["status"] == "blocked"  # claim-check: allow tested status
+    assert record["error_class"] == "invalid_tool_arguments"
+    assert record["result_status"] == "blocked"  # claim-check: allow tested status
+    assert record["tool_name"] == "write_file"
+    assert record["downstream_server"] == "fake-downstream"
+    assert record["expires_at"] is None
+    assert record["approval_token_hash"] is None
+    assert record["resource_hash"] is None
+    assert str(record["payload_hash"]).startswith("sha256:")
+    # Privacy: neither the raw argument value nor the bad argument name's value
+    # reaches the persisted record.
+    assert "deadbeef-secret-value" not in json.dumps(record)
+    # Negative-path assertion: downstream receives only the schema-probe tools/list.
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
+
+
 def test_run_passthrough_does_not_construct_avp_agent_or_call_backend(tmp_path, monkeypatch):
     home = tmp_path / "avp-home"
     init = init_proxy(home=home, agent_name="proxy", plaintext=True)
