@@ -217,28 +217,42 @@ class ApprovalManager:
         thread.start()
 
     def _await_decision(self, request_id: str, timeout: int) -> ApprovalOutcome:
-        """Wait for a local approval decision and persist the resulting state."""
+        """Wait for a local approval decision and persist the resulting state.
 
+        The blocking wait is sliced into bounded (<=60s) polls for
+        responsiveness, but the overall wait honors the full configured
+        ``approval_timeout_seconds`` deadline. A non-HANG timeout only expires
+        the pending record once that real deadline elapses -- a slow (>60s)
+        human approval must not be expired after the first poll slice, otherwise
+        the later approval may fail to make the record reusable and the client
+        retry opens a fresh pending approval (the approval retry loop).
+        """
+
+        deadline = time.monotonic() + float(timeout)
         decision = None
         while decision is None:
+            if self.config.approval.on_timeout is TimeoutAction.HANG:
+                slice_timeout = 60.0
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    try:
+                        self.evidence_store.transition(
+                            request_id,
+                            ApprovalStatus.EXPIRED.value,
+                            error_class="approval_timeout",
+                        )
+                    except ApprovalEvidenceTransitionError:
+                        pass
+                    self.approval_server.unregister(request_id)
+                    return ApprovalOutcome(
+                        request_id, ApprovalStatus.EXPIRED.value, "approval_timeout"
+                    )
+                slice_timeout = min(remaining, 60.0)
             decision = self.approval_server.wait_for_decision(
                 request_id,
-                timeout=min(float(timeout), 60.0),
+                timeout=slice_timeout,
             )
-            if decision is not None:
-                break
-            if self.config.approval.on_timeout is TimeoutAction.HANG:
-                continue
-            try:
-                self.evidence_store.transition(
-                    request_id,
-                    ApprovalStatus.EXPIRED.value,
-                    error_class="approval_timeout",
-                )
-            except ApprovalEvidenceTransitionError:
-                pass
-            self.approval_server.unregister(request_id)
-            return ApprovalOutcome(request_id, ApprovalStatus.EXPIRED.value, "approval_timeout")
         if decision.decision == "approve":
             return self._approve(
                 request_id,
