@@ -1971,6 +1971,39 @@ def test_nonblocking_watcher_honors_full_timeout_before_expiring(tmp_path, monke
         store.close()
 
 
+def test_await_decision_returns_approved_when_post_handler_persisted_first(
+    tmp_path, monkeypatch
+):
+    """POST sync handler may finalize evidence before the waiter reads _decisions."""
+
+    config = _config(policy_rule=_write_rule(), approval_timeout_seconds=1, on_timeout="deny")
+    manager, store, server, _cli = _manager(tmp_path, config=config, wait_for_decision=False)
+    try:
+        outcome = manager.request_approval(
+            _classification(config), reason="local_approval_required"
+        )
+        assert outcome.status == ApprovalStatus.PENDING.value
+        with httpx.Client() as client:
+            csrf = _get_csrf(client, server.approval_url(outcome.request_id))
+            assert _post_decision(
+                client,
+                server.approval_url(outcome.request_id),
+                decision="approve",
+                csrf=csrf,
+            ).status_code == 200
+        assert store.get_pending(outcome.request_id).status == ApprovalStatus.APPROVED.value
+
+        monkeypatch.setattr(server, "wait_for_decision", lambda request_id, *, timeout: None)
+
+        result = manager._await_decision(outcome.request_id, timeout=1)
+        assert result.status == ApprovalStatus.APPROVED.value
+        assert result.reason == "user_approved"
+        assert result.status != ApprovalStatus.EXPIRED.value
+    finally:
+        server.stop()
+        store.close()
+
+
 def _wait_for_status(store, request_id, status, *, timeout=2.0):
     deadline = time.monotonic() + timeout
     record = store.get_pending(request_id)
@@ -1980,10 +2013,11 @@ def _wait_for_status(store, request_id, status, *, timeout=2.0):
     return record
 
 
-def test_nonblocking_retry_after_approval_executes_downstream(tmp_path):
-    """Live-console retry path: first call returns approval_required, operator
-    approves, and the identical retry executes downstream by consuming the exact
-    grant -- without creating a second pending approval.
+def test_immediate_retry_after_approve_post_matches_live_console(tmp_path):
+    """Regression for VPS/console race: POST approve then retry immediately.
+
+    Do not wait for the parent evidence row to reach APPROVED before retrying.
+    Prior tests that called ``_wait_for_status`` masked this race.
     """
 
     config = _config(policy_rule=_write_rule())
@@ -2016,13 +2050,10 @@ def test_nonblocking_retry_after_approval_executes_downstream(tmp_path):
         parent_id = prompts[0].request_id
         with httpx.Client() as client:
             csrf = _get_csrf(client, server.approval_url(parent_id))
-            _post_decision(
+            response = _post_decision(
                 client, server.approval_url(parent_id), decision="approve", csrf=csrf
             )
-
-        parent = _wait_for_status(store, parent_id, ApprovalStatus.APPROVED.value)
-        assert parent is not None and parent.status == ApprovalStatus.APPROVED.value
-        assert parent.approval_scope == "exact"
+        assert response.status_code == 200
 
         retry = passthrough.handle_client_line(_tool_call())
         assert len(retry) == 1
@@ -2037,6 +2068,53 @@ def test_nonblocking_retry_after_approval_executes_downstream(tmp_path):
         ]
         assert len(children) == 1, "retry must reuse the grant, not open a new prompt"
         assert children[0].status == ApprovalStatus.EXECUTED.value
+        parent = store.get_pending(parent_id)
+        assert parent is not None
+        assert parent.status == ApprovalStatus.APPROVED.value
+        for record in store.list_records():
+            blob = f"{record.tool_name}:{record.payload_hash}:{record.status}"
+            assert SECRET not in blob
+    finally:
+        passthrough.stop()
+        server.stop()
+        store.close()
+
+
+def test_immediate_retry_materializes_when_post_handler_disabled(tmp_path):
+    """Grant flush on retry even without the POST sync handler."""
+
+    config = _config(policy_rule=_write_rule())
+    manager, store, server, _cli = _manager(
+        tmp_path, config=config, wait_for_decision=False
+    )
+    server.set_decision_handler(None)
+    log_path = tmp_path / "downstream.log"
+    passthrough = McpPassthrough(
+        DownstreamConfig(
+            command=sys.executable,
+            args=("-u", str(_approval_downstream(tmp_path, log_path))),
+            name="github",
+            env={"DOWNSTREAM_LOG": str(log_path)},
+        ),
+        classifier=ToolCallClassifier(config, server_name="github"),
+        approval_manager=manager,
+    )
+    passthrough.start()
+    try:
+        first = passthrough.handle_client_line(_tool_call())
+        assert first[0]["error"]["data"]["status"] == "approval_required"
+        deadline = time.monotonic() + 2
+        while not server.pending_prompts() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        parent_id = server.pending_prompts()[0].request_id
+        with httpx.Client() as client:
+            csrf = _get_csrf(client, server.approval_url(parent_id))
+            assert _post_decision(
+                client, server.approval_url(parent_id), decision="approve", csrf=csrf
+            ).status_code == 200
+        retry = passthrough.handle_client_line(_tool_call())
+        assert "result" in retry[0]
+        assert server.pending_prompts() == []
     finally:
         passthrough.stop()
         server.stop()

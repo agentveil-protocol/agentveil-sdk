@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import secrets
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs
 
 
@@ -93,8 +93,23 @@ class ApprovalServer:
         self._decisions: dict[str, ApprovalServerDecision] = {}
         self._decision_events: dict[str, threading.Event] = {}
         self._terminal_requests: dict[str, float] = {}
+        self._decision_handler: Callable[[ApprovalServerDecision], None] | None = None
         self._httpd: _DaemonThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+
+    def set_decision_handler(
+        self,
+        handler: Callable[[ApprovalServerDecision], None] | None,
+    ) -> None:
+        """Register a callback invoked after each approve/deny POST is accepted.
+
+        The handler runs outside the server lock so it can persist evidence
+        before the HTTP response returns. That closes the live-console race
+        where the client retries immediately after POST while the background
+        watcher has not yet written APPROVED to the evidence store.
+        """
+
+        self._decision_handler = handler
 
     @property
     def token_hash(self) -> str:
@@ -174,6 +189,18 @@ class ApprovalServer:
             self._decision_events.pop(request_id, None)
             self._terminal_requests[request_id] = self._terminal_retain_until(prompt)
 
+    def list_decided_request_ids(self) -> tuple[str, ...]:
+        """Return request IDs with a local approve/deny decision not yet unregistered."""
+
+        with self._lock:
+            return tuple(self._decisions.keys())
+
+    def get_decision(self, request_id: str) -> ApprovalServerDecision | None:
+        """Return a recorded local decision, if present."""
+
+        with self._lock:
+            return self._decisions.get(request_id)
+
     def wait_for_decision(self, request_id: str, *, timeout: float) -> ApprovalServerDecision | None:
         """Wait for an approve/deny POST for one request."""
 
@@ -237,6 +264,10 @@ class ApprovalServer:
                 approval_scope=approval_scope,
             )
             self._decision_events.setdefault(request_id, threading.Event()).set()
+            snapshot = self._decisions[request_id]
+            handler = self._decision_handler
+        if handler is not None:
+            handler(snapshot)
 
     def _cookie_value(self) -> str:
         message = f"{self.session_token}:{self._cookie_nonce}".encode("utf-8")
