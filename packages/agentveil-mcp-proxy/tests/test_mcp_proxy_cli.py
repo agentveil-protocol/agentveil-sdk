@@ -1448,6 +1448,49 @@ def test_configure_downstream_named_git_preserves_explicit_git_policy(tmp_path):
     assert config["downstream"]["name"] == "git"
 
 
+def test_main_init_policy_pack_fetch_writes_fetch_policy_id(tmp_path):
+    # Real product path (Bug 2 follow-up): the fetch pack must be reachable
+    # through the CLI argv parser, not only via builtin_policy_pack("fetch").
+    home = tmp_path / "avp-home"
+
+    exit_code = main([
+        "init",
+        "--home", str(home),
+        "--agent-name", "proxy",
+        "--policy-pack", "fetch",
+        "--plaintext",
+    ])
+
+    assert exit_code == 0
+    assert _load(proxy_paths(home).config_path)["policy"]["id"] == "fetch"
+
+
+def test_configure_downstream_named_fetch_preserves_explicit_fetch_policy(tmp_path):
+    # configure-downstream writes only the downstream block; it does not infer or
+    # override the policy pack from the downstream name. The fetch policy chosen
+    # at init survives, confirming explicit --policy-pack fetch is the supported
+    # path (the product has no name-based auto-policy-selection for any pack).
+    home = tmp_path / "avp-home"
+    assert main([
+        "init",
+        "--home", str(home),
+        "--agent-name", "proxy",
+        "--policy-pack", "fetch",
+        "--plaintext",
+    ]) == 0
+
+    result = configure_downstream(
+        name="fetch",
+        command=sys.executable,
+        args=("-m", "example_fetch_mcp_server"),
+        home=home,
+    )
+
+    config = _load(result.config_path)
+    assert config["policy"]["id"] == "fetch"
+    assert config["downstream"]["name"] == "fetch"
+
+
 def test_reissue_grant_creates_new_grant_with_default_ttl(tmp_path):
     home = tmp_path / "avp-home"
     result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)

@@ -1921,7 +1921,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument(
         "--policy-pack",
         default="default",
-        choices=["default", "github", "filesystem", "shell", "git"],
+        choices=["default", "github", "filesystem", "shell", "git", "fetch"],
     )
     init.add_argument(
         "--quickstart-filesystem",

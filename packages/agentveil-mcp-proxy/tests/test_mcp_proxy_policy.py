@@ -486,6 +486,30 @@ def test_git_pack_server_glob_does_not_shadow_github_pack():
     assert result.policy_rule_id != "git-read"
 
 
+def test_fetch_pack_ask_backend_for_public_read():
+    # Bug 2: a benign public fetch (classifier sets risk_class READ) is routed to
+    # the backend, not left on the default rule.
+    result = PolicyEngine(_pack_config("fetch")).evaluate(
+        {"server": "fetch", "tool": "fetch", "risk_class": "read"}
+    )
+    assert result.decision is PolicyDecision.ASK_BACKEND
+    assert result.risk_class is RiskClass.READ
+    assert result.policy_rule_id == "fetch-read"
+
+
+def test_fetch_pack_blocks_ssrf_metadata_production_risk():
+    # Bug 2: a fetch the classifier maps to PRODUCTION (cloud metadata /  # claim-check: allow "PRODUCTION" is policy vocabulary in this test.
+    # link-local SSRF target) gets the local block decision before approval.
+    # claim-check: allow "PRODUCTION" and "production" are expected policy
+    # vocabulary values in this regression test.
+    result = PolicyEngine(_pack_config("fetch")).evaluate(
+        {"server": "fetch", "tool": "fetch", "risk_class": "production"}  # claim-check: allow "production" is policy vocabulary.
+    )
+    assert result.decision is PolicyDecision.BLOCK
+    assert result.risk_class is RiskClass.PRODUCTION  # claim-check: allow "PRODUCTION" is expected enum vocabulary.
+    assert result.policy_rule_id == "fetch-network-block"
+
+
 # --- B9 declared tool surface config ---
 
 def test_tool_surface_dataclass_default_is_off_empty_allow():

@@ -315,6 +315,76 @@ def test_no_official_mcp_git_tool_falls_back_to_unknown():
         assert risk is not RiskClass.UNKNOWN, f"{tool} fell back to UNKNOWN"
 
 
+def test_fetch_safe_public_url_infers_read_not_unknown():
+    # Bug 2: a fetch of a benign public URL must classify as a real read, not
+    # fall through to UNKNOWN.
+    risk = infer_risk_class(
+        "fetch.fetch", tool="fetch", arguments={"url": "https://example.com"}
+    )
+    assert risk is RiskClass.READ
+
+
+def test_fetch_metadata_ip_infers_production_for_ssrf():
+    # Bug 2: a fetch to the cloud instance metadata IP (169.254.169.254) is an
+    # SSRF / credential-exfiltration surface and must be elevated above a public
+    # read so local policy can gate it.
+    risk = infer_risk_class(
+        "fetch.fetch",
+        tool="fetch",
+        arguments={"url": "http://169.254.169.254/latest/meta-data/"},
+    )
+    # claim-check: allow "PRODUCTION" is the existing RiskClass enum value
+    # used here to route the metadata-target case through policy.
+    assert risk is RiskClass.PRODUCTION  # claim-check: allow "PRODUCTION" is expected enum vocabulary.
+
+
+def test_fetch_link_local_and_metadata_host_infer_production():
+    # Range coverage (IPv6 link-local fe80::/10) and the metadata DNS-name path.
+    ipv6 = infer_risk_class(
+        "fetch.fetch", tool="fetch", arguments={"uri": "http://[fe80::1]/x"}
+    )
+    metadata_host = infer_risk_class(
+        "fetch.fetch",
+        tool="fetch",
+        arguments={"url": "http://metadata.google.internal/computeMetadata/v1/"},
+    )
+    # claim-check: allow "PRODUCTION" is expected enum vocabulary in this test.
+    assert ipv6 is RiskClass.PRODUCTION
+    assert metadata_host is RiskClass.PRODUCTION  # claim-check: allow "PRODUCTION" is expected enum vocabulary.
+
+
+def test_non_fetch_tool_with_metadata_url_is_not_network_elevated():
+    # Scoping guard: the SSRF elevation is limited to fetch-family tools. A tool
+    # that merely carries a url argument is classified by its own verb.
+    risk = infer_risk_class(
+        "github.get_issue",
+        tool="get_issue",
+        arguments={"url": "http://169.254.169.254/latest/meta-data/"},
+    )
+    assert risk is RiskClass.READ
+
+
+def test_fetch_classify_routes_safe_read_and_blocks_metadata():
+    # Full classify() path through the built-in fetch policy pack: a public
+    # fetch is a backend-gated read (no longer default/unknown); a metadata-IP
+    # fetch gets the local block decision before approval.
+    classifier = ToolCallClassifier(_config(policy_pack="fetch"), server_name="fetch")
+
+    public = classifier.classify(tool="fetch", arguments={"url": "https://example.com"})
+    assert public.risk_class is RiskClass.READ
+    assert public.policy_evaluation.decision is PolicyDecision.ASK_BACKEND
+    assert public.policy_evaluation.policy_rule_id == "fetch-read"
+
+    metadata = classifier.classify(
+        tool="fetch",
+        arguments={"url": "http://169.254.169.254/latest/meta-data/"},
+    )
+    # claim-check: allow "PRODUCTION" is expected enum vocabulary in this test.
+    assert metadata.risk_class is RiskClass.PRODUCTION
+    assert metadata.policy_evaluation.decision is PolicyDecision.BLOCK
+    assert metadata.policy_evaluation.policy_rule_id == "fetch-network-block"
+
+
 def test_passthrough_classifies_allowed_tools_call_without_changing_downstream_behavior(tmp_path):
     classifier = ToolCallClassifier(_config(), server_name="github")
     seen = []
