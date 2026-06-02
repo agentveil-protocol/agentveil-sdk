@@ -942,10 +942,8 @@ def test_v3_export_bundle_embeds_and_strict_verifies(tmp_path):
         verify_evidence_bundle(bundle)
 
 
-def test_waiting_retry_after_local_approval_executes_downstream(tmp_path):
-    """Live-console WAITING retry: gate returns WAITING_FOR_HUMAN_APPROVAL, the
-    operator approves locally, and the identical retry must consume the exact
-    grant and forward downstream -- not open a second pending approval."""
+def test_waiting_immediate_retry_after_approve_post(tmp_path):
+    """WAITING path + live-console race: POST approve then immediate retry."""
 
     import re
 
@@ -987,7 +985,7 @@ def test_waiting_retry_after_local_approval_executes_downstream(tmp_path):
             with httpx.Client() as client:
                 page = client.get(server.approval_url(parent_id))
                 csrf = re.search(r'name="csrf_token" value="([^"]+)"', page.text).group(1)
-                client.post(
+                response = client.post(
                     server.approval_url(parent_id),
                     data={
                         "decision": "approve",
@@ -995,13 +993,7 @@ def test_waiting_retry_after_local_approval_executes_downstream(tmp_path):
                         "approval_scope": "exact",
                     },
                 )
-
-            deadline = time.monotonic() + 2
-            parent = store.get_pending(parent_id)
-            while parent.status != ApprovalStatus.APPROVED.value and time.monotonic() < deadline:
-                time.sleep(0.01)
-                parent = store.get_pending(parent_id)
-            assert parent.status == ApprovalStatus.APPROVED.value
+            assert response.status_code == 200
 
             retry = passthrough.handle_client_line(_tool_call())
             assert "result" in retry[0], retry[0]

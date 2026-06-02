@@ -14,7 +14,11 @@ import webbrowser
 
 from agentveil_mcp_proxy.approval.headless import HeadlessPolicy
 from agentveil_mcp_proxy.approval.notification import ApprovalNotifier
-from agentveil_mcp_proxy.approval.server import ApprovalPrompt, ApprovalServer
+from agentveil_mcp_proxy.approval.server import (
+    ApprovalPrompt,
+    ApprovalServer,
+    ApprovalServerDecision,
+)
 from agentveil_mcp_proxy.classification import ClassifiedToolCall, sha256_jcs
 from agentveil_mcp_proxy.evidence import (
     ApprovalEvidenceError,
@@ -93,6 +97,8 @@ class ApprovalManager:
         self.approval_grant_private_key_seed = approval_grant_private_key_seed
         self.approval_grant_agent_did = approval_grant_agent_did
         self.approval_grant_mint_failures = 0
+        self._finalize_lock = threading.Lock()
+        self.approval_server.set_decision_handler(self._persist_server_decision)
 
     def request_approval(
         self,
@@ -104,6 +110,7 @@ class ApprovalManager:
         """Persist pending approval, notify the user, and await a bounded decision."""
 
         now = int(time.time())
+        self._materialize_server_decisions(classification, now)
         timeout = self.config.approval.approval_timeout_seconds
         prompt_expires_at = now + timeout
         record_expires_at = (
@@ -229,8 +236,7 @@ class ApprovalManager:
         """
 
         deadline = time.monotonic() + float(timeout)
-        decision = None
-        while decision is None:
+        while True:
             if self.config.approval.on_timeout is TimeoutAction.HANG:
                 slice_timeout = 60.0
             else:
@@ -253,14 +259,41 @@ class ApprovalManager:
                 request_id,
                 timeout=slice_timeout,
             )
-        if decision.decision == "approve":
-            return self._approve(
+            terminal = self._outcome_if_terminal_evidence(request_id)
+            if terminal is not None:
+                return terminal
+            if decision is not None:
+                if decision.decision == "approve":
+                    return self._approve(
+                        request_id,
+                        decision.approval_scope,
+                        int(time.time()),
+                        "user_approved",
+                    )
+                return self._deny(request_id, "user_denied")
+
+    def _outcome_if_terminal_evidence(self, request_id: str) -> ApprovalOutcome | None:
+        """Return an outcome when evidence is already terminal.
+
+        The sync POST handler may persist APPROVED/DENIED and unregister the
+        prompt before this waiter reads ``_decisions``, so ``wait_for_decision``
+        can return ``None`` even though the decision is final in the store.
+        """
+
+        record = self.evidence_store.get_pending(request_id)
+        if record is None:
+            return None
+        if record.status == ApprovalStatus.APPROVED.value:
+            scope = record.approval_scope or APPROVAL_SCOPE_EXACT
+            return ApprovalOutcome(
                 request_id,
-                decision.approval_scope,
-                int(time.time()),
+                ApprovalStatus.APPROVED.value,
                 "user_approved",
+                scope,
             )
-        return self._deny(request_id, "user_denied")
+        if record.status == ApprovalStatus.DENIED.value:
+            return ApprovalOutcome(request_id, ApprovalStatus.DENIED.value, "user_denied")
+        return None
 
     def record_runtime_allow(
         self,
@@ -340,6 +373,76 @@ class ApprovalManager:
         except ApprovalEvidenceError:
             return
 
+    def _persist_server_decision(self, decision: ApprovalServerDecision) -> None:
+        """Persist evidence as soon as the approval UI POST is accepted."""
+
+        record = self.evidence_store.get_pending(decision.request_id)
+        if record is None or record.status != ApprovalStatus.PENDING.value:
+            return
+        now = int(time.time())
+        try:
+            if decision.decision == "approve":
+                self._approve(
+                    decision.request_id,
+                    decision.approval_scope,
+                    now,
+                    "user_approved",
+                )
+            else:
+                self._deny(decision.request_id, "user_denied")
+        except Exception:
+            # Best-effort: the background watcher can still finalize later.
+            return
+
+    def _materialize_server_decisions(
+        self,
+        classification: ClassifiedToolCall,
+        now: int,
+    ) -> None:
+        """Flush in-memory approve/deny decisions before grant lookup.
+
+        Covers immediate client retries that land before the POST handler
+        callback or background watcher has finished writing evidence.
+        """
+
+        for request_id in self.approval_server.list_decided_request_ids():
+            record = self.evidence_store.get_pending(request_id)
+            if record is None or record.status != ApprovalStatus.PENDING.value:
+                continue
+            if not self._record_matches_classification(record, classification):
+                continue
+            decision = self.approval_server.get_decision(request_id)
+            if decision is None:
+                continue
+            try:
+                if decision.decision == "approve":
+                    self._approve(
+                        request_id,
+                        decision.approval_scope,
+                        now,
+                        "user_approved",
+                    )
+                else:
+                    self._deny(request_id, "user_denied")
+            except Exception:
+                continue
+
+    @staticmethod
+    def _record_matches_classification(
+        record: PendingApproval,
+        classification: ClassifiedToolCall,
+    ) -> bool:
+        evaluation = classification.policy_evaluation
+        return (
+            record.downstream_server == classification.server
+            and record.tool_name == classification.tool
+            and record.risk_class == classification.risk_class.value
+            and record.policy_rule_id == evaluation.policy_rule_id
+            and record.policy_context_hash == evaluation.policy_context_hash
+            and record.resource_hash == classification.resource_hash
+            and record.payload_hash == classification.payload_hash
+        )
+
     def _approve(
         self,
         request_id: str,
@@ -349,29 +452,41 @@ class ApprovalManager:
         *,
         decided_by: str = "local-user",
     ) -> ApprovalOutcome:
-        granted_expires = decided_at + 300 if approval_scope == APPROVAL_SCOPE_SIMILAR_5M else None
-        current = self.evidence_store.get_pending(request_id)
-        if current is None:
-            raise ApprovalFlowError("approval evidence persistence failed")
-        approval_grant_jcs = self._approval_grant_jcs(
-            current,
-            approval_scope=approval_scope,
-            decided_at=decided_at,
-            decided_by=decided_by,
-            granted_expires_at=granted_expires,
-        )
-        self.evidence_store.transition(
-            request_id,
-            ApprovalStatus.APPROVED.value,
-            approval_token_hash=self.approval_server.token_hash,
-            approval_decided_by=decided_by,
-            approval_scope=approval_scope,
-            granted_scope_expires_at=granted_expires,
-            user_decision_timestamp=decided_at,
-            approval_grant_jcs=approval_grant_jcs,
-        )
-        self.approval_server.unregister(request_id)
-        return ApprovalOutcome(request_id, ApprovalStatus.APPROVED.value, reason, approval_scope)
+        with self._finalize_lock:
+            granted_expires = decided_at + 300 if approval_scope == APPROVAL_SCOPE_SIMILAR_5M else None
+            current = self.evidence_store.get_pending(request_id)
+            if current is None:
+                raise ApprovalFlowError("approval evidence persistence failed")
+            if current.status == ApprovalStatus.APPROVED.value:
+                scope = current.approval_scope or approval_scope
+                self.approval_server.unregister(request_id)
+                return ApprovalOutcome(
+                    request_id,
+                    ApprovalStatus.APPROVED.value,
+                    reason,
+                    scope,
+                )
+            approval_grant_jcs = self._approval_grant_jcs(
+                current,
+                approval_scope=approval_scope,
+                decided_at=decided_at,
+                decided_by=decided_by,
+                granted_expires_at=granted_expires,
+            )
+            self.evidence_store.transition(
+                request_id,
+                ApprovalStatus.APPROVED.value,
+                approval_token_hash=self.approval_server.token_hash,
+                approval_decided_by=decided_by,
+                approval_scope=approval_scope,
+                granted_scope_expires_at=granted_expires,
+                user_decision_timestamp=decided_at,
+                approval_grant_jcs=approval_grant_jcs,
+            )
+            self.approval_server.unregister(request_id)
+            return ApprovalOutcome(
+                request_id, ApprovalStatus.APPROVED.value, reason, approval_scope
+            )
 
     def _approval_grant_jcs(
         self,
@@ -428,18 +543,23 @@ class ApprovalManager:
             return None
 
     def _deny(self, request_id: str, reason: str) -> ApprovalOutcome:
-        now = int(time.time())
-        self.evidence_store.transition(
-            request_id,
-            ApprovalStatus.DENIED.value,
-            approval_token_hash=self.approval_server.token_hash,
-            approval_decided_by="local-user",
-            approval_scope=APPROVAL_SCOPE_EXACT,
-            user_decision_timestamp=now,
-            error_class=reason,
-        )
-        self.approval_server.unregister(request_id)
-        return ApprovalOutcome(request_id, ApprovalStatus.DENIED.value, reason)
+        with self._finalize_lock:
+            current = self.evidence_store.get_pending(request_id)
+            if current is not None and current.status == ApprovalStatus.DENIED.value:
+                self.approval_server.unregister(request_id)
+                return ApprovalOutcome(request_id, ApprovalStatus.DENIED.value, reason)
+            now = int(time.time())
+            self.evidence_store.transition(
+                request_id,
+                ApprovalStatus.DENIED.value,
+                approval_token_hash=self.approval_server.token_hash,
+                approval_decided_by="local-user",
+                approval_scope=APPROVAL_SCOPE_EXACT,
+                user_decision_timestamp=now,
+                error_class=reason,
+            )
+            self.approval_server.unregister(request_id)
+            return ApprovalOutcome(request_id, ApprovalStatus.DENIED.value, reason)
 
     def _notify(self, prompt: ApprovalPrompt, url: str) -> None:
         summary = (
