@@ -24,6 +24,7 @@ import codecs
 from collections import deque
 import ctypes
 from dataclasses import dataclass
+import hashlib
 import json
 import math
 import os
@@ -38,7 +39,11 @@ import uuid
 from typing import Any, Callable, Deque, Mapping, TextIO
 
 from agentveil_mcp_proxy.approval import ApprovalFlowError, ApprovalOutcome
-from agentveil_mcp_proxy.classification import ClassifiedToolCall, ToolCallClassifier
+from agentveil_mcp_proxy.classification import (
+    ClassifiedToolCall,
+    ToolCallClassifier,
+    sha256_jcs,
+)
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceError
 from agentveil_mcp_proxy.policy import PolicyDecision, ProxyConfig, ToolSurfaceMode
 from agentveil_mcp_proxy.tool_schema_validation import (
@@ -71,6 +76,15 @@ MAX_DOWNSTREAM_MESSAGE_BYTES = 1 * 1024 * 1024
 MAX_CLIENT_MESSAGE_BYTES = 1 * 1024 * 1024
 MAX_PENDING_RESPONSES = 1000
 DEFAULT_TIMED_OUT_ID_RETENTION_SECONDS = 600.0
+# Synthetic policy id stamped on terminal deny evidence for pre-classification
+# hard-denies (unknown tool not advertised by downstream, or arguments that fail
+# the downstream tool schema). These denies short-circuit before the local
+# policy engine runs, so no real policy_id is available; this constant keeps the
+# evidence record's required policy_id field non-empty and self-describing.
+_PRE_CLASSIFICATION_DENY_POLICY_ID = "mcp_proxy_pre_classification_guard"
+# Risk class recorded for pre-classification denies. The call is rejected before
+# classification, so the true risk class is genuinely unknown.
+_PRE_CLASSIFICATION_DENY_RISK_CLASS = "unknown"
 _ENV_PASSTHROUGH_BLOCKED_PREFIXES = ("AVP_",)
 _FILE_PATH_TOOLS = frozenset({
     "read_file",
@@ -875,6 +889,11 @@ class McpPassthrough:
             "risk_class": "tool_identity_violation",
             "tool": tool,
         })
+        self._record_pre_classification_deny_evidence(
+            tool=tool,
+            arguments=params.get("arguments"),
+            reason="unknown_tool",
+        )
         return _blocked_error(
             request_id,
             # claim-check: allow "blocked" is the literal JSON-RPC error
@@ -922,6 +941,11 @@ class McpPassthrough:
         if not details:
             return None
         self._record_invalid_arguments_event(tool, details)
+        self._record_pre_classification_deny_evidence(
+            tool=tool,
+            arguments=arguments,
+            reason="invalid_tool_arguments",
+        )
         return jsonrpc_error(
             request_id,
             JSONRPC_INVALID_PARAMS,
@@ -1078,6 +1102,69 @@ class McpPassthrough:
                 "action": "blocked_pre_approval",
                 "reason": reason,
                 "tool": classification.tool,
+            })
+
+    def _record_pre_classification_deny_evidence(
+        self,
+        *,
+        tool: str,
+        arguments: Any,
+        reason: str,
+    ) -> None:
+        """Persist terminal evidence for a pre-classification hard-deny.
+
+        Used by deny paths that reject a ``tools/call`` before local
+        classification runs: an unknown tool absent from the downstream
+        ``tools/list`` surface, or arguments that fail the downstream tool
+        schema. Those paths have no ``ClassifiedToolCall``, so the stored fields
+        are derived directly from the tool name and a one-way JCS hash of the
+        arguments; tests assert representative raw argument values are absent
+        from the persisted record. ``resource_hash`` is omitted because no
+        resource is extracted before classification, and
+        ``policy_id``/``policy_context_hash`` carry a synthetic guard identity
+        because no policy rule was evaluated.
+
+        Best-effort: the call is already being denied, so an evidence-store
+        failure must not change the deny outcome. Requires a configured approval
+        manager (which owns the evidence store); without it the in-memory
+        security event remains the only record.
+        """
+
+        manager = self.approval_manager
+        if manager is None:
+            return
+        store = getattr(manager, "evidence_store", None)
+        if store is None:
+            return
+        server_name = getattr(self.classifier, "server_name", None) or self.downstream.name
+        payload_hash = sha256_jcs({} if arguments is None else arguments)
+        policy_context_hash = hashlib.sha256(
+            f"{_PRE_CLASSIFICATION_DENY_POLICY_ID}:{reason}".encode("utf-8")
+        ).hexdigest()
+        try:
+            store.record_terminal_deny(
+                request_id=str(uuid.uuid4()),
+                session_id=getattr(manager, "session_id", None) or str(uuid.uuid4()),
+                client_id=getattr(manager, "client_id", None),
+                downstream_server=server_name,
+                tool_name=tool,
+                risk_class=_PRE_CLASSIFICATION_DENY_RISK_CLASS,
+                resource_hash=None,
+                payload_hash=payload_hash,
+                policy_id=_PRE_CLASSIFICATION_DENY_POLICY_ID,
+                policy_rule_id=None,
+                policy_context_hash=policy_context_hash,
+                created_at=int(time.time()),
+                reason=reason,
+            )
+        except ApprovalEvidenceError:
+            # Evidence persistence is best-effort: the deny response has already
+            # been selected. Record a sanitized signal and let the deny proceed.
+            self._record_security_event({
+                "type": "deny_evidence_persistence_failed",
+                "action": "blocked_pre_approval",
+                "reason": reason,
+                "tool": tool,
             })
 
     def _candidate_file_paths(self, arguments: Mapping[str, Any]) -> list[str]:
