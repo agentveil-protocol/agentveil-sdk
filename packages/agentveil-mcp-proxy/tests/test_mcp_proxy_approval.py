@@ -1917,3 +1917,127 @@ def test_present_resource_hash_still_attempts_similar_reuse(tmp_path, monkeypatc
     finally:
         server.stop()
         store.close()
+
+
+def test_nonblocking_watcher_honors_full_timeout_before_expiring(tmp_path, monkeypatch):
+    """Regression: the background decision watcher must honor the full configured
+    approval_timeout_seconds.
+
+    A human approval that lands after the first bounded (<=60s) poll slice
+    previously expired the pending parent immediately (on_timeout=deny), so the
+    later approval failed to make the record reusable and the retry opened a
+    fresh pending approval -- the live-console retry loop.
+    """
+
+    config = _config(
+        policy_rule=_write_rule(),
+        approval_timeout_seconds=300,
+        on_timeout="deny",
+    )
+    manager, store, server, _cli = _manager(
+        tmp_path, config=config, wait_for_decision=False
+    )
+    try:
+        calls = {"n": 0}
+
+        def slow_wait(request_id, *, timeout):
+            # First bounded slice returns no decision (operator still deciding);
+            # the next slice carries the approval.
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return None
+            return ApprovalServerDecision(
+                request_id=request_id, decision="approve", approval_scope="exact"
+            )
+
+        monkeypatch.setattr(server, "wait_for_decision", slow_wait)
+
+        outcome = manager.request_approval(
+            _classification(config), reason="local_approval_required"
+        )
+        assert outcome.status == ApprovalStatus.PENDING.value
+
+        deadline = time.monotonic() + 2
+        record = store.get_pending(outcome.request_id)
+        while record.status == ApprovalStatus.PENDING.value and time.monotonic() < deadline:
+            time.sleep(0.01)
+            record = store.get_pending(outcome.request_id)
+
+        assert record.status == ApprovalStatus.APPROVED.value
+        assert record.approval_scope == "exact"
+        assert calls["n"] >= 2
+    finally:
+        server.stop()
+        store.close()
+
+
+def _wait_for_status(store, request_id, status, *, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    record = store.get_pending(request_id)
+    while (record is None or record.status != status) and time.monotonic() < deadline:
+        time.sleep(0.01)
+        record = store.get_pending(request_id)
+    return record
+
+
+def test_nonblocking_retry_after_approval_executes_downstream(tmp_path):
+    """Live-console retry path: first call returns approval_required, operator
+    approves, and the identical retry executes downstream by consuming the exact
+    grant -- without creating a second pending approval.
+    """
+
+    config = _config(policy_rule=_write_rule())
+    manager, store, server, _cli = _manager(
+        tmp_path, config=config, wait_for_decision=False
+    )
+    log_path = tmp_path / "downstream.log"
+    passthrough = McpPassthrough(
+        DownstreamConfig(
+            command=sys.executable,
+            args=("-u", str(_approval_downstream(tmp_path, log_path))),
+            name="github",
+            env={"DOWNSTREAM_LOG": str(log_path)},
+        ),
+        classifier=ToolCallClassifier(config, server_name="github"),
+        approval_manager=manager,
+    )
+    passthrough.start()
+    try:
+        first = passthrough.handle_client_line(_tool_call())
+        assert len(first) == 1
+        assert "error" in first[0], first[0]
+        assert first[0]["error"]["data"]["status"] == "approval_required"
+
+        deadline = time.monotonic() + 2
+        while not server.pending_prompts() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        prompts = server.pending_prompts()
+        assert prompts, "expected a pending approval prompt for the first call"
+        parent_id = prompts[0].request_id
+        with httpx.Client() as client:
+            csrf = _get_csrf(client, server.approval_url(parent_id))
+            _post_decision(
+                client, server.approval_url(parent_id), decision="approve", csrf=csrf
+            )
+
+        parent = _wait_for_status(store, parent_id, ApprovalStatus.APPROVED.value)
+        assert parent is not None and parent.status == ApprovalStatus.APPROVED.value
+        assert parent.approval_scope == "exact"
+
+        retry = passthrough.handle_client_line(_tool_call())
+        assert len(retry) == 1
+        assert "result" in retry[0], retry[0]
+        assert retry[0]["result"]["content"][0]["text"] == "approved"
+        assert server.pending_prompts() == []
+
+        children = [
+            record
+            for record in store.list_records()
+            if record.granted_by_request_id == parent_id
+        ]
+        assert len(children) == 1, "retry must reuse the grant, not open a new prompt"
+        assert children[0].status == ApprovalStatus.EXECUTED.value
+    finally:
+        passthrough.stop()
+        server.stop()
+        store.close()

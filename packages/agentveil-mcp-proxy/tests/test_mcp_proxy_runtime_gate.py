@@ -940,3 +940,81 @@ def test_v3_export_bundle_embeds_and_strict_verifies(tmp_path):
     # Strict default with no external signer fails closed.
     with pytest.raises(EvidenceVerificationError):
         verify_evidence_bundle(bundle)
+
+
+def test_waiting_retry_after_local_approval_executes_downstream(tmp_path):
+    """Live-console WAITING retry: gate returns WAITING_FOR_HUMAN_APPROVAL, the
+    operator approves locally, and the identical retry must consume the exact
+    grant and forward downstream -- not open a second pending approval."""
+
+    import re
+
+    config = _config()
+    gate = StaticGate(RuntimeGateDecision(
+        decision="WAITING_FOR_HUMAN_APPROVAL",
+        audit_id=AUDIT_ID,
+        approval_id="urn:uuid:approval",
+        receipt_digest="aa" * 32,
+        receipt_body={},
+    ))
+    with ApprovalEvidenceStore(tmp_path / "evidence.sqlite") as store:
+        server = ApprovalServer()
+        server.start()
+        manager = ApprovalManager(
+            evidence_store=store,
+            approval_server=server,
+            config=config,
+            client_id="pytest",
+            session_id="session-waiting-retry",
+            cli_out=io.StringIO(),
+            browser_open=lambda _url: False,
+            wait_for_decision=False,
+        )
+        passthrough, _log_path = _passthrough(
+            tmp_path, gate, config, approval_manager=manager
+        )
+        passthrough.start()
+        try:
+            first = passthrough.handle_client_line(_tool_call())
+            assert first[0]["error"]["data"]["status"] == "approval_required"
+
+            deadline = time.monotonic() + 2
+            while not server.pending_prompts() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            prompts = server.pending_prompts()
+            assert prompts, "expected a pending approval prompt for the first call"
+            parent_id = prompts[0].request_id
+            with httpx.Client() as client:
+                page = client.get(server.approval_url(parent_id))
+                csrf = re.search(r'name="csrf_token" value="([^"]+)"', page.text).group(1)
+                client.post(
+                    server.approval_url(parent_id),
+                    data={
+                        "decision": "approve",
+                        "csrf_token": csrf,
+                        "approval_scope": "exact",
+                    },
+                )
+
+            deadline = time.monotonic() + 2
+            parent = store.get_pending(parent_id)
+            while parent.status != ApprovalStatus.APPROVED.value and time.monotonic() < deadline:
+                time.sleep(0.01)
+                parent = store.get_pending(parent_id)
+            assert parent.status == ApprovalStatus.APPROVED.value
+
+            retry = passthrough.handle_client_line(_tool_call())
+            assert "result" in retry[0], retry[0]
+            assert retry[0]["result"]["content"][0]["text"] == "forwarded"
+            assert server.pending_prompts() == []
+
+            children = [
+                record
+                for record in store.list_records()
+                if record.granted_by_request_id == parent_id
+            ]
+            assert len(children) == 1, "retry must reuse the grant, not open a new prompt"
+            assert children[0].status == ApprovalStatus.EXECUTED.value
+        finally:
+            passthrough.stop()
+            server.stop()
