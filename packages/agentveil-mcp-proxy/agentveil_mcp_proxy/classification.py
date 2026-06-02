@@ -8,10 +8,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import ipaddress
 import json
 import math
 import re
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 import jcs
 
@@ -93,6 +95,77 @@ _GIT_TOOL_RISK_CLASSES: Mapping[str, RiskClass] = {
     "git_create_branch": RiskClass.WRITE,
     "git_reset": RiskClass.DESTRUCTIVE,
 }
+
+# Fetch/network MCP tools (e.g. the official MCP "fetch" server's `fetch` tool)
+# take a URL argument. The tool name `fetch` matches the generic _READ prefix,
+# so a benign public fetch already infers READ. The risk that this prefix misses
+# is the *destination*: a URL pointing at cloud instance metadata or the
+# link-local range is a server-side request forgery (SSRF) / credential-
+# exfiltration surface and must not classify like a benign public read. Tool
+# family verified against
+# https://github.com/modelcontextprotocol/servers/tree/main/src/fetch (Bug 2).
+_FETCH_TOOL_PREFIXES = ("fetch",)
+_URL_ARGUMENT_KEYS = ("url", "uri")
+# Hostnames that resolve to a cloud instance metadata service. Link-local IPs
+# (169.254.0.0/16, which includes the 169.254.169.254 metadata endpoint used by
+# AWS / GCP / Azure / DigitalOcean) are detected by range in _is_ssrf_network_host.
+_METADATA_HOSTNAMES = frozenset({"metadata.google.internal", "metadata"})
+
+
+def _is_fetch_tool(tool: str) -> bool:
+    name = tool.lower()
+    return any(
+        name == prefix or name.startswith(f"{prefix}_") or name.startswith(f"{prefix}-")
+        for prefix in _FETCH_TOOL_PREFIXES
+    )
+
+
+def _url_host(arguments: Mapping[str, Any]) -> str | None:
+    """Return the lowercase host of the first URL-like argument, or None."""
+
+    for key in _URL_ARGUMENT_KEYS:
+        value = arguments.get(key)
+        if isinstance(value, str) and value:
+            host = urlsplit(value.strip()).hostname
+            if host:
+                return host.lower()
+    return None
+
+
+def _is_ssrf_network_host(host: str) -> bool:
+    """Return True for cloud-metadata hostnames or link-local IP literals."""
+
+    if host in _METADATA_HOSTNAMES:
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    # Link-local covers 169.254.0.0/16 (incl. 169.254.169.254) and fe80::/10.
+    return ip.is_link_local
+
+
+def _network_fetch_risk(tool: str, arguments: Mapping[str, Any] | None) -> RiskClass | None:
+    """Elevate fetch/network tools that target SSRF-sensitive hosts.
+
+    A fetch whose URL points at cloud instance metadata or the link-local range
+    is mapped to the existing PRODUCTION risk vocabulary so local policy can
+    route it before approval, instead of letting it classify as a public read.
+    Evidence: tests/test_mcp_proxy_classification.py covers this mapping.
+    PRODUCTION is reused (not a new risk class); the `fetch` builtin policy
+    pack maps this to a local block decision. Returns None for non-fetch tools
+    and for fetches to ordinary public hosts (which keep their normal read
+    classification).
+    """
+
+    if not arguments or not _is_fetch_tool(tool):
+        return None
+    host = _url_host(arguments)
+    if host is not None and _is_ssrf_network_host(host):
+        # claim-check: allow "PRODUCTION" is the existing RiskClass enum value
+        # used by tests to carry the network-target signal into policy.
+        return RiskClass.PRODUCTION  # claim-check: allow "PRODUCTION" is the existing RiskClass enum value.
+    return None
 
 
 def sha256_jcs(value: Any) -> str:
@@ -245,6 +318,10 @@ def infer_risk_class(
     git_risk = _GIT_TOOL_RISK_CLASSES.get(tool)
     if git_risk is not None:
         return git_risk
+
+    network_risk = _network_fetch_risk(tool, arguments)
+    if network_risk is not None:
+        return network_risk
 
     text_parts = [action, tool, resource or ""]
     if arguments:

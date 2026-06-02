@@ -930,6 +930,42 @@ def builtin_policy_pack(name: str) -> PolicyConfig:
                 },
             },
         ],
+        # Official MCP Fetch server tool surface. The `fetch` tool performs
+        # network egress, so the two rules below discriminate on the risk class
+        # produced by classification._network_fetch_risk for the SAME tool:
+        #   - a benign public fetch classifies READ -> ask_backend, which keeps
+        #     the decision the proxy already returned for an unmatched fetch
+        #     (this slice only corrects the classification, not the posture);
+        #   - a fetch to cloud metadata / link-local (SSRF) classifies
+        #     PRODUCTION -> block locally before approval.
+        # claim-check: allow "PRODUCTION" and "production" are existing policy
+        # risk vocabulary values covered by fetch policy tests.
+        # Tool verified against
+        # https://github.com/modelcontextprotocol/servers/tree/main/src/fetch (Bug 2).
+        "fetch": [
+            {
+                "id": "fetch-read",
+                "source": "builtin",
+                "decision": "ask_backend",
+                "risk_class": "read",
+                "match": {
+                    "server": ["fetch", "fetch-*", "fetch_*", "*fetch*"],
+                    "tool": ["fetch", "fetch_*"],
+                    "risk_class": ["read"],
+                },
+            },
+            {
+                "id": "fetch-network-block",
+                "source": "builtin",
+                "decision": "block",
+                "risk_class": "production",  # claim-check: allow "production" is policy vocabulary.
+                "match": {
+                    "server": ["fetch", "fetch-*", "fetch_*", "*fetch*"],
+                    "tool": ["fetch", "fetch_*"],
+                    "risk_class": ["production"],  # claim-check: allow "production" is policy vocabulary.
+                },
+            },
+        ],
     }
 
     if name not in packs:
