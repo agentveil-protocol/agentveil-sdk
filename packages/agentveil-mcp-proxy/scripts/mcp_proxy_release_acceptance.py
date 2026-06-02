@@ -148,6 +148,20 @@ def trusted_signer_dids_for_base_url(
     return list(json.loads(result.stdout.strip() or "[]"))
 
 
+def verification_signer_dids(proxy_identity_did: str, backend_signer_dids: list[str]) -> list[str]:
+    """Return external signer pins required by strict bundle verification.
+
+    Decision receipts are signed by the backend trusted signers. Local approval
+    grants are signed by the proxy identity itself, so the release acceptance
+    verifier must pin both trust roots explicitly.
+    """
+    pins: list[str] = []
+    for signer_did in [proxy_identity_did, *backend_signer_dids]:
+        if signer_did and signer_did not in pins:
+            pins.append(signer_did)
+    return pins
+
+
 class JsonRpcClient:
     def __init__(self, command: list[str], *, env: dict[str, str]) -> None:
         self.process = subprocess.Popen(
@@ -371,10 +385,14 @@ def run_acceptance(args: argparse.Namespace) -> None:
             raise AcceptanceError(f"events list did not include approved/executed records: {events_payload}")
 
         run([str(proxy), "export-evidence", *identity_args, str(bundle_path)], env=env)
-        # Strict offline verification pins the signer out of band: ask the
-        # installed package for the trusted signer DID(s) of the backend we
-        # registered against, never the signer list embedded in the bundle.
-        signer_dids = trusted_signer_dids_for_base_url(install_python, args.base_url, env=env)
+        # Strict offline verification pins signer DIDs out of band: backend
+        # DIDs for receipt verification and the proxy identity DID for local
+        # approval grants. Bundle-embedded signer lists are not trust anchors.
+        backend_signer_dids = trusted_signer_dids_for_base_url(install_python, args.base_url, env=env)
+        agent_did = init_payload.get("agent_did")
+        if not isinstance(agent_did, str) or not agent_did:
+            raise AcceptanceError("init did not return agent_did for verification pins")
+        signer_dids = verification_signer_dids(agent_did, backend_signer_dids)
         verify_args = ["verify", str(bundle_path), "--output", "json"]
         for signer_did in signer_dids:
             verify_args += ["--trusted-signer-did", signer_did]
