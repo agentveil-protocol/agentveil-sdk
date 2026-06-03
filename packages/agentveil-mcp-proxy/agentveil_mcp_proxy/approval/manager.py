@@ -155,6 +155,7 @@ class ApprovalManager:
             created_at=now,
             expires_at=prompt_expires_at,
             scope_expansion_allowed=scope_allowed,
+            reason=reason,
         )
         record = self._pending_record(
             classification,
@@ -683,6 +684,7 @@ class ApprovalManager:
         created_at: int,
         expires_at: int,
         scope_expansion_allowed: bool,
+        reason: str,
     ) -> ApprovalPrompt:
         action_details = None
         resource_details = None
@@ -704,6 +706,7 @@ class ApprovalManager:
             risk_class=classification.risk_class.value,
             payload_hash=classification.payload_hash,
             policy_rule_id=classification.policy_evaluation.policy_rule_id,
+            reason=reason,
             created_at=created_at,
             expires_at=expires_at,
             csrf_token=secrets.token_urlsafe(24),

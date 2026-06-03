@@ -8,6 +8,43 @@ from typing import Any
 from agentveil_mcp_proxy.evidence.store import ApprovalStatus, PendingApproval
 
 
+def pending_approval_dict(
+    *,
+    request_id: str,
+    client_id: str,
+    session_id: str,
+    downstream_server: str,
+    tool_name: str,
+    action_display: str,
+    resource_display: str | None,
+    risk_class: str,
+    reason: str,
+    payload_hash: str,
+    policy_rule_id: str,
+    created_at: int,
+    expires_at: int,
+) -> dict[str, Any]:
+    """Build a redacted JSON view for one loopback pending approval."""
+
+    resource = resource_display if resource_display is not None else "none"
+    return {
+        "request_id": request_id,
+        "client_id": client_id,
+        "session_id_prefix": session_id[:8],
+        "downstream_server": downstream_server,
+        "tool_name": tool_name,
+        "risk_class": risk_class,
+        "reason": reason,
+        "action": action_display,
+        "resource": resource,
+        "payload_hash": payload_hash,
+        "policy_rule_id": policy_rule_id,
+        "status": ApprovalStatus.PENDING.value,
+        "created_at": created_at,
+        "expires_at": expires_at,
+    }
+
+
 def execution_record_id_by_parent(
     records: Sequence[PendingApproval],
 ) -> dict[str, str]:

@@ -182,6 +182,7 @@ def _prompt(request_id: str = "req-1") -> ApprovalPrompt:
         risk_class="write",
         payload_hash="sha256:" + "b" * 64,
         policy_rule_id="write-approval",
+        reason="local_approval_required",
         created_at=1_700_000_000,
         expires_at=1_700_000_300,
         csrf_token="csrf-token",
@@ -1195,6 +1196,7 @@ def test_destructive_approval_defaults_to_exact_request_scope(tmp_path):
             created_at=1,
             expires_at=2,
             scope_expansion_allowed=manager._scope_expansion_allowed(classification),
+            reason="local_approval_required",
         )
         assert prompt.scope_expansion_allowed is False
     finally:
@@ -1213,6 +1215,7 @@ def test_write_approval_optional_5min_similar_only_when_policy_allows(tmp_path):
             created_at=1,
             expires_at=2,
             scope_expansion_allowed=manager._scope_expansion_allowed(classification),
+            reason="local_approval_required",
         )
         assert prompt.scope_expansion_allowed is True
     finally:
@@ -2643,6 +2646,92 @@ def test_headless_never_opens_browser_even_when_config_requests_browser(tmp_path
         outcome = manager.request_approval(_classification(config), reason="local_approval_required")
         assert outcome.status == ApprovalStatus.DENIED.value
         assert opened_urls == []
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_api_approvals_returns_pending_json(tmp_path):
+    config = _config(policy_rule=_run_terminal_cmd_approval_rule())
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        wait_for_decision=False,
+    )
+    try:
+        manager.request_approval(
+            _command_classification(config, command="pip list"),
+            reason="local_approval_required",
+        )
+        manager.request_approval(
+            _command_classification(
+                config,
+                command=f"npm install {PACKAGE_MANAGER_SECRET}",
+            ),
+            reason="package_manager_action_requires_approval",
+        )
+        response = httpx.get(
+            f"{server.base_url}/approval/{server.session_token}/api/approvals",
+            timeout=2,
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["ok"] is True
+        assert len(payload["approvals"]) == 2
+        for item in payload["approvals"]:
+            assert item["status"] == ApprovalStatus.PENDING.value
+            assert "request_id" in item
+            assert "session_id_prefix" in item
+            assert len(item["session_id_prefix"]) == 8
+            assert "session_id" not in item
+            assert "csrf_token" not in item
+        reasons = {item["reason"] for item in payload["approvals"]}
+        assert "local_approval_required" in reasons
+        assert "package_manager_action_requires_approval" in reasons
+        _assert_t1_privacy_safe_text(json.dumps(payload))
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_api_approvals_forbidden_without_valid_token():
+    server = ApprovalServer()
+    server.start()
+    try:
+        server.register(_prompt("req-api"))
+        response = httpx.get(f"{server.base_url}/approval/not-a-valid-token/api/approvals")
+        assert response.status_code == 403
+    finally:
+        server.stop()
+
+
+def test_api_approvals_json_excludes_raw_secrets_and_html_still_works(tmp_path):
+    config = _config(policy_rule=_run_terminal_cmd_approval_rule())
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        wait_for_decision=False,
+    )
+    try:
+        manager.request_approval(
+            _command_classification(
+                config,
+                command=f"npm install {PACKAGE_MANAGER_SECRET}",
+            ),
+            reason="package_manager_action_requires_approval",
+        )
+        api_url = f"{server.base_url}/approval/{server.session_token}/api/approvals"
+        payload = httpx.get(api_url).json()
+        _assert_t1_privacy_safe_text(json.dumps(payload))
+
+        list_html = httpx.get(server.approval_center_url()).text
+        assert "Pending approvals" in list_html
+        _assert_t1_privacy_safe_text(list_html)
+
+        prompt = server.pending_prompts()[0]
+        detail_html = httpx.get(server.approval_url(prompt.request_id)).text
+        assert "Approval pending" in detail_html
+        _assert_t1_privacy_safe_text(detail_html)
     finally:
         server.stop()
         store.close()

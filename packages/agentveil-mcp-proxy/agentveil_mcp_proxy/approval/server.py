@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from html import escape
 import hashlib
+import json
 import hmac
 from http import HTTPStatus
 from http.cookies import SimpleCookie
@@ -14,6 +15,8 @@ import threading
 import time
 from typing import Any, Callable
 from urllib.parse import parse_qs
+
+from agentveil_mcp_proxy.evidence.observability import pending_approval_dict
 
 
 MAX_POST_BODY_BYTES = 8192
@@ -62,6 +65,7 @@ class ApprovalPrompt:
     risk_class: str
     payload_hash: str
     policy_rule_id: str
+    reason: str
     created_at: int
     expires_at: int
     csrf_token: str
@@ -218,6 +222,31 @@ class ApprovalServer:
         with self._lock:
             return self._decisions.get(request_id)
 
+    def pending_approvals_api_payload(self) -> dict[str, Any]:
+        """Return sanitized pending approvals for the loopback JSON API."""
+
+        return {
+            "ok": True,
+            "approvals": [
+                pending_approval_dict(
+                    request_id=prompt.request_id,
+                    client_id=prompt.client_id,
+                    session_id=prompt.session_id,
+                    downstream_server=prompt.downstream_server,
+                    tool_name=prompt.tool_name,
+                    action_display=prompt.action_display,
+                    resource_display=prompt.resource_display,
+                    risk_class=prompt.risk_class,
+                    reason=prompt.reason,
+                    payload_hash=prompt.payload_hash,
+                    policy_rule_id=prompt.policy_rule_id,
+                    created_at=prompt.created_at,
+                    expires_at=prompt.expires_at,
+                )
+                for prompt in self.pending_prompts()
+            ],
+        }
+
     def pending_prompts(self) -> list[ApprovalPrompt]:
         """Return currently pending prompts for the token-authenticated list page."""
 
@@ -323,12 +352,18 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
         return
 
     def do_GET(self) -> None:
-        token, request_id = self._parse_path()
+        token, route, request_id = self._parse_path()
         if not self._token_ok(token):
             self._send_text(HTTPStatus.FORBIDDEN, "forbidden")
             return
-        if request_id is None:
+        if route == "api_list":
+            self._send_json(HTTPStatus.OK, self.server_owner.pending_approvals_api_payload())
+            return
+        if route == "list":
             self._send_html(HTTPStatus.OK, self._render_list())
+            return
+        if route != "pending" or request_id is None:
+            self._send_text(HTTPStatus.NOT_FOUND, "not found")
             return
         prompt = self.server_owner.prompt_for(request_id)
         if prompt is None:
@@ -344,8 +379,8 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
         )
 
     def do_POST(self) -> None:
-        token, request_id = self._parse_path()
-        if request_id is None or not self._token_ok(token):
+        token, route, request_id = self._parse_path()
+        if route != "pending" or request_id is None or not self._token_ok(token):
             self._send_text(HTTPStatus.FORBIDDEN, "forbidden")
             return
         prompt = self.server_owner.prompt_for(request_id)
@@ -385,15 +420,17 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
             return
         self._send_html(HTTPStatus.OK, self._page("Approval recorded", "<p>Decision recorded.</p>"))
 
-    def _parse_path(self) -> tuple[str | None, str | None]:
+    def _parse_path(self) -> tuple[str | None, str | None, str | None]:
         parts = [part for part in self.path.split("?")[0].split("/") if part]
         if len(parts) >= 2 and parts[0] == "approval":
             token = parts[1]
             if len(parts) == 2:
-                return token, None
+                return token, "list", None
+            if len(parts) == 4 and parts[2] == "api" and parts[3] == "approvals":
+                return token, "api_list", None
             if len(parts) == 4 and parts[2] == "pending":
-                return token, parts[3]
-        return None, None
+                return token, "pending", parts[3]
+        return None, None, None
 
     def _token_ok(self, token: str | None) -> bool:
         return bool(token) and hmac.compare_digest(token or "", self.server_owner.session_token)
@@ -487,6 +524,14 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
 
     def _send_text(self, status: HTTPStatus, body: str) -> None:
         self._send_bytes(status, body.encode("utf-8"), "text/plain; charset=utf-8", None)
+
+    def _send_json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
+        self._send_bytes(
+            status,
+            json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+            "application/json; charset=utf-8",
+            None,
+        )
 
     def _send_bytes(
         self,

@@ -82,6 +82,7 @@ def _prompt(request_id: str) -> ApprovalPrompt:
         risk_class="write",
         payload_hash="sha256:" + "b" * 64,
         policy_rule_id="default",
+        reason="local_approval_required",
         created_at=1_700_000_000,
         expires_at=1_700_000_300,
         csrf_token=f"csrf-{request_id}",
