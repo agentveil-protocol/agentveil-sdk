@@ -114,10 +114,10 @@ def test_cli_client_config_print_human_output(tmp_path, capsys):
     assert "Cursor" in captured.out
     assert ".cursor/mcp.json" in captured.out
     assert '"mcpServers"' in captured.out
-    assert str(proxy_command) in captured.out
     json_start = captured.out.index("{")
     document = json.loads(captured.out[json_start:])
     entry = document["mcpServers"]["filesystem-gated"]
+    assert entry["command"] == str(proxy_command)
     assert entry["args"] == ["run"]
     assert SECRET_PASSPHRASE not in captured.out
 
@@ -153,8 +153,11 @@ def test_cli_client_config_print_json_output(tmp_path, capsys):
         str(passphrase_file),
     ]
     assert "claude_desktop" in payload["clients"]
+    assert payload["command"] == str(proxy_command)
     assert SECRET_PASSPHRASE not in captured.out
-    assert str(passphrase_file) in captured.out
+    assert str(passphrase_file) in payload["args"]
+    claude_entry = payload["clients"]["claude_desktop"]["document"]["mcpServers"]["agentveil-mcp-proxy"]
+    assert claude_entry["command"] == str(proxy_command)
 
 
 def test_print_client_configs_does_not_write_user_config_dirs(tmp_path, monkeypatch):
@@ -172,11 +175,21 @@ def test_print_client_configs_does_not_write_user_config_dirs(tmp_path, monkeypa
     assert not claude_config.exists()
 
 
-def test_resolve_proxy_command_falls_back_to_default_name():
-    assert resolve_proxy_command(None) in {
-        "agentveil-mcp-proxy",
-        resolve_proxy_command("agentveil-mcp-proxy"),
-    }
+def test_resolve_proxy_command_falls_back_to_default_name(monkeypatch):
+    monkeypatch.setattr("agentveil_mcp_proxy.client_config.shutil.which", lambda _name: None)
+    assert resolve_proxy_command(None) == "agentveil-mcp-proxy"
+
+
+def test_resolve_proxy_command_uses_path_when_installed(monkeypatch, tmp_path):
+    executable = tmp_path / "agentveil-mcp-proxy"
+    executable.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.client_config.shutil.which",
+        lambda name: str(executable) if name == "agentveil-mcp-proxy" else None,
+    )
+
+    assert resolve_proxy_command(None) == str(executable)
 
 
 def test_build_mcp_servers_document_requires_server_name():
