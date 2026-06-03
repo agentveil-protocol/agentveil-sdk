@@ -2604,3 +2604,204 @@ def test_instruction_file_write_honors_local_block_policy(tmp_path, monkeypatch)
     assert "approval_url" not in response["error"]["data"]
     assert _pending_approval_count(home) == 0
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
+
+
+_HIDDEN_UNICODE_CHAR = "\u200b"
+_BIDI_HIDDEN_UNICODE_CHAR = "\u202e"
+_TAINTED_WRITE_CONTENT = f"visible-write-marker{_HIDDEN_UNICODE_CHAR}"
+
+
+@pytest.mark.parametrize("hidden_unicode_char", [_HIDDEN_UNICODE_CHAR, _BIDI_HIDDEN_UNICODE_CHAR])
+def test_hidden_unicode_write_claude_md_hard_deny_before_approval(
+    tmp_path,
+    monkeypatch,
+    hidden_unicode_char,
+):
+    # T3 TrapDoor: hidden Unicode in instruction-file write content is hard-denied
+    # before approval, downstream, and without leaking raw tool arguments.
+    # claim-check: allow tested terminal/policy block assertions
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    _set_downstream(init.config_path, _filesystem_schema_downstream(tmp_path), log_path=log_path)
+    _set_allow_policy(init.config_path, server="fake-downstream", tool="write_file")
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("hidden unicode trapdoor must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+    tainted = f"visible-write-marker{hidden_unicode_char}"
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(
+            _json_line({"jsonrpc": "2.0", "id": "list-1", "method": "tools/list", "params": {}})
+            + _json_line({
+                "jsonrpc": "2.0",
+                "id": "call-1",
+                "method": "tools/call",
+                "params": {
+                    "name": "write_file",
+                    "arguments": {
+                        "path": "CLAUDE.md",
+                        "content": tainted,
+                    },
+                },
+            })
+        ),
+        out=client_out,
+    ) == 0
+
+    response = _responses(client_out.getvalue())[1]
+    assert response["error"]["code"] == JSONRPC_POLICY_BLOCKED
+    assert response["error"]["data"] == {
+        "status": "policy_denied",
+        "reason": "hidden_unicode_instruction_file_blocked",
+    }
+    assert "approval_url" not in response["error"]["data"]
+    assert "record_id" not in response["error"]["data"]
+    assert _pending_approval_count(home) == 0
+    assert tainted not in client_out.getvalue()
+    assert hidden_unicode_char not in client_out.getvalue()
+    assert "CLAUDE.md" not in client_out.getvalue()
+
+    records = _evidence_records(home)
+    assert len(records) == 1
+    record = records[0]
+    assert record["status"] == "blocked"  # claim-check: allow tested status
+    assert record["error_class"] == "hidden_unicode_instruction_file_blocked"
+    assert record["tool_name"] == "write_file"
+    record_json = json.dumps(record)
+    assert tainted not in record_json
+    assert hidden_unicode_char not in record_json
+    assert "CLAUDE.md" not in record_json
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
+
+
+def test_hidden_unicode_edit_agents_md_hard_deny_before_approval(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    tainted = f"visible-edit-marker{_HIDDEN_UNICODE_CHAR}"
+    _set_downstream(
+        init.config_path,
+        _instruction_write_tools_downstream(tmp_path),
+        log_path=log_path,
+    )
+    _set_allow_policy_for_tools(
+        init.config_path,
+        server="fake-downstream",
+        tools=["edit_file"],
+    )
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("hidden unicode trapdoor must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(
+            _json_line({"jsonrpc": "2.0", "id": "list-1", "method": "tools/list", "params": {}})
+            + _json_line({
+                "jsonrpc": "2.0",
+                "id": "call-1",
+                "method": "tools/call",
+                "params": {
+                    "name": "edit_file",
+                    "arguments": {"path": "AGENTS.md", "content": tainted},
+                },
+            })
+        ),
+        out=client_out,
+    ) == 0
+
+    response = _responses(client_out.getvalue())[1]
+    assert response["error"]["code"] == JSONRPC_POLICY_BLOCKED
+    assert response["error"]["data"]["reason"] == "hidden_unicode_instruction_file_blocked"
+    assert "approval_url" not in response["error"]["data"]
+    assert _pending_approval_count(home) == 0
+    assert tainted not in client_out.getvalue()
+    assert _HIDDEN_UNICODE_CHAR not in client_out.getvalue()
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
+
+
+def test_hidden_unicode_instruction_file_cursor_rule_still_requires_approval(
+    tmp_path,
+    monkeypatch,
+):
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    instruction_path = ".cursor/rules/x.mdc"
+    _set_downstream(init.config_path, _filesystem_schema_downstream(tmp_path), log_path=log_path)
+    _set_allow_policy(init.config_path, server="fake-downstream", tool="write_file")
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("instruction trapdoor must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(
+            _json_line({"jsonrpc": "2.0", "id": "list-1", "method": "tools/list", "params": {}})
+            + _json_line({
+                "jsonrpc": "2.0",
+                "id": "call-1",
+                "method": "tools/call",
+                "params": {
+                    "name": "write_file",
+                    "arguments": {"path": instruction_path, "content": "clean content"},
+                },
+            })
+        ),
+        out=client_out,
+    ) == 0
+
+    response = _responses(client_out.getvalue())[1]
+    assert response["error"]["code"] == JSONRPC_APPROVAL_REQUIRED
+    assert response["error"]["data"]["reason"] == "instruction_file_write_requires_approval"
+    assert response["error"]["data"]["approval_url"].startswith("http://127.0.0.1:")
+    assert _pending_approval_count(home) == 1
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
+
+
+def test_hidden_unicode_non_instruction_write_not_guarded(tmp_path):
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    _set_downstream(init.config_path, _filesystem_schema_downstream(tmp_path), log_path=log_path)
+    _set_allow_policy(init.config_path, server="fake-downstream", tool="write_file")
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(
+            _json_line({"jsonrpc": "2.0", "id": "list-1", "method": "tools/list", "params": {}})
+            + _json_line({
+                "jsonrpc": "2.0",
+                "id": "call-1",
+                "method": "tools/call",
+                "params": {
+                    "name": "write_file",
+                    "arguments": {
+                        "path": "workspace/notes.md",
+                        "content": _TAINTED_WRITE_CONTENT,
+                    },
+                },
+            })
+        ),
+        out=client_out,
+    ) == 0
+
+    response = _responses(client_out.getvalue())[1]
+    assert response["result"] == {"content": [{"type": "text", "text": "called"}]}
+    assert _pending_approval_count(home) == 0
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list", "tools/call"]

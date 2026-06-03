@@ -46,6 +46,7 @@ from agentveil_mcp_proxy.classification import (
 )
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceError
 from agentveil_mcp_proxy.instruction_file_guard import (
+    hidden_unicode_instruction_file_block_reason,
     instruction_file_write_reason,
     is_instruction_file_write_tool,
 )
@@ -1089,6 +1090,22 @@ class McpPassthrough:
             return None, None
         if classification.policy_evaluation.decision is PolicyDecision.BLOCK:
             return None, None
+        hidden_unicode_reason = hidden_unicode_instruction_file_block_reason(
+            tool,
+            arguments,
+        )
+        if hidden_unicode_reason is not None:
+            self._record_security_event({
+                "type": "hidden_unicode_instruction_file",
+                "action": "blocked_pre_approval",
+                "reason": hidden_unicode_reason,
+                "tool": tool,
+            })
+            self._record_pre_approval_deny_evidence(classification, hidden_unicode_reason)
+            return _policy_denied_error(
+                request_id,
+                reason=hidden_unicode_reason,
+            ), None
         for candidate in self._candidate_file_paths(arguments):
             reason = instruction_file_write_reason(candidate)
             if reason is None:
