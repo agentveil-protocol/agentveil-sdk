@@ -45,6 +45,10 @@ from agentveil_mcp_proxy.classification import (
     sha256_jcs,
 )
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceError
+from agentveil_mcp_proxy.instruction_file_guard import (
+    instruction_file_write_reason,
+    is_instruction_file_write_tool,
+)
 from agentveil_mcp_proxy.policy import PolicyDecision, ProxyConfig, ToolSurfaceMode
 from agentveil_mcp_proxy.tool_schema_validation import (
     ToolSchemaCache,
@@ -742,7 +746,14 @@ class McpPassthrough:
             )
             if path_error is not None:
                 return [path_error] if has_id else []
-            policy_error, approval_outcome = self._policy_error_response(classification, request_id)
+            instruction_error, _ = self._instruction_file_write_policy_response(
+                message, request_id, classification
+            )
+            if instruction_error is not None:
+                return [instruction_error] if has_id else []
+            policy_error, approval_outcome = self._policy_error_response(
+                classification, request_id
+            )
             if policy_error is not None:
                 return [policy_error] if has_id else []
             response_key = (
@@ -1052,6 +1063,49 @@ class McpPassthrough:
             self._record_pre_approval_deny_evidence(classification, reason)
             return _policy_denied_error(request_id, reason=reason)
         return None
+
+    def _instruction_file_write_policy_response(
+        self,
+        message: Mapping[str, Any],
+        request_id: Any,
+        classification: ClassifiedToolCall | None,
+    ) -> tuple[dict[str, Any] | None, ApprovalOutcome | None]:
+        """TrapDoor T2: force approval before writes to agent instruction files."""
+
+        if message.get("method") != "tools/call":
+            return None, None
+        if not isinstance(classification, ClassifiedToolCall):
+            return None, None
+        params = message.get("params")
+        if not isinstance(params, Mapping):
+            return None, None
+        tool = params.get("name")
+        if not isinstance(tool, str) or not tool:
+            return None, None
+        if not is_instruction_file_write_tool(tool):
+            return None, None
+        arguments = params.get("arguments")
+        if not isinstance(arguments, Mapping):
+            return None, None
+        if classification.policy_evaluation.decision is PolicyDecision.BLOCK:
+            return None, None
+        for candidate in self._candidate_file_paths(arguments):
+            reason = instruction_file_write_reason(candidate)
+            if reason is None:
+                continue
+            self._record_security_event({
+                "type": "instruction_file_write",
+                "action": "approval_required_pre_downstream",
+                "reason": reason,
+                "tool": tool,
+            })
+            return self._approval_flow_response(
+                classification,
+                request_id,
+                reason=reason,
+                message="approval required for agent instruction file write",
+            )
+        return None, None
 
     def _record_pre_approval_deny_evidence(
         self,
