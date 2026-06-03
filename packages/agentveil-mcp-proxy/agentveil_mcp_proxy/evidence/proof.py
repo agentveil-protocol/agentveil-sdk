@@ -394,7 +394,10 @@ def verify_evidence_bundle_legacy(
 
 
 def _bundle_records(records: list[PendingApproval], *, require_genesis: bool = True) -> list[dict[str, Any]]:
+    from agentveil_mcp_proxy.evidence.observability import execution_record_id_by_parent
+
     export_records: list[dict[str, Any]] = []
+    execution_by_parent = execution_record_id_by_parent(records)
     expected_prev_hash = (
         GENESIS_PREV_EVENT_HASH
         if require_genesis or not records
@@ -409,6 +412,9 @@ def _bundle_records(records: list[PendingApproval], *, require_genesis: bool = T
             )
         data = asdict(record)
         data["record_hash"] = record_hash(data)
+        execution_record_id = execution_by_parent.get(record.request_id)
+        if execution_record_id is not None:
+            data["execution_record_id"] = execution_record_id
         expected_prev_hash = data["record_hash"]
         export_records.append(data)
     return export_records
