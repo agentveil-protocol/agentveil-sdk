@@ -18,6 +18,9 @@ from agentveil_mcp_proxy.approval.server import (
     ApprovalPrompt,
     ApprovalServer,
     ApprovalServerDecision,
+    TERMINAL_ALREADY_DECIDED_APPROVE,
+    TERMINAL_ALREADY_DECIDED_DENY,
+    TERMINAL_APPROVAL_EXPIRED,
 )
 from agentveil_mcp_proxy.classification import ClassifiedToolCall, sha256_jcs
 from agentveil_mcp_proxy.evidence import (
@@ -258,7 +261,10 @@ class ApprovalManager:
                         )
                     except ApprovalEvidenceTransitionError:
                         pass
-                    self.approval_server.unregister(request_id)
+                    self.approval_server.unregister(
+                        request_id,
+                        terminal_state=TERMINAL_APPROVAL_EXPIRED,
+                    )
                     return ApprovalOutcome(
                         request_id, ApprovalStatus.EXPIRED.value, "approval_timeout"
                     )
@@ -475,7 +481,10 @@ class ApprovalManager:
                 raise ApprovalFlowError("approval evidence persistence failed")
             if current.status == ApprovalStatus.APPROVED.value:
                 scope = current.approval_scope or approval_scope
-                self.approval_server.unregister(request_id)
+                self.approval_server.unregister(
+                    request_id,
+                    terminal_state=TERMINAL_ALREADY_DECIDED_APPROVE,
+                )
                 return ApprovalOutcome(
                     request_id,
                     ApprovalStatus.APPROVED.value,
@@ -499,7 +508,10 @@ class ApprovalManager:
                 user_decision_timestamp=decided_at,
                 approval_grant_jcs=approval_grant_jcs,
             )
-            self.approval_server.unregister(request_id)
+            self.approval_server.unregister(
+                request_id,
+                terminal_state=TERMINAL_ALREADY_DECIDED_APPROVE,
+            )
             return ApprovalOutcome(
                 request_id, ApprovalStatus.APPROVED.value, reason, approval_scope
             )
@@ -562,7 +574,10 @@ class ApprovalManager:
         with self._finalize_lock:
             current = self.evidence_store.get_pending(request_id)
             if current is not None and current.status == ApprovalStatus.DENIED.value:
-                self.approval_server.unregister(request_id)
+                self.approval_server.unregister(
+                    request_id,
+                    terminal_state=TERMINAL_ALREADY_DECIDED_DENY,
+                )
                 return ApprovalOutcome(request_id, ApprovalStatus.DENIED.value, reason)
             now = int(time.time())
             self.evidence_store.transition(
@@ -574,7 +589,10 @@ class ApprovalManager:
                 user_decision_timestamp=now,
                 error_class=reason,
             )
-            self.approval_server.unregister(request_id)
+            self.approval_server.unregister(
+                request_id,
+                terminal_state=TERMINAL_ALREADY_DECIDED_DENY,
+            )
             return ApprovalOutcome(request_id, ApprovalStatus.DENIED.value, reason)
 
     def _effective_ui_open_mode(self) -> ApprovalUiOpenMode:
