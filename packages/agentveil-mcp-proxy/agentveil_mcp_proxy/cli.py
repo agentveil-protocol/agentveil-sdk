@@ -10,7 +10,7 @@ in-memory circuit breaker for sustained backend failures.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 import getpass
 import io
@@ -59,6 +59,7 @@ from agentveil_mcp_proxy.identity import (
 )
 from agentveil_mcp_proxy.policy import (
     PROXY_CONFIG_SCHEMA_VERSION,
+    ApprovalUiOpenMode,
     PolicyConfig,
     ProxyConfig,
     ProxyConfigError,
@@ -538,6 +539,7 @@ def _build_config_payload(
         "approval": {
             "approval_timeout_seconds": 300,
             "on_timeout": "deny",
+            "ui_open_mode": "browser",
         },
         "circuit_breaker": {
             "failures_before_open": 5,
@@ -1816,6 +1818,7 @@ def run_proxy(
     headless: bool = False,
     auto_deny: bool = False,
     headless_policy_path: Path | None = None,
+    approval_ui_mode: str | None = None,
 ) -> int:
     """Validate readiness and run stdio MCP pass-through."""
 
@@ -1829,6 +1832,18 @@ def run_proxy(
         )
     paths = proxy_paths(home, config_path)
     config = load_proxy_config(paths.config_path)
+    if approval_ui_mode is not None:
+        try:
+            ui_mode = ApprovalUiOpenMode(approval_ui_mode)
+        except ValueError as exc:
+            raise ProxyCliError(
+                "approval UI mode must be one of: browser, terminal, none",
+                exit_code=2,
+            ) from exc
+        config = replace(
+            config,
+            approval=replace(config.approval, ui_open_mode=ui_mode),
+        )
     identity_path = paths.identity_path(config.avp.agent_name)
     identity = _read_json(identity_path, "agent identity")
     identity_passphrase = _resolve_existing_identity_passphrase(
@@ -2008,6 +2023,15 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--headless", action="store_true", help="Disable browser and OS notification attempts")
     run.add_argument("--auto-deny", action="store_true", help="Deny every approval-required action")
     run.add_argument("--headless-policy", type=Path, default=None, help="Headless approval policy JSON path")
+    run.add_argument(
+        "--approval-ui-mode",
+        choices=[mode.value for mode in ApprovalUiOpenMode],
+        default=None,
+        help=(
+            "Override approval.ui_open_mode: browser opens the approval center once, "
+            "terminal prints URLs only, none prints URLs without browser or OS notifications"
+        ),
+    )
 
     register = subparsers.add_parser(
         "register",
@@ -2179,6 +2203,7 @@ def main(argv: list[str] | None = None) -> int:
                 headless=args.headless,
                 auto_deny=args.auto_deny,
                 headless_policy_path=args.headless_policy,
+                approval_ui_mode=args.approval_ui_mode,
             )
         if args.command == "register":
             return register_proxy(

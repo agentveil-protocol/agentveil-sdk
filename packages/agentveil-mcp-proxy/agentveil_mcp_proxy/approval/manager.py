@@ -32,7 +32,13 @@ from agentveil_mcp_proxy.evidence.approval_grant import (
     ApprovalGrantError,
     build_approval_grant,
 )
-from agentveil_mcp_proxy.policy import PolicyRule, ProxyConfig, RiskClass, TimeoutAction
+from agentveil_mcp_proxy.policy import (
+    ApprovalUiOpenMode,
+    PolicyRule,
+    ProxyConfig,
+    RiskClass,
+    TimeoutAction,
+)
 from agentveil_mcp_proxy.runtime_gate import DEFAULT_RUNTIME_ENVIRONMENT, RuntimeGateDecision
 
 
@@ -98,6 +104,7 @@ class ApprovalManager:
         self.approval_grant_agent_did = approval_grant_agent_did
         self.approval_grant_mint_failures = 0
         self._finalize_lock = threading.Lock()
+        self._approval_ui_browser_opened = False
         self.approval_server.set_decision_handler(self._persist_server_decision)
 
     def request_approval(
@@ -569,23 +576,49 @@ class ApprovalManager:
             self.approval_server.unregister(request_id)
             return ApprovalOutcome(request_id, ApprovalStatus.DENIED.value, reason)
 
+    def _effective_ui_open_mode(self) -> ApprovalUiOpenMode:
+        """Return the approval UI mode after applying headless overrides."""
+
+        if self.headless:
+            return ApprovalUiOpenMode.NONE
+        return self.config.approval.ui_open_mode
+
+    def _print_approval_fallback(self, prompt: ApprovalPrompt, url: str, summary: str) -> None:
+        """Print an approval URL line without raw payload details."""
+
+        record_hint = f" record_id={prompt.request_id}"
+        if getattr(self.cli_out, "isatty", lambda: False)():
+            print(f"{summary}{record_hint}: {url}", file=self.cli_out)
+            return
+        print(
+            f"{summary}{record_hint}: approval center "
+            f"http://{self.approval_server.host}:{self.approval_server.port}/approval/ "
+            f"(session token omitted on non-TTY output)",
+            file=self.cli_out,
+        )
+
+    def _maybe_open_approval_browser(self) -> None:
+        """Open the approval center in the browser at most once per manager lifetime."""
+
+        if self._effective_ui_open_mode() is not ApprovalUiOpenMode.BROWSER:
+            return
+        if self._approval_ui_browser_opened:
+            return
+        try:
+            self.browser_open(self.approval_server.approval_center_url())
+        except Exception:
+            pass
+        self._approval_ui_browser_opened = True
+
     def _notify(self, prompt: ApprovalPrompt, url: str) -> None:
         summary = (
             f"approval pending: {prompt.client_id} session {prompt.session_id[:8]} "
             f"{prompt.downstream_server}.{prompt.tool_name} {prompt.risk_class}"
         )
-        if getattr(self.cli_out, "isatty", lambda: False)():
-            print(f"{summary}: {url}", file=self.cli_out)
-        else:
-            print(
-                f"{summary}: approval server bound to {self.approval_server.port}; check via 'doctor'",
-                file=self.cli_out,
-            )
-        try:
-            self.browser_open(url)
-        except Exception:
-            pass
-        self.notifier.notify(prompt)
+        self._print_approval_fallback(prompt, url, summary)
+        self._maybe_open_approval_browser()
+        if self._effective_ui_open_mode() is not ApprovalUiOpenMode.NONE:
+            self.notifier.notify(prompt)
 
     def _pending_record(
         self,

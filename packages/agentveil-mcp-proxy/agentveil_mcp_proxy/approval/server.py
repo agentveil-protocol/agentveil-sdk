@@ -164,6 +164,11 @@ class ApprovalServer:
         self._httpd = None
         self._thread = None
 
+    def approval_center_url(self) -> str:
+        """Return the loopback approval list URL for the current server session."""
+
+        return f"{self.base_url}/approval/{self.session_token}"
+
     def approval_url(self, request_id: str) -> str:
         """Return the authenticated approval URL for a pending request."""
 

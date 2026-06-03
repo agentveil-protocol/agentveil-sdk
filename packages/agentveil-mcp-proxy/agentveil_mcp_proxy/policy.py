@@ -45,6 +45,14 @@ class ToolSurfaceMode(str, Enum):
     ENFORCE = "enforce"
 
 
+class ApprovalUiOpenMode(str, Enum):
+    """How the local approval surface is presented to the operator."""
+
+    BROWSER = "browser"
+    TERMINAL = "terminal"
+    NONE = "none"
+
+
 class PolicyDecision(str, Enum):
     """Internal local-policy decision vocabulary."""
 
@@ -329,15 +337,20 @@ class FallbackConfig:
 
 @dataclass(frozen=True)
 class ApprovalConfig:
-    """Approval timeout defaults."""
+    """Approval timeout and local approval UI defaults."""
 
     approval_timeout_seconds: int = 300
     on_timeout: TimeoutAction = TimeoutAction.DENY
+    ui_open_mode: ApprovalUiOpenMode = ApprovalUiOpenMode.BROWSER
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any] | None = None) -> "ApprovalConfig":
         data = _require_mapping(data or {}, "approval")
-        _reject_unknown(data, {"approval_timeout_seconds", "on_timeout"}, "approval")
+        _reject_unknown(
+            data,
+            {"approval_timeout_seconds", "on_timeout", "ui_open_mode"},
+            "approval",
+        )
         timeout_action = data.get("on_timeout", "deny")
         if timeout_action == "allow":
             raise ProxyConfigError(
@@ -350,6 +363,11 @@ class ApprovalConfig:
                 "approval.approval_timeout_seconds",
             ),
             on_timeout=_enum(TimeoutAction, timeout_action, "approval.on_timeout"),
+            ui_open_mode=_enum(
+                ApprovalUiOpenMode,
+                data.get("ui_open_mode", ApprovalUiOpenMode.BROWSER.value),
+                "approval.ui_open_mode",
+            ),
         )
 
 
@@ -982,6 +1000,7 @@ def builtin_policy_pack(name: str) -> PolicyConfig:
 
 __all__ = [
     "ApprovalConfig",
+    "ApprovalUiOpenMode",
     "AvpConfig",
     "DecisionMode",
     "FallbackConfig",

@@ -13,11 +13,12 @@ import socket
 import sys
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlencode, urlsplit
 
 import httpx
 import pytest
+import webbrowser
 from nacl.signing import SigningKey
 
 from agentveil.delegation import _public_key_to_did
@@ -79,6 +80,7 @@ def _config(
     policy_rule: dict[str, Any] | None = None,
     approval_timeout_seconds: int = 300,
     on_timeout: str = "deny",
+    ui_open_mode: str = "browser",
     policy_id: str = "approval-test",
 ) -> ProxyConfig:
     return ProxyConfig.from_dict({
@@ -106,6 +108,7 @@ def _config(
         "approval": {
             "approval_timeout_seconds": approval_timeout_seconds,
             "on_timeout": on_timeout,
+            "ui_open_mode": ui_open_mode,
         },
         "policy": {
             "id": policy_id,
@@ -194,6 +197,7 @@ def _manager(
     auto_deny: bool = False,
     headless_policy: HeadlessPolicy | None = None,
     cli_out: io.StringIO | None = None,
+    browser_open: Callable[[str], bool] | None = None,
     wait_for_decision: bool = True,
     approval_grant_private_key_seed: bytes | None = None,
     approval_grant_agent_did: str | None = None,
@@ -213,7 +217,7 @@ def _manager(
         auto_deny=auto_deny,
         headless_policy=headless_policy,
         cli_out=cli,
-        browser_open=lambda _url: False,
+        browser_open=browser_open or (lambda _url: False),
         notifier=NoopNotifier(),
         wait_for_decision=wait_for_decision,
         approval_grant_private_key_seed=approval_grant_private_key_seed,
@@ -995,7 +999,8 @@ def test_token_url_not_printed_when_stdout_not_tty(tmp_path):
         while not server.pending_prompts() and time.monotonic() < deadline:
             time.sleep(0.01)
         assert server.session_token not in cli.getvalue()
-        assert "approval server bound" in cli.getvalue()
+        assert "record_id=" in cli.getvalue()
+        assert "session token omitted on non-TTY output" in cli.getvalue()
     finally:
         prompt = server.pending_prompts()[0]
         url = server.approval_url(prompt.request_id)
@@ -2395,6 +2400,250 @@ def test_package_manager_retry_executes_once_after_approval(tmp_path):
         )
     finally:
         passthrough.stop()
+        server.stop()
+        store.close()
+
+
+def _tty_cli() -> io.StringIO:
+    cli = io.StringIO()
+    cli.isatty = lambda: True  # type: ignore[method-assign]
+    return cli
+
+
+def _run_terminal_cmd_approval_rule() -> dict[str, Any]:
+    return {
+        "id": "cmd-approval",
+        "source": "user",
+        "decision": "approval",
+        "risk_class": "write",
+        "match": {"server": "fake-downstream", "tool": "run_terminal_cmd"},
+    }
+
+
+def _command_classification(config: ProxyConfig, *, command: str) -> Any:
+    return ToolCallClassifier(config, server_name="fake-downstream").classify(
+        tool="run_terminal_cmd",
+        arguments={"command": command},
+    )
+
+
+T1_FORBIDDEN_HTML_FRAGMENTS = (
+    SECRET,
+    "ghp_private",
+    PACKAGE_MANAGER_SECRET,
+    "npm install",
+    "private-repo",
+    "print('private')",
+    '"arguments"',
+    '"command":',
+)
+
+
+def _assert_t1_privacy_safe_text(text: str) -> None:
+    for fragment in T1_FORBIDDEN_HTML_FRAGMENTS:
+        assert fragment not in text
+
+
+@pytest.mark.parametrize(
+    ("ui_open_mode", "headless", "auto_deny", "expected_browser_open_calls"),
+    [
+        ("browser", False, False, 1),
+        ("terminal", False, False, 0),
+        ("none", False, False, 0),
+        ("browser", True, True, 0),
+    ],
+)
+def test_t1_browser_open_budget_uses_injected_mock_only(
+    tmp_path,
+    ui_open_mode,
+    headless,
+    auto_deny,
+    expected_browser_open_calls,
+):
+    """T1 acceptance: browser spam fix through injected browser_open."""
+
+    opened_urls: list[str] = []
+    config = _config(ui_open_mode=ui_open_mode)
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        cli_out=_tty_cli(),
+        headless=headless,
+        auto_deny=auto_deny,
+        wait_for_decision=False,
+        browser_open=lambda url: opened_urls.append(url) or True,
+    )
+    assert manager.browser_open is not webbrowser.open
+    try:
+        repeat = 1 if headless else 10
+        for _index in range(repeat):
+            manager.request_approval(_classification(config), reason="local_approval_required")
+        assert len(opened_urls) == expected_browser_open_calls
+        if expected_browser_open_calls == 1:
+            assert opened_urls[0] == server.approval_center_url()
+            for fragment in T1_FORBIDDEN_HTML_FRAGMENTS:
+                assert fragment not in opened_urls[0]
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_t1_default_approval_list_and_detail_html_exclude_raw_secrets(tmp_path):
+    """T1 acceptance: default HTML surfaces stay redacted; no raw arg preview."""
+
+    cmd_config = _config(policy_rule=_run_terminal_cmd_approval_rule())
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=cmd_config,
+        wait_for_decision=False,
+    )
+    try:
+        manager.request_approval(
+            _command_classification(cmd_config, command="pip list"),
+            reason="local_approval_required",
+        )
+        manager.request_approval(
+            _command_classification(
+                cmd_config,
+                command=f"npm install {PACKAGE_MANAGER_SECRET}",
+            ),
+            reason="package_manager_action_requires_approval",
+        )
+        list_html = httpx.get(server.approval_center_url(), follow_redirects=True).text
+        _assert_t1_privacy_safe_text(list_html)
+        assert "Show local details" not in list_html
+
+        for prompt in server.pending_prompts():
+            detail_html = httpx.get(server.approval_url(prompt.request_id)).text
+            _assert_t1_privacy_safe_text(detail_html)
+            assert "Show local details" not in detail_html
+            assert cmd_config.privacy.show_details_in_approval_ui is False
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_t1_center_output_lines_exclude_raw_payload(tmp_path):
+    """T1 acceptance: CLI fallback/center output omits raw MCP payload."""
+
+    cli = _tty_cli()
+    config = _config(
+        ui_open_mode="browser",
+        policy_rule=_run_terminal_cmd_approval_rule(),
+    )
+    opened_urls: list[str] = []
+    manager, store, server, _ = _manager(
+        tmp_path,
+        config=config,
+        cli_out=cli,
+        wait_for_decision=False,
+        browser_open=lambda url: opened_urls.append(url) or True,
+    )
+    try:
+        for _index in range(3):
+            manager.request_approval(
+                _command_classification(
+                    config,
+                    command=f"npm install {PACKAGE_MANAGER_SECRET}",
+                ),
+                reason="local_approval_required",
+            )
+        output = cli.getvalue()
+        _assert_t1_privacy_safe_text(output)
+        assert len(opened_urls) == 1
+        assert opened_urls[0] == server.approval_center_url()
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_browser_mode_opens_approval_center_once_for_repeated_pending(tmp_path):
+    opened_urls: list[str] = []
+    config = _config()
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        cli_out=_tty_cli(),
+        wait_for_decision=False,
+        browser_open=lambda url: opened_urls.append(url) or True,
+    )
+    try:
+        for _index in range(10):
+            outcome = manager.request_approval(
+                _classification(config),
+                reason="local_approval_required",
+            )
+            assert outcome.status == ApprovalStatus.PENDING.value
+        assert len(opened_urls) == 1
+        assert opened_urls[0] == server.approval_center_url()
+        assert len(server.pending_prompts()) == 10
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_terminal_mode_prints_url_without_browser_open(tmp_path):
+    opened_urls: list[str] = []
+    cli = _tty_cli()
+    config = _config(ui_open_mode="terminal")
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        cli_out=cli,
+        wait_for_decision=False,
+        browser_open=lambda url: opened_urls.append(url) or True,
+    )
+    try:
+        outcome = manager.request_approval(
+            _classification(config),
+            reason="local_approval_required",
+        )
+        assert outcome.status == ApprovalStatus.PENDING.value
+        assert opened_urls == []
+        rendered = cli.getvalue()
+        assert "/pending/" in rendered
+        assert "record_id=" in rendered
+        assert SECRET not in rendered
+    finally:
+        server.stop()
+        store.close()
+
+
+@pytest.mark.parametrize("ui_mode", ["none"])
+def test_ui_none_mode_never_opens_browser(tmp_path, ui_mode):
+    opened_urls: list[str] = []
+    config = _config(ui_open_mode=ui_mode)
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        cli_out=_tty_cli(),
+        wait_for_decision=False,
+        browser_open=lambda url: opened_urls.append(url) or True,
+    )
+    try:
+        manager.request_approval(_classification(config), reason="local_approval_required")
+        assert opened_urls == []
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_headless_never_opens_browser_even_when_config_requests_browser(tmp_path):
+    opened_urls: list[str] = []
+    config = _config(ui_open_mode="browser")
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        headless=True,
+        auto_deny=True,
+        wait_for_decision=False,
+        browser_open=lambda url: opened_urls.append(url) or True,
+    )
+    try:
+        outcome = manager.request_approval(_classification(config), reason="local_approval_required")
+        assert outcome.status == ApprovalStatus.DENIED.value
+        assert opened_urls == []
+    finally:
         server.stop()
         store.close()
 
