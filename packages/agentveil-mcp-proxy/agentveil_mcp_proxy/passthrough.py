@@ -50,6 +50,7 @@ from agentveil_mcp_proxy.instruction_file_guard import (
     instruction_file_write_reason,
     is_instruction_file_write_tool,
 )
+from agentveil_mcp_proxy.package_manager_guard import package_manager_action_reason
 from agentveil_mcp_proxy.persistence_path_guard import (
     is_filesystem_mutation_tool,
     persistence_path_write_reason,
@@ -789,6 +790,17 @@ class McpPassthrough:
             )
             if persistence_error is not None:
                 return [persistence_error] if has_id else []
+            package_manager_error, package_manager_outcome = (
+                self._package_manager_action_policy_response(
+                    message, request_id, classification
+                )
+            )
+            approval_outcome = _coalesce_approval_outcome(
+                approval_outcome,
+                package_manager_outcome,
+            )
+            if package_manager_error is not None:
+                return [package_manager_error] if has_id else []
             policy_error, policy_outcome = self._policy_error_response(
                 classification, request_id
             )
@@ -1207,6 +1219,45 @@ class McpPassthrough:
                 message="approval required for persistence path write",
             )
         return None, None
+
+    def _package_manager_action_policy_response(
+        self,
+        message: Mapping[str, Any],
+        request_id: Any,
+        classification: ClassifiedToolCall | None,
+    ) -> tuple[dict[str, Any] | None, ApprovalOutcome | None]:
+        """TrapDoor T6: force approval before package-manager mutation commands."""
+
+        if message.get("method") != "tools/call":
+            return None, None
+        if not isinstance(classification, ClassifiedToolCall):
+            return None, None
+        params = message.get("params")
+        if not isinstance(params, Mapping):
+            return None, None
+        tool = params.get("name")
+        if not isinstance(tool, str) or not tool:
+            return None, None
+        arguments = params.get("arguments")
+        if not isinstance(arguments, Mapping):
+            return None, None
+        if classification.policy_evaluation.decision is PolicyDecision.BLOCK:
+            return None, None
+        reason = package_manager_action_reason(tool, arguments)
+        if reason is None:
+            return None, None
+        self._record_security_event({
+            "type": "package_manager_action",
+            "action": "approval_required_pre_downstream",
+            "reason": reason,
+            "tool": tool,
+        })
+        return self._approval_flow_response(
+            classification,
+            request_id,
+            reason=reason,
+            message="approval required for package manager action",
+        )
 
     def _record_pre_approval_deny_evidence(
         self,
