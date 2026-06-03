@@ -115,6 +115,15 @@ def test_proxy_config_schema_requires_version_and_trusted_signers():
     assert cfg.privacy.payload == "hash_only"
     assert cfg.approval.approval_timeout_seconds == 300
     assert cfg.approval.on_timeout.value == "deny"
+    assert cfg.approval.ui_open_mode.value == "browser"
+
+    bad_approval_mode = _base_config()
+    bad_approval_mode["approval"] = {
+        **bad_approval_mode["approval"],
+        "ui_open_mode": "popup",
+    }
+    with pytest.raises(ProxyConfigError, match="approval.ui_open_mode"):
+        ProxyConfig.from_dict(bad_approval_mode)
 
     with pytest.raises(ProxyConfigError, match="proxy_config_schema_version must be 1"):
         ProxyConfig.from_dict(_base_config(proxy_config_schema_version=2))

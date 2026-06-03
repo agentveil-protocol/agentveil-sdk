@@ -13,11 +13,12 @@ import socket
 import sys
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlencode, urlsplit
 
 import httpx
 import pytest
+import webbrowser
 from nacl.signing import SigningKey
 
 from agentveil.delegation import _public_key_to_did
@@ -79,6 +80,7 @@ def _config(
     policy_rule: dict[str, Any] | None = None,
     approval_timeout_seconds: int = 300,
     on_timeout: str = "deny",
+    ui_open_mode: str = "browser",
     policy_id: str = "approval-test",
 ) -> ProxyConfig:
     return ProxyConfig.from_dict({
@@ -106,6 +108,7 @@ def _config(
         "approval": {
             "approval_timeout_seconds": approval_timeout_seconds,
             "on_timeout": on_timeout,
+            "ui_open_mode": ui_open_mode,
         },
         "policy": {
             "id": policy_id,
@@ -136,6 +139,44 @@ def _allow_write_file_rule() -> dict[str, Any]:
         "risk_class": "write",
         "match": {"server": "fake-downstream", "tool": "write_file"},
     }
+
+
+def _fake_downstream_write_approval_rule() -> dict[str, Any]:
+    return {
+        "id": "fake-write-approval",
+        "source": "user",
+        "decision": "approval",
+        "risk_class": "write",
+        "match": {"server": "fake-downstream", "tool": "write_file"},
+    }
+
+
+def _fake_downstream_write_ask_backend_rule() -> dict[str, Any]:
+    return {
+        "id": "fake-write-ask-backend",
+        "source": "user",
+        "decision": "ask_backend",
+        "risk_class": "write",
+        "match": {"server": "fake-downstream", "tool": "write_file"},
+    }
+
+
+RUNTIME_GATE_WAITING_AUDIT_ID = "urn:uuid:11111111-1111-4111-8111-111111111111"
+
+
+class _RuntimeGateWaitingStub:
+    """Returns WAITING_FOR_HUMAN_APPROVAL for TrapDoor/runtime-gate regression tests."""
+
+    def evaluate(self, _classification):
+        from agentveil_mcp_proxy.runtime_gate import RuntimeGateDecision
+
+        return RuntimeGateDecision(
+            decision="WAITING_FOR_HUMAN_APPROVAL",
+            audit_id=RUNTIME_GATE_WAITING_AUDIT_ID,
+            approval_id="urn:uuid:approval",
+            receipt_digest="aa" * 32,
+            receipt_body={},
+        )
 
 
 def _write_rule(*, scope_expansion: bool = False, risk_class: str = "write") -> dict[str, Any]:
@@ -179,6 +220,7 @@ def _prompt(request_id: str = "req-1") -> ApprovalPrompt:
         risk_class="write",
         payload_hash="sha256:" + "b" * 64,
         policy_rule_id="write-approval",
+        reason="local_approval_required",
         created_at=1_700_000_000,
         expires_at=1_700_000_300,
         csrf_token="csrf-token",
@@ -194,6 +236,7 @@ def _manager(
     auto_deny: bool = False,
     headless_policy: HeadlessPolicy | None = None,
     cli_out: io.StringIO | None = None,
+    browser_open: Callable[[str], bool] | None = None,
     wait_for_decision: bool = True,
     approval_grant_private_key_seed: bytes | None = None,
     approval_grant_agent_did: str | None = None,
@@ -213,7 +256,7 @@ def _manager(
         auto_deny=auto_deny,
         headless_policy=headless_policy,
         cli_out=cli,
-        browser_open=lambda _url: False,
+        browser_open=browser_open or (lambda _url: False),
         notifier=NoopNotifier(),
         wait_for_decision=wait_for_decision,
         approval_grant_private_key_seed=approval_grant_private_key_seed,
@@ -995,7 +1038,8 @@ def test_token_url_not_printed_when_stdout_not_tty(tmp_path):
         while not server.pending_prompts() and time.monotonic() < deadline:
             time.sleep(0.01)
         assert server.session_token not in cli.getvalue()
-        assert "approval server bound" in cli.getvalue()
+        assert "record_id=" in cli.getvalue()
+        assert "session token omitted on non-TTY output" in cli.getvalue()
     finally:
         prompt = server.pending_prompts()[0]
         url = server.approval_url(prompt.request_id)
@@ -1190,6 +1234,7 @@ def test_destructive_approval_defaults_to_exact_request_scope(tmp_path):
             created_at=1,
             expires_at=2,
             scope_expansion_allowed=manager._scope_expansion_allowed(classification),
+            reason="local_approval_required",
         )
         assert prompt.scope_expansion_allowed is False
     finally:
@@ -1208,6 +1253,7 @@ def test_write_approval_optional_5min_similar_only_when_policy_allows(tmp_path):
             created_at=1,
             expires_at=2,
             scope_expansion_allowed=manager._scope_expansion_allowed(classification),
+            reason="local_approval_required",
         )
         assert prompt.scope_expansion_allowed is True
     finally:
@@ -1515,8 +1561,9 @@ def test_pending_list_shows_correlation_fields_for_multiple_clients():
         first = _prompt("req-a")
         second = replace(_prompt("req-b"), client_id="claude:session-2", session_id="session-b")
         server.register(first)
-        list_url = server.register(second).rsplit("/pending/", 1)[0]
-        text = httpx.get(list_url).text
+        server.register(second)
+        text = httpx.get(server.approval_center_url()).text
+        assert "approval-card" in text
         assert "github.create_issue" in text
         assert "write" in text
         assert "cursor:session-1" in text
@@ -1634,10 +1681,10 @@ def _filesystem_write_downstream(tmp_path: Path, log_path: Path) -> Path:
     )
 
 
-def _persistence_bashrc_call() -> str:
+def _persistence_bashrc_call(*, call_id: str = "call-1") -> str:
     return json.dumps({
         "jsonrpc": "2.0",
-        "id": "call-1",
+        "id": call_id,
         "method": "tools/call",
         "params": {
             "name": "write_file",
@@ -2191,6 +2238,191 @@ def test_immediate_retry_after_approve_post_matches_live_console(tmp_path):
         store.close()
 
 
+def test_persistence_retry_after_approve_does_not_reopen_pending(tmp_path):
+    """Regression for approval-center user path: trapdoor then policy on retry.
+
+    After POST approve, a persistent ``run`` retry hits persistence TrapDoor
+    (``request_approval`` + grant child) and then local policy still returns
+    APPROVAL. The policy layer must coalesce the in-flight TrapDoor approval,
+    not register a second pending prompt.
+    """
+
+    config = _config(policy_rule=_fake_downstream_write_approval_rule())
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        wait_for_decision=False,
+    )
+    log_path = tmp_path / "downstream.log"
+    passthrough = McpPassthrough(
+        DownstreamConfig(
+            command=sys.executable,
+            args=("-u", str(_filesystem_write_downstream(tmp_path, log_path))),
+            name="fake-downstream",
+            env={"DOWNSTREAM_LOG": str(log_path)},
+        ),
+        classifier=ToolCallClassifier(config, server_name="fake-downstream"),
+        approval_manager=manager,
+    )
+    passthrough.start()
+    try:
+        first = passthrough.handle_client_line(_persistence_bashrc_call())
+        assert first[0]["error"]["data"]["status"] == "approval_required"
+
+        deadline = time.monotonic() + 2
+        while not server.pending_prompts() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        parent_id = server.pending_prompts()[0].request_id
+        with httpx.Client() as client:
+            csrf = _get_csrf(client, server.approval_url(parent_id))
+            assert _post_decision(
+                client,
+                server.approval_url(parent_id),
+                decision="approve",
+                csrf=csrf,
+            ).status_code == 200
+
+        retry = passthrough.handle_client_line(_persistence_bashrc_call())
+        assert len(retry) == 1
+        assert "result" in retry[0], retry[0]
+        assert server.pending_prompts() == []
+        assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list", "tools/call"]
+
+        children = [
+            record
+            for record in store.list_records()
+            if record.granted_by_request_id == parent_id
+        ]
+        assert len(children) == 1
+        assert children[0].status == ApprovalStatus.EXECUTED.value
+        parent = store.get_pending(parent_id)
+        assert parent is not None
+        assert parent.status == ApprovalStatus.APPROVED.value
+    finally:
+        passthrough.stop()
+        server.stop()
+        store.close()
+
+
+def test_trapdoor_approved_retry_still_requires_runtime_gate_waiting(tmp_path):
+    """TrapDoor grant must not satisfy a separate Runtime Gate WAITING approval."""
+
+    config = _config(policy_rule=_fake_downstream_write_ask_backend_rule())
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        wait_for_decision=False,
+    )
+    log_path = tmp_path / "downstream.log"
+    passthrough = McpPassthrough(
+        DownstreamConfig(
+            command=sys.executable,
+            args=("-u", str(_filesystem_write_downstream(tmp_path, log_path))),
+            name="fake-downstream",
+            env={"DOWNSTREAM_LOG": str(log_path)},
+        ),
+        classifier=ToolCallClassifier(config, server_name="fake-downstream"),
+        approval_manager=manager,
+        runtime_gate_factory=_RuntimeGateWaitingStub,
+    )
+    passthrough.start()
+    try:
+        first = passthrough.handle_client_line(_persistence_bashrc_call(call_id="call-1"))
+        assert first[0]["error"]["data"]["reason"] == "persistence_path_write_requires_approval"
+
+        deadline = time.monotonic() + 2
+        while not server.pending_prompts() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        trapdoor_parent_id = server.pending_prompts()[0].request_id
+        with httpx.Client() as client:
+            csrf = _get_csrf(client, server.approval_url(trapdoor_parent_id))
+            assert _post_decision(
+                client,
+                server.approval_url(trapdoor_parent_id),
+                decision="approve",
+                csrf=csrf,
+            ).status_code == 200
+
+        retry = passthrough.handle_client_line(_persistence_bashrc_call(call_id="call-2"))
+        assert len(retry) == 1
+        assert "error" in retry[0]
+        assert retry[0]["error"]["data"]["status"] == "approval_required"
+        assert (
+            retry[0]["error"]["data"]["reason"]
+            == "runtime_gate_waiting_for_human_approval"
+        )
+        assert retry[0]["error"]["data"]["decision"] == "WAITING_FOR_HUMAN_APPROVAL"
+        assert retry[0]["error"]["data"]["audit_id"] == RUNTIME_GATE_WAITING_AUDIT_ID
+        assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
+        assert len(server.pending_prompts()) >= 1
+        runtime_prompt_ids = {
+            prompt.request_id
+            for prompt in server.pending_prompts()
+        }
+        assert runtime_prompt_ids.isdisjoint({trapdoor_parent_id})
+    finally:
+        passthrough.stop()
+        server.stop()
+        store.close()
+
+
+def test_independent_identical_request_does_not_reuse_inflight_approval(tmp_path):
+    """Approved retry children must not auto-reuse across separate MCP requests."""
+
+    config = _config(policy_rule=_fake_downstream_write_approval_rule())
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        wait_for_decision=False,
+    )
+    log_path = tmp_path / "downstream.log"
+    passthrough = McpPassthrough(
+        DownstreamConfig(
+            command=sys.executable,
+            args=("-u", str(_filesystem_write_downstream(tmp_path, log_path))),
+            name="fake-downstream",
+            env={"DOWNSTREAM_LOG": str(log_path)},
+        ),
+        classifier=ToolCallClassifier(config, server_name="fake-downstream"),
+        approval_manager=manager,
+    )
+    passthrough.start()
+    try:
+        first = passthrough.handle_client_line(_persistence_bashrc_call(call_id="call-1"))
+        assert first[0]["error"]["data"]["status"] == "approval_required"
+        deadline = time.monotonic() + 2
+        while not server.pending_prompts() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        parent_id = server.pending_prompts()[0].request_id
+        with httpx.Client() as client:
+            csrf = _get_csrf(client, server.approval_url(parent_id))
+            assert _post_decision(
+                client,
+                server.approval_url(parent_id),
+                decision="approve",
+                csrf=csrf,
+            ).status_code == 200
+
+        retry = passthrough.handle_client_line(_persistence_bashrc_call(call_id="call-2"))
+        assert "result" in retry[0]
+        assert server.pending_prompts() == []
+
+        second_request = passthrough.handle_client_line(
+            _persistence_bashrc_call(call_id="call-3")
+        )
+        assert second_request[0]["error"]["data"]["status"] == "approval_required"
+        assert len(server.pending_prompts()) == 1
+        assert server.pending_prompts()[0].request_id != parent_id
+        assert log_path.read_text(encoding="utf-8").splitlines() == [
+            "tools/list",
+            "tools/call",
+        ]
+    finally:
+        passthrough.stop()
+        server.stop()
+        store.close()
+
+
 def test_passthrough_retry_after_trapdoor_approval_records_executed_evidence(tmp_path):
     """Regression for persistent run: trapdoor approval must keep retry outcome.
 
@@ -2395,6 +2627,524 @@ def test_package_manager_retry_executes_once_after_approval(tmp_path):
         )
     finally:
         passthrough.stop()
+        server.stop()
+        store.close()
+
+
+def _tty_cli() -> io.StringIO:
+    cli = io.StringIO()
+    cli.isatty = lambda: True  # type: ignore[method-assign]
+    return cli
+
+
+def _run_terminal_cmd_approval_rule() -> dict[str, Any]:
+    return {
+        "id": "cmd-approval",
+        "source": "user",
+        "decision": "approval",
+        "risk_class": "write",
+        "match": {"server": "fake-downstream", "tool": "run_terminal_cmd"},
+    }
+
+
+def _command_classification(config: ProxyConfig, *, command: str) -> Any:
+    return ToolCallClassifier(config, server_name="fake-downstream").classify(
+        tool="run_terminal_cmd",
+        arguments={"command": command},
+    )
+
+
+T1_FORBIDDEN_HTML_FRAGMENTS = (
+    SECRET,
+    "ghp_private",
+    PACKAGE_MANAGER_SECRET,
+    "npm install",
+    "private-repo",
+    "print('private')",
+    '"arguments"',
+    '"command":',
+)
+
+
+def _assert_t1_privacy_safe_text(text: str) -> None:
+    for fragment in T1_FORBIDDEN_HTML_FRAGMENTS:
+        assert fragment not in text
+
+
+@pytest.mark.parametrize(
+    ("ui_open_mode", "headless", "auto_deny", "expected_browser_open_calls"),
+    [
+        ("browser", False, False, 1),
+        ("terminal", False, False, 0),
+        ("none", False, False, 0),
+        ("browser", True, True, 0),
+    ],
+)
+def test_t1_browser_open_budget_uses_injected_mock_only(
+    tmp_path,
+    ui_open_mode,
+    headless,
+    auto_deny,
+    expected_browser_open_calls,
+):
+    """T1 acceptance: browser spam fix through injected browser_open."""
+
+    opened_urls: list[str] = []
+    config = _config(ui_open_mode=ui_open_mode)
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        cli_out=_tty_cli(),
+        headless=headless,
+        auto_deny=auto_deny,
+        wait_for_decision=False,
+        browser_open=lambda url: opened_urls.append(url) or True,
+    )
+    assert manager.browser_open is not webbrowser.open
+    try:
+        repeat = 1 if headless else 10
+        for _index in range(repeat):
+            manager.request_approval(_classification(config), reason="local_approval_required")
+        assert len(opened_urls) == expected_browser_open_calls
+        if expected_browser_open_calls == 1:
+            assert opened_urls[0] == server.approval_center_url()
+            for fragment in T1_FORBIDDEN_HTML_FRAGMENTS:
+                assert fragment not in opened_urls[0]
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_t1_default_approval_list_and_detail_html_exclude_raw_secrets(tmp_path):
+    """T1 acceptance: default HTML surfaces stay redacted; no raw arg preview."""
+
+    cmd_config = _config(policy_rule=_run_terminal_cmd_approval_rule())
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=cmd_config,
+        wait_for_decision=False,
+    )
+    try:
+        manager.request_approval(
+            _command_classification(cmd_config, command="pip list"),
+            reason="local_approval_required",
+        )
+        manager.request_approval(
+            _command_classification(
+                cmd_config,
+                command=f"npm install {PACKAGE_MANAGER_SECRET}",
+            ),
+            reason="package_manager_action_requires_approval",
+        )
+        list_html = httpx.get(server.approval_center_url(), follow_redirects=True).text
+        _assert_t1_privacy_safe_text(list_html)
+        assert "Show local details" not in list_html
+
+        for prompt in server.pending_prompts():
+            detail_html = httpx.get(server.approval_url(prompt.request_id)).text
+            _assert_t1_privacy_safe_text(detail_html)
+            assert "Show local details" not in detail_html
+            assert cmd_config.privacy.show_details_in_approval_ui is False
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_t1_center_output_lines_exclude_raw_payload(tmp_path):
+    """T1 acceptance: CLI fallback/center output omits raw MCP payload."""
+
+    cli = _tty_cli()
+    config = _config(
+        ui_open_mode="browser",
+        policy_rule=_run_terminal_cmd_approval_rule(),
+    )
+    opened_urls: list[str] = []
+    manager, store, server, _ = _manager(
+        tmp_path,
+        config=config,
+        cli_out=cli,
+        wait_for_decision=False,
+        browser_open=lambda url: opened_urls.append(url) or True,
+    )
+    try:
+        for _index in range(3):
+            manager.request_approval(
+                _command_classification(
+                    config,
+                    command=f"npm install {PACKAGE_MANAGER_SECRET}",
+                ),
+                reason="local_approval_required",
+            )
+        output = cli.getvalue()
+        _assert_t1_privacy_safe_text(output)
+        assert len(opened_urls) == 1
+        assert opened_urls[0] == server.approval_center_url()
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_browser_mode_opens_approval_center_once_for_repeated_pending(tmp_path):
+    opened_urls: list[str] = []
+    config = _config()
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        cli_out=_tty_cli(),
+        wait_for_decision=False,
+        browser_open=lambda url: opened_urls.append(url) or True,
+    )
+    try:
+        for _index in range(10):
+            outcome = manager.request_approval(
+                _classification(config),
+                reason="local_approval_required",
+            )
+            assert outcome.status == ApprovalStatus.PENDING.value
+        assert len(opened_urls) == 1
+        assert opened_urls[0] == server.approval_center_url()
+        assert len(server.pending_prompts()) == 10
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_terminal_mode_prints_url_without_browser_open(tmp_path):
+    opened_urls: list[str] = []
+    cli = _tty_cli()
+    config = _config(ui_open_mode="terminal")
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        cli_out=cli,
+        wait_for_decision=False,
+        browser_open=lambda url: opened_urls.append(url) or True,
+    )
+    try:
+        outcome = manager.request_approval(
+            _classification(config),
+            reason="local_approval_required",
+        )
+        assert outcome.status == ApprovalStatus.PENDING.value
+        assert opened_urls == []
+        rendered = cli.getvalue()
+        assert "/pending/" in rendered
+        assert "record_id=" in rendered
+        assert SECRET not in rendered
+    finally:
+        server.stop()
+        store.close()
+
+
+@pytest.mark.parametrize("ui_mode", ["none"])
+def test_ui_none_mode_never_opens_browser(tmp_path, ui_mode):
+    opened_urls: list[str] = []
+    config = _config(ui_open_mode=ui_mode)
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        cli_out=_tty_cli(),
+        wait_for_decision=False,
+        browser_open=lambda url: opened_urls.append(url) or True,
+    )
+    try:
+        manager.request_approval(_classification(config), reason="local_approval_required")
+        assert opened_urls == []
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_headless_never_opens_browser_even_when_config_requests_browser(tmp_path):
+    opened_urls: list[str] = []
+    config = _config(ui_open_mode="browser")
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        headless=True,
+        auto_deny=True,
+        wait_for_decision=False,
+        browser_open=lambda url: opened_urls.append(url) or True,
+    )
+    try:
+        outcome = manager.request_approval(_classification(config), reason="local_approval_required")
+        assert outcome.status == ApprovalStatus.DENIED.value
+        assert opened_urls == []
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_api_approvals_returns_pending_json(tmp_path):
+    config = _config(policy_rule=_run_terminal_cmd_approval_rule())
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        wait_for_decision=False,
+    )
+    try:
+        manager.request_approval(
+            _command_classification(config, command="pip list"),
+            reason="local_approval_required",
+        )
+        manager.request_approval(
+            _command_classification(
+                config,
+                command=f"npm install {PACKAGE_MANAGER_SECRET}",
+            ),
+            reason="package_manager_action_requires_approval",
+        )
+        response = httpx.get(
+            f"{server.base_url}/approval/{server.session_token}/api/approvals",
+            timeout=2,
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["ok"] is True
+        assert len(payload["approvals"]) == 2
+        for item in payload["approvals"]:
+            assert item["status"] == ApprovalStatus.PENDING.value
+            assert "request_id" in item
+            assert "session_id_prefix" in item
+            assert len(item["session_id_prefix"]) == 8
+            assert "session_id" not in item
+            assert "csrf_token" not in item
+        reasons = {item["reason"] for item in payload["approvals"]}
+        assert "local_approval_required" in reasons
+        assert "package_manager_action_requires_approval" in reasons
+        _assert_t1_privacy_safe_text(json.dumps(payload))
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_api_approvals_forbidden_without_valid_token():
+    server = ApprovalServer()
+    server.start()
+    try:
+        server.register(_prompt("req-api"))
+        response = httpx.get(f"{server.base_url}/approval/not-a-valid-token/api/approvals")
+        assert response.status_code == 403
+    finally:
+        server.stop()
+
+
+def test_dashboard_empty_state_renders():
+    server = ApprovalServer()
+    server.start()
+    try:
+        text = httpx.get(server.approval_center_url()).text
+        assert "No pending approvals" in text
+        assert "approval-empty" in text
+        assert "approval-card" not in text
+    finally:
+        server.stop()
+
+
+def test_dashboard_pending_cards_render_sanitized_fields(tmp_path):
+    config = _config(policy_rule=_run_terminal_cmd_approval_rule())
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        wait_for_decision=False,
+    )
+    try:
+        outcome = manager.request_approval(
+            _command_classification(config, command="pip list"),
+            reason="local_approval_required",
+        )
+        assert outcome.status == ApprovalStatus.PENDING.value
+        text = httpx.get(server.approval_center_url()).text
+        assert "approval-card" in text
+        assert "fake-downstream" in text
+        assert "run_terminal_cmd" in text
+        assert "local_approval_required" in text
+        assert "approval-risk-write" in text or "approval-risk" in text
+        assert "Review &amp; decide" in text
+        assert "approval-request-id" in text
+        assert str(outcome.request_id) in text
+        assert "approval-wrap" in text
+        assert "Created" in text
+        assert "Expires" in text
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_dashboard_excludes_raw_secrets_and_long_plaintext(tmp_path):
+    config = _config(policy_rule=_run_terminal_cmd_approval_rule())
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        wait_for_decision=False,
+    )
+    try:
+        manager.request_approval(
+            _command_classification(
+                config,
+                command=f"npm install {PACKAGE_MANAGER_SECRET}",
+            ),
+            reason="package_manager_action_requires_approval",
+        )
+        text = httpx.get(server.approval_center_url()).text
+        _assert_t1_privacy_safe_text(text)
+        assert "sha256:" in text
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_dashboard_hides_terminal_prompts():
+    server = ApprovalServer()
+    server.start()
+    try:
+        server.register(_prompt("req-terminal"))
+        server.unregister("req-terminal")
+        text = httpx.get(server.approval_center_url()).text
+        assert "No pending approvals" in text
+        assert "req-terminal" not in text
+    finally:
+        server.stop()
+
+
+def test_dashboard_detail_approve_deny_flow_still_works(tmp_path):
+    """Dashboard links to detail page; approve POST + immediate retry still execute."""
+
+    config = _config(policy_rule=_write_rule())
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        wait_for_decision=False,
+    )
+    log_path = tmp_path / "downstream.log"
+    passthrough = McpPassthrough(
+        DownstreamConfig(
+            command=sys.executable,
+            args=("-u", str(_approval_downstream(tmp_path, log_path))),
+            name="github",
+            env={"DOWNSTREAM_LOG": str(log_path)},
+        ),
+        classifier=ToolCallClassifier(config, server_name="github"),
+        approval_manager=manager,
+    )
+    passthrough.start()
+    try:
+        first = passthrough.handle_client_line(_tool_call())
+        assert len(first) == 1
+        assert first[0]["error"]["data"]["status"] == "approval_required"
+
+        deadline = time.monotonic() + 2
+        while not server.pending_prompts() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        dashboard = httpx.get(server.approval_center_url()).text
+        assert "approval-card" in dashboard
+        prompt = server.pending_prompts()[0]
+        detail_url = server.approval_url(prompt.request_id)
+        detail = httpx.get(detail_url).text
+        assert "Approve" in detail
+        assert "Deny" in detail
+        assert "Back to pending list" in detail
+        assert "&larr;" in detail
+        with httpx.Client() as client:
+            csrf = _get_csrf(client, detail_url)
+            response = _post_decision(
+                client,
+                detail_url,
+                decision="approve",
+                csrf=csrf,
+            )
+        assert response.status_code == 200
+
+        retry = passthrough.handle_client_line(_tool_call())
+        assert len(retry) == 1
+        assert "result" in retry[0], retry[0]
+        assert log_path.read_text(encoding="utf-8").splitlines() == [
+            "tools/list",
+            "tools/call",
+        ]
+    finally:
+        passthrough.stop()
+        server.stop()
+        store.close()
+
+
+def test_dashboard_and_detail_include_light_theme_css():
+    server = ApprovalServer()
+    server.start()
+    try:
+        dashboard = httpx.get(server.approval_center_url()).text
+        detail_url = server.register(_prompt("req-t31-theme"))
+        detail = httpx.get(detail_url).text
+        for html in (dashboard, detail):
+            assert "prefers-color-scheme: light" in html
+            assert ":root" in html
+            assert "--bg:" in html
+            assert "var(--text)" in html
+            assert "var(--bg)" in html
+    finally:
+        server.stop()
+
+
+def test_detail_shows_session_prefix_not_full_session_id():
+    server = ApprovalServer()
+    server.start()
+    try:
+        prompt = _prompt("req-t31-session")
+        assert prompt.session_id == "session-abcdef"
+        assert prompt.session_id[:8] == "session-"
+        detail = httpx.get(server.register(prompt)).text
+        assert "session-abcdef" not in detail
+        assert "abcdef" not in detail
+        assert "Session prefix" in detail
+        assert "session-" in detail
+        assert "req-t31-session" in detail
+    finally:
+        server.stop()
+
+
+def test_dashboard_and_detail_include_local_url_warning():
+    warning = approval_server_module.APPROVAL_LOCAL_URL_WARNING
+    server = ApprovalServer()
+    server.start()
+    try:
+        dashboard = httpx.get(server.approval_center_url()).text
+        detail = httpx.get(server.register(_prompt("req-t31-warning"))).text
+        for html in (dashboard, detail):
+            assert warning in html
+            assert "approval-security-notice" in html
+    finally:
+        server.stop()
+
+
+def test_api_approvals_json_excludes_raw_secrets_and_html_still_works(tmp_path):
+    config = _config(policy_rule=_run_terminal_cmd_approval_rule())
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        wait_for_decision=False,
+    )
+    try:
+        manager.request_approval(
+            _command_classification(
+                config,
+                command=f"npm install {PACKAGE_MANAGER_SECRET}",
+            ),
+            reason="package_manager_action_requires_approval",
+        )
+        api_url = f"{server.base_url}/approval/{server.session_token}/api/approvals"
+        payload = httpx.get(api_url).json()
+        _assert_t1_privacy_safe_text(json.dumps(payload))
+
+        list_html = httpx.get(server.approval_center_url()).text
+        assert "Pending approvals" in list_html
+        assert "approval-card" in list_html
+        _assert_t1_privacy_safe_text(list_html)
+
+        prompt = server.pending_prompts()[0]
+        detail_html = httpx.get(server.approval_url(prompt.request_id)).text
+        assert "Approval pending" in detail_html
+        _assert_t1_privacy_safe_text(detail_html)
+    finally:
         server.stop()
         store.close()
 
