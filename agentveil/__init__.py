@@ -40,7 +40,7 @@ from agentveil.exceptions import (
     AVPServerError,
 )
 
-__version__ = "0.7.20"
+__version__ = "0.7.21"
 
 __all__ = [
     "AVPAgent",
