@@ -127,6 +127,9 @@ _DESTRUCTIVE_FILE_PATH_TOOL_PREFIXES = (
 _PATH_ARG_KEYS = ("path", "paths", "source", "destination")
 _SECRET_PATH_FILENAMES = frozenset({
     ".env",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
     "id_rsa",
     "id_ed25519",
     "credentials",

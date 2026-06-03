@@ -1321,6 +1321,75 @@ def test_secret_path_hard_deny_writes_terminal_blocked_evidence(tmp_path, monkey
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
 
 
+@pytest.mark.parametrize(
+    ("secret_basename", "tool_path"),
+    [
+        (".npmrc", "/home/user/.npmrc"),
+        (".pypirc", "/home/user/.pypirc"),
+        (".netrc", "/home/user/.netrc"),
+    ],
+)
+def test_trapdoor_package_credential_paths_hard_deny_before_approval(
+    tmp_path,
+    monkeypatch,
+    secret_basename,
+    tool_path,
+):
+    # T1 TrapDoor: package-manager credential files are denied before approval,
+    # downstream, and evidence must not echo the raw path.
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    _set_downstream(init.config_path, _normal_downstream(tmp_path), log_path=log_path)
+    _set_allow_policy(init.config_path, server="fake-downstream", tool="read_file")
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("path policy must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line({
+            "jsonrpc": "2.0",
+            "id": "call-1",
+            "method": "tools/call",
+            "params": {"name": "read_file", "arguments": {"path": tool_path}},
+        })),
+        out=client_out,
+    ) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    assert response["error"]["code"] == JSONRPC_POLICY_BLOCKED
+    assert response["error"]["data"] == {
+        "status": "policy_denied",
+        "reason": "secret_path_blocked",
+    }
+    assert "approval_url" not in response["error"]["data"]
+    assert "record_id" not in response["error"]["data"]
+    assert _pending_approval_count(home) == 0
+    assert tool_path not in client_out.getvalue()
+    assert secret_basename not in client_out.getvalue()
+
+    records = _evidence_records(home)
+    assert len(records) == 1
+    record = records[0]
+    assert record["status"] == "blocked"  # claim-check: allow tested status
+    assert record["error_class"] == "secret_path_blocked"
+    assert record["result_status"] == "blocked"  # claim-check: allow tested status
+    assert record["tool_name"] == "read_file"
+    assert record["expires_at"] is None
+    assert record["approval_token_hash"] is None
+    assert record["decision_audit_id"] is None
+    record_json = json.dumps(record)
+    assert tool_path not in record_json
+    assert secret_basename not in record_json
+    assert str(record["resource_hash"]).startswith("sha256:")
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
+
+
 def test_schema_deny_records_documented_validation_event(tmp_path):
     # Bug 3: a schema-deny (write_file called with file_path instead of path)
     # records a documented validation event: argument NAMES only, no values.
