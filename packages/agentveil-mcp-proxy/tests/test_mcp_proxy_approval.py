@@ -141,6 +141,44 @@ def _allow_write_file_rule() -> dict[str, Any]:
     }
 
 
+def _fake_downstream_write_approval_rule() -> dict[str, Any]:
+    return {
+        "id": "fake-write-approval",
+        "source": "user",
+        "decision": "approval",
+        "risk_class": "write",
+        "match": {"server": "fake-downstream", "tool": "write_file"},
+    }
+
+
+def _fake_downstream_write_ask_backend_rule() -> dict[str, Any]:
+    return {
+        "id": "fake-write-ask-backend",
+        "source": "user",
+        "decision": "ask_backend",
+        "risk_class": "write",
+        "match": {"server": "fake-downstream", "tool": "write_file"},
+    }
+
+
+RUNTIME_GATE_WAITING_AUDIT_ID = "urn:uuid:11111111-1111-4111-8111-111111111111"
+
+
+class _RuntimeGateWaitingStub:
+    """Returns WAITING_FOR_HUMAN_APPROVAL for TrapDoor/runtime-gate regression tests."""
+
+    def evaluate(self, _classification):
+        from agentveil_mcp_proxy.runtime_gate import RuntimeGateDecision
+
+        return RuntimeGateDecision(
+            decision="WAITING_FOR_HUMAN_APPROVAL",
+            audit_id=RUNTIME_GATE_WAITING_AUDIT_ID,
+            approval_id="urn:uuid:approval",
+            receipt_digest="aa" * 32,
+            receipt_body={},
+        )
+
+
 def _write_rule(*, scope_expansion: bool = False, risk_class: str = "write") -> dict[str, Any]:
     rule: dict[str, Any] = {
         "id": "write-approval",
@@ -1643,10 +1681,10 @@ def _filesystem_write_downstream(tmp_path: Path, log_path: Path) -> Path:
     )
 
 
-def _persistence_bashrc_call() -> str:
+def _persistence_bashrc_call(*, call_id: str = "call-1") -> str:
     return json.dumps({
         "jsonrpc": "2.0",
-        "id": "call-1",
+        "id": call_id,
         "method": "tools/call",
         "params": {
             "name": "write_file",
@@ -2194,6 +2232,191 @@ def test_immediate_retry_after_approve_post_matches_live_console(tmp_path):
             blob = f"{record.tool_name}:{record.payload_hash}:{record.status}"
             assert SECRET not in blob
         assert SECRET not in json.dumps(bundle)
+    finally:
+        passthrough.stop()
+        server.stop()
+        store.close()
+
+
+def test_persistence_retry_after_approve_does_not_reopen_pending(tmp_path):
+    """Regression for approval-center user path: trapdoor then policy on retry.
+
+    After POST approve, a persistent ``run`` retry hits persistence TrapDoor
+    (``request_approval`` + grant child) and then local policy still returns
+    APPROVAL. The policy layer must coalesce the in-flight TrapDoor approval,
+    not register a second pending prompt.
+    """
+
+    config = _config(policy_rule=_fake_downstream_write_approval_rule())
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        wait_for_decision=False,
+    )
+    log_path = tmp_path / "downstream.log"
+    passthrough = McpPassthrough(
+        DownstreamConfig(
+            command=sys.executable,
+            args=("-u", str(_filesystem_write_downstream(tmp_path, log_path))),
+            name="fake-downstream",
+            env={"DOWNSTREAM_LOG": str(log_path)},
+        ),
+        classifier=ToolCallClassifier(config, server_name="fake-downstream"),
+        approval_manager=manager,
+    )
+    passthrough.start()
+    try:
+        first = passthrough.handle_client_line(_persistence_bashrc_call())
+        assert first[0]["error"]["data"]["status"] == "approval_required"
+
+        deadline = time.monotonic() + 2
+        while not server.pending_prompts() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        parent_id = server.pending_prompts()[0].request_id
+        with httpx.Client() as client:
+            csrf = _get_csrf(client, server.approval_url(parent_id))
+            assert _post_decision(
+                client,
+                server.approval_url(parent_id),
+                decision="approve",
+                csrf=csrf,
+            ).status_code == 200
+
+        retry = passthrough.handle_client_line(_persistence_bashrc_call())
+        assert len(retry) == 1
+        assert "result" in retry[0], retry[0]
+        assert server.pending_prompts() == []
+        assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list", "tools/call"]
+
+        children = [
+            record
+            for record in store.list_records()
+            if record.granted_by_request_id == parent_id
+        ]
+        assert len(children) == 1
+        assert children[0].status == ApprovalStatus.EXECUTED.value
+        parent = store.get_pending(parent_id)
+        assert parent is not None
+        assert parent.status == ApprovalStatus.APPROVED.value
+    finally:
+        passthrough.stop()
+        server.stop()
+        store.close()
+
+
+def test_trapdoor_approved_retry_still_requires_runtime_gate_waiting(tmp_path):
+    """TrapDoor grant must not satisfy a separate Runtime Gate WAITING approval."""
+
+    config = _config(policy_rule=_fake_downstream_write_ask_backend_rule())
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        wait_for_decision=False,
+    )
+    log_path = tmp_path / "downstream.log"
+    passthrough = McpPassthrough(
+        DownstreamConfig(
+            command=sys.executable,
+            args=("-u", str(_filesystem_write_downstream(tmp_path, log_path))),
+            name="fake-downstream",
+            env={"DOWNSTREAM_LOG": str(log_path)},
+        ),
+        classifier=ToolCallClassifier(config, server_name="fake-downstream"),
+        approval_manager=manager,
+        runtime_gate_factory=_RuntimeGateWaitingStub,
+    )
+    passthrough.start()
+    try:
+        first = passthrough.handle_client_line(_persistence_bashrc_call(call_id="call-1"))
+        assert first[0]["error"]["data"]["reason"] == "persistence_path_write_requires_approval"
+
+        deadline = time.monotonic() + 2
+        while not server.pending_prompts() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        trapdoor_parent_id = server.pending_prompts()[0].request_id
+        with httpx.Client() as client:
+            csrf = _get_csrf(client, server.approval_url(trapdoor_parent_id))
+            assert _post_decision(
+                client,
+                server.approval_url(trapdoor_parent_id),
+                decision="approve",
+                csrf=csrf,
+            ).status_code == 200
+
+        retry = passthrough.handle_client_line(_persistence_bashrc_call(call_id="call-2"))
+        assert len(retry) == 1
+        assert "error" in retry[0]
+        assert retry[0]["error"]["data"]["status"] == "approval_required"
+        assert (
+            retry[0]["error"]["data"]["reason"]
+            == "runtime_gate_waiting_for_human_approval"
+        )
+        assert retry[0]["error"]["data"]["decision"] == "WAITING_FOR_HUMAN_APPROVAL"
+        assert retry[0]["error"]["data"]["audit_id"] == RUNTIME_GATE_WAITING_AUDIT_ID
+        assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
+        assert len(server.pending_prompts()) >= 1
+        runtime_prompt_ids = {
+            prompt.request_id
+            for prompt in server.pending_prompts()
+        }
+        assert runtime_prompt_ids.isdisjoint({trapdoor_parent_id})
+    finally:
+        passthrough.stop()
+        server.stop()
+        store.close()
+
+
+def test_independent_identical_request_does_not_reuse_inflight_approval(tmp_path):
+    """Approved retry children must not auto-reuse across separate MCP requests."""
+
+    config = _config(policy_rule=_fake_downstream_write_approval_rule())
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        wait_for_decision=False,
+    )
+    log_path = tmp_path / "downstream.log"
+    passthrough = McpPassthrough(
+        DownstreamConfig(
+            command=sys.executable,
+            args=("-u", str(_filesystem_write_downstream(tmp_path, log_path))),
+            name="fake-downstream",
+            env={"DOWNSTREAM_LOG": str(log_path)},
+        ),
+        classifier=ToolCallClassifier(config, server_name="fake-downstream"),
+        approval_manager=manager,
+    )
+    passthrough.start()
+    try:
+        first = passthrough.handle_client_line(_persistence_bashrc_call(call_id="call-1"))
+        assert first[0]["error"]["data"]["status"] == "approval_required"
+        deadline = time.monotonic() + 2
+        while not server.pending_prompts() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        parent_id = server.pending_prompts()[0].request_id
+        with httpx.Client() as client:
+            csrf = _get_csrf(client, server.approval_url(parent_id))
+            assert _post_decision(
+                client,
+                server.approval_url(parent_id),
+                decision="approve",
+                csrf=csrf,
+            ).status_code == 200
+
+        retry = passthrough.handle_client_line(_persistence_bashrc_call(call_id="call-2"))
+        assert "result" in retry[0]
+        assert server.pending_prompts() == []
+
+        second_request = passthrough.handle_client_line(
+            _persistence_bashrc_call(call_id="call-3")
+        )
+        assert second_request[0]["error"]["data"]["status"] == "approval_required"
+        assert len(server.pending_prompts()) == 1
+        assert server.pending_prompts()[0].request_id != parent_id
+        assert log_path.read_text(encoding="utf-8").splitlines() == [
+            "tools/list",
+            "tools/call",
+        ]
     finally:
         passthrough.stop()
         server.stop()

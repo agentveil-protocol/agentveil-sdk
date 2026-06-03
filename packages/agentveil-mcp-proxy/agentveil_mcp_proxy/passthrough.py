@@ -496,7 +496,7 @@ def _coalesce_approval_outcome(
     current: ApprovalOutcome | None,
     new: ApprovalOutcome | None,
 ) -> ApprovalOutcome | None:
-    """Keep an approved retry outcome when later policy steps return allow."""
+    """Keep an approved in-flight outcome across TrapDoor and policy layers."""
 
     if new is not None and new.approved:
         return new
@@ -770,7 +770,10 @@ class McpPassthrough:
                 return [path_error] if has_id else []
             instruction_error, instruction_outcome = (
                 self._instruction_file_write_policy_response(
-                    message, request_id, classification
+                    message,
+                    request_id,
+                    classification,
+                    in_flight_approval=approval_outcome,
                 )
             )
             approval_outcome = _coalesce_approval_outcome(
@@ -781,7 +784,10 @@ class McpPassthrough:
                 return [instruction_error] if has_id else []
             persistence_error, persistence_outcome = (
                 self._persistence_path_write_policy_response(
-                    message, request_id, classification
+                    message,
+                    request_id,
+                    classification,
+                    in_flight_approval=approval_outcome,
                 )
             )
             approval_outcome = _coalesce_approval_outcome(
@@ -792,7 +798,10 @@ class McpPassthrough:
                 return [persistence_error] if has_id else []
             package_manager_error, package_manager_outcome = (
                 self._package_manager_action_policy_response(
-                    message, request_id, classification
+                    message,
+                    request_id,
+                    classification,
+                    in_flight_approval=approval_outcome,
                 )
             )
             approval_outcome = _coalesce_approval_outcome(
@@ -802,7 +811,9 @@ class McpPassthrough:
             if package_manager_error is not None:
                 return [package_manager_error] if has_id else []
             policy_error, policy_outcome = self._policy_error_response(
-                classification, request_id
+                classification,
+                request_id,
+                in_flight_approval=approval_outcome,
             )
             approval_outcome = _coalesce_approval_outcome(
                 approval_outcome,
@@ -1123,6 +1134,8 @@ class McpPassthrough:
         message: Mapping[str, Any],
         request_id: Any,
         classification: ClassifiedToolCall | None,
+        *,
+        in_flight_approval: ApprovalOutcome | None = None,
     ) -> tuple[dict[str, Any] | None, ApprovalOutcome | None]:
         """TrapDoor T2: force approval before writes to agent instruction files."""
 
@@ -1174,6 +1187,8 @@ class McpPassthrough:
                 request_id,
                 reason=reason,
                 message="approval required for agent instruction file write",
+                in_flight_approval=in_flight_approval,
+                coalesce_in_flight=True,
             )
         return None, None
 
@@ -1182,6 +1197,8 @@ class McpPassthrough:
         message: Mapping[str, Any],
         request_id: Any,
         classification: ClassifiedToolCall | None,
+        *,
+        in_flight_approval: ApprovalOutcome | None = None,
     ) -> tuple[dict[str, Any] | None, ApprovalOutcome | None]:
         """TrapDoor T4: force approval before writes to persistence/backdoor paths."""
 
@@ -1217,6 +1234,8 @@ class McpPassthrough:
                 request_id,
                 reason=reason,
                 message="approval required for persistence path write",
+                in_flight_approval=in_flight_approval,
+                coalesce_in_flight=True,
             )
         return None, None
 
@@ -1225,6 +1244,8 @@ class McpPassthrough:
         message: Mapping[str, Any],
         request_id: Any,
         classification: ClassifiedToolCall | None,
+        *,
+        in_flight_approval: ApprovalOutcome | None = None,
     ) -> tuple[dict[str, Any] | None, ApprovalOutcome | None]:
         """TrapDoor T6: force approval before package-manager mutation commands."""
 
@@ -1257,6 +1278,8 @@ class McpPassthrough:
             request_id,
             reason=reason,
             message="approval required for package manager action",
+            in_flight_approval=in_flight_approval,
+            coalesce_in_flight=True,
         )
 
     def _record_pre_approval_deny_evidence(
@@ -1467,6 +1490,8 @@ class McpPassthrough:
         self,
         classification: ClassifiedToolCall | None,
         request_id: Any,
+        *,
+        in_flight_approval: ApprovalOutcome | None = None,
     ) -> tuple[dict[str, Any] | None, ApprovalOutcome | None]:
         if classification is None:
             return None, None
@@ -1487,6 +1512,8 @@ class McpPassthrough:
                 classification,
                 request_id,
                 reason="local_approval_required",
+                in_flight_approval=in_flight_approval,
+                coalesce_in_flight=True,
             )
         if decision is PolicyDecision.ASK_BACKEND:
             if self.runtime_gate_factory is None:
@@ -1614,7 +1641,15 @@ class McpPassthrough:
         reason: str,
         message: str = "approval required",
         runtime_decision: RuntimeGateDecision | None = None,
+        in_flight_approval: ApprovalOutcome | None = None,
+        coalesce_in_flight: bool = False,
     ) -> tuple[dict[str, Any] | None, ApprovalOutcome | None]:
+        if (
+            coalesce_in_flight
+            and in_flight_approval is not None
+            and in_flight_approval.approved
+        ):
+            return None, in_flight_approval
         if self.approval_manager is None:
             return _approval_required_error(
                 request_id,
