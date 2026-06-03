@@ -45,7 +45,7 @@ From an **installed wheel** in a clean virtualenv and an isolated `--home`:
 7. Risky `write_file` → `approval_required`, sandbox file **absent**
 8. Approval Center `GET …/api/approvals` when the wheel exposes it and a pending item exists
 9. HTTP approve + **one** successful retry; third identical call must **not** execute again
-10. Separate `run --headless --auto-deny` → deny path, deny probe file absent
+10. Separate `run --approval-ui-mode none --headless --auto-deny` → deny path, deny probe file absent
 11. `events list --json` (approved, executed, denied)
 12. `export-evidence` + strict `verify --output json`
 13. Privacy scan on bundle, events, client-config JSON, runner output, and final report
@@ -66,5 +66,8 @@ onboarding works.
 ## Proof Boundary
 
 - Loopback approval via HTTP (no real browser, no operator click).
+- `run` subprocesses pass `--approval-ui-mode none` so the gate does not open browser
+  tabs or OS notifications; `approval_url` in JSON-RPC is still used internally for
+  HTTP approve only.
 - Does not launch an IDE or mutate the operator’s `~/.avp`.
 - VPS replay is optional later (same commands on a clean Linux host).

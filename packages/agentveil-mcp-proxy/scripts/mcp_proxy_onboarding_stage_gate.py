@@ -52,6 +52,8 @@ from mcp_proxy_acceptance_lib import (
 APPROVE_WRITE_NAME = "onboarding-approve.txt"
 DENY_WRITE_NAME = "onboarding-deny-probe.txt"
 WRITE_CONTENT = "onboarding stage gate write\n"
+# Non-interactive approval UI: no browser tabs or OS notifications during gate runs.
+RUN_NONINTERACTIVE_UI_ARGS = ["--approval-ui-mode", "none"]
 
 
 def assert_approval_required(response: dict[str, Any], *, sandbox_file: Path) -> dict[str, Any]:
@@ -233,7 +235,7 @@ def run_stage_gate(args: argparse.Namespace) -> dict[str, Any]:
         approval_center: dict[str, Any] = {"status": "not_run"}
         approval_token: str | None = None
         client = JsonRpcClient(
-            [str(proxy), "run", *identity_args],
+            [str(proxy), "run", *identity_args, *RUN_NONINTERACTIVE_UI_ARGS],
             env=gate_env,
             cwd=work_root,
         )
@@ -298,7 +300,14 @@ def run_stage_gate(args: argparse.Namespace) -> dict[str, Any]:
             client.close()
 
         deny_client = JsonRpcClient(
-            [str(proxy), "run", *identity_args, "--headless", "--auto-deny"],
+            [
+                str(proxy),
+                "run",
+                *identity_args,
+                *RUN_NONINTERACTIVE_UI_ARGS,
+                "--headless",
+                "--auto-deny",
+            ],
             cwd=work_root,
             env=gate_env,
         )
