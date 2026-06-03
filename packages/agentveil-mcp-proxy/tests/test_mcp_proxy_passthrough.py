@@ -2874,3 +2874,190 @@ def test_hidden_unicode_non_instruction_write_not_guarded(tmp_path):
     assert response["result"] == {"content": [{"type": "text", "text": "called"}]}
     assert _pending_approval_count(home) == 0
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list", "tools/call"]
+
+
+@pytest.mark.parametrize(
+    "persistence_path",
+    [
+        ".git/hooks/pre-commit",
+        ".bashrc",
+        ".zshrc",
+        ".config/systemd/user/evil.service",
+        "Library/LaunchAgents/com.evil.agent.plist",
+    ],
+)
+def test_persistence_path_write_requires_approval_before_downstream(
+    tmp_path,
+    monkeypatch,
+    persistence_path,
+):
+    # T4 TrapDoor: persistence/backdoor path writes require approval before downstream
+    # even when local policy would allow the same tool to a normal workspace path.
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    _set_downstream(init.config_path, _filesystem_schema_downstream(tmp_path), log_path=log_path)
+    _set_allow_policy(init.config_path, server="fake-downstream", tool="write_file")
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("persistence trapdoor must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(
+            _json_line({"jsonrpc": "2.0", "id": "list-1", "method": "tools/list", "params": {}})
+            + _json_line({
+                "jsonrpc": "2.0",
+                "id": "call-1",
+                "method": "tools/call",
+                "params": {
+                    "name": "write_file",
+                    "arguments": {"path": persistence_path, "content": "hook body"},
+                },
+            })
+        ),
+        out=client_out,
+    ) == 0
+
+    response = _responses(client_out.getvalue())[1]
+    assert response["error"]["code"] == JSONRPC_APPROVAL_REQUIRED
+    assert response["error"]["data"]["status"] == "approval_required"
+    assert response["error"]["data"]["reason"] == "persistence_path_write_requires_approval"
+    assert response["error"]["data"]["approval_url"].startswith("http://127.0.0.1:")
+    assert persistence_path not in client_out.getvalue()
+    assert "hook body" not in client_out.getvalue()
+    assert _pending_approval_count(home) == 1
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
+
+
+def test_persistence_path_move_destination_requires_approval(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    destination = ".git/hooks/pre-commit"
+    _set_downstream(
+        init.config_path,
+        _instruction_write_tools_downstream(tmp_path),
+        log_path=log_path,
+    )
+    _set_allow_policy_for_tools(
+        init.config_path,
+        server="fake-downstream",
+        tools=["move_file"],
+    )
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("persistence trapdoor must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(
+            _json_line({"jsonrpc": "2.0", "id": "list-1", "method": "tools/list", "params": {}})
+            + _json_line({
+                "jsonrpc": "2.0",
+                "id": "call-1",
+                "method": "tools/call",
+                "params": {
+                    "name": "move_file",
+                    "arguments": {
+                        "source": "draft.txt",
+                        "destination": destination,
+                    },
+                },
+            })
+        ),
+        out=client_out,
+    ) == 0
+
+    response = _responses(client_out.getvalue())[1]
+    assert response["error"]["code"] == JSONRPC_APPROVAL_REQUIRED
+    assert response["error"]["data"]["reason"] == "persistence_path_write_requires_approval"
+    assert _pending_approval_count(home) == 1
+    assert destination not in client_out.getvalue()
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
+
+
+def test_persistence_path_non_persistence_write_allowed_with_allow_policy(tmp_path):
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    _set_downstream(init.config_path, _filesystem_schema_downstream(tmp_path), log_path=log_path)
+    _set_allow_policy(init.config_path, server="fake-downstream", tool="write_file")
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(
+            _json_line({"jsonrpc": "2.0", "id": "list-1", "method": "tools/list", "params": {}})
+            + _json_line({
+                "jsonrpc": "2.0",
+                "id": "call-1",
+                "method": "tools/call",
+                "params": {
+                    "name": "write_file",
+                    "arguments": {"path": "workspace/notes.md", "content": "ok"},
+                },
+            })
+        ),
+        out=client_out,
+    ) == 0
+
+    response = _responses(client_out.getvalue())[1]
+    assert response["result"] == {"content": [{"type": "text", "text": "called"}]}
+    assert _pending_approval_count(home) == 0
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list", "tools/call"]
+
+
+def test_persistence_path_ssh_authorized_keys_stays_secret_path_blocked(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    _set_downstream(init.config_path, _filesystem_schema_downstream(tmp_path), log_path=log_path)
+    _set_allow_policy(init.config_path, server="fake-downstream", tool="write_file")
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("secret path guard must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(
+            _json_line({"jsonrpc": "2.0", "id": "list-1", "method": "tools/list", "params": {}})
+            + _json_line({
+                "jsonrpc": "2.0",
+                "id": "call-1",
+                "method": "tools/call",
+                "params": {
+                    "name": "write_file",
+                    "arguments": {
+                        "path": ".ssh/authorized_keys",
+                        "content": "ssh-rsa AAAA...",
+                    },
+                },
+            })
+        ),
+        out=client_out,
+    ) == 0
+
+    response = _responses(client_out.getvalue())[1]
+    assert response["error"]["code"] == JSONRPC_POLICY_BLOCKED
+    assert response["error"]["data"] == {
+        "status": "policy_denied",
+        "reason": "secret_path_blocked",
+    }
+    assert "approval_url" not in response["error"]["data"]
+    assert _pending_approval_count(home) == 0
+    assert ".ssh/authorized_keys" not in client_out.getvalue()
+    assert "ssh-rsa" not in client_out.getvalue()
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]

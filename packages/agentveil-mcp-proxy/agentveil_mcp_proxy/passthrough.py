@@ -50,6 +50,10 @@ from agentveil_mcp_proxy.instruction_file_guard import (
     instruction_file_write_reason,
     is_instruction_file_write_tool,
 )
+from agentveil_mcp_proxy.persistence_path_guard import (
+    is_filesystem_mutation_tool,
+    persistence_path_write_reason,
+)
 from agentveil_mcp_proxy.policy import PolicyDecision, ProxyConfig, ToolSurfaceMode
 from agentveil_mcp_proxy.tool_schema_validation import (
     ToolSchemaCache,
@@ -755,6 +759,11 @@ class McpPassthrough:
             )
             if instruction_error is not None:
                 return [instruction_error] if has_id else []
+            persistence_error, _ = self._persistence_path_write_policy_response(
+                message, request_id, classification
+            )
+            if persistence_error is not None:
+                return [persistence_error] if has_id else []
             policy_error, approval_outcome = self._policy_error_response(
                 classification, request_id
             )
@@ -1124,6 +1133,49 @@ class McpPassthrough:
                 request_id,
                 reason=reason,
                 message="approval required for agent instruction file write",
+            )
+        return None, None
+
+    def _persistence_path_write_policy_response(
+        self,
+        message: Mapping[str, Any],
+        request_id: Any,
+        classification: ClassifiedToolCall | None,
+    ) -> tuple[dict[str, Any] | None, ApprovalOutcome | None]:
+        """TrapDoor T4: force approval before writes to persistence/backdoor paths."""
+
+        if message.get("method") != "tools/call":
+            return None, None
+        if not isinstance(classification, ClassifiedToolCall):
+            return None, None
+        params = message.get("params")
+        if not isinstance(params, Mapping):
+            return None, None
+        tool = params.get("name")
+        if not isinstance(tool, str) or not tool:
+            return None, None
+        if not is_filesystem_mutation_tool(tool):
+            return None, None
+        arguments = params.get("arguments")
+        if not isinstance(arguments, Mapping):
+            return None, None
+        if classification.policy_evaluation.decision is PolicyDecision.BLOCK:
+            return None, None
+        for candidate in self._candidate_file_paths(arguments):
+            reason = persistence_path_write_reason(candidate)
+            if reason is None:
+                continue
+            self._record_security_event({
+                "type": "persistence_path_write",
+                "action": "approval_required_pre_downstream",
+                "reason": reason,
+                "tool": tool,
+            })
+            return self._approval_flow_response(
+                classification,
+                request_id,
+                reason=reason,
+                message="approval required for persistence path write",
             )
         return None, None
 
