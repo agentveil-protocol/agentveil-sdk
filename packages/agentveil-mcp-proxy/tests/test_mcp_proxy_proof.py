@@ -297,6 +297,49 @@ def test_bundle_records_uses_stored_prev_event_hash():
     assert records[1]["prev_event_hash"] == second_prev
 
 
+def test_bundle_records_adds_execution_record_id_for_executed_child(tmp_path):
+    with _store(tmp_path) as store:
+        store.write_pending(_record("req-parent", created_at=10))
+        store.transition(
+            "req-parent",
+            ApprovalStatus.APPROVED.value,
+            approval_token_hash=APPROVAL_TOKEN_HASH,
+        )
+        child = PendingApproval(
+            request_id="req-child",
+            session_id="session-1",
+            client_id="cursor:session-7",
+            downstream_server="github-mcp",
+            tool_name="github.create_issue",
+            action_class="write",
+            risk_class="write",
+            resource_hash=RESOURCE_HASH,
+            payload_hash=PAYLOAD_HASH,
+            policy_id="github-default",
+            policy_rule_id="rule-write",
+            policy_context_hash=POLICY_CONTEXT_HASH,
+            status=ApprovalStatus.PENDING.value,
+            created_at=12,
+            expires_at=312,
+            granted_by_request_id="req-parent",
+        )
+        store.write_pending(child)
+        store.transition(
+            "req-child",
+            ApprovalStatus.EXECUTED.value,
+            result_status="executed",
+            result_hash=RESULT_HASH,
+        )
+        exported = _bundle_records(store.list_records())
+
+    parent = next(item for item in exported if item["request_id"] == "req-parent")
+    child_row = next(item for item in exported if item["request_id"] == "req-child")
+    assert parent["execution_record_id"] == "req-child"
+    assert child_row["granted_by_request_id"] == "req-parent"
+    assert "execution_record_id" not in child_row
+    assert record_hash(parent) == parent["record_hash"]
+
+
 def test_bundle_export_raises_on_broken_chain():
     broken = replace(_record("req-broken"), prev_event_hash="sha256:" + "0" * 64)
 

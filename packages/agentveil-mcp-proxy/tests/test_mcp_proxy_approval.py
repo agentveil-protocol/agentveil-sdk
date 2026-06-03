@@ -39,6 +39,11 @@ from agentveil_mcp_proxy.evidence import (
     ApprovalEvidenceCapacityError,
     ApprovalEvidenceStore,
     ApprovalStatus,
+    build_evidence_bundle,
+)
+from agentveil_mcp_proxy.evidence.observability import (
+    event_record_dict,
+    execution_record_id_by_parent,
 )
 from agentveil_mcp_proxy.evidence.approval_grant import (
     ApprovalGrantError,
@@ -108,6 +113,16 @@ def _config(
         },
         "downstream": {},
     })
+
+
+def _allow_write_file_rule() -> dict[str, Any]:
+    return {
+        "id": "allow-write-file",
+        "source": "user",
+        "decision": "allow",
+        "risk_class": "write",
+        "match": {"server": "fake-downstream", "tool": "write_file"},
+    }
 
 
 def _write_rule(*, scope_expansion: bool = False, risk_class: str = "write") -> dict[str, Any]:
@@ -1561,6 +1576,36 @@ def _approval_downstream(tmp_path: Path, log_path: Path) -> Path:
     )
 
 
+def _filesystem_write_downstream(tmp_path: Path, log_path: Path) -> Path:
+    schema = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "content": {"type": "string"},
+        },
+        "required": ["path", "content"],
+        "additionalProperties": False,
+    }
+    return write_downstream(
+        tmp_path,
+        filename="filesystem_write_downstream.py",
+        tools=[tool_entry("write_file", schema)],
+        call_result_text="downstream-ok",
+    )
+
+
+def _persistence_bashrc_call() -> str:
+    return json.dumps({
+        "jsonrpc": "2.0",
+        "id": "call-1",
+        "method": "tools/call",
+        "params": {
+            "name": "write_file",
+            "arguments": {"path": ".bashrc", "content": "persistence trapdoor body"},
+        },
+    }, separators=(",", ":")) + "\n"
+
+
 def _tool_call() -> str:
     return json.dumps({
         "jsonrpc": "2.0",
@@ -1606,6 +1651,7 @@ def test_approve_resumes_downstream_call_and_records_evidence(tmp_path):
         assert responses[0]["result"]["content"][0]["text"] == "approved"
         record = store.get_pending(prompt.request_id)
         assert record.status == ApprovalStatus.EXECUTED.value
+        assert record.result_status == "executed"
         assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list", "tools/call"]
     finally:
         passthrough.stop()
@@ -2070,12 +2116,111 @@ def test_immediate_retry_after_approve_post_matches_live_console(tmp_path):
         ]
         assert len(children) == 1, "retry must reuse the grant, not open a new prompt"
         assert children[0].status == ApprovalStatus.EXECUTED.value
+        assert children[0].result_status == "executed"
         parent = store.get_pending(parent_id)
         assert parent is not None
         assert parent.status == ApprovalStatus.APPROVED.value
-        for record in store.list_records():
+        assert parent.result_status == "executed"
+        records = store.list_records()
+        execution_by_parent = execution_record_id_by_parent(records)
+        assert execution_by_parent[parent_id] == children[0].request_id
+        parent_event = event_record_dict(
+            parent,
+            execution_record_id=execution_by_parent[parent_id],
+        )
+        assert parent_event["result_status"] == "executed"
+        assert parent_event["execution_record_id"] == children[0].request_id
+        bundle = build_evidence_bundle(
+            store,
+            proxy_identity_did=APPROVAL_GRANT_DID,
+            trusted_signer_dids=[APPROVAL_GRANT_DID],
+        )
+        exported_parent = next(
+            item for item in bundle["records"] if item["request_id"] == parent_id
+        )
+        assert exported_parent["status"] == ApprovalStatus.APPROVED.value
+        assert exported_parent["result_status"] == "executed"
+        assert exported_parent["execution_record_id"] == children[0].request_id
+        for record in records:
             blob = f"{record.tool_name}:{record.payload_hash}:{record.status}"
             assert SECRET not in blob
+        assert SECRET not in json.dumps(bundle)
+    finally:
+        passthrough.stop()
+        server.stop()
+        store.close()
+
+
+def test_passthrough_retry_after_trapdoor_approval_records_executed_evidence(tmp_path):
+    """Regression for persistent run: trapdoor approval must keep retry outcome.
+
+    Mirrors ``run_proxy`` (``wait_for_decision=False``) plus TrapDoor persistence
+    path approval before local policy allow would otherwise drop the outcome.
+    """
+
+    config = _config(policy_rule=_allow_write_file_rule())
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        wait_for_decision=False,
+        approval_grant_private_key_seed=APPROVAL_GRANT_SEED,
+        approval_grant_agent_did=APPROVAL_GRANT_DID,
+    )
+    log_path = tmp_path / "downstream.log"
+    passthrough = McpPassthrough(
+        DownstreamConfig(
+            command=sys.executable,
+            args=("-u", str(_filesystem_write_downstream(tmp_path, log_path))),
+            name="fake-downstream",
+            env={"DOWNSTREAM_LOG": str(log_path)},
+        ),
+        classifier=ToolCallClassifier(config, server_name="fake-downstream"),
+        approval_manager=manager,
+    )
+    passthrough.start()
+    try:
+        first = passthrough.handle_client_line(_persistence_bashrc_call())
+        assert len(first) == 1
+        assert first[0]["error"]["data"]["reason"] == "persistence_path_write_requires_approval"
+
+        deadline = time.monotonic() + 2
+        while not server.pending_prompts() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        parent_id = server.pending_prompts()[0].request_id
+        with httpx.Client() as client:
+            csrf = _get_csrf(client, server.approval_url(parent_id))
+            response = _post_decision(
+                client,
+                server.approval_url(parent_id),
+                decision="approve",
+                csrf=csrf,
+            )
+        assert response.status_code == 200
+
+        retry = passthrough.handle_client_line(_persistence_bashrc_call())
+        assert len(retry) == 1
+        assert retry[0]["result"]["content"][0]["text"] == "downstream-ok"
+        assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list", "tools/call"]
+
+        children = [
+            record
+            for record in store.list_records()
+            if record.granted_by_request_id == parent_id
+        ]
+        assert len(children) == 1
+        assert children[0].status == ApprovalStatus.EXECUTED.value
+        assert children[0].result_status == "executed"
+        parent = store.get_pending(parent_id)
+        assert parent.status == ApprovalStatus.APPROVED.value
+        assert parent.result_status == "executed"
+        execution_by_parent = execution_record_id_by_parent(store.list_records())
+        assert execution_by_parent[parent_id] == children[0].request_id
+        assert "persistence trapdoor body" not in json.dumps(
+            event_record_dict(
+                parent,
+                execution_record_id=execution_by_parent[parent_id],
+            )
+        )
     finally:
         passthrough.stop()
         server.stop()

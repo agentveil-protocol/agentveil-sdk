@@ -349,12 +349,20 @@ class ApprovalManager:
                     error_class="downstream_error",
                 )
             else:
-                self.evidence_store.transition(
+                result_hash = sha256_jcs(response.get("result", {}))
+                updated = self.evidence_store.transition(
                     outcome.request_id,
                     ApprovalStatus.EXECUTED.value,
                     result_status="executed",
-                    result_hash=sha256_jcs(response.get("result", {})),
+                    result_hash=result_hash,
                 )
+                parent_request_id = updated.granted_by_request_id
+                if parent_request_id is not None:
+                    self.evidence_store.annotate_linked_execution(
+                        parent_request_id,
+                        result_status=ApprovalStatus.EXECUTED.value,
+                        result_hash=result_hash,
+                    )
         except ApprovalEvidenceError:
             return
 

@@ -705,6 +705,103 @@ def test_expire_stale_approvals_returns_request_ids(tmp_path):
     assert stale == ["req-old-approved"]
 
 
+def test_export_bundle_parent_includes_execution_record_id_for_executed_child(tmp_path):
+    with _store(tmp_path) as store:
+        store.write_pending(_record("req-parent", created_at=10))
+        store.transition(
+            "req-parent",
+            ApprovalStatus.APPROVED.value,
+            approval_token_hash=APPROVAL_TOKEN_HASH,
+            approval_decided_at=11,
+        )
+        store.write_pending(
+            PendingApproval(
+                request_id="req-child",
+                session_id="session-1",
+                client_id="cursor:session-7",
+                downstream_server="github-mcp",
+                tool_name="github.create_issue",
+                action_class="write",
+                risk_class="write",
+                resource_hash=RESOURCE_HASH,
+                payload_hash=PAYLOAD_HASH,
+                policy_id="github-default",
+                policy_rule_id="rule-write",
+                policy_context_hash=POLICY_CONTEXT_HASH,
+                status=ApprovalStatus.PENDING.value,
+                created_at=12,
+                expires_at=312,
+                granted_by_request_id="req-parent",
+            )
+        )
+        store.transition(
+            "req-child",
+            ApprovalStatus.APPROVED.value,
+            approval_token_hash=APPROVAL_TOKEN_HASH,
+            approval_decided_at=13,
+        )
+        store.transition(
+            "req-child",
+            ApprovalStatus.EXECUTED.value,
+            result_status="executed",
+            result_hash=RESULT_HASH,
+        )
+        store.annotate_linked_execution(
+            "req-parent",
+            result_status=ApprovalStatus.EXECUTED.value,
+            result_hash=RESULT_HASH,
+        )
+        bundle = build_evidence_bundle(
+            store,
+            proxy_identity_did=GRANT_DID,
+            trusted_signer_dids=[GRANT_DID],
+        )
+
+    parent = next(item for item in bundle["records"] if item["request_id"] == "req-parent")
+    child = next(item for item in bundle["records"] if item["request_id"] == "req-child")
+    assert parent["execution_record_id"] == "req-child"
+    assert child["granted_by_request_id"] == "req-parent"
+    assert "execution_record_id" not in child
+    assert verify_evidence_bundle(bundle, trusted_signer_dids=[GRANT_DID]).valid is True
+
+
+def test_expire_stale_approvals_skips_parent_with_linked_execution_result(tmp_path):
+    now = 1_700_010_000
+    with _store(tmp_path) as store:
+        store.write_pending(_record("req-parent", created_at=now - 7_300, expires_at=now + 300))
+        store.write_pending(_record("req-child", created_at=now - 7_290, expires_at=now + 300))
+        store.transition(
+            "req-parent",
+            ApprovalStatus.APPROVED.value,
+            approval_token_hash=APPROVAL_TOKEN_HASH,
+            approval_decided_at=now - 7_200,
+        )
+        store.transition(
+            "req-child",
+            ApprovalStatus.APPROVED.value,
+            approval_token_hash=APPROVAL_TOKEN_HASH,
+            approval_decided_at=now - 7_190,
+        )
+        store.transition(
+            "req-child",
+            ApprovalStatus.EXECUTED.value,
+            result_status="executed",
+            result_hash=RESULT_HASH,
+        )
+        store.annotate_linked_execution(
+            "req-parent",
+            result_status=ApprovalStatus.EXECUTED.value,
+            result_hash=RESULT_HASH,
+        )
+
+        stale = store.expire_stale_approvals(now_timestamp=now, grace_seconds=3_600)
+        parent = store.get_pending("req-parent")
+
+    assert stale == []
+    assert parent.status == ApprovalStatus.APPROVED.value
+    assert parent.result_status == "executed"
+
+
 def test_recovery_report_contains_stale_approval_request_ids(tmp_path):
     with ApprovalEvidenceStore(tmp_path / "evidence.sqlite") as store:
         report = store.recover_on_startup(now_timestamp=1_700_010_000)
