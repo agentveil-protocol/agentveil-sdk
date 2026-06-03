@@ -107,6 +107,17 @@ checks.
 If you installed into a virtual environment, point `command` at the full path of
 `agentveil-mcp-proxy` inside that environment (`which agentveil-mcp-proxy`).
 
+To print copy-pasteable client config without editing IDE files:
+
+```bash
+agentveil-mcp-proxy client-config print
+agentveil-mcp-proxy client-config print --client cursor --proxy-command "$(which agentveil-mcp-proxy)"
+agentveil-mcp-proxy client-config print --json
+```
+
+This is dry-run only: it writes to stdout, not `~/.cursor`, Claude Desktop, or
+other application config directories.
+
 ### Claude Desktop
 
 `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS, or

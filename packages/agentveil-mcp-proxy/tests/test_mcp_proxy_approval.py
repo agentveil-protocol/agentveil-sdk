@@ -34,6 +34,11 @@ from agentveil_mcp_proxy.approval import (
     HeadlessPolicy,
     HeadlessPolicyError,
 )
+from agentveil_mcp_proxy.approval.server import (
+    TERMINAL_ALREADY_DECIDED_APPROVE,
+    TERMINAL_ALREADY_DECIDED_DENY,
+    TERMINAL_APPROVAL_EXPIRED,
+)
 from agentveil_mcp_proxy.approval.notification import NotificationResult
 from agentveil_mcp_proxy.classification import ToolCallClassifier
 from agentveil_mcp_proxy.evidence import (
@@ -227,6 +232,11 @@ def _prompt(request_id: str = "req-1") -> ApprovalPrompt:
     )
 
 
+def _prompt_not_expired(request_id: str = "req-1") -> ApprovalPrompt:
+    now = int(time.time())
+    return replace(_prompt(request_id), created_at=now, expires_at=now + 300)
+
+
 def _manager(
     tmp_path: Path,
     *,
@@ -393,7 +403,7 @@ def test_approval_server_request_threads_are_daemon(monkeypatch):
     try:
         assert server._httpd is not None
         assert server._httpd.daemon_threads is True
-        url = server.register(_prompt())
+        url = server.register(_prompt_not_expired())
         response = httpx.get(url)
         assert response.status_code == 200
         assert seen["daemon"] is True
@@ -405,7 +415,7 @@ def _assert_invalid_content_length_rejected(content_length: str) -> None:
     server = ApprovalServer()
     server.start()
     try:
-        url = server.register(_prompt())
+        url = server.register(_prompt_not_expired())
         with httpx.Client() as client:
             _csrf, cookie = _get_csrf_and_cookie(client, url)
         response = _raw_post(server, url, content_length=content_length, cookie=cookie)
@@ -431,7 +441,7 @@ def test_post_with_valid_content_length_succeeds():
     server = ApprovalServer()
     server.start()
     try:
-        url = server.register(_prompt())
+        url = server.register(_prompt_not_expired())
         with httpx.Client() as client:
             csrf, cookie = _get_csrf_and_cookie(client, url)
         body = urlencode({
@@ -476,7 +486,7 @@ def test_post_without_token_returns_403():
     server = ApprovalServer()
     server.start()
     try:
-        server.register(_prompt())
+        server.register(_prompt_not_expired())
         response = httpx.post(f"{server.base_url}/approval/wrong/pending/req-1", data={})
         assert response.status_code == 403
     finally:
@@ -487,7 +497,7 @@ def test_post_with_wrong_csrf_returns_403():
     server = ApprovalServer()
     server.start()
     try:
-        url = server.register(_prompt())
+        url = server.register(_prompt_not_expired())
         with httpx.Client() as client:
             _get_csrf(client, url)
             response = _post_decision(client, url, decision="approve", csrf="wrong")
@@ -500,7 +510,7 @@ def test_post_with_correct_token_and_cookie_and_csrf_records_decision():
     server = ApprovalServer()
     server.start()
     try:
-        url = server.register(_prompt())
+        url = server.register(_prompt_not_expired())
         with httpx.Client() as client:
             csrf = _get_csrf(client, url)
             response = _post_decision(client, url, decision="approve", csrf=csrf)
@@ -517,12 +527,15 @@ def test_post_after_approve_returns_410_gone():
     server = ApprovalServer()
     server.start()
     try:
-        url = server.register(_prompt())
+        url = server.register(_prompt_not_expired())
         with httpx.Client() as client:
             csrf, cookie = _get_csrf_and_cookie(client, url)
             assert _post_decision(client, url, decision="approve", csrf=csrf).status_code == 200
         with httpx.Client(headers={"Cookie": cookie}) as client:
-            assert _post_decision(client, url, decision="deny", csrf=csrf).status_code == 410
+            stale_post = _post_decision(client, url, decision="deny", csrf=csrf)
+        assert stale_post.status_code == 410
+        assert "text/html" in stale_post.headers.get("content-type", "")
+        _assert_stale_html_privacy_safe(stale_post.text, session_token=server.session_token)
     finally:
         server.stop()
 
@@ -531,12 +544,15 @@ def test_post_after_deny_returns_410_gone():
     server = ApprovalServer()
     server.start()
     try:
-        url = server.register(_prompt())
+        url = server.register(_prompt_not_expired())
         with httpx.Client() as client:
             csrf, cookie = _get_csrf_and_cookie(client, url)
             assert _post_decision(client, url, decision="deny", csrf=csrf).status_code == 200
         with httpx.Client(headers={"Cookie": cookie}) as client:
-            assert _post_decision(client, url, decision="approve", csrf=csrf).status_code == 410
+            stale_post = _post_decision(client, url, decision="approve", csrf=csrf)
+        assert stale_post.status_code == 410
+        assert "text/html" in stale_post.headers.get("content-type", "")
+        _assert_stale_html_privacy_safe(stale_post.text, session_token=server.session_token)
     finally:
         server.stop()
 
@@ -545,7 +561,7 @@ def test_response_headers_include_referrer_policy_no_referrer():
     server = ApprovalServer()
     server.start()
     try:
-        url = server.register(_prompt())
+        url = server.register(_prompt_not_expired())
         response = httpx.get(url)
         assert response.headers["Referrer-Policy"] == "no-referrer"
     finally:
@@ -556,7 +572,7 @@ def test_response_headers_include_cache_control_no_store():
     server = ApprovalServer()
     server.start()
     try:
-        url = server.register(_prompt())
+        url = server.register(_prompt_not_expired())
         response = httpx.get(url)
         assert "no-store" in response.headers["Cache-Control"]
         assert "max-age=0" in response.headers["Cache-Control"]
@@ -568,7 +584,7 @@ def test_response_headers_include_x_frame_options_deny_and_csp_frame_ancestors_n
     server = ApprovalServer()
     server.start()
     try:
-        url = server.register(_prompt())
+        url = server.register(_prompt_not_expired())
         response = httpx.get(url)
         assert response.headers["X-Frame-Options"] == "DENY"
         assert "frame-ancestors 'none'" in response.headers["Content-Security-Policy"]
@@ -1148,11 +1164,11 @@ def test_show_details_button_only_renders_when_config_allows():
     server = ApprovalServer()
     server.start()
     try:
-        no_details = server.register(_prompt("no-details"))
+        no_details = server.register(_prompt_not_expired("no-details"))
         assert "Show local details" not in httpx.get(no_details).text
 
         details_prompt = replace(
-            _prompt("details"),
+            _prompt_not_expired("details"),
             action_details="github.create_issue",
             resource_details="github:acme/private-repo",
         )
@@ -1558,8 +1574,12 @@ def test_pending_list_shows_correlation_fields_for_multiple_clients():
     server = ApprovalServer()
     server.start()
     try:
-        first = _prompt("req-a")
-        second = replace(_prompt("req-b"), client_id="claude:session-2", session_id="session-b")
+        first = _prompt_not_expired("req-a")
+        second = replace(
+            _prompt_not_expired("req-b"),
+            client_id="claude:session-2",
+            session_id="session-b",
+        )
         server.register(first)
         server.register(second)
         text = httpx.get(server.approval_center_url()).text
@@ -1576,7 +1596,7 @@ def test_browser_tab_title_includes_client_id_and_session_short_id():
     server = ApprovalServer()
     server.start()
     try:
-        url = server.register(_prompt())
+        url = server.register(_prompt_not_expired())
         text = httpx.get(url).text
         assert "<title>Approval pending: cursor:session-1 session session-" in text
     finally:
@@ -3073,7 +3093,7 @@ def test_dashboard_and_detail_include_light_theme_css():
     server.start()
     try:
         dashboard = httpx.get(server.approval_center_url()).text
-        detail_url = server.register(_prompt("req-t31-theme"))
+        detail_url = server.register(_prompt_not_expired("req-t31-theme"))
         detail = httpx.get(detail_url).text
         for html in (dashboard, detail):
             assert "prefers-color-scheme: light" in html
@@ -3089,7 +3109,7 @@ def test_detail_shows_session_prefix_not_full_session_id():
     server = ApprovalServer()
     server.start()
     try:
-        prompt = _prompt("req-t31-session")
+        prompt = _prompt_not_expired("req-t31-session")
         assert prompt.session_id == "session-abcdef"
         assert prompt.session_id[:8] == "session-"
         detail = httpx.get(server.register(prompt)).text
@@ -3108,7 +3128,7 @@ def test_dashboard_and_detail_include_local_url_warning():
     server.start()
     try:
         dashboard = httpx.get(server.approval_center_url()).text
-        detail = httpx.get(server.register(_prompt("req-t31-warning"))).text
+        detail = httpx.get(server.register(_prompt_not_expired("req-t31-warning"))).text
         for html in (dashboard, detail):
             assert warning in html
             assert "approval-security-notice" in html
@@ -3188,3 +3208,170 @@ def test_immediate_retry_materializes_when_post_handler_disabled(tmp_path):
         passthrough.stop()
         server.stop()
         store.close()
+
+
+STALE_HTML_FORBIDDEN_FRAGMENTS = (
+    SECRET,
+    PACKAGE_MANAGER_SECRET,
+    '"arguments"',
+    '"command":',
+    "csrf-token",
+    "session-abcdef",
+)
+
+
+def _assert_stale_html_privacy_safe(text: str, *, session_token: str | None = None) -> None:
+    lowered = text.lower()
+    assert "<form" not in lowered
+    assert 'name="csrf_token"' not in lowered
+    if session_token:
+        assert session_token not in text
+    for fragment in STALE_HTML_FORBIDDEN_FRAGMENTS:
+        assert fragment not in text
+
+
+def _assert_stale_html_response(
+    response: httpx.Response,
+    *,
+    headline: str,
+    session_token: str | None = None,
+) -> None:
+    assert "text/html" in response.headers.get("content-type", "")
+    assert headline in response.text
+    _assert_stale_html_privacy_safe(response.text, session_token=session_token)
+
+
+def test_get_after_approve_returns_stale_html_terminal_no_forms():
+    server = ApprovalServer()
+    server.start()
+    try:
+        url = server.register(_prompt_not_expired())
+        with httpx.Client() as client:
+            csrf, cookie = _get_csrf_and_cookie(client, url)
+            assert _post_decision(client, url, decision="approve", csrf=csrf).status_code == 200
+            stale = client.get(url, headers={"Cookie": cookie})
+        assert stale.status_code == 410
+        _assert_stale_html_response(
+            stale,
+            headline="Already decided",
+            session_token=server.session_token,
+        )
+        assert "Approved" in stale.text
+        snapshot = server.stale_terminal_snapshot_for("req-1")
+        assert snapshot is not None
+        assert snapshot.state == TERMINAL_ALREADY_DECIDED_APPROVE
+    finally:
+        server.stop()
+
+
+def test_get_after_deny_returns_stale_html_terminal_no_forms():
+    server = ApprovalServer()
+    server.start()
+    try:
+        url = server.register(_prompt_not_expired("req-deny"))
+        with httpx.Client() as client:
+            csrf, cookie = _get_csrf_and_cookie(client, url)
+            assert _post_decision(client, url, decision="deny", csrf=csrf).status_code == 200
+            stale = client.get(url, headers={"Cookie": cookie})
+        assert stale.status_code == 410
+        _assert_stale_html_response(
+            stale,
+            headline="Already decided",
+            session_token=server.session_token,
+        )
+        assert "Denied" in stale.text
+        snapshot = server.stale_terminal_snapshot_for("req-deny")
+        assert snapshot is not None
+        assert snapshot.state == TERMINAL_ALREADY_DECIDED_DENY
+    finally:
+        server.stop()
+
+
+def test_get_after_timeout_unregister_returns_expired_html_page(tmp_path):
+    config = _config(policy_rule=_write_rule(), approval_timeout_seconds=1)
+    manager, store, server, _cli = _manager(tmp_path, config=config)
+    worker = threading.Thread(
+        target=lambda: manager.request_approval(
+            _classification(config),
+            reason="local_approval_required",
+        ),
+        daemon=True,
+    )
+    worker.start()
+    try:
+        deadline = time.monotonic() + 2
+        while not server.pending_prompts() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        prompt = server.pending_prompts()[0]
+        url = server.approval_url(prompt.request_id)
+        worker.join(timeout=3)
+        snapshot = server.terminal_snapshot_for(prompt.request_id)
+        assert snapshot is not None
+        assert snapshot.state == TERMINAL_APPROVAL_EXPIRED
+        stale = httpx.get(url)
+        assert stale.status_code == 410
+        _assert_stale_html_response(
+            stale,
+            headline="Approval expired",
+            session_token=server.session_token,
+        )
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_get_unknown_request_id_returns_html_no_longer_pending():
+    server = ApprovalServer()
+    server.start()
+    try:
+        response = httpx.get(
+            f"{server.base_url}/approval/{server.session_token}/pending/does-not-exist",
+        )
+        assert response.status_code == 404
+        _assert_stale_html_response(
+            response,
+            headline="Request no longer pending",
+            session_token=server.session_token,
+        )
+    finally:
+        server.stop()
+
+
+def test_get_expired_prompt_before_unregister_shows_expired_html(monkeypatch):
+    server = ApprovalServer()
+    server.start()
+    try:
+        prompt = replace(
+            _prompt("req-expired"),
+            created_at=100,
+            expires_at=150,
+        )
+        url = server.register(prompt)
+        monkeypatch.setattr(approval_server_module.time, "time", lambda: 200.0)
+        response = httpx.get(url)
+        assert response.status_code == 410
+        _assert_stale_html_response(
+            response,
+            headline="Approval expired",
+            session_token=server.session_token,
+        )
+        assert server.pending_prompts(), "prompt remains until manager unregisters"
+    finally:
+        server.stop()
+
+
+def test_invalid_approval_token_returns_403_html_without_leaking_pending():
+    server = ApprovalServer()
+    server.start()
+    try:
+        url = server.register(_prompt_not_expired("req-secret"))
+        wrong = url.replace(server.session_token, "not-the-real-session-token-value")
+        response = httpx.get(wrong)
+        assert response.status_code == 403
+        assert "text/html" in response.headers.get("content-type", "")
+        assert "Forbidden" in response.text
+        assert "req-secret" not in response.text
+        assert "github.create_issue" not in response.text
+        _assert_stale_html_privacy_safe(response.text, session_token=server.session_token)
+    finally:
+        server.stop()

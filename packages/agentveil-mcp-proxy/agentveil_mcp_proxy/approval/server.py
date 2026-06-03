@@ -40,6 +40,11 @@ APPROVAL_LOCAL_URL_WARNING = (
     "This local approval URL is a bearer-style session URL. Do not share it."
 )
 
+TERMINAL_ALREADY_DECIDED_APPROVE = "already_decided_approve"
+TERMINAL_ALREADY_DECIDED_DENY = "already_decided_deny"
+TERMINAL_APPROVAL_EXPIRED = "approval_expired"
+TERMINAL_ALREADY_DECIDED = "already_decided"
+
 
 class _DaemonThreadingHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
@@ -85,6 +90,43 @@ class ApprovalServerDecision:
     approval_scope: str
 
 
+@dataclass(frozen=True)
+class TerminalApprovalSnapshot:
+    """Sanitized approval context retained for stale loopback URLs."""
+
+    request_id: str
+    state: str
+    client_id: str
+    session_id_prefix: str
+    downstream_server: str
+    tool_name: str
+    risk_class: str
+    reason: str
+    action_display: str
+    resource_display: str
+    policy_rule_id: str
+    created_at: int
+    expires_at: int
+
+    @classmethod
+    def from_prompt(cls, prompt: ApprovalPrompt, *, state: str) -> TerminalApprovalSnapshot:
+        return cls(
+            request_id=prompt.request_id,
+            state=state,
+            client_id=prompt.client_id,
+            session_id_prefix=prompt.session_id[:8],
+            downstream_server=prompt.downstream_server,
+            tool_name=prompt.tool_name,
+            risk_class=prompt.risk_class,
+            reason=prompt.reason,
+            action_display=prompt.action_display,
+            resource_display=prompt.resource_display or "none",
+            policy_rule_id=prompt.policy_rule_id,
+            created_at=prompt.created_at,
+            expires_at=prompt.expires_at,
+        )
+
+
 class ApprovalServer:
     """Authenticated loopback HTTP server for local approval decisions."""
 
@@ -101,6 +143,7 @@ class ApprovalServer:
         self._decisions: dict[str, ApprovalServerDecision] = {}
         self._decision_events: dict[str, threading.Event] = {}
         self._terminal_requests: dict[str, float] = {}
+        self._terminal_snapshots: dict[str, TerminalApprovalSnapshot] = {}
         self._decision_handler: Callable[[ApprovalServerDecision], None] | None = None
         self._httpd: _DaemonThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -190,16 +233,28 @@ class ApprovalServer:
             self._prompts[prompt.request_id] = prompt
             self._decision_events[prompt.request_id] = threading.Event()
             self._terminal_requests.pop(prompt.request_id, None)
+            self._terminal_snapshots.pop(prompt.request_id, None)
         return self.approval_url(prompt.request_id)
 
-    def unregister(self, request_id: str) -> None:
+    def unregister(self, request_id: str, *, terminal_state: str = TERMINAL_ALREADY_DECIDED) -> None:
         """Mark an approval URL as no longer actionable."""
 
         with self._lock:
             self._prune_terminal_requests_locked()
             prompt = self._prompts.pop(request_id, None)
-            self._decisions.pop(request_id, None)
+            decision = self._decisions.pop(request_id, None)
             self._decision_events.pop(request_id, None)
+            state = terminal_state
+            if prompt is not None and state == TERMINAL_ALREADY_DECIDED and decision is not None:
+                if decision.decision == "approve":
+                    state = TERMINAL_ALREADY_DECIDED_APPROVE
+                elif decision.decision == "deny":
+                    state = TERMINAL_ALREADY_DECIDED_DENY
+            if prompt is not None:
+                self._terminal_snapshots[request_id] = TerminalApprovalSnapshot.from_prompt(
+                    prompt,
+                    state=state,
+                )
             self._terminal_requests[request_id] = self._terminal_retain_until(prompt)
 
     def list_decided_request_ids(self) -> tuple[str, ...]:
@@ -285,6 +340,32 @@ class ApprovalServer:
             self._prune_terminal_requests_locked()
             return request_id in self._terminal_requests or request_id in self._decisions
 
+    def terminal_snapshot_for(self, request_id: str) -> TerminalApprovalSnapshot | None:
+        """Return sanitized stale-state context while the terminal retention window is active."""
+
+        with self._lock:
+            self._prune_terminal_requests_locked()
+            return self._terminal_snapshots.get(request_id)
+
+    def stale_terminal_snapshot_for(self, request_id: str) -> TerminalApprovalSnapshot | None:
+        """Return retained or inferred terminal context for a non-actionable request."""
+
+        with self._lock:
+            self._prune_terminal_requests_locked()
+            snapshot = self._terminal_snapshots.get(request_id)
+            if snapshot is not None:
+                return snapshot
+            decision = self._decisions.get(request_id)
+            prompt = self._prompts.get(request_id)
+            if decision is None or prompt is None:
+                return None
+            state = TERMINAL_ALREADY_DECIDED
+            if decision.decision == "approve":
+                state = TERMINAL_ALREADY_DECIDED_APPROVE
+            elif decision.decision == "deny":
+                state = TERMINAL_ALREADY_DECIDED_DENY
+            return TerminalApprovalSnapshot.from_prompt(prompt, state=state)
+
     def submit_decision(self, request_id: str, decision: str, approval_scope: str) -> None:
         """Record a local approve/deny POST."""
 
@@ -348,6 +429,7 @@ class ApprovalServer:
         ]
         for request_id in expired:
             self._terminal_requests.pop(request_id, None)
+            self._terminal_snapshots.pop(request_id, None)
 
 
 class _ApprovalRequestHandler(BaseHTTPRequestHandler):
@@ -363,7 +445,10 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         token, route, request_id = self._parse_path()
         if not self._token_ok(token):
-            self._send_text(HTTPStatus.FORBIDDEN, "forbidden")
+            if route == "api_list":
+                self._send_text(HTTPStatus.FORBIDDEN, "forbidden")
+            else:
+                self._send_html(HTTPStatus.FORBIDDEN, self._render_forbidden_session())
             return
         if route == "api_list":
             self._send_json(HTTPStatus.OK, self.server_owner.pending_approvals_api_payload())
@@ -374,30 +459,26 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
         if route != "pending" or request_id is None:
             self._send_text(HTTPStatus.NOT_FOUND, "not found")
             return
-        prompt = self.server_owner.prompt_for(request_id)
-        if prompt is None:
-            if self.server_owner.is_terminal(request_id):
-                self._send_text(HTTPStatus.GONE, "approval already decided")
-            else:
-                self._send_text(HTTPStatus.NOT_FOUND, "not found")
-            return
-        self._send_html(
-            HTTPStatus.OK,
-            self._render_prompt(prompt),
-            extra_headers={"Set-Cookie": self._session_cookie_header()},
-        )
+        self._respond_pending_get(request_id)
 
     def do_POST(self) -> None:
         token, route, request_id = self._parse_path()
         if route != "pending" or request_id is None or not self._token_ok(token):
-            self._send_text(HTTPStatus.FORBIDDEN, "forbidden")
+            if route == "api_list":
+                self._send_text(HTTPStatus.FORBIDDEN, "forbidden")
+            else:
+                self._send_html(HTTPStatus.FORBIDDEN, self._render_forbidden_session())
             return
         prompt = self.server_owner.prompt_for(request_id)
         if prompt is None:
-            if self.server_owner.is_terminal(request_id):
-                self._send_text(HTTPStatus.GONE, "approval already decided")
-            else:
-                self._send_text(HTTPStatus.NOT_FOUND, "not found")
+            self._respond_stale_pending(request_id)
+            return
+        if int(time.time()) > prompt.expires_at:
+            snapshot = TerminalApprovalSnapshot.from_prompt(
+                prompt,
+                state=TERMINAL_APPROVAL_EXPIRED,
+            )
+            self._send_html(HTTPStatus.GONE, self._render_terminal(snapshot))
             return
         if not self.server_owner._valid_cookie(self.headers.get("Cookie")):
             self._send_text(HTTPStatus.FORBIDDEN, "forbidden")
@@ -422,12 +503,59 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
         try:
             self.server_owner.submit_decision(request_id, decision, scope)
         except ApprovalServerGone:
-            self._send_text(HTTPStatus.GONE, "approval already decided")
+            self._respond_stale_pending(request_id)
             return
         except ApprovalServerError:
-            self._send_text(HTTPStatus.FORBIDDEN, "forbidden")
+            self._send_html(HTTPStatus.FORBIDDEN, self._render_forbidden_session())
             return
         self._send_html(HTTPStatus.OK, self._page("Approval recorded", "<p>Decision recorded.</p>"))
+
+    def _respond_pending_get(self, request_id: str) -> None:
+        prompt = self.server_owner.prompt_for(request_id)
+        if prompt is not None and int(time.time()) > prompt.expires_at:
+            snapshot = TerminalApprovalSnapshot.from_prompt(
+                prompt,
+                state=TERMINAL_APPROVAL_EXPIRED,
+            )
+            self._send_html(HTTPStatus.GONE, self._render_terminal(snapshot))
+            return
+        if prompt is not None:
+            self._send_html(
+                HTTPStatus.OK,
+                self._render_prompt(prompt),
+                extra_headers={"Set-Cookie": self._session_cookie_header()},
+            )
+            return
+        self._respond_stale_pending(request_id)
+
+    def _respond_stale_pending(self, request_id: str) -> None:
+        snapshot = self.server_owner.stale_terminal_snapshot_for(request_id)
+        if snapshot is not None:
+            self._send_html(HTTPStatus.GONE, self._render_terminal(snapshot))
+            return
+        if self.server_owner.is_terminal(request_id):
+            self._send_html(
+                HTTPStatus.GONE,
+                self._render_terminal(
+                    TerminalApprovalSnapshot(
+                        request_id=request_id,
+                        state=TERMINAL_ALREADY_DECIDED,
+                        client_id="-",
+                        session_id_prefix="-",
+                        downstream_server="-",
+                        tool_name="-",
+                        risk_class="-",
+                        reason="-",
+                        action_display="-",
+                        resource_display="none",
+                        policy_rule_id="-",
+                        created_at=0,
+                        expires_at=0,
+                    ),
+                ),
+            )
+            return
+        self._send_html(HTTPStatus.NOT_FOUND, self._render_request_not_found(request_id))
 
     def _parse_path(self) -> tuple[str | None, str | None, str | None]:
         parts = [part for part in self.path.split("?")[0].split("/") if part]
@@ -449,6 +577,51 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
             f"{COOKIE_NAME}={self.server_owner._cookie_value()}; "
             f"Path=/approval/{self.server_owner.session_token}; HttpOnly; SameSite=Strict"
         )
+
+    def _render_forbidden_session(self) -> str:
+        return self._page(
+            "Forbidden",
+            "<p>Invalid approval session URL.</p>",
+        )
+
+    def _render_request_not_found(self, request_id: str) -> str:
+        body = (
+            "<p>This approval request is no longer pending.</p>"
+            f"<p class=\"approval-request-id\">request {escape(request_id)}</p>"
+            "<p>Open your Approval Center pending list from the original notification link.</p>"
+        )
+        return self._page("Request no longer pending", body)
+
+    def _terminal_titles(self, state: str) -> tuple[str, str]:
+        if state == TERMINAL_APPROVAL_EXPIRED:
+            return "Approval expired", "This approval request has expired."
+        if state == TERMINAL_ALREADY_DECIDED_APPROVE:
+            return "Already decided", "Approved"
+        if state == TERMINAL_ALREADY_DECIDED_DENY:
+            return "Already decided", "Denied"
+        return "Already decided", "This approval request is no longer actionable."
+
+    def _render_terminal(self, snapshot: TerminalApprovalSnapshot) -> str:
+        title, subtitle = self._terminal_titles(snapshot.state)
+        body = f"""
+<p>{escape(subtitle)}</p>
+<p class="approval-request-id">request {escape(snapshot.request_id)}</p>
+<dl>
+<dt>Client</dt><dd>{escape(snapshot.client_id)}</dd>
+<dt>Session prefix</dt><dd>{escape(snapshot.session_id_prefix)}</dd>
+<dt>Downstream</dt><dd>{escape(snapshot.downstream_server)}</dd>
+<dt>Tool</dt><dd>{escape(snapshot.tool_name)}</dd>
+<dt>Action</dt><dd>{escape(snapshot.action_display)}</dd>
+<dt>Resource</dt><dd>{escape(snapshot.resource_display)}</dd>
+<dt>Risk</dt><dd>{escape(snapshot.risk_class)}</dd>
+<dt>Reason</dt><dd>{escape(snapshot.reason)}</dd>
+<dt>Policy rule</dt><dd>{escape(snapshot.policy_rule_id)}</dd>
+<dt>Created</dt><dd>{snapshot.created_at}</dd>
+<dt>Expires</dt><dd>{snapshot.expires_at}</dd>
+</dl>
+<p>Open your Approval Center pending list from the original notification link.</p>
+"""
+        return self._page(title, body)
 
     def _render_list(self) -> str:
         prompts = self.server_owner.pending_prompts()
@@ -785,4 +958,9 @@ __all__ = [
     "ApprovalServerError",
     "ApprovalServerGone",
     "SECURITY_HEADERS",
+    "TERMINAL_ALREADY_DECIDED",
+    "TERMINAL_ALREADY_DECIDED_APPROVE",
+    "TERMINAL_ALREADY_DECIDED_DENY",
+    "TERMINAL_APPROVAL_EXPIRED",
+    "TerminalApprovalSnapshot",
 ]

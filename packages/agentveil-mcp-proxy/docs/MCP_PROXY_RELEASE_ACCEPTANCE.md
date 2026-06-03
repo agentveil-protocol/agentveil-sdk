@@ -6,6 +6,10 @@ Runtime Gate integration. It is intentionally separate from the regular pytest
 suite because it builds a wheel, installs it into a clean virtualenv, and talks
 to the configured backend.
 
+For the **onboarding stage** (smoke, `client-config print`, deny path, privacy scan, Approval
+Center API when pending), use
+[`MCP_PROXY_ONBOARDING_STAGE_GATE.md`](MCP_PROXY_ONBOARDING_STAGE_GATE.md).
+
 Run this before tagging or publishing an MCP Proxy release:
 
 ```bash
