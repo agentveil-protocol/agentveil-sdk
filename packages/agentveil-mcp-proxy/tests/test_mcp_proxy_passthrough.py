@@ -3061,3 +3061,115 @@ def test_persistence_path_ssh_authorized_keys_stays_secret_path_blocked(tmp_path
     assert ".ssh/authorized_keys" not in client_out.getvalue()
     assert "ssh-rsa" not in client_out.getvalue()
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
+
+
+def _command_tool_downstream(tmp_path: Path) -> Path:
+    schema = {
+        "type": "object",
+        "properties": {"command": {"type": "string"}},
+        "required": ["command"],
+        "additionalProperties": False,
+    }
+    return write_downstream(
+        tmp_path,
+        filename="command_tool_downstream.py",
+        tools=[tool_entry("run_terminal_cmd", schema)],
+        call_result_text="pkg-ok",
+    )
+
+
+def _package_manager_tool_call(command: str) -> dict:
+    return {
+        "jsonrpc": "2.0",
+        "id": "call-1",
+        "method": "tools/call",
+        "params": {
+            "name": "run_terminal_cmd",
+            "arguments": {"command": command},
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "npm install left-pad",
+        "yarn add left-pad",
+        "pnpm add left-pad",
+        "pip install requests",
+        "poetry add pandas",
+        "uv pip install httpx",
+        "cargo install ripgrep",
+        "go install example.com/tool@latest",
+        "composer require symfony/console",
+    ],
+)
+def test_package_manager_mutation_requires_approval_before_downstream(
+    tmp_path,
+    monkeypatch,
+    command,
+):
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    _set_downstream(
+        init.config_path,
+        _command_tool_downstream(tmp_path),
+        log_path=log_path,
+    )
+    _set_allow_policy(init.config_path, server="fake-downstream", tool="run_terminal_cmd")
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("package manager trapdoor must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(
+            _json_line({"jsonrpc": "2.0", "id": "list-1", "method": "tools/list", "params": {}})
+            + _json_line(_package_manager_tool_call(command=command))
+        ),
+        out=client_out,
+    ) == 0
+
+    response = _responses(client_out.getvalue())[1]
+    assert response["error"]["code"] == JSONRPC_APPROVAL_REQUIRED
+    assert response["error"]["data"]["status"] == "approval_required"
+    assert response["error"]["data"]["reason"] == "package_manager_action_requires_approval"
+    assert response["error"]["data"]["approval_url"].startswith("http://127.0.0.1:")
+    output = client_out.getvalue()
+    assert command not in output
+    for secret_fragment in ("left-pad", "requests", "pandas", "httpx", "ripgrep", "marker-pkg"):
+        assert secret_fragment not in output
+    assert _pending_approval_count(home) == 1
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
+
+
+def test_package_manager_safe_command_allowed_with_allow_policy(tmp_path):
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    _set_downstream(
+        init.config_path,
+        _command_tool_downstream(tmp_path),
+        log_path=log_path,
+    )
+    _set_allow_policy(init.config_path, server="fake-downstream", tool="run_terminal_cmd")
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(
+            _json_line({"jsonrpc": "2.0", "id": "list-1", "method": "tools/list", "params": {}})
+            + _json_line(_package_manager_tool_call(command="pip list"))
+        ),
+        out=client_out,
+    ) == 0
+
+    response = _responses(client_out.getvalue())[1]
+    assert response["result"] == {"content": [{"type": "text", "text": "pkg-ok"}]}
+    assert _pending_approval_count(home) == 0
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list", "tools/call"]

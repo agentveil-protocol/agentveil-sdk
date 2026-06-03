@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 import io
 import json
@@ -44,6 +44,7 @@ from agentveil_mcp_proxy.evidence import (
 from agentveil_mcp_proxy.evidence.observability import (
     event_record_dict,
     execution_record_id_by_parent,
+    format_event_record,
 )
 from agentveil_mcp_proxy.evidence.approval_grant import (
     ApprovalGrantError,
@@ -56,6 +57,8 @@ from mcp_fake_downstream import tool_entry, write_downstream
 
 
 SECRET = "SECRET_APPROVAL_PAYLOAD"
+PACKAGE_MANAGER_SECRET = "marker-pkg"
+PACKAGE_MANAGER_COMMAND_FRAGMENT = "npm install"
 TOKEN_RE = re.compile(r'name="csrf_token" value="([^"]+)"')
 APPROVAL_GRANT_SEED = bytes.fromhex("33" * 32)
 APPROVAL_GRANT_DID = _public_key_to_did(bytes(SigningKey(APPROVAL_GRANT_SEED).verify_key))
@@ -113,6 +116,16 @@ def _config(
         },
         "downstream": {},
     })
+
+
+def _allow_run_terminal_cmd_rule() -> dict[str, Any]:
+    return {
+        "id": "allow-run-terminal",
+        "source": "user",
+        "decision": "allow",
+        "risk_class": "unknown",
+        "match": {"server": "fake-downstream", "tool": "run_terminal_cmd"},
+    }
 
 
 def _allow_write_file_rule() -> dict[str, Any]:
@@ -1576,6 +1589,33 @@ def _approval_downstream(tmp_path: Path, log_path: Path) -> Path:
     )
 
 
+def _command_tool_downstream(tmp_path: Path, log_path: Path) -> Path:
+    schema = {
+        "type": "object",
+        "properties": {"command": {"type": "string"}},
+        "required": ["command"],
+        "additionalProperties": False,
+    }
+    return write_downstream(
+        tmp_path,
+        filename="command_tool_downstream.py",
+        tools=[tool_entry("run_terminal_cmd", schema)],
+        call_result_text="pkg-ok",
+    )
+
+
+def _npm_install_call() -> str:
+    return json.dumps({
+        "jsonrpc": "2.0",
+        "id": "call-1",
+        "method": "tools/call",
+        "params": {
+            "name": "run_terminal_cmd",
+            "arguments": {"command": "npm install marker-pkg"},
+        },
+    }, separators=(",", ":")) + "\n"
+
+
 def _filesystem_write_downstream(tmp_path: Path, log_path: Path) -> Path:
     schema = {
         "type": "object",
@@ -2220,6 +2260,138 @@ def test_passthrough_retry_after_trapdoor_approval_records_executed_evidence(tmp
                 parent,
                 execution_record_id=execution_by_parent[parent_id],
             )
+        )
+    finally:
+        passthrough.stop()
+        server.stop()
+        store.close()
+
+
+def _assert_package_manager_evidence_privacy_safe(
+    *,
+    store: ApprovalEvidenceStore,
+    parent_id: str,
+    parent: Any,
+    children: list[Any],
+    secret: str = PACKAGE_MANAGER_SECRET,
+    command_fragment: str = PACKAGE_MANAGER_COMMAND_FRAGMENT,
+) -> None:
+    """Assert T6 evidence surfaces omit raw package-manager command content."""
+
+    records = store.list_records()
+    execution_by_parent = execution_record_id_by_parent(records)
+    assert execution_by_parent[parent_id] == children[0].request_id
+    parent_event = event_record_dict(
+        parent,
+        execution_record_id=execution_by_parent[parent_id],
+    )
+    assert parent_event["result_status"] == "executed"
+    assert parent_event["execution_record_id"] == children[0].request_id
+    for forbidden in (secret, command_fragment):
+        assert forbidden not in json.dumps(parent_event)
+
+    bundle = build_evidence_bundle(
+        store,
+        proxy_identity_did=APPROVAL_GRANT_DID,
+        trusted_signer_dids=[APPROVAL_GRANT_DID],
+    )
+    exported_parent = next(
+        item for item in bundle["records"] if item["request_id"] == parent_id
+    )
+    exported_child = next(
+        item for item in bundle["records"] if item["request_id"] == children[0].request_id
+    )
+    assert exported_parent["execution_record_id"] == children[0].request_id
+    assert "execution_record_id" not in exported_child
+    bundle_blob = json.dumps(bundle)
+    for forbidden in (secret, command_fragment):
+        assert forbidden not in json.dumps(exported_parent)
+        assert forbidden not in json.dumps(exported_child)
+        assert forbidden not in bundle_blob
+    assert '"arguments"' not in bundle_blob
+
+    for record in records:
+        blob = json.dumps(asdict(record))
+        for forbidden in (secret, command_fragment):
+            assert forbidden not in blob
+        assert '"arguments"' not in blob
+
+    rendered_event = format_event_record(
+        parent,
+        receipt_status="present",
+        execution_record_id=execution_by_parent[parent_id],
+        timestamp_formatter=str,
+        token_formatter=str,
+    )
+    for forbidden in (secret, command_fragment):
+        assert forbidden not in rendered_event
+
+
+def test_package_manager_retry_executes_once_after_approval(tmp_path):
+    """Approved package-manager retry runs downstream once with executed evidence."""
+
+    config = _config(policy_rule=_allow_run_terminal_cmd_rule())
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        wait_for_decision=False,
+        approval_grant_private_key_seed=APPROVAL_GRANT_SEED,
+        approval_grant_agent_did=APPROVAL_GRANT_DID,
+    )
+    log_path = tmp_path / "downstream.log"
+    passthrough = McpPassthrough(
+        DownstreamConfig(
+            command=sys.executable,
+            args=("-u", str(_command_tool_downstream(tmp_path, log_path))),
+            name="fake-downstream",
+            env={"DOWNSTREAM_LOG": str(log_path)},
+        ),
+        classifier=ToolCallClassifier(config, server_name="fake-downstream"),
+        approval_manager=manager,
+    )
+    passthrough.start()
+    try:
+        first = passthrough.handle_client_line(_npm_install_call())
+        assert first[0]["error"]["data"]["reason"] == "package_manager_action_requires_approval"
+        for forbidden in (PACKAGE_MANAGER_SECRET, PACKAGE_MANAGER_COMMAND_FRAGMENT):
+            assert forbidden not in json.dumps(first[0])
+
+        deadline = time.monotonic() + 2
+        while not server.pending_prompts() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        parent_id = server.pending_prompts()[0].request_id
+        with httpx.Client() as client:
+            csrf = _get_csrf(client, server.approval_url(parent_id))
+            response = _post_decision(
+                client,
+                server.approval_url(parent_id),
+                decision="approve",
+                csrf=csrf,
+            )
+        assert response.status_code == 200
+
+        retry = passthrough.handle_client_line(_npm_install_call())
+        assert retry[0]["result"]["content"][0]["text"] == "pkg-ok"
+        assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list", "tools/call"]
+        assert server.pending_prompts() == []
+
+        children = [
+            record
+            for record in store.list_records()
+            if record.granted_by_request_id == parent_id
+        ]
+        assert len(children) == 1
+        assert children[0].status == ApprovalStatus.EXECUTED.value
+        assert children[0].result_status == "executed"
+        parent = store.get_pending(parent_id)
+        assert parent is not None
+        assert parent.status == ApprovalStatus.APPROVED.value
+        assert parent.result_status == "executed"
+        _assert_package_manager_evidence_privacy_safe(
+            store=store,
+            parent_id=parent_id,
+            parent=parent,
+            children=children,
         )
     finally:
         passthrough.stop()
