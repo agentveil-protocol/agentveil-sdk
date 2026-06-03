@@ -65,6 +65,16 @@ from agentveil_mcp_proxy.policy import (
     ProxyConfigError,
     builtin_policy_pack,
 )
+from agentveil_mcp_proxy.client_config import (
+    CLIENT_TARGETS,
+    ClientConfigError,
+    DEFAULT_SERVER_NAME,
+    build_run_args,
+    format_client_config_json_payload,
+    format_client_config_text,
+    render_client_configs,
+    resolve_proxy_command,
+)
 from agentveil_mcp_proxy.passthrough import DownstreamConfig, McpPassthrough, PassthroughError
 from agentveil_mcp_proxy.runtime_gate import RuntimeGateClient
 
@@ -1969,6 +1979,50 @@ def _add_downstream_set_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def print_client_configs(
+    *,
+    clients: list[str],
+    server_name: str = DEFAULT_SERVER_NAME,
+    command: str | None = None,
+    home: Path | None = None,
+    config_path: Path | None = None,
+    passphrase_file: Path | None = None,
+    output_json: bool = False,
+    out: TextIO | None = None,
+) -> None:
+    """Print copy-paste MCP client config without writing desktop config files."""
+
+    sink = out or sys.stdout
+    try:
+        rendered = render_client_configs(
+            clients=clients,
+            server_name=server_name,
+            command=command,
+            home=home,
+            config_path=config_path,
+            passphrase_file=passphrase_file,
+        )
+        resolved_command = resolve_proxy_command(command)
+        run_args = build_run_args(
+            home=home,
+            config_path=config_path,
+            passphrase_file=passphrase_file,
+        )
+    except ClientConfigError as exc:
+        raise ProxyCliError(str(exc), exit_code=2) from exc
+
+    if output_json:
+        payload = format_client_config_json_payload(
+            rendered,
+            command=resolved_command,
+            run_args=run_args,
+        )
+        _print_json(payload, out=sink)
+        return
+
+    sink.write(format_client_config_text(rendered))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agentveil-mcp-proxy")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -2100,6 +2154,44 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_EVIDENCE_VACUUM_MAX_AGE_DAYS,
     )
     events.add_argument("--before", default=None, help="Prune terminal records before UTC timestamp")
+
+    client_config = subparsers.add_parser(
+        "client-config",
+        help="Print copy-paste MCP client config (dry-run; does not edit IDE files)",
+    )
+    client_config_subparsers = client_config.add_subparsers(
+        dest="client_config_action",
+        required=True,
+    )
+    client_config_print = client_config_subparsers.add_parser(
+        "print",
+        help="Render MCP client config JSON for supported desktop clients",
+    )
+    _add_common_path_args(client_config_print)
+    client_config_print.add_argument(
+        "--client",
+        action="append",
+        default=None,
+        choices=[*sorted(CLIENT_TARGETS), "all"],
+        help="Client target to render (repeatable; default: all supported clients)",
+    )
+    client_config_print.add_argument(
+        "--server-name",
+        default=DEFAULT_SERVER_NAME,
+        help="MCP server entry name inside mcpServers",
+    )
+    client_config_print.add_argument(
+        "--proxy-command",
+        default=None,
+        help="Path to agentveil-mcp-proxy executable (default: resolve from PATH)",
+    )
+    client_config_print.add_argument(
+        "--passphrase-file",
+        type=Path,
+        default=None,
+        help="Include --passphrase-file in run args (file path only; passphrase content is not printed)",
+    )
+    _add_json_arg(client_config_print)
 
     return parser
 
@@ -2303,6 +2395,19 @@ def main(argv: list[str] | None = None) -> int:
                 )
             else:
                 raise ProxyCliError("events action must be list, tail, or vacuum")
+            return 0
+        if args.command == "client-config":
+            if args.client_config_action != "print":
+                raise ProxyCliError("client-config action must be print")
+            print_client_configs(
+                clients=args.client or sorted(CLIENT_TARGETS),
+                server_name=args.server_name,
+                command=args.proxy_command,
+                home=args.home,
+                config_path=args.config,
+                passphrase_file=args.passphrase_file,
+                output_json=args.json_output,
+            )
             return 0
     except (ProxyCliError, ApprovalEvidenceError, EvidenceExportError, EvidenceVerificationError) as exc:
         if getattr(args, "json_output", False):
