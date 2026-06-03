@@ -30,11 +30,15 @@ SECURITY_HEADERS = {
     "Expires": "0",
     "X-Frame-Options": "DENY",
     "Content-Security-Policy": (
-        "default-src 'self'; script-src 'self'; style-src 'self'; frame-ancestors 'none'"
+        "default-src 'self'; script-src 'self'; "
+        "style-src 'self' 'unsafe-inline'; frame-ancestors 'none'"
     ),
     "X-Content-Type-Options": "nosniff",
 }
 COOKIE_NAME = "avp_approval_session"
+APPROVAL_LOCAL_URL_WARNING = (
+    "This local approval URL is a bearer-style session URL. Do not share it."
+)
 
 
 class _DaemonThreadingHTTPServer(ThreadingHTTPServer):
@@ -222,27 +226,32 @@ class ApprovalServer:
         with self._lock:
             return self._decisions.get(request_id)
 
+    def pending_row_dict(self, prompt: ApprovalPrompt) -> dict[str, Any]:
+        """Sanitized pending row shared by the dashboard HTML and JSON API."""
+
+        return pending_approval_dict(
+            request_id=prompt.request_id,
+            client_id=prompt.client_id,
+            session_id=prompt.session_id,
+            downstream_server=prompt.downstream_server,
+            tool_name=prompt.tool_name,
+            action_display=prompt.action_display,
+            resource_display=prompt.resource_display,
+            risk_class=prompt.risk_class,
+            reason=prompt.reason,
+            payload_hash=prompt.payload_hash,
+            policy_rule_id=prompt.policy_rule_id,
+            created_at=prompt.created_at,
+            expires_at=prompt.expires_at,
+        )
+
     def pending_approvals_api_payload(self) -> dict[str, Any]:
         """Return sanitized pending approvals for the loopback JSON API."""
 
         return {
             "ok": True,
             "approvals": [
-                pending_approval_dict(
-                    request_id=prompt.request_id,
-                    client_id=prompt.client_id,
-                    session_id=prompt.session_id,
-                    downstream_server=prompt.downstream_server,
-                    tool_name=prompt.tool_name,
-                    action_display=prompt.action_display,
-                    resource_display=prompt.resource_display,
-                    risk_class=prompt.risk_class,
-                    reason=prompt.reason,
-                    payload_hash=prompt.payload_hash,
-                    policy_rule_id=prompt.policy_rule_id,
-                    created_at=prompt.created_at,
-                    expires_at=prompt.expires_at,
-                )
+                self.pending_row_dict(prompt)
                 for prompt in self.pending_prompts()
             ],
         }
@@ -442,22 +451,59 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
         )
 
     def _render_list(self) -> str:
-        items = []
-        for prompt in self.server_owner.pending_prompts():
-            href = f"/approval/{self.server_owner.session_token}/pending/{prompt.request_id}"
-            items.append(
-                "<li>"
-                f"<a href=\"{escape(href)}\">{escape(prompt.downstream_server)}."
-                f"{escape(prompt.tool_name)}</a> "
-                f"{escape(prompt.risk_class)} {escape(prompt.payload_hash[:19])} "
-                f"{escape(prompt.client_id)} session {escape(prompt.session_id[:8])}"
-                "</li>"
+        prompts = self.server_owner.pending_prompts()
+        token = self.server_owner.session_token
+        if not prompts:
+            body = '<p class="approval-empty">No pending approvals</p>'
+        else:
+            cards = "".join(
+                self._render_dashboard_card(
+                    self.server_owner.pending_row_dict(prompt),
+                    detail_href=f"/approval/{token}/pending/{prompt.request_id}",
+                )
+                for prompt in prompts
             )
-        body = "<p>No pending approvals.</p>" if not items else "<ul>" + "".join(items) + "</ul>"
-        return self._page("Pending approvals", body)
+            body = f'<section class="approval-cards">{cards}</section>'
+        return self._page(
+            "Pending approvals",
+            body,
+            page_kind="dashboard",
+            include_card_styles=bool(prompts),
+        )
+
+    def _render_dashboard_card(self, row: dict[str, Any], *, detail_href: str) -> str:
+        risk = escape(row["risk_class"])
+        return (
+            '<article class="approval-card">'
+            '<header class="approval-card-header">'
+            f'<span class="approval-tool">'
+            f'{escape(row["downstream_server"])}.{escape(row["tool_name"])}</span>'
+            f'<span class="approval-risk approval-risk-{risk}">{risk}</span>'
+            "</header>"
+            f'<p class="approval-reason">{escape(row["reason"])}</p>'
+            '<dl class="approval-meta">'
+            f'<div><dt>Action</dt><dd class="approval-wrap">{escape(row["action"])}</dd></div>'
+            f'<div><dt>Resource</dt><dd class="approval-wrap">{escape(row["resource"])}</dd></div>'
+            f'<div><dt>Client</dt><dd class="approval-wrap">{escape(row["client_id"])}</dd></div>'
+            f'<div><dt>Session</dt><dd>{escape(row["session_id_prefix"])}</dd></div>'
+            f'<div><dt>Created</dt><dd>{row["created_at"]}</dd></div>'
+            f'<div><dt>Expires</dt><dd>{row["expires_at"]}</dd></div>'
+            f'<div><dt>Payload hash</dt><dd class="approval-wrap">{escape(row["payload_hash"])}</dd></div>'
+            "</dl>"
+            f'<p class="approval-request-id">request {escape(row["request_id"])}</p>'
+            f'<p class="approval-card-actions">'
+            f'<a class="approval-button" href="{escape(detail_href)}">Review &amp; decide</a>'
+            "</p>"
+            "</article>"
+        )
 
     def _render_prompt(self, prompt: ApprovalPrompt) -> str:
+        token = self.server_owner.session_token
         title = f"Approval pending: {prompt.client_id} session {prompt.session_id[:8]}"
+        back_link = (
+            f'<p class="approval-back"><a href="/approval/{escape(token)}">'
+            "&larr; Back to pending list</a></p>"
+        )
         detail = ""
         if prompt.action_details or prompt.resource_details:
             detail_items = []
@@ -480,11 +526,12 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
                 "Approve similar for 5 minutes</button>"
                 "</form>"
             )
+        session_prefix = prompt.session_id[:8]
         body = f"""
-<h1>Approval pending</h1>
-<dl>
+{back_link}
+<dl class="approval-detail">
 <dt>Client</dt><dd>{escape(prompt.client_id)}</dd>
-<dt>Session</dt><dd>{escape(prompt.session_id)}</dd>
+<dt>Session prefix</dt><dd>{escape(session_prefix)}</dd>
 <dt>Request</dt><dd>{escape(prompt.request_id)}</dd>
 <dt>Downstream</dt><dd>{escape(prompt.downstream_server)}</dd>
 <dt>Tool</dt><dd>{escape(prompt.tool_name)}</dd>
@@ -505,12 +552,190 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
 </form>
 {similar}
 """
-        return self._page(title, body)
+        return self._page(title, body, page_kind="detail")
 
-    def _page(self, title: str, body: str) -> str:
+    def _security_notice_html(self) -> str:
+        return (
+            '<p class="approval-security-notice">'
+            f"{escape(APPROVAL_LOCAL_URL_WARNING)}"
+            "</p>"
+        )
+
+    def _approval_page_styles(self, *, include_card_styles: bool = True) -> str:
+        card_styles = """
+.approval-cards { display: flex; flex-direction: column; gap: 8px; }
+.approval-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  background: var(--card-bg);
+}
+.approval-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.approval-tool { font-weight: 600; word-break: break-word; color: var(--text); }
+.approval-risk {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--badge-bg);
+  color: var(--badge-text);
+}
+.approval-reason {
+  margin: 0 0 8px;
+  color: var(--muted);
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+.approval-meta {
+  margin: 0 0 8px;
+  display: grid;
+  gap: 4px 12px;
+  grid-template-columns: auto 1fr;
+}
+.approval-meta div { display: contents; }
+.approval-meta dt {
+  margin: 0;
+  color: var(--label);
+  font-size: 11px;
+  text-transform: uppercase;
+}
+.approval-meta dd { margin: 0; color: var(--text-secondary); }
+.approval-wrap {
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+.approval-request-id {
+  margin: 0 0 8px;
+  font-size: 11px;
+  color: var(--label);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow-wrap: anywhere;
+}
+.approval-card-actions { margin: 0; }
+.approval-button {
+  display: inline-block;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--button-border);
+  background: var(--button-bg);
+  color: var(--button-text);
+  text-decoration: none;
+  font-size: 12px;
+  font-weight: 500;
+}
+.approval-button:hover { background: var(--button-bg-hover); }
+""" if include_card_styles else ""
+        return f"""
+<style>
+:root {{
+  --bg: #12141a;
+  --text: #e8eaed;
+  --text-secondary: #d1d5db;
+  --muted: #b8bcc4;
+  --label: #6b7280;
+  --border: #2d333b;
+  --card-bg: #1a1d24;
+  --badge-bg: #2d333b;
+  --badge-text: #c9d1d9;
+  --button-bg: #252930;
+  --button-bg-hover: #2f3540;
+  --button-border: #3d4450;
+  --button-text: #e8eaed;
+  --link: #8ab4f8;
+  --notice-bg: #1a1d24;
+  --notice-border: #2d333b;
+  --notice-text: #9aa0a6;
+}}
+@media (prefers-color-scheme: light) {{
+  :root {{
+    --bg: #f6f7f9;
+    --text: #1f2328;
+    --text-secondary: #3d444d;
+    --muted: #57606a;
+    --label: #656d76;
+    --border: #d0d7de;
+    --card-bg: #ffffff;
+    --badge-bg: #eaeef2;
+    --badge-text: #24292f;
+    --button-bg: #f6f8fa;
+    --button-bg-hover: #eaeef2;
+    --button-border: #d0d7de;
+    --button-text: #24292f;
+    --link: #0969da;
+    --notice-bg: #f6f8fa;
+    --notice-border: #d0d7de;
+    --notice-text: #57606a;
+  }}
+}}
+body {{
+  margin: 0;
+  padding: 16px;
+  font: 13px/1.45 system-ui, -apple-system, Segoe UI, sans-serif;
+  color: var(--text);
+  background: var(--bg);
+}}
+h1 {{ font-size: 16px; font-weight: 600; margin: 0 0 12px; color: var(--text); }}
+.approval-security-notice {{
+  margin: 0 0 12px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--notice-border);
+  background: var(--notice-bg);
+  color: var(--notice-text);
+  font-size: 12px;
+  line-height: 1.4;
+}}
+.approval-empty {{ margin: 0; color: var(--muted); }}
+{card_styles}.approval-back {{ margin: 0 0 12px; font-size: 12px; }}
+.approval-back a {{ color: var(--link); text-decoration: none; }}
+dl {{ margin: 0 0 12px; }}
+dt {{ color: var(--label); font-size: 11px; text-transform: uppercase; }}
+dd {{ margin: 0 0 8px; color: var(--text-secondary); word-break: break-word; overflow-wrap: anywhere; }}
+button {{
+  margin-right: 8px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--button-border);
+  background: var(--button-bg);
+  color: var(--button-text);
+  font-size: 12px;
+  cursor: pointer;
+}}
+details {{ margin: 8px 0 12px; }}
+</style>
+"""
+
+    def _page(
+        self,
+        title: str,
+        body: str,
+        *,
+        page_kind: str = "plain",
+        include_card_styles: bool = True,
+    ) -> str:
+        styles = (
+            self._approval_page_styles(include_card_styles=include_card_styles)
+            if page_kind in {"dashboard", "detail"}
+            else ""
+        )
+        notice = (
+            self._security_notice_html()
+            if page_kind in {"dashboard", "detail"}
+            else ""
+        )
         return (
             "<!doctype html><html><head><meta charset=\"utf-8\">"
-            f"<title>{escape(title)}</title></head><body>{body}</body></html>"
+            f"<title>{escape(title)}</title>{styles}</head>"
+            f"<body>{notice}<h1>{escape(title)}</h1>{body}</body></html>"
         )
 
     def _send_html(
@@ -553,6 +778,7 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
 
 
 __all__ = [
+    "APPROVAL_LOCAL_URL_WARNING",
     "ApprovalPrompt",
     "ApprovalServer",
     "ApprovalServerDecision",

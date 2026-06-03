@@ -1523,8 +1523,9 @@ def test_pending_list_shows_correlation_fields_for_multiple_clients():
         first = _prompt("req-a")
         second = replace(_prompt("req-b"), client_id="claude:session-2", session_id="session-b")
         server.register(first)
-        list_url = server.register(second).rsplit("/pending/", 1)[0]
-        text = httpx.get(list_url).text
+        server.register(second)
+        text = httpx.get(server.approval_center_url()).text
+        assert "approval-card" in text
         assert "github.create_issue" in text
         assert "write" in text
         assert "cursor:session-1" in text
@@ -2705,6 +2706,193 @@ def test_api_approvals_forbidden_without_valid_token():
         server.stop()
 
 
+def test_dashboard_empty_state_renders():
+    server = ApprovalServer()
+    server.start()
+    try:
+        text = httpx.get(server.approval_center_url()).text
+        assert "No pending approvals" in text
+        assert "approval-empty" in text
+        assert "approval-card" not in text
+    finally:
+        server.stop()
+
+
+def test_dashboard_pending_cards_render_sanitized_fields(tmp_path):
+    config = _config(policy_rule=_run_terminal_cmd_approval_rule())
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        wait_for_decision=False,
+    )
+    try:
+        outcome = manager.request_approval(
+            _command_classification(config, command="pip list"),
+            reason="local_approval_required",
+        )
+        assert outcome.status == ApprovalStatus.PENDING.value
+        text = httpx.get(server.approval_center_url()).text
+        assert "approval-card" in text
+        assert "fake-downstream" in text
+        assert "run_terminal_cmd" in text
+        assert "local_approval_required" in text
+        assert "approval-risk-write" in text or "approval-risk" in text
+        assert "Review &amp; decide" in text
+        assert "approval-request-id" in text
+        assert str(outcome.request_id) in text
+        assert "approval-wrap" in text
+        assert "Created" in text
+        assert "Expires" in text
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_dashboard_excludes_raw_secrets_and_long_plaintext(tmp_path):
+    config = _config(policy_rule=_run_terminal_cmd_approval_rule())
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        wait_for_decision=False,
+    )
+    try:
+        manager.request_approval(
+            _command_classification(
+                config,
+                command=f"npm install {PACKAGE_MANAGER_SECRET}",
+            ),
+            reason="package_manager_action_requires_approval",
+        )
+        text = httpx.get(server.approval_center_url()).text
+        _assert_t1_privacy_safe_text(text)
+        assert "sha256:" in text
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_dashboard_hides_terminal_prompts():
+    server = ApprovalServer()
+    server.start()
+    try:
+        server.register(_prompt("req-terminal"))
+        server.unregister("req-terminal")
+        text = httpx.get(server.approval_center_url()).text
+        assert "No pending approvals" in text
+        assert "req-terminal" not in text
+    finally:
+        server.stop()
+
+
+def test_dashboard_detail_approve_deny_flow_still_works(tmp_path):
+    """Dashboard links to detail page; approve POST + immediate retry still execute."""
+
+    config = _config(policy_rule=_write_rule())
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        wait_for_decision=False,
+    )
+    log_path = tmp_path / "downstream.log"
+    passthrough = McpPassthrough(
+        DownstreamConfig(
+            command=sys.executable,
+            args=("-u", str(_approval_downstream(tmp_path, log_path))),
+            name="github",
+            env={"DOWNSTREAM_LOG": str(log_path)},
+        ),
+        classifier=ToolCallClassifier(config, server_name="github"),
+        approval_manager=manager,
+    )
+    passthrough.start()
+    try:
+        first = passthrough.handle_client_line(_tool_call())
+        assert len(first) == 1
+        assert first[0]["error"]["data"]["status"] == "approval_required"
+
+        deadline = time.monotonic() + 2
+        while not server.pending_prompts() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        dashboard = httpx.get(server.approval_center_url()).text
+        assert "approval-card" in dashboard
+        prompt = server.pending_prompts()[0]
+        detail_url = server.approval_url(prompt.request_id)
+        detail = httpx.get(detail_url).text
+        assert "Approve" in detail
+        assert "Deny" in detail
+        assert "Back to pending list" in detail
+        assert "&larr;" in detail
+        with httpx.Client() as client:
+            csrf = _get_csrf(client, detail_url)
+            response = _post_decision(
+                client,
+                detail_url,
+                decision="approve",
+                csrf=csrf,
+            )
+        assert response.status_code == 200
+
+        retry = passthrough.handle_client_line(_tool_call())
+        assert len(retry) == 1
+        assert "result" in retry[0], retry[0]
+        assert log_path.read_text(encoding="utf-8").splitlines() == [
+            "tools/list",
+            "tools/call",
+        ]
+    finally:
+        passthrough.stop()
+        server.stop()
+        store.close()
+
+
+def test_dashboard_and_detail_include_light_theme_css():
+    server = ApprovalServer()
+    server.start()
+    try:
+        dashboard = httpx.get(server.approval_center_url()).text
+        detail_url = server.register(_prompt("req-t31-theme"))
+        detail = httpx.get(detail_url).text
+        for html in (dashboard, detail):
+            assert "prefers-color-scheme: light" in html
+            assert ":root" in html
+            assert "--bg:" in html
+            assert "var(--text)" in html
+            assert "var(--bg)" in html
+    finally:
+        server.stop()
+
+
+def test_detail_shows_session_prefix_not_full_session_id():
+    server = ApprovalServer()
+    server.start()
+    try:
+        prompt = _prompt("req-t31-session")
+        assert prompt.session_id == "session-abcdef"
+        assert prompt.session_id[:8] == "session-"
+        detail = httpx.get(server.register(prompt)).text
+        assert "session-abcdef" not in detail
+        assert "abcdef" not in detail
+        assert "Session prefix" in detail
+        assert "session-" in detail
+        assert "req-t31-session" in detail
+    finally:
+        server.stop()
+
+
+def test_dashboard_and_detail_include_local_url_warning():
+    warning = approval_server_module.APPROVAL_LOCAL_URL_WARNING
+    server = ApprovalServer()
+    server.start()
+    try:
+        dashboard = httpx.get(server.approval_center_url()).text
+        detail = httpx.get(server.register(_prompt("req-t31-warning"))).text
+        for html in (dashboard, detail):
+            assert warning in html
+            assert "approval-security-notice" in html
+    finally:
+        server.stop()
+
+
 def test_api_approvals_json_excludes_raw_secrets_and_html_still_works(tmp_path):
     config = _config(policy_rule=_run_terminal_cmd_approval_rule())
     manager, store, server, _cli = _manager(
@@ -2726,6 +2914,7 @@ def test_api_approvals_json_excludes_raw_secrets_and_html_still_works(tmp_path):
 
         list_html = httpx.get(server.approval_center_url()).text
         assert "Pending approvals" in list_html
+        assert "approval-card" in list_html
         _assert_t1_privacy_safe_text(list_html)
 
         prompt = server.pending_prompts()[0]
