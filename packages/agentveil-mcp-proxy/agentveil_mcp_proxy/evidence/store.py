@@ -319,7 +319,7 @@ class ApprovalEvidenceStore:
                     updates.setdefault("approval_decided_at", now_timestamp)
                 if normalized in {
                     ApprovalStatus.EXECUTED.value,
-                    ApprovalStatus.BLOCKED.value,
+                    ApprovalStatus.BLOCKED.value,  # claim-check: allow terminal enum vocabulary in transition guard
                     ApprovalStatus.ERROR.value,
                 }:
                     updates.setdefault("result_status", normalized)
@@ -342,6 +342,65 @@ class ApprovalEvidenceStore:
         updated = self.get_pending(request_id)
         if updated is None:
             raise ApprovalEvidenceNotFoundError(f"approval record not found: {request_id}")
+        return updated
+
+    def annotate_linked_execution(
+        self,
+        parent_request_id: str,
+        *,
+        result_status: str,
+        result_hash: str | None = None,
+    ) -> PendingApproval:
+        """Mirror a child retry execution outcome onto an approved parent row.
+
+        The parent approval status stays ``approved`` so grant semantics and
+        existing retry tests remain unchanged, while export/events can surface
+        ``result_status=executed`` on the parent record.
+        """
+
+        normalized_status = _normalize_status(result_status)
+        if normalized_status not in {
+            ApprovalStatus.EXECUTED.value,
+            ApprovalStatus.BLOCKED.value,  # claim-check: allow terminal enum vocabulary in linked-execution guard
+            ApprovalStatus.ERROR.value,
+        }:
+            raise ApprovalEvidenceTransitionError(
+                "linked execution annotation requires a terminal result_status"
+            )
+        updates: dict[str, Any] = {"result_status": normalized_status}
+        if result_hash is not None:
+            updates["result_hash"] = result_hash
+        self._validate_transition_fields(updates)
+        with self._lock:
+            self._begin()
+            try:
+                row = self._conn.execute(
+                    f"SELECT {', '.join(_COLUMNS)} FROM pending_approvals WHERE request_id = ?",  # nosec B608
+                    (parent_request_id,),
+                ).fetchone()
+                if row is None:
+                    raise ApprovalEvidenceNotFoundError(
+                        f"approval record not found: {parent_request_id}"
+                    )
+                record = _row_to_record(row)
+                if record.status != ApprovalStatus.APPROVED.value:
+                    return record
+                assignments = ", ".join(f"{column} = ?" for column in updates)
+                self._conn.execute(
+                    f"UPDATE pending_approvals SET {assignments} WHERE request_id = ?",  # nosec B608
+                    (*updates.values(), parent_request_id),
+                )
+                self._rebuild_chain_locked()
+                self._conn.commit()
+                self._secure_auxiliary_files()
+            except Exception:
+                self._conn.rollback()
+                raise
+        updated = self.get_pending(parent_request_id)
+        if updated is None:
+            raise ApprovalEvidenceNotFoundError(
+                f"approval record not found: {parent_request_id}"
+            )
         return updated
 
     def record_terminal_deny(
@@ -490,8 +549,14 @@ class ApprovalEvidenceStore:
             rows = self._conn.execute(
                 "SELECT request_id FROM pending_approvals "
                 "WHERE status = ? AND approval_decided_at IS NOT NULL "
-                "AND approval_decided_at <= ? ORDER BY created_at, request_id",
-                (ApprovalStatus.APPROVED.value, cutoff),
+                "AND approval_decided_at <= ? "
+                "AND (result_status IS NULL OR result_status != ?) "
+                "ORDER BY created_at, request_id",
+                (
+                    ApprovalStatus.APPROVED.value,
+                    cutoff,
+                    ApprovalStatus.EXECUTED.value,
+                ),
             ).fetchall()
             request_ids = [str(row["request_id"]) for row in rows]
         for request_id in request_ids:
@@ -925,6 +990,8 @@ def record_hash(record: PendingApproval | Mapping[str, Any]) -> str:
         data = dict(record)
     data.pop("prev_event_hash", None)
     data.pop("record_hash", None)
+    # Export-only linkage from an approved parent to its executed child retry row.
+    data.pop("execution_record_id", None)
     return "sha256:" + hashlib.sha256(jcs.canonicalize(data)).hexdigest()
 
 

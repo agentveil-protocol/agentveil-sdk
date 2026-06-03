@@ -491,6 +491,19 @@ def _approval_required_error(
     return jsonrpc_error(request_id, JSONRPC_APPROVAL_REQUIRED, message, data=data)
 
 
+def _coalesce_approval_outcome(
+    current: ApprovalOutcome | None,
+    new: ApprovalOutcome | None,
+) -> ApprovalOutcome | None:
+    """Keep an approved retry outcome when later policy steps return allow."""
+
+    if new is not None and new.approved:
+        return new
+    if current is not None and current.approved:
+        return current
+    return new if new is not None else current
+
+
 def _policy_denied_error(request_id: Any, *, reason: str) -> dict[str, Any]:
     return jsonrpc_error(
         request_id,
@@ -754,18 +767,34 @@ class McpPassthrough:
             )
             if path_error is not None:
                 return [path_error] if has_id else []
-            instruction_error, _ = self._instruction_file_write_policy_response(
-                message, request_id, classification
+            instruction_error, instruction_outcome = (
+                self._instruction_file_write_policy_response(
+                    message, request_id, classification
+                )
+            )
+            approval_outcome = _coalesce_approval_outcome(
+                approval_outcome,
+                instruction_outcome,
             )
             if instruction_error is not None:
                 return [instruction_error] if has_id else []
-            persistence_error, _ = self._persistence_path_write_policy_response(
-                message, request_id, classification
+            persistence_error, persistence_outcome = (
+                self._persistence_path_write_policy_response(
+                    message, request_id, classification
+                )
+            )
+            approval_outcome = _coalesce_approval_outcome(
+                approval_outcome,
+                persistence_outcome,
             )
             if persistence_error is not None:
                 return [persistence_error] if has_id else []
-            policy_error, approval_outcome = self._policy_error_response(
+            policy_error, policy_outcome = self._policy_error_response(
                 classification, request_id
+            )
+            approval_outcome = _coalesce_approval_outcome(
+                approval_outcome,
+                policy_outcome,
             )
             if policy_error is not None:
                 return [policy_error] if has_id else []

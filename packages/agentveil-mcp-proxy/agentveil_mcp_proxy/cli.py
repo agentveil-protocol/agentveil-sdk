@@ -227,17 +227,23 @@ def _downstream_info_if_available(config_path: Path) -> dict[str, Any] | None:
         return None
 
 
-def _event_record_dict(record: Any) -> dict[str, Any]:
-    return {
-        "timestamp": _event_timestamp(record.created_at),
-        "server": record.downstream_server,
-        "tool": record.tool_name,
-        "risk_class": record.risk_class,
-        "status": record.status,
-        "policy_rule": record.policy_rule_id,
-        "receipt": _receipt_status(record),
-        "record_id": record.request_id,
-    }
+def _event_record_dict(
+    record: Any,
+    *,
+    execution_record_id: str | None = None,
+) -> dict[str, Any]:
+    from agentveil_mcp_proxy.evidence.observability import event_record_dict
+
+    payload = event_record_dict(record, execution_record_id=execution_record_id)
+    payload["timestamp"] = _event_timestamp(record.created_at)
+    payload["receipt"] = _receipt_status(record)
+    return payload
+
+
+def _execution_record_ids_by_parent(records: list[Any]) -> dict[str, str]:
+    from agentveil_mcp_proxy.evidence.observability import execution_record_id_by_parent
+
+    return execution_record_id_by_parent(records)
 
 
 def default_home() -> Path:
@@ -1592,16 +1598,19 @@ def _receipt_status(record: Any) -> str:
     return "none"
 
 
-def _format_event_record(record: Any) -> str:
-    return (
-        f"{_event_timestamp(record.created_at)} "
-        f"server={_event_token(record.downstream_server)} "
-        f"tool={_event_token(record.tool_name)} "
-        f"risk={_event_token(record.risk_class)} "
-        f"status={_event_token(record.status)} "
-        f"rule={_event_token(record.policy_rule_id)} "
-        f"receipt={_receipt_status(record)} "
-        f"id={_event_token(record.request_id)}"
+def _format_event_record(
+    record: Any,
+    *,
+    execution_record_id: str | None = None,
+) -> str:
+    from agentveil_mcp_proxy.evidence.observability import format_event_record
+
+    return format_event_record(
+        record,
+        receipt_status=_receipt_status(record),
+        execution_record_id=execution_record_id,
+        timestamp_formatter=_event_timestamp,
+        token_formatter=_event_token,
     )
 
 
@@ -1622,6 +1631,7 @@ def list_events(
     with ApprovalEvidenceStore(paths.proxy_dir / "evidence.sqlite") as store:
         records = store.list_records()
     selected = records[-limit:]
+    execution_by_parent = _execution_record_ids_by_parent(records)
     if output_json:
         _print_json({
             "ok": True,
@@ -1629,14 +1639,26 @@ def list_events(
             "warnings": [],
             "downstream": _downstream_info_if_available(paths.config_path),
             "evidence_count": len(records),
-            "events": [_event_record_dict(record) for record in selected],
+            "events": [
+                _event_record_dict(
+                    record,
+                    execution_record_id=execution_by_parent.get(record.request_id),
+                )
+                for record in selected
+            ],
         }, out)
         return len(selected)
     if not selected:
         print("No evidence records", file=out)
         return 0
     for record in selected:
-        print(_format_event_record(record), file=out)
+        print(
+            _format_event_record(
+                record,
+                execution_record_id=execution_by_parent.get(record.request_id),
+            ),
+            file=out,
+        )
     return len(selected)
 
 
@@ -1663,6 +1685,7 @@ def tail_events(
         selected = records[-limit:] if initial else [
             record for record in records if record.request_id not in printed
         ]
+        execution_by_parent = _execution_record_ids_by_parent(records)
         if output_json and not follow:
             _print_json({
                 "ok": True,
@@ -1670,14 +1693,36 @@ def tail_events(
                 "warnings": [],
                 "downstream": _downstream_info_if_available(paths.config_path),
                 "evidence_count": len(records),
-                "events": [_event_record_dict(record) for record in selected],
+                "events": [
+                    _event_record_dict(
+                        record,
+                        execution_record_id=execution_by_parent.get(record.request_id),
+                    )
+                    for record in selected
+                ],
             }, out)
             return len(selected)
         for record in selected:
+            execution_record_id = execution_by_parent.get(record.request_id)
             if output_json:
-                print(json.dumps(_event_record_dict(record), sort_keys=True), file=out)
+                print(
+                    json.dumps(
+                        _event_record_dict(
+                            record,
+                            execution_record_id=execution_record_id,
+                        ),
+                        sort_keys=True,
+                    ),
+                    file=out,
+                )
             else:
-                print(_format_event_record(record), file=out)
+                print(
+                    _format_event_record(
+                        record,
+                        execution_record_id=execution_record_id,
+                    ),
+                    file=out,
+                )
             printed.add(record.request_id)
         if hasattr(out, "flush"):
             out.flush()
