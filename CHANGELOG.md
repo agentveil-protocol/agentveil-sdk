@@ -6,6 +6,58 @@ All notable changes to the `agentveil` SDK.
 
 No unreleased changes.
 
+## [0.7.21] - 2026-06-04
+
+MCP Proxy hardening and onboarding foundation release. The separately packaged
+`agentveil-mcp-proxy` package is prepared for release as `0.7.21` on PyPI after
+operator approval. The root `agentveil` package is version-aligned at `0.7.21`
+with no functional SDK changes beyond the version constant.
+
+### MCP Proxy added
+- Expanded secret credential path hard-deny coverage, including `.npmrc`,
+  `.pypirc`, and `.netrc`, before approval or downstream execution.
+- Added instruction-file write approval for guarded project-rule paths and a
+  hard-deny for hidden Unicode in guarded instruction-file content.
+- Added approval requirements for persistence/backdoor path writes, including
+  git hooks, shell rc files, cron, systemd, launchd, and related paths.
+- Added approval requirements for package-manager mutation commands such as
+  install/add/update/remove flows across common manager variants.
+- Added privacy-preserving parent/child executed linkage in local evidence
+  after approved TrapDoor and policy retries. Events JSON and evidence export
+  include execution linkage without raw command arguments and omit null
+  `result_status` fields.
+- Added onboarding and Approval Center foundation pieces: client-config dry-run,
+  onboarding stage gate, noninteractive approval gate mode, and stale Approval
+  Center pages for dogfood.
+
+### MCP Proxy unchanged
+- Fetch/metadata-IP local policy blocking from `0.7.20`, including
+  `169.254.169.254`, remains in place.
+- MCP Proxy does not replace OS sandboxing, IAM, backend systems of record, or
+  provider-side controls. It gates tool calls that flow through the configured
+  proxy path.
+<!-- claim-check: allow "production-ready" appears in a negative boundary note for the Approval Center foundation. -->
+- The Approval Center foundation is not a production-ready persistent Approval
+  Center lifecycle.
+
+### Product boundary
+AgentVeil blocks or escalates dangerous agent actions caused by poisoned
+project rules when those actions pass through the controlled MCP/tool path.
+This release does not claim broad prevention of prompt injection, malicious
+packages, or off-proxy agent behavior.
+
+### MCP Proxy verification
+- Focused TrapDoor regression covered secret paths, instruction files, hidden
+  Unicode, persistence paths, package-manager policy, approval retry execution,
+  and evidence privacy surfaces.
+- The TrapDoor P0 installed-candidate VPS gate passed on `55da7e9`, not from
+  PyPI.
+- The onboarding / Approval Center foundation stage merged in PR #60 at
+  `6dff73331641c6ebc96eaacdcca9818c95131249` after CI and VPS user-path
+  acceptance.
+- Run `packages/agentveil-mcp-proxy/scripts/mcp_proxy_release_acceptance.py`
+  against the current `0.7.21` release-candidate wheel before tag or publish.
+
 ## [0.7.20] - 2026-06-01
 
 Verifier-readiness release for `execution_receipt/3` and
