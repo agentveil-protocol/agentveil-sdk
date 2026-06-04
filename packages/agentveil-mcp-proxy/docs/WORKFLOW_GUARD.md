@@ -42,3 +42,39 @@ to the evidence database.
 - No command execution or subprocess-based parsing.
 - No prompts/chats inspection.
 - No changes to existing approval, policy, evidence, or Runtime Gate behavior.
+
+## T2 role policy and redirect playbooks
+
+`WorkflowGuardPolicyEvaluator` in `workflow_guard_policy.py` maps a T1
+`WorkflowActionEnvelope` plus a `WorkflowPolicyContext` to a
+`WorkflowPolicyResult`:
+
+- **Role profiles:** `reviewer`, `implementer`, `ops`, `release`
+- **Decisions:** `allow`, `approval_required`, `block`, `block_and_redirect`
+- **Redirects:** `RedirectPlaybook` with compact, copy-ready `workflow_text`
+
+Policy input is metadata/hash-first only (envelope fields and optional markers
+such as `implementation_scope_allowed`, `release_approval_marker`,
+`ops_infra_approved`). It does not store raw shell, prompts, secrets, file
+contents, or command output.
+
+### Role summary
+
+| Profile | Local read/test | File mutation | Remote / push / release |
+| --- | --- | --- | --- |
+| reviewer | allow | redirect unless scoped | block_and_redirect |
+| implementer | allow | allow | approval_required |
+| ops | allow | redirect | allow infra class only when `ops_infra_approved` |
+| release | allow | — | publish needs marker or approval |
+
+T2 does not execute commands, wrap shells, or integrate with CLI, evidence,
+Runtime Gate, or Approval Center. Ops **allow** is policy metadata only.
+
+T1 `block_candidate` dispositions (for example pipeline-exec, injection, or empty
+commands) map to `approval_required` or `block_and_redirect` with the dangerous-
+action playbook, not a dead-end plain `block`.
+
+## Bypass warning (T2)
+
+Policy evaluation does not close the T1 bypass: unwrapped shell still runs
+unless a future enforcement layer applies classifier + policy before execution.
