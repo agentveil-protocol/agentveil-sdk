@@ -8,7 +8,13 @@ Runtime Gate, Approval Center, or MCP Proxy enforcement.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import StrEnum
+try:
+    from enum import StrEnum
+except ImportError:  # Python < 3.11
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        pass
 from typing import Any
 
 from agentveil_mcp_proxy.workflow_guard import (
