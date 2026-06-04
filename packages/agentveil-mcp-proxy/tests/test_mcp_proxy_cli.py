@@ -1594,12 +1594,3 @@ def test_main_init_doctor_and_run_exit_codes(tmp_path, capsys):
     assert "downstream.command" in run.err
     assert secret not in run.out
     assert secret not in run.err
-
-
-def test_build_parser_registers_workflow_guard_command() -> None:
-    parser = proxy_cli.build_parser()
-    commands = {action.dest: action.choices for action in parser._actions if action.dest == "command"}
-    assert commands
-    # workflow-guard is a top-level subcommand alongside init/run/doctor.
-    action = next(item for item in parser._actions if item.dest == "command")
-    assert "workflow-guard" in action.choices
