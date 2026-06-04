@@ -78,3 +78,65 @@ action playbook, not a dead-end plain `block`.
 
 Policy evaluation does not close the T1 bypass: unwrapped shell still runs
 unless a future enforcement layer applies classifier + policy before execution.
+
+## T3 controlled runner and metadata event log
+
+`WorkflowGuardRunner` in `workflow_guard_runner.py` wires the **controlled
+wrapped-command path**:
+
+1. T1 `WorkflowGuardClassifier.classify()`
+2. T2 `WorkflowGuardPolicyEvaluator.evaluate()`
+3. Injected `WorkflowCommandExecutor` runs **only** when decision is `allow`
+4. Compact decision text (default) or full playbook/task text (`RunnerOutputMode.PLAYBOOK`)
+5. Append one metadata-only JSONL event per run via `append_workflow_guard_event()`
+
+### Library API (T3)
+
+```python
+runner = WorkflowGuardRunner()
+result = runner.run(
+    "git status --short --branch",
+    context=WorkflowPolicyContext(role_profile=RoleProfile.REVIEWER),
+    executor=my_executor,
+    output_mode=RunnerOutputMode.COMPACT,
+    event_sink="/tmp/workflow_guard_events.jsonl",
+)
+print(result.compact_message)
+```
+
+Default compact output:
+
+```text
+Decision: allow
+Rule: reviewer_local_allow
+Executed: true
+```
+
+Redirected runs add `Next: <playbook_id>` and do not execute.
+
+### JSONL event fields
+
+`timestamp`, `role_profile`, `command_family`, `action_type`, `disposition`,
+`decision`, `policy_rule_id`, `target_hash`, `payload_hash`,
+`redirect_playbook_id`, `executed`, and `executor_result_status` (allow path
+only). Events omit raw shell, secrets, full paths, prompts, and executor output.
+
+`executor_result_status` is normalized via `normalize_executor_status()` to a
+small allowlisted label (`ok`, `failed`, `timeout`, `rejected`, `cancelled`, or
+`unknown`). Hostile executor-provided status strings are normalized before event
+write.
+
+### Not Runtime Isolation
+
+T3 is a **library runner** for wrapped commands. It is not CLI-registered yet,
+not a kernel/sandbox, and not Approval Center or Runtime Gate integration.
+**Raw shell outside the wrapper remains a bypass.**
+
+### Intended future CLI shape (not implemented in T3)
+
+```text
+agentveil-mcp-proxy workflow-guard run --role reviewer -- <command...>
+```
+
+Future CLI would call `WorkflowGuardRunner` with a real executor adapter; T3
+only defines the library contract and test `RecordingExecutor`.
