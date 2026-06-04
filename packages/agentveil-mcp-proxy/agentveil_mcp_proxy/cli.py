@@ -77,6 +77,11 @@ from agentveil_mcp_proxy.client_config import (
 )
 from agentveil_mcp_proxy.passthrough import DownstreamConfig, McpPassthrough, PassthroughError
 from agentveil_mcp_proxy.runtime_gate import RuntimeGateClient
+from agentveil_mcp_proxy.workflow_guard_cli import (
+    WorkflowGuardCliError,
+    dispatch_workflow_guard,
+    register_workflow_guard_parser,
+)
 
 
 DEFAULT_BASE_URL = "https://agentveil.dev"
@@ -2193,6 +2198,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_json_arg(client_config_print)
 
+    register_workflow_guard_parser(subparsers)
+
     return parser
 
 
@@ -2216,7 +2223,11 @@ def _normalize_downstream_arg_values(argv: list[str]) -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     parse_argv = sys.argv[1:] if argv is None else argv
-    args = parser.parse_args(_normalize_downstream_arg_values(parse_argv))
+    if parse_argv[:1] == ["workflow-guard"]:
+        normalized_argv = parse_argv
+    else:
+        normalized_argv = _normalize_downstream_arg_values(parse_argv)
+    args = parser.parse_args(normalized_argv)
     try:
         if args.command == "init":
             downstream_config = None
@@ -2409,7 +2420,9 @@ def main(argv: list[str] | None = None) -> int:
                 output_json=args.json_output,
             )
             return 0
-    except (ProxyCliError, ApprovalEvidenceError, EvidenceExportError, EvidenceVerificationError) as exc:
+        if args.command == "workflow-guard":
+            return dispatch_workflow_guard(args)
+    except (ProxyCliError, WorkflowGuardCliError, ApprovalEvidenceError, EvidenceExportError, EvidenceVerificationError) as exc:
         if getattr(args, "json_output", False):
             _print_json({
                 "ok": False,
@@ -2420,7 +2433,9 @@ def main(argv: list[str] | None = None) -> int:
             })
         else:
             print(f"ERROR: {exc}", file=sys.stderr)
-        return exc.exit_code if isinstance(exc, ProxyCliError) else 1
+        if isinstance(exc, (ProxyCliError, WorkflowGuardCliError)):
+            return exc.exit_code
+        return 1
     raise AssertionError(f"unhandled command: {args.command}")
 
 
