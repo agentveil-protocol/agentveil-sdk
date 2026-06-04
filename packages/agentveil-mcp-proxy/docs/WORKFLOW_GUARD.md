@@ -140,3 +140,57 @@ agentveil-mcp-proxy workflow-guard run --role reviewer -- <command...>
 
 Future CLI would call `WorkflowGuardRunner` with a real executor adapter; T3
 only defines the library contract and test `RecordingExecutor`.
+
+## T4 controlled CLI, doctor, and smoke
+
+`workflow_guard_cli.py` registers a top-level `workflow-guard` command on
+`agentveil-mcp-proxy` with three subcommands:
+
+```text
+agentveil-mcp-proxy workflow-guard run --role reviewer [--execute] [--playbook] [--event-log PATH] -- <command...>
+agentveil-mcp-proxy workflow-guard doctor [--home PATH] [--event-log PATH] [--json]
+agentveil-mcp-proxy workflow-guard smoke [--home PATH] [--event-log PATH] [--json]
+```
+
+`scripts/workflow_guard_smoke.py` is a standalone entrypoint that calls the same
+smoke scenarios (metadata-only, no real shell unless an external wrapper passes
+`--execute` on `run`).
+
+### Controlled run (default dry-run)
+
+1. T1 classify → T2 policy
+2. Print compact `Decision` / `Rule` / `Executed` / optional `Next` lines
+3. Optionally append one metadata-only JSONL event when `--event-log` is set
+
+Without `--execute`, policy may return `allow` but the CLI does **not** shell
+out (`Executed: false`). With `--execute`, policy `allow` runs the command through
+an injected subprocess executor inside `workflow_guard_cli.py` only.
+
+Shell argv after `--` is rebuilt with `shlex.join()` (not plain `" ".join()`),
+so arguments containing spaces round-trip into classification and subprocess
+execution.
+
+`workflow-guard smoke` and `scripts/workflow_guard_smoke.py` include a CLI
+product-path check: `workflow-guard run --execute` with relative `touch` targets
+checks that allowed paths reach a marker file, denied paths do not, and JSONL
+events stay metadata-only.
+
+With `--json`, nested product-path `run` output is suppressed so stdout is a single
+parseable JSON document (no leading `Decision:` lines).
+
+### Doctor
+
+Validates T1/T2/T3 imports, role profiles, event-log writability, and a dry-run
+allow path with metadata-only events.
+
+### Smoke
+
+Runs a built-in scenario matrix (reviewer allow/redirect, implementer test allow
+with `RecordingExecutor`, secret surface, block candidate) and checks JSONL
+event count plus privacy constraints.
+
+### Bypass warning (T4)
+
+CLI registration does **not** isolate the host shell. Commands started outside
+`agentveil-mcp-proxy workflow-guard run` remain a bypass. T4 is the controlled
+wrapped-command path, not a sandbox or Approval Center integration.
