@@ -1670,11 +1670,16 @@ class McpPassthrough:
         if decision in {PolicyDecision.ALLOW, PolicyDecision.OBSERVE}:
             return None, None
         if decision is PolicyDecision.BLOCK:
-            self._record_policy_block_controlled_path(classification, request_id)
+            block_reason = evaluation.reason or "local_policy_block"
+            self._record_policy_block_controlled_path(
+                classification,
+                request_id,
+                block_reason=block_reason,
+            )
             return _blocked_error(
                 request_id,
                 "blocked by local MCP policy",
-                reason="local_policy_block",
+                reason=block_reason,
             ), None
         if decision is PolicyDecision.APPROVAL:
             return self._approval_flow_response(
@@ -1888,6 +1893,15 @@ class McpPassthrough:
     def _metadata_jcs(self, metadata: Mapping[str, Any]) -> str:
         return json.dumps(metadata, separators=(",", ":"), sort_keys=True)
 
+    @staticmethod
+    def _least_agency_metadata_fields(classification: ClassifiedToolCall) -> dict[str, str]:
+        fields: dict[str, str] = {"action_family": classification.action_family}
+        if classification.role is not None:
+            fields["role"] = classification.role
+        if classification.authority is not None:
+            fields["authority"] = classification.authority
+        return fields
+
     def _annotate_pending_controlled_path(
         self,
         classification: ClassifiedToolCall,
@@ -1906,6 +1920,7 @@ class McpPassthrough:
             target_reached=False,
             request_id=outcome.request_id,
             payload_hash=classification.payload_hash,
+            **self._least_agency_metadata_fields(classification),
         )
         try:
             store.annotate_controlled_path_metadata(
@@ -1968,6 +1983,8 @@ class McpPassthrough:
         self,
         classification: ClassifiedToolCall,
         request_id: Any,
+        *,
+        block_reason: str = "local_policy_block",
     ) -> None:
         store = self._controlled_path_store()
         if store is None:
@@ -1985,6 +2002,7 @@ class McpPassthrough:
             target_reached=False,
             request_id=request_id_text,
             payload_hash=classification.payload_hash,
+            **self._least_agency_metadata_fields(classification),
         )
         try:
             store.record_terminal_deny(
@@ -2000,7 +2018,7 @@ class McpPassthrough:
                 policy_rule_id=classification.policy_evaluation.policy_rule_id,
                 policy_context_hash=classification.policy_evaluation.policy_context_hash,
                 created_at=int(time.time()),
-                reason="local_policy_block",
+                reason=block_reason,
                 action_gate_metadata_jcs=self._metadata_jcs(metadata),
             )
         except ApprovalEvidenceError:
@@ -2034,6 +2052,7 @@ class McpPassthrough:
             ),
             request_id=request_id_text,
             payload_hash=classification.payload_hash,
+            **self._least_agency_metadata_fields(classification),
         )
         try:
             store.record_allow_execution(

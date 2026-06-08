@@ -45,6 +45,13 @@ class ToolSurfaceMode(str, Enum):
     ENFORCE = "enforce"
 
 
+class RoleAuthorityMode(str, Enum):
+    """Least Agency role/authority enforcement mode."""
+
+    OFF = "off"
+    ENFORCE = "enforce"
+
+
 class ApprovalUiOpenMode(str, Enum):
     """How the local approval surface is presented to the operator."""
 
@@ -415,16 +422,29 @@ class PolicyMatch:
     tool: tuple[str, ...] = ()
     action: tuple[str, ...] = ()
     risk_class: tuple[RiskClass, ...] = ()
+    role: tuple[str, ...] = ()
+    authority: tuple[str, ...] = ()
+    action_family: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any] | None = None) -> "PolicyMatch":
         data = _require_mapping(data or {}, "policy.rules[].match")
-        _reject_unknown(data, {"server", "tool", "action", "risk_class"}, "policy.rules[].match")
+        _reject_unknown(
+            data,
+            {"server", "tool", "action", "risk_class", "role", "authority", "action_family"},
+            "policy.rules[].match",
+        )
         return cls(
             server=_string_patterns(data.get("server"), "policy.rules[].match.server"),
             tool=_string_patterns(data.get("tool"), "policy.rules[].match.tool"),
             action=_string_patterns(data.get("action"), "policy.rules[].match.action"),
             risk_class=_risk_values(data.get("risk_class"), "policy.rules[].match.risk_class"),
+            role=_string_patterns(data.get("role"), "policy.rules[].match.role"),
+            authority=_string_patterns(data.get("authority"), "policy.rules[].match.authority"),
+            action_family=_string_patterns(
+                data.get("action_family"),
+                "policy.rules[].match.action_family",
+            ),
         )
 
     def matches(self, context: "ToolCallContext") -> bool:
@@ -433,6 +453,9 @@ class PolicyMatch:
             and _patterns_match(self.tool, context.tool)
             and _patterns_match(self.action, context.action)
             and _risk_match(self.risk_class, context.risk_class)
+            and _patterns_match(self.role, context.role)
+            and _patterns_match(self.authority, context.authority)
+            and _patterns_match(self.action_family, context.action_family)
         )
 
 
@@ -602,6 +625,72 @@ class ToolSurfaceConfig:
         return tuple(sorted(tool for tool in observed if not self.is_declared(tool)))
 
 
+@dataclass(frozen=True)
+class RoleAuthorityConfig:
+    """Operator-declared Least Agency role and authority for brokered tool calls."""
+
+    mode: RoleAuthorityMode = RoleAuthorityMode.OFF
+    role: str | None = None
+    authority: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any] | None = None) -> "RoleAuthorityConfig":
+        if data is None:
+            data = {}
+        data = _require_mapping(data, "role_authority")
+        _reject_unknown(data, {"mode", "role", "authority"}, "role_authority")
+        mode = _enum(RoleAuthorityMode, data.get("mode", "off"), "role_authority.mode")
+        role = data.get("role")
+        authority = data.get("authority")
+        if role is not None:
+            role = _non_empty_str(role, "role_authority.role")
+        if authority is not None:
+            authority = _non_empty_str(authority, "role_authority.authority")
+        if mode is RoleAuthorityMode.ENFORCE and role is None:
+            raise ProxyConfigError("role_authority.role is required when role_authority.mode is enforce")
+        return cls(mode=mode, role=role, authority=authority)
+
+    def is_enforced(self) -> bool:
+        return self.mode is RoleAuthorityMode.ENFORCE and self.role is not None
+
+
+_ROLE_AUTHORITY_REVIEWER_BLOCKED_FAMILIES = (
+    "write",
+    "create",
+    "update",
+    "delete",
+    "remove",
+    "exec",
+    "shell",
+)
+_ROLE_AUTHORITY_RULE_ID = "role_authority_reviewer_blocks_implementation"
+_ROLE_AUTHORITY_REASON = "role_authority_denied"
+_ROLE_AUTHORITY_AUTHORITY = "review_only"
+
+
+def role_authority_builtin_rules(role_authority: RoleAuthorityConfig) -> tuple[PolicyRule, ...]:
+    """Return built-in Least Agency role/authority deny rules for one config."""
+
+    if not role_authority.is_enforced() or role_authority.role != "reviewer":
+        return ()
+    authority_patterns: tuple[str, ...] = ()
+    if role_authority.authority is not None:
+        authority_patterns = (role_authority.authority,)
+    return (
+        PolicyRule(
+            id=_ROLE_AUTHORITY_RULE_ID,
+            decision=PolicyDecision.BLOCK,
+            match=PolicyMatch(
+                role=("reviewer",),
+                authority=authority_patterns,
+                action_family=_ROLE_AUTHORITY_REVIEWER_BLOCKED_FAMILIES,
+            ),
+            source="builtin",
+            reason=_ROLE_AUTHORITY_REASON,
+        ),
+    )
+
+
 _ACTION_GATE_POLICY_ID = "mcp_proxy_action_gate"
 _ACTION_GATE_AUTHORITY = "operator_declared_surface"
 _ACTION_GATE_ESCALATION_SURFACE_DRIFT = "downstream_surface_drift"
@@ -634,6 +723,9 @@ def build_controlled_path_metadata(
     request_id: str,
     request_chain: Iterable[str] | None = None,
     payload_hash: str | None = None,
+    role: str | None = None,
+    authority: str | None = None,
+    action_family: str | None = None,
 ) -> dict[str, Any]:
     """Build bounded fake-target controlled-path metadata for evidence export."""
 
@@ -650,6 +742,12 @@ def build_controlled_path_metadata(
     }
     if payload_hash is not None:
         metadata["payload_hash"] = payload_hash
+    if role is not None:
+        metadata["role"] = role
+    if authority is not None:
+        metadata["authority"] = authority
+    if action_family is not None:
+        metadata["action_family"] = action_family
     return metadata
 
 
@@ -715,6 +813,7 @@ class ProxyConfig:
     circuit_breaker: ProxyCircuitBreakerConfig = field(default_factory=ProxyCircuitBreakerConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     tool_surface: ToolSurfaceConfig = field(default_factory=ToolSurfaceConfig)
+    role_authority: RoleAuthorityConfig = field(default_factory=RoleAuthorityConfig)
     downstream: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
 
     @classmethod
@@ -732,6 +831,7 @@ class ProxyConfig:
                 "circuit_breaker",
                 "policy",
                 "tool_surface",
+                "role_authority",
                 "downstream",
             },
             "proxy config",
@@ -751,6 +851,7 @@ class ProxyConfig:
             circuit_breaker=ProxyCircuitBreakerConfig.from_dict(data.get("circuit_breaker")),
             policy=PolicyConfig.from_dict(data.get("policy", {})),
             tool_surface=ToolSurfaceConfig.from_dict(data.get("tool_surface", {})),
+            role_authority=RoleAuthorityConfig.from_dict(data.get("role_authority", {})),
             downstream=MappingProxyType(dict(downstream)),
         )
 
@@ -763,19 +864,38 @@ class ToolCallContext:
     tool: str
     action: str | None = None
     risk_class: RiskClass = RiskClass.UNKNOWN
+    role: str | None = None
+    authority: str | None = None
+    action_family: str | None = None
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "ToolCallContext":
         data = _require_mapping(data, "tool_call_context")
-        _reject_unknown(data, {"server", "tool", "action", "risk_class"}, "tool_call_context")
+        _reject_unknown(
+            data,
+            {"server", "tool", "action", "risk_class", "role", "authority", "action_family"},
+            "tool_call_context",
+        )
         action = data.get("action")
         if action is not None:
             action = _non_empty_str(action, "tool_call_context.action")
+        role = data.get("role")
+        authority = data.get("authority")
+        action_family = data.get("action_family")
+        if role is not None:
+            role = _non_empty_str(role, "tool_call_context.role")
+        if authority is not None:
+            authority = _non_empty_str(authority, "tool_call_context.authority")
+        if action_family is not None:
+            action_family = _non_empty_str(action_family, "tool_call_context.action_family")
         return cls(
             server=_non_empty_str(data.get("server"), "tool_call_context.server"),
             tool=_non_empty_str(data.get("tool"), "tool_call_context.tool"),
             action=action,
             risk_class=_enum(RiskClass, data.get("risk_class", "unknown"), "tool_call_context.risk_class"),
+            role=role,
+            authority=authority,
+            action_family=action_family,
         )
 
 
@@ -803,7 +923,8 @@ class PolicyEngine:
     def evaluate(self, context: ToolCallContext | Mapping[str, Any]) -> PolicyEvaluation:
         if isinstance(context, Mapping):
             context = ToolCallContext.from_dict(context)
-        matching = tuple(rule for rule in self.config.policy.rules if rule.matches(context))
+        rules = self.config.policy.rules + role_authority_builtin_rules(self.config.role_authority)
+        matching = tuple(rule for rule in rules if rule.matches(context))
         selected, override_applied = self._select_rule(matching)
         risk = self._risk_for(selected, context)
         effective = selected.decision
@@ -1135,10 +1256,13 @@ __all__ = [
     "ProxyConfig",
     "ProxyConfigError",
     "RiskClass",
+    "RoleAuthorityConfig",
+    "RoleAuthorityMode",
     "TimeoutAction",
     "ToolCallContext",
     "ToolSurfaceConfig",
     "ToolSurfaceMode",
     "builtin_policy_pack",
+    "role_authority_builtin_rules",
     "policy_context_hash",
 ]

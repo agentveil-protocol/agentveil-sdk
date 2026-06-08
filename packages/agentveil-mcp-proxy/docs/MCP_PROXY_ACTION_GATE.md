@@ -120,3 +120,46 @@ PYTHONPATH=.:packages/agentveil-mcp-proxy pytest \
 PYTHONPATH=.:packages/agentveil-mcp-proxy python \
   packages/agentveil-mcp-proxy/tests/live/mcp_proxy_fake_target_controlled_path_smoke.py
 ```
+
+## P10A.3 role / authority policy gate
+
+P10A.3 adds Least Agency role/authority enforcement on the brokered MCP/tool path.
+It extends the existing policy/classification model; it does not add credential
+custody, shell/runtime hooks, or provider-native controls.
+
+Activation:
+
+```json
+"role_authority": {
+  "mode": "enforce",
+  "role": "reviewer",
+  "authority": "review_only"
+}
+```
+
+Policy rules and built-in role rules may match on `role`, `authority`, and
+`action_family` in addition to server/tool/action/risk_class. Built-in reviewer
+enforcement blocks implementation/write action families
+(`write`, `create`, `update`, `delete`, `remove`, `exec`, `shell`) before
+downstream execution with `reason=role_authority_denied`.
+
+Product-path claims:
+
+- **Reviewer + write/implement action** does not reach fake downstream;
+  `target_reached=false`.
+- **Reviewer + read action** and **implementer + write action** may reach fake
+  downstream when local policy allows; `target_reached=true`.
+- Controlled-path evidence stores bounded `role`, `authority`, and
+  `action_family` beside `target_reached`.
+- Strict `verify_evidence_bundle()` still rejects tampered parsed
+  `action_gate_metadata`.
+
+Verification:
+
+```bash
+PYTHONPATH=.:packages/agentveil-mcp-proxy pytest \
+  packages/agentveil-mcp-proxy/tests/test_mcp_proxy_role_authority_policy.py -q
+
+PYTHONPATH=.:packages/agentveil-mcp-proxy python3 \
+  packages/agentveil-mcp-proxy/tests/live/mcp_proxy_role_authority_policy_smoke.py
+```
