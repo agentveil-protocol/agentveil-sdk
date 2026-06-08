@@ -246,3 +246,37 @@ PYTHONPATH=.:packages/agentveil-mcp-proxy pytest \
 PYTHONPATH=.:packages/agentveil-mcp-proxy python3 \
   packages/agentveil-mcp-proxy/tests/live/mcp_proxy_role_doctor_smoke.py
 ```
+
+## P10A.6 one-command agent templates
+
+P10A.6 ships copy-paste runnable starter commands for the first Level 2
+review/build/readonly agents. Templates reuse the normal product path:
+
+```bash
+agentveil-mcp-proxy templates print --template review --home ~/.avp-review-agent --sandbox ~/.avp-review-sandbox
+agentveil-mcp-proxy templates print --template build --home ~/.avp-build-agent --sandbox ~/.avp-build-sandbox
+agentveil-mcp-proxy templates print --template readonly --home ~/.avp-readonly-agent --sandbox ~/.avp-readonly-sandbox
+```
+
+Each template emits bounded commands for:
+
+1. `init --role ... --quickstart-filesystem ...`
+2. `client-config print`
+3. `explain role`
+4. `run --approval-ui-mode terminal`
+
+Template behavior:
+
+- `review` → reviewer preset blocks `write_file` before downstream target
+- `build` → implementer preset reaches allowed quickstart filesystem write
+- `readonly` → readonly preset denies mutation before downstream target
+
+Verification:
+
+```bash
+PYTHONPATH=.:packages/agentveil-mcp-proxy pytest \
+  packages/agentveil-mcp-proxy/tests/test_mcp_proxy_agent_templates.py -q
+
+PYTHONPATH=.:packages/agentveil-mcp-proxy python3 \
+  packages/agentveil-mcp-proxy/tests/live/mcp_proxy_agent_templates_smoke.py
+```

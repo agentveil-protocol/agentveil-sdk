@@ -77,6 +77,13 @@ from agentveil_mcp_proxy.client_config import (
     resolve_proxy_command,
 )
 from agentveil_mcp_proxy.passthrough import DownstreamConfig, McpPassthrough, PassthroughError
+from agentveil_mcp_proxy.agent_templates import (
+    AGENT_TEMPLATE_NAMES,
+    AgentTemplateError,
+    build_agent_template_report,
+    build_template_commands,
+    format_agent_template_text,
+)
 from agentveil_mcp_proxy.role_doctor import (
     build_role_doctor_report,
     format_role_doctor_report,
@@ -1225,6 +1232,52 @@ def doctor_proxy(
         return 1
 
 
+def print_agent_templates(
+    *,
+    template_id: str | None = None,
+    home: Path | None = None,
+    sandbox_root: Path | None = None,
+    proxy_command: str | None = None,
+    out: TextIO | None = None,
+    output_json: bool = False,
+) -> int:
+    """Print copy-paste runnable starter commands for review/build/readonly agents."""
+
+    sink = out or sys.stdout
+    resolved_command = resolve_proxy_command(proxy_command)
+    try:
+        if output_json:
+            payload = build_agent_template_report(
+                template_id=template_id,
+                home=home,
+                sandbox_root=sandbox_root,
+                proxy_command=resolved_command,
+            )
+            _print_json({"ok": True, **payload}, sink)
+            return 0
+        if template_id is not None:
+            plan = build_template_commands(
+                template_id,
+                home=home,
+                sandbox_root=sandbox_root,
+                proxy_command=resolved_command,
+            )
+            sink.write(format_agent_template_text(plan, proxy_command=resolved_command))
+            return 0
+        for name in AGENT_TEMPLATE_NAMES:
+            plan = build_template_commands(
+                name,
+                home=home,
+                sandbox_root=sandbox_root,
+                proxy_command=resolved_command,
+            )
+            sink.write(format_agent_template_text(plan, proxy_command=resolved_command))
+            sink.write("\n")
+        return 0
+    except AgentTemplateError as exc:
+        raise ProxyCliError(str(exc), exit_code=2) from exc
+
+
 def explain_role_proxy(
     *,
     home: Path | None = None,
@@ -2275,6 +2328,40 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_json_arg(explain_role)
 
+    templates = subparsers.add_parser(
+        "templates",
+        help="Print copy-paste runnable starter commands for review/build/readonly agents",
+    )
+    templates_subparsers = templates.add_subparsers(dest="templates_action", required=True)
+    templates_print = templates_subparsers.add_parser(
+        "print",
+        help="Render starter init/client-config/explain/run commands",
+    )
+    templates_print.add_argument(
+        "--template",
+        choices=[*AGENT_TEMPLATE_NAMES, "set"],
+        default="set",
+        help="Starter template to render (default: set)",
+    )
+    templates_print.add_argument(
+        "--home",
+        type=Path,
+        default=None,
+        help="Concrete AVP home path to embed in generated commands",
+    )
+    templates_print.add_argument(
+        "--sandbox",
+        type=Path,
+        default=None,
+        help="Concrete quickstart filesystem sandbox path to embed in generated commands",
+    )
+    templates_print.add_argument(
+        "--proxy-command",
+        default=None,
+        help="Path to agentveil-mcp-proxy executable (default: resolve from PATH)",
+    )
+    _add_json_arg(templates_print)
+
     return parser
 
 
@@ -2506,6 +2593,17 @@ def main(argv: list[str] | None = None) -> int:
                 home=args.home,
                 config_path=args.config,
                 preset=args.preset,
+                output_json=args.json_output,
+            )
+        if args.command == "templates":
+            if args.templates_action != "print":
+                raise ProxyCliError("templates action must be print")
+            template_id = None if args.template == "set" else args.template
+            return print_agent_templates(
+                template_id=template_id,
+                home=args.home,
+                sandbox_root=args.sandbox,
+                proxy_command=args.proxy_command,
                 output_json=args.json_output,
             )
     except (ProxyCliError, ApprovalEvidenceError, EvidenceExportError, EvidenceVerificationError) as exc:
