@@ -77,6 +77,10 @@ from agentveil_mcp_proxy.client_config import (
     resolve_proxy_command,
 )
 from agentveil_mcp_proxy.passthrough import DownstreamConfig, McpPassthrough, PassthroughError
+from agentveil_mcp_proxy.role_doctor import (
+    build_role_doctor_report,
+    format_role_doctor_report,
+)
 from agentveil_mcp_proxy.role_presets import (
     ROLE_PRESET_NAMES,
     RolePresetError,
@@ -1221,6 +1225,32 @@ def doctor_proxy(
         return 1
 
 
+def explain_role_proxy(
+    *,
+    home: Path | None = None,
+    config_path: Path | None = None,
+    preset: str | None = None,
+    out: TextIO | None = None,
+    output_json: bool = False,
+) -> int:
+    """Print bounded role doctor guidance for one preset or the preset set."""
+
+    out = out or sys.stdout
+    paths = proxy_paths(home, config_path)
+    selected_preset = preset
+    if selected_preset is None:
+        selected_preset = read_role_preset_from_config(paths.config_path)
+    try:
+        report = build_role_doctor_report(preset_name=selected_preset)
+    except RolePresetError as exc:
+        raise ProxyCliError(str(exc)) from exc
+    if output_json:
+        _print_json({"ok": True, "role_doctor": report}, out)
+    else:
+        print(format_role_doctor_report(report), file=out)
+    return 0
+
+
 def _rewrite_proxy_identity_after_register(
     *,
     identity_path: Path,
@@ -2227,6 +2257,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_json_arg(client_config_print)
 
+    explain = subparsers.add_parser(
+        "explain",
+        help="Print bounded operator guidance without starting transport",
+    )
+    explain_subparsers = explain.add_subparsers(dest="explain_action", required=True)
+    explain_role = explain_subparsers.add_parser(
+        "role",
+        help="Show allowed, approval-required, and denied action families by role preset",
+    )
+    _add_common_path_args(explain_role)
+    explain_role.add_argument(
+        "--preset",
+        choices=list(ROLE_PRESET_NAMES),
+        default=None,
+        help="Explain one preset; default reads role_preset from config or the preset set",
+    )
+    _add_json_arg(explain_role)
+
     return parser
 
 
@@ -2451,6 +2499,15 @@ def main(argv: list[str] | None = None) -> int:
                 output_json=args.json_output,
             )
             return 0
+        if args.command == "explain":
+            if args.explain_action != "role":
+                raise ProxyCliError("explain action must be role")
+            return explain_role_proxy(
+                home=args.home,
+                config_path=args.config,
+                preset=args.preset,
+                output_json=args.json_output,
+            )
     except (ProxyCliError, ApprovalEvidenceError, EvidenceExportError, EvidenceVerificationError) as exc:
         if getattr(args, "json_output", False):
             _print_json({

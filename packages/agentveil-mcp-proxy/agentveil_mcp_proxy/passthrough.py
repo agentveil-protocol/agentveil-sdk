@@ -54,6 +54,7 @@ from agentveil_mcp_proxy.instruction_file_guard import (
     is_instruction_file_write_tool,
 )
 from agentveil_mcp_proxy.package_manager_guard import package_manager_action_reason
+from agentveil_mcp_proxy.role_doctor import blocked_error_message, enrich_error_data
 from agentveil_mcp_proxy.persistence_path_guard import (
     is_filesystem_mutation_tool,
     persistence_path_write_reason,
@@ -451,12 +452,21 @@ def _blocked_error(
     *,
     reason: str,
     decision: RuntimeGateDecision | None = None,
+    classification: ClassifiedToolCall | None = None,
+    enrich_guidance: bool = False,
 ) -> dict[str, Any]:
     data: dict[str, Any] = {"status": "blocked", "reason": reason}
     if decision is not None:
         data["decision"] = decision.decision
         if decision.audit_id is not None:
             data["audit_id"] = decision.audit_id
+    if enrich_guidance:
+        data = enrich_error_data(data, classification, outcome="deny")
+        message = blocked_error_message(
+            classification,
+            reason=reason,
+            default_message=message,
+        )
     return jsonrpc_error(request_id, JSONRPC_POLICY_BLOCKED, message, data=data)
 
 
@@ -486,6 +496,8 @@ def _approval_required_error(
     message: str = "approval required",
     decision: RuntimeGateDecision | None = None,
     approval_outcome: ApprovalOutcome | None = None,
+    classification: ClassifiedToolCall | None = None,
+    enrich_guidance: bool = False,
 ) -> dict[str, Any]:
     data: dict[str, Any] = {"status": "approval_required", "reason": reason}
     if decision is not None:
@@ -502,6 +514,8 @@ def _approval_required_error(
             data["instructions"] = (
                 "Open approval_url to approve or deny, then retry the MCP tool call if approved."
             )
+    if enrich_guidance:
+        data = enrich_error_data(data, classification, outcome="approval")
     return jsonrpc_error(request_id, JSONRPC_APPROVAL_REQUIRED, message, data=data)
 
 
@@ -1680,6 +1694,8 @@ class McpPassthrough:
                 request_id,
                 "blocked by local MCP policy",
                 reason=block_reason,
+                classification=classification,
+                enrich_guidance=True,
             ), None
         if decision is PolicyDecision.APPROVAL:
             return self._approval_flow_response(
@@ -1688,6 +1704,7 @@ class McpPassthrough:
                 reason="local_approval_required",
                 in_flight_approval=in_flight_approval,
                 coalesce_in_flight=True,
+                enrich_guidance=True,
             )
         if decision is PolicyDecision.ASK_BACKEND:
             if self.runtime_gate_factory is None:
@@ -1817,6 +1834,7 @@ class McpPassthrough:
         runtime_decision: RuntimeGateDecision | None = None,
         in_flight_approval: ApprovalOutcome | None = None,
         coalesce_in_flight: bool = False,
+        enrich_guidance: bool = False,
     ) -> tuple[dict[str, Any] | None, ApprovalOutcome | None]:
         if (
             coalesce_in_flight
@@ -1830,6 +1848,8 @@ class McpPassthrough:
                 reason=reason,
                 message=message,
                 decision=runtime_decision,
+                classification=classification,
+                enrich_guidance=enrich_guidance,
             ), None
         try:
             outcome = self.approval_manager.request_approval(
@@ -1854,6 +1874,8 @@ class McpPassthrough:
                 message=message,
                 decision=runtime_decision,
                 approval_outcome=outcome,
+                classification=classification,
+                enrich_guidance=enrich_guidance,
             ), None
         if outcome.status == "expired":
             return jsonrpc_error(

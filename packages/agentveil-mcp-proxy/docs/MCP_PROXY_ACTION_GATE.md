@@ -205,3 +205,44 @@ PYTHONPATH=.:packages/agentveil-mcp-proxy pytest \
 PYTHONPATH=.:packages/agentveil-mcp-proxy python3 \
   packages/agentveil-mcp-proxy/tests/live/mcp_proxy_role_presets_smoke.py
 ```
+
+## P10A.5 explain / redirect / role doctor
+
+P10A.5 makes P10A.4 role presets understandable and actionable. Deny and
+approval-required JSON-RPC errors include bounded `explanation` text plus redirect
+metadata:
+
+- `next_step`
+- `suggested_next_step_id`
+- `redirect_playbook_id`
+
+Examples:
+
+- reviewer write deny → `create_implementer_task`
+- readonly mutation deny → `use_read_only_tool`
+- approval-required risky action → `request_approval`
+- unknown high-risk block → `stop_and_classify_unknown_action`
+
+Redirect guidance does not call downstream targets, mutate config, auto-approve,
+or auto-execute.
+
+Role doctor CLI:
+
+```bash
+agentveil-mcp-proxy explain role --preset reviewer
+agentveil-mcp-proxy explain role --home ~/.avp
+```
+
+<!-- claim-check: allow "blocked" is bounded role-doctor status vocabulary. -->
+Output lists allowed, approval-required, and blocked action families per preset
+without raw prompts, secrets, stdout/stderr, or full payloads.
+
+Verification:
+
+```bash
+PYTHONPATH=.:packages/agentveil-mcp-proxy pytest \
+  packages/agentveil-mcp-proxy/tests/test_mcp_proxy_role_doctor.py -q
+
+PYTHONPATH=.:packages/agentveil-mcp-proxy python3 \
+  packages/agentveil-mcp-proxy/tests/live/mcp_proxy_role_doctor_smoke.py
+```
