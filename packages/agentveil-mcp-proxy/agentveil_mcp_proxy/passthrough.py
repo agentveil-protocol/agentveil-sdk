@@ -66,6 +66,8 @@ from agentveil_mcp_proxy.policy import (
     _ACTION_GATE_ESCALATION_SURFACE_DRIFT,
     _ACTION_GATE_POLICY_ID,
     build_action_gate_metadata,
+    build_controlled_path_metadata,
+    derive_target_reached,
 )
 from agentveil_mcp_proxy.tool_schema_validation import (
     ToolSchemaCache,
@@ -570,6 +572,7 @@ class McpPassthrough:
         self._timed_out_response_ids: dict[str, float] = {}
         self._tool_schemas = ToolSchemaCache()
         self._schema_request_counter = 0
+        self._downstream_tool_calls_forwarded = 0
         self._windows_job: _WindowsJobObject | None = None
 
     @property
@@ -607,6 +610,13 @@ class McpPassthrough:
         """Number of downstream responses dropped for unknown client request IDs."""
 
         return self._unsolicited_downstream_responses
+
+    @property
+    def downstream_tool_calls_forwarded(self) -> int:
+        """Number of ``tools/call`` messages forwarded to the downstream."""
+
+        with self._counters_lock:
+            return self._downstream_tool_calls_forwarded
 
     @property
     def security_events(self) -> tuple[Mapping[str, Any], ...]:
@@ -843,6 +853,12 @@ class McpPassthrough:
                     return []
                 response = self._wait_downstream_response(request_id)
                 self._record_approval_result(approval_outcome, response)
+                self._record_allow_controlled_path_if_needed(
+                    classification,
+                    approval_outcome,
+                    request_id,
+                    response,
+                )
                 return [response]
             finally:
                 if response_key is not None:
@@ -1654,6 +1670,7 @@ class McpPassthrough:
         if decision in {PolicyDecision.ALLOW, PolicyDecision.OBSERVE}:
             return None, None
         if decision is PolicyDecision.BLOCK:
+            self._record_policy_block_controlled_path(classification, request_id)
             return _blocked_error(
                 request_id,
                 "blocked by local MCP policy",
@@ -1825,6 +1842,7 @@ class McpPassthrough:
         if outcome.approved:
             return None, outcome
         if outcome.status == "pending":
+            self._annotate_pending_controlled_path(classification, outcome)
             return _approval_required_error(
                 request_id,
                 reason=outcome.reason,
@@ -1853,6 +1871,190 @@ class McpPassthrough:
         if outcome is None or self.approval_manager is None:
             return
         self.approval_manager.record_execution_result(outcome, response)
+        self._annotate_executed_controlled_path(outcome, response)
+
+    def _controlled_path_fixture_id(self, classification: ClassifiedToolCall) -> str:
+        rule_id = classification.policy_evaluation.policy_rule_id
+        if isinstance(rule_id, str) and rule_id:
+            return rule_id
+        return f"{classification.server}.{classification.tool}"
+
+    def _controlled_path_store(self) -> Any | None:
+        manager = self.approval_manager
+        if manager is None:
+            return None
+        return getattr(manager, "evidence_store", None)
+
+    def _metadata_jcs(self, metadata: Mapping[str, Any]) -> str:
+        return json.dumps(metadata, separators=(",", ":"), sort_keys=True)
+
+    def _annotate_pending_controlled_path(
+        self,
+        classification: ClassifiedToolCall,
+        outcome: ApprovalOutcome,
+    ) -> None:
+        store = self._controlled_path_store()
+        if store is None:
+            return
+        metadata = build_controlled_path_metadata(
+            fixture_id=self._controlled_path_fixture_id(classification),
+            tool_name=classification.tool,
+            policy_decision=classification.policy_evaluation.decision.value,
+            policy_rule_id=classification.policy_evaluation.policy_rule_id,
+            approval_status=ApprovalStatus.PENDING.value,
+            execution_status="not_reached",
+            target_reached=False,
+            request_id=outcome.request_id,
+            payload_hash=classification.payload_hash,
+        )
+        try:
+            store.annotate_controlled_path_metadata(
+                outcome.request_id,
+                metadata_jcs=self._metadata_jcs(metadata),
+            )
+        except ApprovalEvidenceError:
+            return
+
+    def _annotate_executed_controlled_path(
+        self,
+        outcome: ApprovalOutcome,
+        response: dict[str, Any],
+    ) -> None:
+        if not outcome.approved:
+            return
+        store = self._controlled_path_store()
+        if store is None:
+            return
+        execution_status = (
+            ApprovalStatus.BLOCKED.value  # claim-check: allow enum value; negative tests cover no target reach.
+            if "error" in response
+            else ApprovalStatus.EXECUTED.value
+        )
+        record = store.get_pending(outcome.request_id)
+        if record is None:
+            return
+        metadata = build_controlled_path_metadata(
+            fixture_id=self._controlled_path_fixture_id_from_record(record),
+            tool_name=record.tool_name,
+            policy_decision="approval",
+            policy_rule_id=record.policy_rule_id,
+            approval_status=ApprovalStatus.APPROVED.value,
+            execution_status=execution_status,
+            target_reached=derive_target_reached(
+                execution_status=execution_status,
+                downstream_tool_call_seen=self.downstream_tool_calls_forwarded > 0,
+            ),
+            request_id=outcome.request_id,
+            payload_hash=record.payload_hash,
+        )
+        try:
+            store.annotate_controlled_path_metadata(
+                outcome.request_id,
+                metadata_jcs=self._metadata_jcs(metadata),
+            )
+        except ApprovalEvidenceError:
+            return
+
+    @staticmethod
+    def _controlled_path_fixture_id_from_record(record: Any) -> str:
+        rule_id = getattr(record, "policy_rule_id", None)
+        if isinstance(rule_id, str) and rule_id:
+            return rule_id
+        server = getattr(record, "downstream_server", "downstream")
+        tool = getattr(record, "tool_name", "tool")
+        return f"{server}.{tool}"
+
+    def _record_policy_block_controlled_path(
+        self,
+        classification: ClassifiedToolCall,
+        request_id: Any,
+    ) -> None:
+        store = self._controlled_path_store()
+        if store is None:
+            return
+        manager = self.approval_manager
+        request_id_text = str(request_id) if request_id is not None else str(uuid.uuid4())
+        metadata = build_controlled_path_metadata(
+            fixture_id=self._controlled_path_fixture_id(classification),
+            tool_name=classification.tool,
+            policy_decision=PolicyDecision.BLOCK.value,
+            policy_rule_id=classification.policy_evaluation.policy_rule_id,
+            # claim-check: allow enum value; this records a local policy deny status.
+            approval_status=ApprovalStatus.BLOCKED.value,
+            execution_status="not_reached",
+            target_reached=False,
+            request_id=request_id_text,
+            payload_hash=classification.payload_hash,
+        )
+        try:
+            store.record_terminal_deny(
+                request_id=request_id_text,
+                session_id=getattr(manager, "session_id", None) or str(uuid.uuid4()),
+                client_id=getattr(manager, "client_id", None),
+                downstream_server=classification.server,
+                tool_name=classification.tool,
+                risk_class=classification.risk_class.value,
+                resource_hash=classification.resource_hash,
+                payload_hash=classification.payload_hash,
+                policy_id=classification.policy_evaluation.policy_id,
+                policy_rule_id=classification.policy_evaluation.policy_rule_id,
+                policy_context_hash=classification.policy_evaluation.policy_context_hash,
+                created_at=int(time.time()),
+                reason="local_policy_block",
+                action_gate_metadata_jcs=self._metadata_jcs(metadata),
+            )
+        except ApprovalEvidenceError:
+            return
+
+    def _record_allow_controlled_path_if_needed(
+        self,
+        classification: ClassifiedToolCall | None,
+        outcome: ApprovalOutcome | None,
+        request_id: Any,
+        response: dict[str, Any],
+    ) -> None:
+        if outcome is not None or classification is None or "error" in response:
+            return
+        store = self._controlled_path_store()
+        manager = self.approval_manager
+        if store is None:
+            return
+        request_id_text = str(request_id) if request_id is not None else str(uuid.uuid4())
+        execution_status = ApprovalStatus.EXECUTED.value
+        metadata = build_controlled_path_metadata(
+            fixture_id=self._controlled_path_fixture_id(classification),
+            tool_name=classification.tool,
+            policy_decision=classification.policy_evaluation.decision.value,
+            policy_rule_id=classification.policy_evaluation.policy_rule_id,
+            approval_status=ApprovalStatus.EXECUTED.value,
+            execution_status=execution_status,
+            target_reached=derive_target_reached(
+                execution_status=execution_status,
+                downstream_tool_call_seen=self.downstream_tool_calls_forwarded > 0,
+            ),
+            request_id=request_id_text,
+            payload_hash=classification.payload_hash,
+        )
+        try:
+            store.record_allow_execution(
+                request_id=request_id_text,
+                session_id=getattr(manager, "session_id", None) or str(uuid.uuid4()),
+                client_id=getattr(manager, "client_id", None),
+                downstream_server=classification.server,
+                tool_name=classification.tool,
+                action_class=classification.risk_class.value,
+                risk_class=classification.risk_class.value,
+                resource_hash=classification.resource_hash,
+                payload_hash=classification.payload_hash,
+                policy_id=classification.policy_evaluation.policy_id,
+                policy_rule_id=classification.policy_evaluation.policy_rule_id,
+                policy_context_hash=classification.policy_evaluation.policy_context_hash,
+                created_at=int(time.time()),
+                result_hash=sha256_jcs(response.get("result", {})),
+                action_gate_metadata_jcs=self._metadata_jcs(metadata),
+            )
+        except ApprovalEvidenceError:
+            return
 
     def _record_approval_error(self, outcome: ApprovalOutcome | None, error_class: str) -> None:
         if outcome is None or self.approval_manager is None:
@@ -1901,6 +2103,9 @@ class McpPassthrough:
         proc = self._require_process()
         if proc.poll() is not None or proc.stdin is None:
             raise PassthroughError("downstream process is not running")
+        if message.get("method") == "tools/call":
+            with self._counters_lock:
+                self._downstream_tool_calls_forwarded += 1
         payload = json.dumps(message, separators=(",", ":"), ensure_ascii=False)
         try:
             with self._downstream_stdin_lock:

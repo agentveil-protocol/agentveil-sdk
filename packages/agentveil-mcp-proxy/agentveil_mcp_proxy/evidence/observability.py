@@ -62,6 +62,12 @@ def execution_record_id_by_parent(
     return mapping
 
 
+def parse_controlled_path_metadata(record: PendingApproval) -> dict[str, Any] | None:
+    """Parse bounded controlled-path metadata stored on one evidence record."""
+
+    return parse_action_gate_metadata(record)
+
+
 def parse_action_gate_metadata(record: PendingApproval) -> dict[str, Any] | None:
     """Parse bounded action-gate metadata stored on one evidence record."""
 
@@ -97,9 +103,11 @@ def event_record_dict(
         payload["granted_by_request_id"] = record.granted_by_request_id
     if execution_record_id is not None:
         payload["execution_record_id"] = execution_record_id
-    action_gate = parse_action_gate_metadata(record)
-    if action_gate is not None:
-        payload["action_gate"] = action_gate
+    controlled_path = parse_controlled_path_metadata(record)
+    if controlled_path is not None:
+        payload["controlled_path"] = controlled_path
+        if "target_reached" in controlled_path:
+            payload["target_reached"] = controlled_path["target_reached"]
     return payload
 
 

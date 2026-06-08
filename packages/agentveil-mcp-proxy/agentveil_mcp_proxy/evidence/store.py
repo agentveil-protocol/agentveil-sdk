@@ -507,6 +507,130 @@ class ApprovalEvidenceStore:
             raise ApprovalEvidenceNotFoundError(f"approval record not found: {request_id}")
         return updated
 
+    def annotate_controlled_path_metadata(
+        self,
+        request_id: str,
+        *,
+        metadata_jcs: str,
+    ) -> PendingApproval:
+        """Attach bounded controlled-path metadata to an existing evidence row."""
+
+        with self._lock:
+            self._begin()
+            try:
+                row = self._conn.execute(
+                    "SELECT 1 FROM pending_approvals WHERE request_id = ?",
+                    (request_id,),
+                ).fetchone()
+                if row is None:
+                    raise ApprovalEvidenceNotFoundError(
+                        f"approval record not found: {request_id}"
+                    )
+                self._conn.execute(
+                    "UPDATE pending_approvals SET action_gate_metadata_jcs = ? "
+                    "WHERE request_id = ?",
+                    (metadata_jcs, request_id),
+                )
+                self._rebuild_chain_locked()
+                self._conn.commit()
+                self._secure_auxiliary_files()
+            except Exception:
+                self._conn.rollback()
+                raise
+        updated = self.get_pending(request_id)
+        if updated is None:
+            raise ApprovalEvidenceNotFoundError(f"approval record not found: {request_id}")
+        return updated
+
+    def record_allow_execution(
+        self,
+        *,
+        request_id: str,
+        session_id: str,
+        client_id: str | None,
+        downstream_server: str,
+        tool_name: str,
+        action_class: str,
+        risk_class: str,
+        resource_hash: str | None,
+        payload_hash: str,
+        policy_id: str,
+        policy_rule_id: str | None,
+        policy_context_hash: str,
+        created_at: int,
+        result_hash: str,
+        action_gate_metadata_jcs: str | None = None,
+    ) -> PendingApproval:
+        """Persist a local ALLOW execution as a terminal executed evidence record."""
+
+        record = PendingApproval(
+            request_id=request_id,
+            session_id=session_id,
+            client_id=client_id,
+            downstream_server=downstream_server,
+            tool_name=tool_name,
+            action_class=action_class,
+            risk_class=risk_class,
+            resource_hash=resource_hash,
+            payload_hash=payload_hash,
+            policy_id=policy_id,
+            policy_rule_id=policy_rule_id,
+            policy_context_hash=policy_context_hash,
+            status=ApprovalStatus.PENDING.value,
+            created_at=created_at,
+            expires_at=None,
+            action_gate_metadata_jcs=action_gate_metadata_jcs,
+        )
+        self._validate_pending_record(record)
+        normalized = ApprovalStatus.EXECUTED.value
+        with self._lock:
+            self._begin()
+            try:
+                count = self._conn.execute("SELECT COUNT(*) FROM pending_approvals").fetchone()[0]
+                if count >= self.max_records:
+                    raise ApprovalEvidenceCapacityError(
+                        "approval evidence store record cap reached; operator pruning required"
+                    )
+                existing = self._conn.execute(
+                    "SELECT 1 FROM pending_approvals WHERE request_id = ?",
+                    (record.request_id,),
+                ).fetchone()
+                if existing is not None:
+                    raise ApprovalEvidenceDuplicateError(
+                        f"pending approval already exists: {record.request_id}"
+                    )
+                prev_event_hash, append_only = self._compute_chain_link_for_insert_locked(record)
+                record = replace(record, prev_event_hash=prev_event_hash)
+                values = _record_values(record)
+                placeholders = ", ".join("?" for _ in _COLUMNS)
+                self._conn.execute(
+                    f"INSERT INTO pending_approvals ({', '.join(_COLUMNS)}) VALUES ({placeholders})",  # nosec B608
+                    values,
+                )
+                self._validate_transition(record.status, normalized)
+                updates = {
+                    "result_status": normalized,
+                    "result_hash": result_hash,
+                    "status": normalized,
+                }
+                self._validate_transition_fields(updates)
+                assignments = ", ".join(f"{column} = ?" for column in updates)
+                self._conn.execute(
+                    f"UPDATE pending_approvals SET {assignments} WHERE request_id = ?",  # nosec B608
+                    (*updates.values(), request_id),
+                )
+                if not append_only:
+                    self._rebuild_chain_locked()
+                self._conn.commit()
+                self._secure_auxiliary_files()
+            except Exception:
+                self._conn.rollback()
+                raise
+        updated = self.get_pending(request_id)
+        if updated is None:
+            raise ApprovalEvidenceNotFoundError(f"approval record not found: {request_id}")
+        return updated
+
     def expire_overdue(self, *, now_timestamp: int | None = None) -> list[str]:
         """Mark pending records past expires_at as expired."""
 

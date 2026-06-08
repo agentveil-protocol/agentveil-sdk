@@ -616,6 +616,43 @@ def surface_name_hash(tool_names: Iterable[str]) -> str:
     return "sha256:" + hashlib.sha256(jcs.canonicalize(bounded)).hexdigest()
 
 
+def derive_target_reached(*, execution_status: str, downstream_tool_call_seen: bool) -> bool:
+    """Return True only when a brokered tools/call reached the fake downstream."""
+
+    return downstream_tool_call_seen and execution_status == "executed"
+
+
+def build_controlled_path_metadata(
+    *,
+    fixture_id: str,
+    tool_name: str,
+    policy_decision: str,
+    policy_rule_id: str | None,
+    approval_status: str,
+    execution_status: str,
+    target_reached: bool,
+    request_id: str,
+    request_chain: Iterable[str] | None = None,
+    payload_hash: str | None = None,
+) -> dict[str, Any]:
+    """Build bounded fake-target controlled-path metadata for evidence export."""
+
+    metadata: dict[str, Any] = {
+        "fixture_id": fixture_id,
+        "tool": tool_name,
+        "policy_decision": policy_decision,
+        "policy_rule": policy_rule_id,
+        "approval_status": approval_status,
+        "execution_status": execution_status,
+        "target_reached": target_reached,
+        "request_id": request_id,
+        "request_chain": list(request_chain or (request_id,)),
+    }
+    if payload_hash is not None:
+        metadata["payload_hash"] = payload_hash
+    return metadata
+
+
 def build_action_gate_metadata(
     *,
     declared_patterns: Iterable[str],
@@ -630,6 +667,7 @@ def build_action_gate_metadata(
     request_chain: Iterable[str] | None = None,
     escalation_trigger: str | None = None,
     payload_hash: str | None = None,
+    target_reached: bool = False,
 ) -> dict[str, Any]:
     """Build bounded Least Agency metadata for one MCP action-gate event."""
 
@@ -655,6 +693,7 @@ def build_action_gate_metadata(
         "request_id": request_id,
         "request_chain": list(request_chain or (request_id,)),
         "tool": tool_name,
+        "target_reached": target_reached,
     }
     if escalation_trigger is not None:
         metadata["escalation_trigger"] = escalation_trigger

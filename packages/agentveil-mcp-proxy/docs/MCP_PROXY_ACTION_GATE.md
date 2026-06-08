@@ -14,8 +14,9 @@ operator configures a declared downstream tool surface.
 - Emits bounded Least Agency metadata through the existing local evidence store
   and proof export path.
 
-P10A.1 is foundation for later `target_reached` product proof (P10A.2). It does
-not add approval UI changes, shell/runtime hooks, or provider-native controls.
+P10A.2 adds fake-target controlled-path proof on the same brokered MCP/tool path.
+Neither slice adds approval UI changes, shell/runtime hooks, or provider-native
+controls.
 
 ## Activation
 
@@ -79,3 +80,43 @@ Boundary: security events and evidence records carry tool names, bounded hashes,
 and surface summaries only. Negative tests must continue to prove representative
 raw argument values are absent from policy-denied responses, security events,
 evidence DB text, and exported bundles.
+
+## P10A.2 fake-target controlled path
+
+P10A.2 proves brokered `tools/call` target control with schema-aware fake
+downstream fixtures (`tests/mcp_fake_downstream.py` controlled-path mode).
+
+Product-path claims:
+
+- **ALLOW** forwards to the fake downstream; `target_reached=true`.
+- **BLOCK** returns `reason=local_policy_block`; the controlled-path negative
+  test records no fake downstream `tools/call`; `target_reached=false`.
+- **APPROVAL (pending)** returns `status=approval_required`; the controlled-path
+  negative test records no fake downstream `tools/call` before approval;
+  `target_reached=false`.
+- **APPROVAL (retry)** after loopback approval and an identical retry reaches
+  the fake downstream once; `target_reached=true`.
+
+Bounded controlled-path metadata is stored on evidence rows as
+`action_gate_metadata_jcs` and parsed by `parse_controlled_path_metadata()` /
+observability export:
+
+- `fixture_id`, `tool`, `policy_decision`, `policy_rule`
+- `approval_status`, `execution_status`, `target_reached`
+- `request_id`, `request_chain`, `payload_hash`
+
+Fake-target outcome logs (`FAKE_TARGET_OUTCOME_LOG`) store fixture id, MCP
+method, outcome (`reached` / `observed`), and a tool-call counter only. Boundary:
+negative tests assert raw arguments, stdout/stderr, secrets, and full payloads
+are absent from those logs.
+
+Verification:
+
+```bash
+PYTHONPATH=.:packages/agentveil-mcp-proxy pytest \
+  packages/agentveil-mcp-proxy/tests/test_mcp_proxy_passthrough.py \
+  packages/agentveil-mcp-proxy/tests/test_mcp_proxy_fake_target_controlled_path.py -q
+
+PYTHONPATH=.:packages/agentveil-mcp-proxy python \
+  packages/agentveil-mcp-proxy/tests/live/mcp_proxy_fake_target_controlled_path_smoke.py
+```
