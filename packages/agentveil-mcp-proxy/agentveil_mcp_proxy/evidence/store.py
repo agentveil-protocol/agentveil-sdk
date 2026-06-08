@@ -131,6 +131,7 @@ class PendingApproval:
     user_decision_timestamp: int | None = None
     granted_by_request_id: str | None = None
     approval_grant_jcs: str | None = None
+    action_gate_metadata_jcs: str | None = None
 
 
 @dataclass(frozen=True)
@@ -165,6 +166,7 @@ _OPTIONAL_COLUMNS = {
     "user_decision_timestamp",
     "granted_by_request_id",
     "approval_grant_jcs",
+    "action_gate_metadata_jcs",
 }
 _TRANSITION_FIELDS = {
     "decision_audit_id",
@@ -419,6 +421,7 @@ class ApprovalEvidenceStore:
         policy_context_hash: str,
         created_at: int,
         reason: str,
+        action_gate_metadata_jcs: str | None = None,
     ) -> PendingApproval:
         """Persist a pre-approval local deny as a terminal evidence record.
 
@@ -450,6 +453,7 @@ class ApprovalEvidenceStore:
             status=ApprovalStatus.PENDING.value,
             created_at=created_at,
             expires_at=None,
+            action_gate_metadata_jcs=action_gate_metadata_jcs,
         )
         self._validate_pending_record(record)
         normalized = ApprovalStatus.BLOCKED.value  # claim-check: allow tested terminal status
@@ -835,6 +839,7 @@ class ApprovalEvidenceStore:
             "prev_event_hash": "TEXT NULL",
             "granted_by_request_id": "TEXT NULL",
             "approval_grant_jcs": "TEXT NULL",
+            "action_gate_metadata_jcs": "TEXT NULL",
         }.items():
             if column not in existing:
                 self._conn.execute(f"ALTER TABLE pending_approvals ADD COLUMN {column} {column_type}")
@@ -1056,7 +1061,8 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
     matched_policy_rule TEXT NULL,
     user_decision_timestamp INTEGER NULL,
     granted_by_request_id TEXT NULL,
-    approval_grant_jcs TEXT NULL
+    approval_grant_jcs TEXT NULL,
+    action_gate_metadata_jcs TEXT NULL
 )
 """
 

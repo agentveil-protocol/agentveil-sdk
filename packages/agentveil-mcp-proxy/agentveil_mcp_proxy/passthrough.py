@@ -26,6 +26,8 @@ import ctypes
 from dataclasses import dataclass
 import hashlib
 import json
+
+import jcs
 import math
 import os
 from pathlib import Path
@@ -42,9 +44,10 @@ from agentveil_mcp_proxy.approval import ApprovalFlowError, ApprovalOutcome
 from agentveil_mcp_proxy.classification import (
     ClassifiedToolCall,
     ToolCallClassifier,
+    infer_action_family,
     sha256_jcs,
 )
-from agentveil_mcp_proxy.evidence import ApprovalEvidenceError
+from agentveil_mcp_proxy.evidence import ApprovalEvidenceError, ApprovalStatus
 from agentveil_mcp_proxy.instruction_file_guard import (
     hidden_unicode_instruction_file_block_reason,
     instruction_file_write_reason,
@@ -55,7 +58,15 @@ from agentveil_mcp_proxy.persistence_path_guard import (
     is_filesystem_mutation_tool,
     persistence_path_write_reason,
 )
-from agentveil_mcp_proxy.policy import PolicyDecision, ProxyConfig, ToolSurfaceMode
+from agentveil_mcp_proxy.policy import (
+    PolicyDecision,
+    ProxyConfig,
+    ToolSurfaceMode,
+    _ACTION_GATE_ESCALATION_EXTRA_TOOL,
+    _ACTION_GATE_ESCALATION_SURFACE_DRIFT,
+    _ACTION_GATE_POLICY_ID,
+    build_action_gate_metadata,
+)
 from agentveil_mcp_proxy.tool_schema_validation import (
     ToolSchemaCache,
     validate_arguments,
@@ -896,6 +907,8 @@ class McpPassthrough:
             return None
         if tool_surface.is_declared(tool):
             return None
+        if tool_surface.is_action_gate_active() and self._tool_schemas.is_advertised(tool):
+            return self._block_extra_downstream_tool(message, request_id, tool=tool)
         if tool_surface.mode is ToolSurfaceMode.ENFORCE:
             self._record_security_event({
                 "type": "undeclared_tool_call",
@@ -915,6 +928,92 @@ class McpPassthrough:
             "tool": tool,
         })
         return None
+
+    def _block_extra_downstream_tool(
+        self,
+        message: Mapping[str, Any],
+        request_id: Any,
+        *,
+        tool: str,
+    ) -> dict[str, Any]:
+        # claim-check: allow fail-closed wording for this tested MCP proxy branch.
+        """Fail closed on a downstream-advertised tool outside declared surface."""
+
+        config = self.config
+        tool_surface = config.tool_surface if isinstance(config, ProxyConfig) else None
+        observed = self._tool_schemas.observed_tool_names()
+        params = message.get("params")
+        arguments = params.get("arguments") if isinstance(params, Mapping) else None
+        request_id_text = str(request_id) if request_id is not None else str(uuid.uuid4())
+        metadata = build_action_gate_metadata(
+            declared_patterns=tool_surface.allow if tool_surface is not None else (),
+            observed_tools=observed,
+            tool_name=tool,
+            action_family=infer_action_family(tool),
+            policy_decision="block",
+            policy_rule_id="action_gate_extra_downstream_tool",
+            # claim-check: allow BLOCKED as stored approval-status enum value.
+            approval_status=ApprovalStatus.BLOCKED.value,
+            execution_status="not_reached",
+            request_id=request_id_text,
+            escalation_trigger=_ACTION_GATE_ESCALATION_EXTRA_TOOL,
+            payload_hash=sha256_jcs({} if arguments is None else arguments),
+        )
+        self._record_security_event({
+            "type": "action_gate_extra_downstream_tool",
+            "action": "blocked_pre_approval",
+            "reason": "extra_undeclared_downstream_tool",
+            "tool": tool,
+            "declared_surface_hash": metadata["declared_surface_hash"],
+            "observed_surface_hash": metadata["observed_surface_hash"],
+        })
+        self._record_action_gate_deny_evidence(
+            tool=tool,
+            arguments=arguments,
+            reason="extra_undeclared_downstream_tool",
+            metadata=metadata,
+        )
+        return _blocked_error(
+            request_id,
+            # claim-check: allow "blocked" as JSON-RPC error message text.
+            "blocked by MCP proxy: downstream tool outside declared surface",
+            reason="extra_undeclared_downstream_tool",
+        )
+
+    def _sync_downstream_surface_quarantine(self) -> tuple[str, ...]:
+        """Refresh quarantined downstream tools from declared-vs-observed surface."""
+
+        config = self.config
+        tool_surface = config.tool_surface if isinstance(config, ProxyConfig) else None
+        if tool_surface is None or not tool_surface.is_action_gate_active():
+            self._tool_schemas.clear_quarantine()
+            return ()
+        observed = self._tool_schemas.observed_tool_names()
+        extra = tool_surface.extra_observed_tools(observed)
+        quarantined = self._tool_schemas.set_quarantined(extra)
+        if extra:
+            metadata = build_action_gate_metadata(
+                declared_patterns=tool_surface.allow,
+                observed_tools=observed,
+                tool_name="",
+                action_family="surface_audit",
+                policy_decision="quarantine",
+                policy_rule_id="action_gate_surface_drift",
+                # claim-check: allow BLOCKED as stored approval-status enum value.
+                approval_status=ApprovalStatus.BLOCKED.value,
+                execution_status="not_reached",
+                request_id=f"surface-audit:{uuid.uuid4()}",
+                escalation_trigger=_ACTION_GATE_ESCALATION_SURFACE_DRIFT,
+            )
+            self._record_security_event({
+                "type": "action_gate_surface_drift",
+                "action": "quarantined",
+                "reason": "downstream_surface_drift",
+                "extra_tool_count": len(extra),
+                "declared_surface_hash": metadata["declared_surface_hash"],
+                "observed_surface_hash": metadata["observed_surface_hash"],
+            })
+        return quarantined
 
     def _unknown_tool_error_response(
         self,
@@ -956,6 +1055,7 @@ class McpPassthrough:
         response = self._request_downstream_tools_list()
         if response is not None:
             self._tool_schemas.update_from_response(response)
+            self._sync_downstream_surface_quarantine()
         if self._tool_schemas.is_advertised(tool):
             return None
         self._record_security_event({
@@ -1076,6 +1176,7 @@ class McpPassthrough:
         response = self._request_downstream_tools_list()
         if response is not None:
             self._tool_schemas.update_from_response(response)
+            self._sync_downstream_surface_quarantine()
         return self._tool_schemas.get(tool)
 
     def _request_downstream_tools_list(self) -> dict[str, Any] | None:
@@ -1331,6 +1432,57 @@ class McpPassthrough:
                 "action": "blocked_pre_approval",
                 "reason": reason,
                 "tool": classification.tool,
+            })
+
+    def _record_action_gate_deny_evidence(
+        self,
+        *,
+        tool: str,
+        arguments: Any,
+        reason: str,
+        metadata: Mapping[str, Any],
+    ) -> None:
+        """Persist terminal action-gate evidence with bounded Least Agency metadata."""
+
+        manager = self.approval_manager
+        if manager is None:
+            return
+        store = getattr(manager, "evidence_store", None)
+        if store is None:
+            return
+        server_name = getattr(self.classifier, "server_name", None) or self.downstream.name
+        payload_hash = sha256_jcs({} if arguments is None else arguments)
+        policy_context_hash = hashlib.sha256(
+            jcs.canonicalize({
+                "policy_id": _ACTION_GATE_POLICY_ID,
+                "reason": reason,
+                "declared_surface_hash": metadata.get("declared_surface_hash"),
+                "observed_surface_hash": metadata.get("observed_surface_hash"),
+            })
+        ).hexdigest()
+        try:
+            store.record_terminal_deny(
+                request_id=str(metadata.get("request_id") or uuid.uuid4()),
+                session_id=getattr(manager, "session_id", None) or str(uuid.uuid4()),
+                client_id=getattr(manager, "client_id", None),
+                downstream_server=server_name,
+                tool_name=tool,
+                risk_class="tool_surface_violation",
+                resource_hash=None,
+                payload_hash=payload_hash,
+                policy_id=_ACTION_GATE_POLICY_ID,
+                policy_rule_id=str(metadata.get("policy_rule") or "action_gate"),
+                policy_context_hash=policy_context_hash,
+                created_at=int(time.time()),
+                reason=reason,
+                action_gate_metadata_jcs=json.dumps(metadata, separators=(",", ":"), sort_keys=True),
+            )
+        except ApprovalEvidenceError:
+            self._record_security_event({
+                "type": "deny_evidence_persistence_failed",
+                "action": "blocked_pre_approval",
+                "reason": reason,
+                "tool": tool,
             })
 
     def _record_pre_classification_deny_evidence(

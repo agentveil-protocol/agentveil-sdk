@@ -415,6 +415,13 @@ def _bundle_records(records: list[PendingApproval], *, require_genesis: bool = T
         execution_record_id = execution_by_parent.get(record.request_id)
         if execution_record_id is not None:
             data["execution_record_id"] = execution_record_id
+        if record.action_gate_metadata_jcs:
+            try:
+                parsed = json.loads(record.action_gate_metadata_jcs)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                data["action_gate_metadata"] = parsed
         expected_prev_hash = data["record_hash"]
         export_records.append(data)
     return export_records

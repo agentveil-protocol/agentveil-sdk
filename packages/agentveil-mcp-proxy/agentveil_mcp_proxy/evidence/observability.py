@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import json
 from typing import Any
 
 from agentveil_mcp_proxy.evidence.store import ApprovalStatus, PendingApproval
@@ -61,6 +62,19 @@ def execution_record_id_by_parent(
     return mapping
 
 
+def parse_action_gate_metadata(record: PendingApproval) -> dict[str, Any] | None:
+    """Parse bounded action-gate metadata stored on one evidence record."""
+
+    raw = record.action_gate_metadata_jcs
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def event_record_dict(
     record: PendingApproval,
     *,
@@ -83,6 +97,9 @@ def event_record_dict(
         payload["granted_by_request_id"] = record.granted_by_request_id
     if execution_record_id is not None:
         payload["execution_record_id"] = execution_record_id
+    action_gate = parse_action_gate_metadata(record)
+    if action_gate is not None:
+        payload["action_gate"] = action_gate
     return payload
 
 

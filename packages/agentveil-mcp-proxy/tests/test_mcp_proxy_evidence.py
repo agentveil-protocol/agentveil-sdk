@@ -375,6 +375,52 @@ def test_record_terminal_deny_writes_single_blocked_record(tmp_path):
     assert pending == 0
 
 
+def test_record_terminal_deny_persists_action_gate_metadata(tmp_path):
+    metadata = {
+        "declared_tool_surface": ["get_*"],
+        "observed_tool_surface": ["delete_repo", "get_issue"],
+        "action_family": "delete",
+        "authority": "operator_declared_surface",
+        "escalation_trigger": "extra_undeclared_downstream_tool",
+        "policy_decision": "block",
+        "policy_rule": "action_gate_extra_downstream_tool",
+        # claim-check: allow BLOCKED as stored approval-status enum value.
+        "approval_status": ApprovalStatus.BLOCKED.value,
+        "execution_status": "not_reached",
+        "request_id": "deny-gate-1",
+        "request_chain": ["deny-gate-1"],
+        "payload_hash": PAYLOAD_HASH,
+    }
+    with _store(tmp_path) as store:
+        returned = store.record_terminal_deny(
+            request_id="deny-gate-1",
+            session_id="session-1",
+            client_id="cursor:session-7",
+            downstream_server="github-mcp",
+            tool_name="delete_repo",
+            risk_class="tool_surface_violation",
+            resource_hash=None,
+            payload_hash=PAYLOAD_HASH,
+            policy_id="mcp_proxy_action_gate",
+            policy_rule_id="action_gate_extra_downstream_tool",
+            policy_context_hash=POLICY_CONTEXT_HASH,
+            created_at=1_700_000_000,
+            reason="extra_undeclared_downstream_tool",
+            action_gate_metadata_jcs=json.dumps(metadata, sort_keys=True),
+        )
+
+        assert returned.action_gate_metadata_jcs is not None
+        assert SECRET not in returned.action_gate_metadata_jcs
+        bundle = build_evidence_bundle(
+            store,
+            proxy_identity_did=None,
+            trusted_signer_dids=[],
+        )
+        exported = bundle["records"][0]["action_gate_metadata"]
+        assert exported["declared_tool_surface"] == ["get_*"]
+        assert exported["execution_status"] == "not_reached"
+
+
 def test_record_terminal_deny_rolls_back_on_transition_error(tmp_path, monkeypatch):
     # Regression coverage: transition failure rolls the evidence write back.
     # claim-check: allow pending-count assertion for rollback test

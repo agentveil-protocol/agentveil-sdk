@@ -13,7 +13,7 @@ from enum import Enum
 import fnmatch
 import hashlib
 from types import MappingProxyType
-from typing import Any, Deque, Mapping, Sequence
+from typing import Any, Deque, Iterable, Mapping, Sequence
 
 import jcs
 
@@ -585,6 +585,82 @@ class ToolSurfaceConfig:
         """Return True when ``tool_name`` matches at least one allow pattern."""
 
         return any(fnmatch.fnmatchcase(tool_name, pattern) for pattern in self.allow)
+
+    def is_action_gate_active(self) -> bool:
+        """Return True when declared-vs-observed downstream surface checks apply."""
+
+        return self.mode is not ToolSurfaceMode.OFF and bool(self.allow)
+
+    def matching_observed_tools(self, observed: Iterable[str]) -> tuple[str, ...]:
+        """Return sorted observed tool names that match at least one allow pattern."""
+
+        return tuple(sorted(tool for tool in observed if self.is_declared(tool)))
+
+    def extra_observed_tools(self, observed: Iterable[str]) -> tuple[str, ...]:
+        """Return sorted observed tool names absent from the declared surface."""
+
+        return tuple(sorted(tool for tool in observed if not self.is_declared(tool)))
+
+
+_ACTION_GATE_POLICY_ID = "mcp_proxy_action_gate"
+_ACTION_GATE_AUTHORITY = "operator_declared_surface"
+_ACTION_GATE_ESCALATION_SURFACE_DRIFT = "downstream_surface_drift"
+_ACTION_GATE_ESCALATION_EXTRA_TOOL = "extra_undeclared_downstream_tool"
+_ACTION_GATE_MAX_SURFACE_TOOLS = 64
+
+
+def surface_name_hash(tool_names: Iterable[str]) -> str:
+    """Return a bounded sha256 digest over a sorted tool-name list."""
+
+    bounded = tuple(sorted(tool_names))[:_ACTION_GATE_MAX_SURFACE_TOOLS]
+    return "sha256:" + hashlib.sha256(jcs.canonicalize(bounded)).hexdigest()
+
+
+def build_action_gate_metadata(
+    *,
+    declared_patterns: Iterable[str],
+    observed_tools: Iterable[str],
+    tool_name: str,
+    action_family: str,
+    policy_decision: str,
+    policy_rule_id: str | None,
+    approval_status: str,
+    execution_status: str,
+    request_id: str,
+    request_chain: Iterable[str] | None = None,
+    escalation_trigger: str | None = None,
+    payload_hash: str | None = None,
+) -> dict[str, Any]:
+    """Build bounded Least Agency metadata for one MCP action-gate event."""
+
+    declared = tuple(sorted(declared_patterns))[:_ACTION_GATE_MAX_SURFACE_TOOLS]
+    observed = tuple(sorted(observed_tools))[:_ACTION_GATE_MAX_SURFACE_TOOLS]
+    matching = tuple(
+        sorted(tool for tool in observed if any(fnmatch.fnmatchcase(tool, pattern) for pattern in declared))
+    )
+    extra = tuple(sorted(tool for tool in observed if tool not in matching))
+    metadata: dict[str, Any] = {
+        "declared_tool_surface": list(declared),
+        "observed_tool_surface": list(observed),
+        "matching_tool_surface": list(matching),
+        "extra_undeclared_tools": list(extra),
+        "declared_surface_hash": surface_name_hash(declared),
+        "observed_surface_hash": surface_name_hash(observed),
+        "action_family": action_family,
+        "authority": _ACTION_GATE_AUTHORITY,
+        "policy_decision": policy_decision,
+        "policy_rule": policy_rule_id,
+        "approval_status": approval_status,
+        "execution_status": execution_status,
+        "request_id": request_id,
+        "request_chain": list(request_chain or (request_id,)),
+        "tool": tool_name,
+    }
+    if escalation_trigger is not None:
+        metadata["escalation_trigger"] = escalation_trigger
+    if payload_hash is not None:
+        metadata["payload_hash"] = payload_hash
+    return metadata
 
 
 @dataclass(frozen=True)

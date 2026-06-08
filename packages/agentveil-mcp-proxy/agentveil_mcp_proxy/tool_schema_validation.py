@@ -25,7 +25,7 @@ is advertised at all.
 from __future__ import annotations
 
 import threading
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 
 _TYPE_CHECKS = {
@@ -105,6 +105,7 @@ class ToolSchemaCache:
         self._lock = threading.Lock()
         self._schemas: dict[str, dict[str, Any]] = {}
         self._advertised_names: set[str] = set()
+        self._quarantined_names: set[str] = set()
 
     def update_from_response(self, response: Any) -> int:
         """Cache ``inputSchema`` for each tool in a ``tools/list``-shaped
@@ -154,6 +155,31 @@ class ToolSchemaCache:
         """
         with self._lock:
             return tool_name in self._advertised_names
+
+    def observed_tool_names(self) -> frozenset[str]:
+        """Return the sorted downstream-advertised tool names currently cached."""
+
+        with self._lock:
+            return frozenset(self._advertised_names)
+
+    def is_quarantined(self, tool_name: str) -> bool:
+        """Return True when a downstream-advertised tool is outside declared surface."""
+
+        with self._lock:
+            return tool_name in self._quarantined_names
+
+    def set_quarantined(self, tool_names: Iterable[str]) -> tuple[str, ...]:
+        """Replace the quarantined downstream tool set and return the sorted names."""
+
+        with self._lock:
+            self._quarantined_names = {name for name in tool_names if isinstance(name, str) and name}
+            return tuple(sorted(self._quarantined_names))
+
+    def clear_quarantine(self) -> None:
+        """Clear quarantined downstream tools when action-gate checks are inactive."""
+
+        with self._lock:
+            self._quarantined_names.clear()
 
 
 __all__ = ["ToolSchemaCache", "validate_arguments"]

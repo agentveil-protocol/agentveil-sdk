@@ -306,6 +306,34 @@ def extract_resource(arguments: Mapping[str, Any]) -> str | None:
     return None
 
 
+def infer_action_family(tool: str) -> str:
+    # claim-check: allow "privacy-safe" describes a coarse label helper, not full data safety.
+    """Return a coarse, privacy-safe action family label for one MCP tool name."""
+
+    if not tool:
+        return "unknown"
+    if "." in tool:
+        return tool.rsplit(".", 1)[0]
+    lowered = tool.lower()
+    for prefix in (
+        "get_",
+        "list_",
+        "read_",
+        "search_",
+        "fetch_",
+        "create_",
+        "update_",
+        "write_",
+        "delete_",
+        "remove_",
+        "shell",
+        "exec",
+    ):
+        if lowered == prefix.rstrip("_") or lowered.startswith(prefix):
+            return prefix.rstrip("_")
+    return "unknown"
+
+
 def infer_risk_class(
     action: str,
     *,
@@ -385,6 +413,7 @@ __all__ = [
     "REDACTED",
     "ToolCallClassifier",
     "extract_resource",
+    "infer_action_family",
     "infer_risk_class",
     "sha256_jcs",
     "sha256_text",
