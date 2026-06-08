@@ -72,10 +72,18 @@ from agentveil_mcp_proxy.client_config import (
     build_run_args,
     format_client_config_json_payload,
     format_client_config_text,
+    read_role_preset_from_config,
     render_client_configs,
     resolve_proxy_command,
 )
 from agentveil_mcp_proxy.passthrough import DownstreamConfig, McpPassthrough, PassthroughError
+from agentveil_mcp_proxy.role_presets import (
+    ROLE_PRESET_NAMES,
+    RolePresetError,
+    apply_env_role_override_to_config,
+    apply_role_preset_to_config_payload,
+    resolve_role_preset,
+)
 from agentveil_mcp_proxy.runtime_gate import RuntimeGateClient
 
 
@@ -521,6 +529,7 @@ def _build_config_payload(
     agent_name: str,
     trusted_signer_dids: Iterable[str],
     policy_pack: str,
+    role_preset: str,
     downstream_config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     policy = builtin_policy_pack(policy_pack)
@@ -561,6 +570,7 @@ def _build_config_payload(
         "tool_surface": {"mode": "off", "allow": []},
         "downstream": dict(downstream_config or {}),
     }
+    payload = apply_role_preset_to_config_payload(payload, preset_name=role_preset)
     ProxyConfig.from_dict(payload)
     return payload
 
@@ -573,6 +583,7 @@ def init_proxy(
     agent_name: str = DEFAULT_AGENT_NAME,
     trusted_signer_dids: Iterable[str] | None = None,
     policy_pack: str = "default",
+    role_preset: str = "implementer",
     ttl_days: int = DEFAULT_CONTROL_GRANT_TTL_DAYS,
     allowed_categories: Iterable[str] = DEFAULT_ALLOWED_CATEGORIES,
     downstream_config: Mapping[str, Any] | None = None,
@@ -631,11 +642,17 @@ def init_proxy(
     verified_grant = verify_delegation(control_grant)
     expires_at = str(verified_grant["valid_until"])
 
+    try:
+        preset = resolve_role_preset(role_preset)
+    except RolePresetError as exc:
+        raise ProxyCliError(str(exc), exit_code=2) from exc
+
     config_payload = _build_config_payload(
         base_url=base_url,
         agent_name=agent_name,
         trusted_signer_dids=signers,
         policy_pack=policy_pack,
+        role_preset=preset.name,
         downstream_config=downstream_config,
     )
 
@@ -765,9 +782,13 @@ def load_proxy_config(path: Path) -> ProxyConfig:
 
     data = _read_json(path, "proxy config")
     try:
-        return ProxyConfig.from_dict(data)
+        config = ProxyConfig.from_dict(data)
     except ProxyConfigError as exc:
         raise ProxyCliError(f"proxy config invalid: {exc}", exit_code=1) from exc
+    try:
+        return apply_env_role_override_to_config(config)
+    except RolePresetError as exc:
+        raise ProxyCliError(str(exc), exit_code=2) from exc
 
 
 def _parse_grant_timestamp(grant: Mapping[str, Any], field: str) -> datetime:
@@ -2012,10 +2033,17 @@ def print_client_configs(
         raise ProxyCliError(str(exc), exit_code=2) from exc
 
     if output_json:
+        preset = (
+            read_role_preset_from_config(config_path)
+            if config_path is not None
+            else None
+        )
         payload = format_client_config_json_payload(
             rendered,
             command=resolved_command,
             run_args=run_args,
+            config_path=config_path,
+            role_preset=preset,
         )
         _print_json(payload, out=sink)
         return
@@ -2036,6 +2064,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--policy-pack",
         default="default",
         choices=["default", "github", "filesystem", "shell", "git", "fetch"],
+    )
+    init.add_argument(
+        "--role",
+        required=True,
+        choices=list(ROLE_PRESET_NAMES),
+        help="Least Agency role preset written into generated role_authority config",
     )
     init.add_argument(
         "--quickstart-filesystem",
@@ -2245,6 +2279,7 @@ def main(argv: list[str] | None = None) -> int:
                 agent_name=args.agent_name,
                 trusted_signer_dids=args.trusted_signer_did,
                 policy_pack=policy_pack,
+                role_preset=args.role,
                 ttl_days=args.ttl_days,
                 allowed_categories=args.allowed_category or DEFAULT_ALLOWED_CATEGORIES,
                 downstream_config=downstream_config,
@@ -2254,8 +2289,8 @@ def main(argv: list[str] | None = None) -> int:
                 err=io.StringIO() if args.json_output else sys.stderr,
                 force=args.force,
             )
+            config = load_proxy_config(result.config_path)
             if args.json_output:
-                config = load_proxy_config(result.config_path)
                 _print_json({
                     "ok": True,
                     "errors": [],
@@ -2266,6 +2301,12 @@ def main(argv: list[str] | None = None) -> int:
                     "config_path": str(result.config_path),
                     "control_grant_path": str(result.control_grant_path),
                     "control_grant_expires_at": result.control_grant_expires_at,
+                    "role_preset": config.role_preset,
+                    "role_authority": {
+                        "mode": config.role_authority.mode.value,
+                        "role": config.role_authority.role,
+                        "authority": config.role_authority.authority,
+                    },
                     "downstream": _downstream_info(config),
                     "evidence_count": _evidence_count(proxy_paths(args.home, args.config)),
                 })
@@ -2273,6 +2314,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Created MCP proxy identity: {result.agent_did}")
                 print(f"Identity: {result.identity_path}")
                 print(f"Config: {result.config_path}")
+                print(f"Role preset: {config.role_preset}")
                 print(f"Control grant: {result.control_grant_path}")
                 print(f"Control grant expires: {result.control_grant_expires_at}")
             return 0

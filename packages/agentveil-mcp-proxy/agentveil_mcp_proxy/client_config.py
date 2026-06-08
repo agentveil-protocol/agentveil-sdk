@@ -175,11 +175,28 @@ def format_client_config_text(
     return "\n".join(blocks)
 
 
+def read_role_preset_from_config(config_path: Path | None) -> str | None:
+    """Return the stored role preset name from a proxy config file, if present."""
+
+    if config_path is None:
+        return None
+    try:
+        payload = json.loads(config_path.expanduser().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    preset = payload.get("role_preset")
+    return preset if isinstance(preset, str) and preset.strip() else None
+
+
 def format_client_config_json_payload(
     rendered: Mapping[str, Mapping[str, Any]],
     *,
     command: str,
     run_args: list[str],
+    config_path: Path | None = None,
+    role_preset: str | None = None,
 ) -> dict[str, Any]:
     """Return structured JSON for ``client-config print --json``."""
 
@@ -192,7 +209,7 @@ def format_client_config_json_payload(
             "document": document,
             "rendered": json.dumps(document, indent=2, sort_keys=True) + "\n",
         }
-    return {
+    payload: dict[str, Any] = {
         "ok": True,
         "dry_run": True,
         "writes_user_config": False,
@@ -205,6 +222,11 @@ def format_client_config_json_payload(
             "includes_private_key": False,
         },
     }
+    if config_path is not None:
+        payload["config_path"] = str(config_path.expanduser())
+    if role_preset is not None:
+        payload["role_preset"] = role_preset
+    return payload
 
 
 def assert_rendered_config_is_privacy_safe(
@@ -252,6 +274,7 @@ __all__ = [
     "build_run_args",
     "format_client_config_json_payload",
     "format_client_config_text",
+    "read_role_preset_from_config",
     "render_client_configs",
     "resolve_proxy_command",
 ]

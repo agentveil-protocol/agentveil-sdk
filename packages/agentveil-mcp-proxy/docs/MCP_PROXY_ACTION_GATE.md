@@ -163,3 +163,45 @@ PYTHONPATH=.:packages/agentveil-mcp-proxy pytest \
 PYTHONPATH=.:packages/agentveil-mcp-proxy python3 \
   packages/agentveil-mcp-proxy/tests/live/mcp_proxy_role_authority_policy_smoke.py
 ```
+
+## P10A.4 role presets / no-JSON setup
+
+P10A.4 turns P10A.3 role/authority into a starter path without hand-editing
+`role_authority` JSON. Operators choose a preset at init time:
+
+```bash
+agentveil-mcp-proxy init --role reviewer --plaintext
+agentveil-mcp-proxy init --role readonly --plaintext
+agentveil-mcp-proxy init --role implementer --plaintext
+agentveil-mcp-proxy init --role build --plaintext
+```
+
+Generated config includes:
+
+- `role_preset` — selected preset name
+- `role_authority` — enforced `mode`, `role`, `authority` for that preset
+
+Optional runtime override:
+
+```bash
+AVP_PROXY_ROLE=reviewer agentveil-mcp-proxy run --home ~/.avp ...
+```
+
+`client-config print --config <path>` emits run args with `--config` pointing at
+the generated preset config and includes `role_preset` in JSON output.
+
+Preset behavior:
+
+- `reviewer` → `reviewer` / `review_only`; builtin denies mutation action families
+- `readonly` → `readonly` / `read_only`; builtin denies mutation action families
+- `implementer` / `build` → write-capable roles without reviewer builtin deny
+
+Verification:
+
+```bash
+PYTHONPATH=.:packages/agentveil-mcp-proxy pytest \
+  packages/agentveil-mcp-proxy/tests/test_mcp_proxy_role_presets.py -q
+
+PYTHONPATH=.:packages/agentveil-mcp-proxy python3 \
+  packages/agentveil-mcp-proxy/tests/live/mcp_proxy_role_presets_smoke.py
+```

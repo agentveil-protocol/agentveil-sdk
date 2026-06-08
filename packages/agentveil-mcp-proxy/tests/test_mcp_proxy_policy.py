@@ -659,3 +659,28 @@ def test_proxy_config_wires_role_authority():
     assert config.role_authority.mode is RoleAuthorityMode.ENFORCE
     assert config.role_authority.role == "reviewer"
     assert config.role_authority.authority == "review_only"
+
+
+def test_readonly_role_blocks_mutation_action_family():
+    config = ProxyConfig.from_dict(_base_config(
+        role_authority={"mode": "enforce", "role": "readonly", "authority": "read_only"},
+        policy={
+            "id": "role-authority-policy",
+            "policy_schema_version": 1,
+            "default_decision": "allow",
+            "default_risk_class": "read",
+            "rules": [],
+        },
+    ))
+    evaluation = PolicyEngine(config).evaluate(ToolCallContext(
+        server="fake-downstream",
+        tool="write_file",
+        action="fake-downstream.write_file",
+        risk_class=RiskClass.WRITE,
+        role="readonly",
+        authority="read_only",
+        action_family="write",
+    ))
+    assert evaluation.decision is PolicyDecision.BLOCK
+    assert evaluation.policy_rule_id == "role_authority_readonly_blocks_mutation"
+    assert evaluation.reason == "role_authority_denied"

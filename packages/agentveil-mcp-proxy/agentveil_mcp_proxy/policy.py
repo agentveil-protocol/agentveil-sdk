@@ -664,31 +664,62 @@ _ROLE_AUTHORITY_REVIEWER_BLOCKED_FAMILIES = (
     "shell",
 )
 _ROLE_AUTHORITY_RULE_ID = "role_authority_reviewer_blocks_implementation"
+_ROLE_AUTHORITY_READONLY_RULE_ID = "role_authority_readonly_blocks_mutation"
 _ROLE_AUTHORITY_REASON = "role_authority_denied"
 _ROLE_AUTHORITY_AUTHORITY = "review_only"
+_ROLE_AUTHORITY_MUTATION_FAMILIES = _ROLE_AUTHORITY_REVIEWER_BLOCKED_FAMILIES
+
+
+def _role_authority_match_patterns(
+    role_authority: RoleAuthorityConfig,
+) -> tuple[str, ...]:
+    if role_authority.authority is None:
+        return ()
+    return (role_authority.authority,)
+
+
+def _mutation_deny_rule(
+    *,
+    rule_id: str,
+    role: str,
+    authority_patterns: tuple[str, ...],
+) -> PolicyRule:
+    return PolicyRule(
+        id=rule_id,
+        decision=PolicyDecision.BLOCK,
+        match=PolicyMatch(
+            role=(role,),
+            authority=authority_patterns,
+            action_family=_ROLE_AUTHORITY_MUTATION_FAMILIES,
+        ),
+        source="builtin",
+        reason=_ROLE_AUTHORITY_REASON,
+    )
 
 
 def role_authority_builtin_rules(role_authority: RoleAuthorityConfig) -> tuple[PolicyRule, ...]:
     """Return built-in Least Agency role/authority deny rules for one config."""
 
-    if not role_authority.is_enforced() or role_authority.role != "reviewer":
+    if not role_authority.is_enforced() or role_authority.role is None:
         return ()
-    authority_patterns: tuple[str, ...] = ()
-    if role_authority.authority is not None:
-        authority_patterns = (role_authority.authority,)
-    return (
-        PolicyRule(
-            id=_ROLE_AUTHORITY_RULE_ID,
-            decision=PolicyDecision.BLOCK,
-            match=PolicyMatch(
-                role=("reviewer",),
-                authority=authority_patterns,
-                action_family=_ROLE_AUTHORITY_REVIEWER_BLOCKED_FAMILIES,
+    authority_patterns = _role_authority_match_patterns(role_authority)
+    if role_authority.role == "reviewer":
+        return (
+            _mutation_deny_rule(
+                rule_id=_ROLE_AUTHORITY_RULE_ID,
+                role="reviewer",
+                authority_patterns=authority_patterns,
             ),
-            source="builtin",
-            reason=_ROLE_AUTHORITY_REASON,
-        ),
-    )
+        )
+    if role_authority.role == "readonly":
+        return (
+            _mutation_deny_rule(
+                rule_id=_ROLE_AUTHORITY_READONLY_RULE_ID,
+                role="readonly",
+                authority_patterns=authority_patterns,
+            ),
+        )
+    return ()
 
 
 _ACTION_GATE_POLICY_ID = "mcp_proxy_action_gate"
@@ -814,6 +845,7 @@ class ProxyConfig:
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     tool_surface: ToolSurfaceConfig = field(default_factory=ToolSurfaceConfig)
     role_authority: RoleAuthorityConfig = field(default_factory=RoleAuthorityConfig)
+    role_preset: str | None = None
     downstream: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
 
     @classmethod
@@ -832,6 +864,7 @@ class ProxyConfig:
                 "policy",
                 "tool_surface",
                 "role_authority",
+                "role_preset",
                 "downstream",
             },
             "proxy config",
@@ -852,6 +885,11 @@ class ProxyConfig:
             policy=PolicyConfig.from_dict(data.get("policy", {})),
             tool_surface=ToolSurfaceConfig.from_dict(data.get("tool_surface", {})),
             role_authority=RoleAuthorityConfig.from_dict(data.get("role_authority", {})),
+            role_preset=(
+                None
+                if data.get("role_preset") is None
+                else _non_empty_str(data.get("role_preset"), "role_preset")
+            ),
             downstream=MappingProxyType(dict(downstream)),
         )
 
