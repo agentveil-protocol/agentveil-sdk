@@ -17,6 +17,7 @@ import webbrowser
 
 import agentveil_mcp_proxy.cli as proxy_cli
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore, ApprovalStatus, build_evidence_bundle
+from agentveil_mcp_proxy.evidence.proof import EvidenceVerificationError, verify_evidence_bundle
 from agentveil_mcp_proxy.evidence.observability import parse_controlled_path_metadata
 from agentveil_mcp_proxy.cli import init_proxy, run_proxy
 
@@ -228,6 +229,9 @@ def test_allow_reaches_fake_target_and_records_metadata(tmp_path, monkeypatch):
         assert metadata["execution_status"] == ApprovalStatus.EXECUTED.value
         assert metadata["target_reached"] is True
         bundle = build_evidence_bundle(store, proxy_identity_did=None, trusted_signer_dids=[])
+        verify_result = verify_evidence_bundle(bundle, trusted_signer_dids=[])
+        assert verify_result.valid is True
+        assert bundle["records"][0]["action_gate_metadata"]["target_reached"] is True
         _privacy_clean(
             outcome_path=outcome_path,
             evidence_text=json.dumps(bundle),
@@ -427,3 +431,39 @@ def test_approval_retry_reaches_fake_target_after_approve(tmp_path, monkeypatch)
     finally:
         staged_in.release_next()
         worker.join(timeout=1)
+
+
+def test_strict_verifier_rejects_tampered_action_gate_metadata(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    outcome_path = tmp_path / "outcome.jsonl"
+    fixture_id = "tamper-allow-read-file"
+    downstream = write_downstream(
+        tmp_path,
+        tools=[tool_entry("read_file")],
+        call_result_text="fake-target-ok",
+        controlled_path=True,
+    )
+    _set_downstream(init.config_path, downstream, log_path=log_path, outcome_path=outcome_path, fixture_id=fixture_id)
+    _set_allow_policy(init.config_path, server="fake-downstream", tool="read_file", rule_id=fixture_id)
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("tamper test must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_tool_call("read_file")),
+        out=client_out,
+        approval_ui_mode="none",
+    ) == 0
+
+    with _evidence_store(home) as store:
+        bundle = build_evidence_bundle(store, proxy_identity_did=None, trusted_signer_dids=[])
+        verify_evidence_bundle(bundle, trusted_signer_dids=[], strict=True)
+        bundle["records"][0]["action_gate_metadata"]["target_reached"] = False
+        with pytest.raises(EvidenceVerificationError, match="action_gate_metadata does not match"):
+            verify_evidence_bundle(bundle, trusted_signer_dids=[], strict=True)

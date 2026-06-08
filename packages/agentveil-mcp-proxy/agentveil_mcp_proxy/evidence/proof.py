@@ -229,6 +229,7 @@ def verify_evidence_bundle(
         computed = record_hash(record)
         if record.get("record_hash") != computed:
             raise EvidenceVerificationError(f"record_hash mismatch for {request_id}")
+        _validate_export_action_gate_metadata(record, request_id)
         expected_prev = computed
         last_hash = computed
     if bundle.get("chain_root_hash") != last_hash:
@@ -393,6 +394,43 @@ def verify_evidence_bundle_legacy(
     )
 
 
+def _validate_export_action_gate_metadata(record: Mapping[str, Any], request_id: str) -> None:
+    """Ensure parsed export metadata matches the canonical JCS field."""
+
+    jcs = record.get("action_gate_metadata_jcs")
+    parsed_export = record.get("action_gate_metadata")
+    if jcs is None or jcs == "":
+        if parsed_export is not None:
+            raise EvidenceVerificationError(
+                f"action_gate_metadata present without action_gate_metadata_jcs for {request_id}"
+            )
+        return
+    if not isinstance(jcs, str):
+        raise EvidenceVerificationError(
+            f"action_gate_metadata_jcs must be a string for {request_id}"
+        )
+    try:
+        canonical_parsed = json.loads(jcs)
+    except json.JSONDecodeError as exc:
+        raise EvidenceVerificationError(
+            f"action_gate_metadata_jcs is not valid JSON for {request_id}"
+        ) from exc
+    if not isinstance(canonical_parsed, dict):
+        if parsed_export is not None:
+            raise EvidenceVerificationError(
+                f"action_gate_metadata present without canonical object metadata for {request_id}"
+            )
+        return
+    if not isinstance(parsed_export, dict):
+        raise EvidenceVerificationError(
+            f"action_gate_metadata missing or invalid for {request_id}"
+        )
+    if parsed_export != canonical_parsed:
+        raise EvidenceVerificationError(
+            f"action_gate_metadata does not match action_gate_metadata_jcs for {request_id}"
+        )
+
+
 def _bundle_records(records: list[PendingApproval], *, require_genesis: bool = True) -> list[dict[str, Any]]:
     from agentveil_mcp_proxy.evidence.observability import execution_record_id_by_parent
 
@@ -411,7 +449,6 @@ def _bundle_records(records: list[PendingApproval], *, require_genesis: bool = T
                 "run doctor or inspect evidence DB integrity"
             )
         data = asdict(record)
-        data["record_hash"] = record_hash(data)
         execution_record_id = execution_by_parent.get(record.request_id)
         if execution_record_id is not None:
             data["execution_record_id"] = execution_record_id
@@ -422,6 +459,7 @@ def _bundle_records(records: list[PendingApproval], *, require_genesis: bool = T
                 parsed = None
             if isinstance(parsed, dict):
                 data["action_gate_metadata"] = parsed
+        data["record_hash"] = record_hash(data)
         expected_prev_hash = data["record_hash"]
         export_records.append(data)
     return export_records

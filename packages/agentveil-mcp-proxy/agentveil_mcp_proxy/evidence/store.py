@@ -1121,6 +1121,8 @@ def record_hash(record: PendingApproval | Mapping[str, Any]) -> str:
     data.pop("record_hash", None)
     # Export-only linkage from an approved parent to its executed child retry row.
     data.pop("execution_record_id", None)
+    # Parsed export view; canonical chain hash uses action_gate_metadata_jcs.
+    data.pop("action_gate_metadata", None)
     return "sha256:" + hashlib.sha256(jcs.canonicalize(data)).hexdigest()
 
 
