@@ -12,6 +12,7 @@ from pathlib import Path
 
 import httpx
 
+from agentveil_mcp_proxy.approval import persistent as persistent_module
 from agentveil_mcp_proxy.approval import ApprovalManager, ApprovalNotifier, ApprovalPrompt
 from agentveil_mcp_proxy.approval.client import RemoteApprovalServer, resolve_approval_server
 from agentveil_mcp_proxy.approval.persistent import (
@@ -124,6 +125,22 @@ def test_persistent_manifest_is_reachable(tmp_path):
         assert manifest.port == server.port
         assert manifest.session_token == server.session_token
         assert manifest.internal_register_token == server.internal_register_token
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_manifest_health_check_ignores_global_urlopen(tmp_path, monkeypatch):
+    store, server, _manager, proxy_dir = _start_persistent_center(tmp_path)
+
+    def fail_global_urlopen(*_args, **_kwargs):
+        raise AssertionError("loopback health checks must not use global urlopen")
+
+    monkeypatch.setattr(persistent_module.urllib.request, "urlopen", fail_global_urlopen)
+    try:
+        manifest = load_manifest(proxy_dir)
+        assert manifest is not None
+        assert manifest_is_reachable(manifest)
     finally:
         server.stop()
         store.close()

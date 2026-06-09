@@ -13,6 +13,7 @@ from typing import Any, Callable
 from agentveil_mcp_proxy.approval.persistent import (
     ApprovalCenterManifest,
     load_manifest,
+    loopback_urlopen,
     manifest_is_reachable,
 )
 from agentveil_mcp_proxy.approval.server import (
@@ -93,7 +94,7 @@ class RemoteApprovalServer:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=REGISTER_TIMEOUT_SECONDS) as response:
+            with loopback_urlopen(request, timeout=REGISTER_TIMEOUT_SECONDS) as response:
                 body = response.read().decode("utf-8")
         except urllib.error.URLError as exc:
             raise ApprovalServerError("persistent approval center is unavailable") from exc

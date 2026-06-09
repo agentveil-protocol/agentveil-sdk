@@ -19,6 +19,7 @@ from agentveil_mcp_proxy.approval.server import ApprovalServer, ApprovalServerEr
 MANIFEST_FILENAME = "approval-center.manifest.json"
 MANIFEST_SCHEMA_VERSION = 2
 HEALTH_TIMEOUT_SECONDS = 2.0
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 class PersistentApprovalCenterError(RuntimeError):
@@ -123,10 +124,20 @@ def _health_check(manifest: ApprovalCenterManifest) -> bool:
     url = f"{manifest.approval_center_url()}/api/approvals"
     request = urllib.request.Request(url, method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=HEALTH_TIMEOUT_SECONDS) as response:
+        with loopback_urlopen(request, timeout=HEALTH_TIMEOUT_SECONDS) as response:
             return int(response.status) == 200
     except (urllib.error.URLError, TimeoutError, ValueError):
         return False
+
+
+def loopback_urlopen(
+    request: urllib.request.Request,
+    *,
+    timeout: float,
+) -> Any:
+    """Open a loopback Approval Center request without environment proxies."""
+
+    return _NO_PROXY_OPENER.open(request, timeout=timeout)
 
 
 def manifest_is_reachable(manifest: ApprovalCenterManifest) -> bool:
@@ -194,6 +205,7 @@ __all__ = [
     "build_manifest_for_server",
     "create_persistent_server",
     "load_manifest",
+    "loopback_urlopen",
     "manifest_is_reachable",
     "manifest_path",
     "save_manifest",
