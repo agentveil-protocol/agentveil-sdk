@@ -1141,11 +1141,14 @@ details {{ margin: 8px 0 12px; }}
             self.send_header(key, value)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
         if extra_headers:
             for key, value in extra_headers.items():
                 self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
+        self.wfile.flush()
+        self.close_connection = True
 
 
 __all__ = [
