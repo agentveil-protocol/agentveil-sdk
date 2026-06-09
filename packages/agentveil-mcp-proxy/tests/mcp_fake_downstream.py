@@ -38,6 +38,7 @@ def downstream_script(
     call_result_text: str = "forwarded",
     call_result: Mapping[str, Any] | None = None,
     advertise_schema: bool = True,
+    controlled_path: bool = False,
 ) -> str:
     """Return Python source for a stdio MCP downstream.
 
@@ -49,6 +50,11 @@ def downstream_script(
     schema-unavailable path.
 
     If ``$DOWNSTREAM_LOG`` is set, each received method is appended to it.
+
+    When ``controlled_path`` is true the script also appends bounded JSON
+    outcome rows to ``$FAKE_TARGET_OUTCOME_LOG`` using ``$FAKE_TARGET_FIXTURE``.
+    Outcome rows include fixture/outcome metadata only; privacy tests assert raw
+    MCP arguments and payloads are absent.
     """
     if call_result is None:
         call_result = {"content": [{"type": "text", "text": call_result_text}]}
@@ -59,15 +65,31 @@ def downstream_script(
         f"TOOLS = json.loads({json.dumps(list(tools))!r})\n"
         f"CALL_RESULT = json.loads({json.dumps(dict(call_result))!r})\n"
         f"ADVERTISE_SCHEMA = {bool(advertise_schema)!r}\n"
+        f"CONTROLLED_PATH = {bool(controlled_path)!r}\n"
     )
     body = r'''
 log_path = os.environ.get("DOWNSTREAM_LOG")
+outcome_log = os.environ.get("FAKE_TARGET_OUTCOME_LOG")
+fixture_id = os.environ.get("FAKE_TARGET_FIXTURE", "")
+tool_call_count = 0
 for line in sys.stdin:
     msg = json.loads(line)
     method = msg.get("method", "")
     if log_path:
         with open(log_path, "a", encoding="utf-8") as fh:
             fh.write(method + "\n")
+    if CONTROLLED_PATH and outcome_log and "id" in msg:
+        outcome = "reached" if method == "tools/call" else "observed"
+        if method == "tools/call":
+            tool_call_count += 1
+        entry = {
+            "fixture_id": fixture_id,
+            "method": method,
+            "outcome": outcome,
+            "tool_call_count": tool_call_count if method == "tools/call" else 0,
+        }
+        with open(outcome_log, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, separators=(",", ":"), sort_keys=True) + "\n")
     if "id" not in msg:
         continue
     if method == "initialize":
@@ -85,6 +107,30 @@ for line in sys.stdin:
     return header + body
 
 
+def read_outcome_log(path: Path) -> list[dict[str, Any]]:
+    """Return parsed bounded fake-target outcome rows."""
+
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        parsed = json.loads(line)
+        if isinstance(parsed, dict):
+            rows.append(parsed)
+    return rows
+
+
+def fake_target_reached(path: Path) -> bool:
+    """Return True when the outcome log records a downstream tools/call reach."""
+
+    return any(
+        row.get("method") == "tools/call" and row.get("outcome") == "reached"
+        for row in read_outcome_log(path)
+    )
+
+
 def write_downstream(
     tmp_path: Path,
     *,
@@ -93,6 +139,7 @@ def write_downstream(
     call_result_text: str = "forwarded",
     call_result: Mapping[str, Any] | None = None,
     advertise_schema: bool = True,
+    controlled_path: bool = False,
 ) -> Path:
     """Write a fake downstream script to ``tmp_path`` and return its path."""
     if tools is None:
@@ -104,6 +151,7 @@ def write_downstream(
             call_result_text=call_result_text,
             call_result=call_result,
             advertise_schema=advertise_schema,
+            controlled_path=controlled_path,
         ),
         encoding="utf-8",
     )
@@ -126,6 +174,8 @@ def seed_tool_schemas(passthrough: Any, tools: Sequence[Mapping[str, Any]]) -> N
 __all__ = [
     "PERMISSIVE_OBJECT_SCHEMA",
     "downstream_script",
+    "fake_target_reached",
+    "read_outcome_log",
     "seed_tool_schemas",
     "tool_entry",
     "write_downstream",

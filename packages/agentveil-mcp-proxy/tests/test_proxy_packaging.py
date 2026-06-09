@@ -22,6 +22,16 @@ def _release_acceptance_module():
     return module
 
 
+def _onboarding_stage_gate_module():
+    script = PACKAGE_ROOT / "scripts" / "mcp_proxy_onboarding_stage_gate.py"
+    spec = importlib.util.spec_from_file_location("mcp_proxy_onboarding_stage_gate", script)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_proxy_package_console_script_entrypoint():
     with (PACKAGE_ROOT / "pyproject.toml").open("rb") as f:
         pyproject = tomllib.load(f)
@@ -56,3 +66,12 @@ def test_release_acceptance_verifier_pins_proxy_and_backend_signers():
         "did:key:zProxy",
         ["did:key:zBackend1", "did:key:zProxy", "did:key:zBackend2"],
     ) == ["did:key:zProxy", "did:key:zBackend1", "did:key:zBackend2"]
+
+
+def test_installed_wheel_acceptance_runners_default_to_build_role():
+    for module in (_release_acceptance_module(), _onboarding_stage_gate_module()):
+        parser = module.build_parser()
+        args = parser.parse_args([])
+
+        assert args.role == "build"
+        assert "build" in module.ACCEPTANCE_ROLE_CHOICES

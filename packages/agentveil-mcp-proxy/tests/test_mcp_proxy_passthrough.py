@@ -15,6 +15,7 @@ import threading
 import time
 
 import pytest
+import webbrowser
 
 import agentveil_mcp_proxy.passthrough as passthrough_module
 import agentveil_mcp_proxy.cli as proxy_cli
@@ -35,6 +36,13 @@ from mcp_fake_downstream import seed_tool_schemas, tool_entry, write_downstream
 
 
 SECRET = "SECRET_DOWNSTREAM_TOKEN"
+
+
+@pytest.fixture(autouse=True)
+def _suppress_approval_browser_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep local pytest runs from opening real Approval Center browser tabs."""
+
+    monkeypatch.setattr(webbrowser, "open", lambda *_args, **_kwargs: False)
 
 
 def _json_line(message: dict) -> str:

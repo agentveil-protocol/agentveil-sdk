@@ -420,3 +420,40 @@ def test_passthrough_classifies_allowed_tools_call_without_changing_downstream_b
     assert seen[0].payload_hash == sha256_jcs({"owner": "acme", "repo": "private", "title": SECRET})
     assert SECRET not in metadata_text
     assert "private" not in metadata_text
+
+
+def test_classify_attaches_role_authority_and_action_family():
+    config = ProxyConfig.from_dict({
+        "proxy_config_schema_version": 1,
+        "avp": {
+            "base_url": "https://agentveil.dev",
+            "agent_name": "agentveil-mcp-proxy",
+            "trusted_signer_dids": ["did:key:z6MktrustedSigner"],
+        },
+        "mode": "protect",
+        "privacy": {
+            "action": "redacted",
+            "resource": "hash",
+            "payload": "hash_only",
+            "evidence_upload": False,
+        },
+        "fallback": {},
+        "role_authority": {
+            "mode": "enforce",
+            "role": "reviewer",
+            "authority": "review_only",
+        },
+        "policy": {
+            "id": "classification-role-authority",
+            "policy_schema_version": 1,
+            "default_decision": "allow",
+            "default_risk_class": "read",
+            "rules": [],
+        },
+    })
+    classifier = ToolCallClassifier(config, server_name="fake-downstream")
+    classified = classifier.classify(tool="write_file", arguments={"path": "note.txt"})
+    assert classified.action_family == "write"
+    assert classified.role == "reviewer"
+    assert classified.authority == "review_only"
+    assert classified.policy_evaluation.decision is PolicyDecision.BLOCK

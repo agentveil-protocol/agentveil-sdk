@@ -1382,6 +1382,7 @@ def test_main_init_json_supports_noninteractive_downstream_flags(tmp_path, capsy
 
     exit_code = main([
         "init",
+        "--role", "implementer",
         "--home", str(home),
         "--agent-name", "proxy",
         "--passphrase-file", str(passphrase_file),
@@ -1412,6 +1413,7 @@ def test_main_init_policy_pack_git_writes_git_policy_id(tmp_path):
 
     exit_code = main([
         "init",
+        "--role", "implementer",
         "--home", str(home),
         "--agent-name", "proxy",
         "--policy-pack", "git",
@@ -1430,6 +1432,7 @@ def test_configure_downstream_named_git_preserves_explicit_git_policy(tmp_path):
     home = tmp_path / "avp-home"
     assert main([
         "init",
+        "--role", "implementer",
         "--home", str(home),
         "--agent-name", "proxy",
         "--policy-pack", "git",
@@ -1455,6 +1458,7 @@ def test_main_init_policy_pack_fetch_writes_fetch_policy_id(tmp_path):
 
     exit_code = main([
         "init",
+        "--role", "implementer",
         "--home", str(home),
         "--agent-name", "proxy",
         "--policy-pack", "fetch",
@@ -1473,6 +1477,7 @@ def test_configure_downstream_named_fetch_preserves_explicit_fetch_policy(tmp_pa
     home = tmp_path / "avp-home"
     assert main([
         "init",
+        "--role", "implementer",
         "--home", str(home),
         "--agent-name", "proxy",
         "--policy-pack", "fetch",
@@ -1571,6 +1576,7 @@ def test_main_init_doctor_and_run_exit_codes(tmp_path, capsys):
 
     assert main([
         "init",
+        "--role", "implementer",
         "--home",
         str(home),
         "--agent-name",

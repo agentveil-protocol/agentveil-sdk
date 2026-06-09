@@ -195,6 +195,9 @@ class ClassifiedToolCall:
     payload_hash: str
     risk_class: RiskClass
     policy_evaluation: PolicyEvaluation
+    action_family: str
+    role: str | None = None
+    authority: str | None = None
 
     def backend_metadata(self) -> dict[str, Any]:
         """Return privacy-filtered metadata intended for later backend calls."""
@@ -232,6 +235,9 @@ class ClassifiedToolCall:
             "policy_context_hash": self.policy_evaluation.policy_context_hash,
             "local_decision": self.policy_evaluation.decision.value,
             "matched_rule_ids": list(self.policy_evaluation.matched_rule_ids),
+            "action_family": self.action_family,
+            "role": self.role,
+            "authority": self.authority,
         }
 
 
@@ -264,11 +270,16 @@ class ToolCallClassifier:
         action_plain = f"{self.server_name}.{tool}"
         resource_plain = extract_resource(args)
         heuristic_risk = infer_risk_class(action_plain, tool=tool, resource=resource_plain, arguments=args)
+        action_family = infer_action_family(tool)
+        role_authority = self.config.role_authority
         context = ToolCallContext(
             server=self.server_name,
             tool=tool,
             action=action_plain,
             risk_class=heuristic_risk,
+            role=role_authority.role if role_authority.is_enforced() else None,
+            authority=role_authority.authority if role_authority.is_enforced() else None,
+            action_family=action_family,
         )
         evaluation = self.engine.evaluate(context)
         action_hash = sha256_text(action_plain)
@@ -285,6 +296,9 @@ class ToolCallClassifier:
             payload_hash=sha256_jcs(payload),
             risk_class=evaluation.risk_class,
             policy_evaluation=evaluation,
+            action_family=action_family,
+            role=context.role,
+            authority=context.authority,
         )
 
 
@@ -304,6 +318,34 @@ def extract_resource(arguments: Mapping[str, Any]) -> str | None:
         if isinstance(value, int) and not isinstance(value, bool):
             return f"{key}:{value}"
     return None
+
+
+def infer_action_family(tool: str) -> str:
+    # claim-check: allow "privacy-safe" describes a coarse label helper, not full data safety.
+    """Return a coarse, privacy-safe action family label for one MCP tool name."""
+
+    if not tool:
+        return "unknown"
+    if "." in tool:
+        return tool.rsplit(".", 1)[0]
+    lowered = tool.lower()
+    for prefix in (
+        "get_",
+        "list_",
+        "read_",
+        "search_",
+        "fetch_",
+        "create_",
+        "update_",
+        "write_",
+        "delete_",
+        "remove_",
+        "shell",
+        "exec",
+    ):
+        if lowered == prefix.rstrip("_") or lowered.startswith(prefix):
+            return prefix.rstrip("_")
+    return "unknown"
 
 
 def infer_risk_class(
@@ -385,6 +427,7 @@ __all__ = [
     "REDACTED",
     "ToolCallClassifier",
     "extract_resource",
+    "infer_action_family",
     "infer_risk_class",
     "sha256_jcs",
     "sha256_text",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import json
 from typing import Any
 
 from agentveil_mcp_proxy.evidence.store import ApprovalStatus, PendingApproval
@@ -23,11 +24,12 @@ def pending_approval_dict(
     policy_rule_id: str,
     created_at: int,
     expires_at: int,
+    action_gate_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a redacted JSON view for one loopback pending approval."""
 
     resource = resource_display if resource_display is not None else "none"
-    return {
+    payload = {
         "request_id": request_id,
         "client_id": client_id,
         "session_id_prefix": session_id[:8],
@@ -43,6 +45,9 @@ def pending_approval_dict(
         "created_at": created_at,
         "expires_at": expires_at,
     }
+    if action_gate_metadata is not None:
+        payload["action_gate_metadata"] = action_gate_metadata
+    return payload
 
 
 def execution_record_id_by_parent(
@@ -59,6 +64,63 @@ def execution_record_id_by_parent(
             continue
         mapping[parent_id] = record.request_id
     return mapping
+
+
+def parse_controlled_path_metadata(record: PendingApproval) -> dict[str, Any] | None:
+    """Parse bounded controlled-path metadata stored on one evidence record."""
+
+    return parse_action_gate_metadata(record)
+
+
+def terminal_state_for_record_status(status: str) -> str | None:
+    """Map durable evidence status to Approval Center terminal page state."""
+
+    if status == ApprovalStatus.APPROVED.value:
+        return "already_decided_approve"
+    if status == ApprovalStatus.DENIED.value:
+        return "already_decided_deny"
+    if status == ApprovalStatus.EXPIRED.value:
+        return "approval_expired"
+    return None
+
+
+def bounded_action_display(record: PendingApproval) -> str:
+    """Return a bounded action label for one evidence record."""
+
+    return f"{record.downstream_server}.{record.tool_name}"
+
+
+def bounded_resource_display(record: PendingApproval) -> str:
+    """Return a bounded resource label for one evidence record."""
+
+    if not record.resource_hash:
+        return "none"
+    return f"hash:{record.resource_hash[:12]}"
+
+
+def bounded_reason_for_record(record: PendingApproval) -> str:
+    """Return a bounded reason label for one evidence record."""
+
+    if record.error_class:
+        return record.error_class
+    if record.status == ApprovalStatus.APPROVED.value:
+        return "user_approved"
+    if record.status == ApprovalStatus.DENIED.value:
+        return "user_denied"
+    return "local_approval_required"
+
+
+def parse_action_gate_metadata(record: PendingApproval) -> dict[str, Any] | None:
+    """Parse bounded action-gate metadata stored on one evidence record."""
+
+    raw = record.action_gate_metadata_jcs
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def event_record_dict(
@@ -83,6 +145,11 @@ def event_record_dict(
         payload["granted_by_request_id"] = record.granted_by_request_id
     if execution_record_id is not None:
         payload["execution_record_id"] = execution_record_id
+    controlled_path = parse_controlled_path_metadata(record)
+    if controlled_path is not None:
+        payload["controlled_path"] = controlled_path
+        if "target_reached" in controlled_path:
+            payload["target_reached"] = controlled_path["target_reached"]
     return payload
 
 

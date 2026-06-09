@@ -23,9 +23,15 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import agentveil.agent as agent_module
 from agentveil.agent import AVPAgent
 from agentveil.proof import ProofVerificationError, verify_signed_jcs
-from agentveil_mcp_proxy.classification import ClassifiedToolCall, sha256_jcs, sha256_text
+from agentveil_mcp_proxy.classification import (
+    ClassifiedToolCall,
+    infer_action_family,
+    sha256_jcs,
+    sha256_text,
+)
 from agentveil_mcp_proxy.cli import init_proxy
 from agentveil_mcp_proxy.identity import load_agent_from_identity
 from agentveil_mcp_proxy.policy import (
@@ -46,6 +52,7 @@ TRUSTED_SIGNERS = (
     "did:key:z6Mkjw22249tpNN4LJGLyq1oGSq1Skh3ks94fiMrgi4oqveo",
 )
 PASSPHRASE = os.environ.get("AVP_PROXY_PASSPHRASE", "agentveil-live-smoke-passphrase")
+RUN_LIVE_RUNTIME_GATE = os.environ.get("AVP_MCP_PROXY_RUNTIME_GATE_LIVE") == "1"
 
 
 @dataclass(frozen=True)
@@ -167,6 +174,7 @@ def classification_for(fixture: Fixture, config: ProxyConfig) -> ClassifiedToolC
         payload_hash=sha256_jcs(fixture.params),
         risk_class=fixture.risk_class,
         policy_evaluation=evaluation,
+        action_family=infer_action_family(fixture.action),
     )
 
 
@@ -190,7 +198,15 @@ def verify_digest_round_trip(client: RuntimeGateClient, audit_id: str, expected_
 
 def main() -> int:
     try:
+        if not RUN_LIVE_RUNTIME_GATE:
+            log(
+                "MCP_PROXY_RUNTIME_GATE_LIVE_SMOKE SKIP",
+                reason="set AVP_MCP_PROXY_RUNTIME_GATE_LIVE=1 to run legacy live backend signer check",
+            )
+            return 0
         require(BASE_URL == "https://agentveil.dev", f"unexpected base URL: {BASE_URL}")
+        agent_module.AGENTS_DIR = str(HOME / "agents")
+        os.makedirs(agent_module.AGENTS_DIR, exist_ok=True)
         result = init_proxy(
             home=HOME,
             base_url=BASE_URL,

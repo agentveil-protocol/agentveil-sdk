@@ -1,8 +1,9 @@
-"""B9 declared tool surface enforcement tests for the MCP passthrough.
+"""Declared tool surface and P10A.1 action-gate tests for the MCP passthrough.
 
 These exercise handle_client_line directly with a stubbed downstream so the
-tool-surface check (which runs before schema/classification/policy/Runtime
-Gate/downstream) can be observed in isolation.
+tool-surface and declared-vs-observed downstream surface checks (which run
+before schema/classification/policy/Runtime Gate/downstream) can be observed
+in isolation.
 """
 
 from __future__ import annotations
@@ -12,6 +13,8 @@ import sys
 from typing import Any, Mapping
 
 from agentveil_mcp_proxy.classification import ToolCallClassifier
+from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore, ApprovalStatus
+from agentveil_mcp_proxy.evidence.observability import parse_action_gate_metadata
 from agentveil_mcp_proxy.passthrough import (
     DownstreamConfig,
     JSONRPC_POLICY_BLOCKED,
@@ -58,16 +61,31 @@ def _config(*, mode: str, allow: Any = None) -> ProxyConfig:
     return ProxyConfig.from_dict(payload)
 
 
+class _RecordingApprovalManager:
+    def __init__(self, store: ApprovalEvidenceStore) -> None:
+        self.evidence_store = store
+        self.session_id = "session-action-gate"
+        self.client_id = "cursor:session-action-gate"
+
+
 class _RecordingPassthrough(McpPassthrough):
     """Passthrough that records downstream forwards without a real subprocess."""
 
-    def __init__(self, config: ProxyConfig) -> None:
+    def __init__(
+        self,
+        config: ProxyConfig,
+        *,
+        evidence_store: ApprovalEvidenceStore | None = None,
+    ) -> None:
         classifier = ToolCallClassifier(config, server_name="srv")
         super().__init__(
             DownstreamConfig(command=sys.executable, args=(), name="srv"),
             classifier=classifier,
         )
         self.forwarded: list[Mapping[str, Any]] = []
+        self.policy_calls = 0
+        if evidence_store is not None:
+            self.approval_manager = _RecordingApprovalManager(evidence_store)
         seed_tool_schemas(
             self,
             [
@@ -82,6 +100,14 @@ class _RecordingPassthrough(McpPassthrough):
 
     def _wait_downstream_response(self, expected_id: Any) -> dict[str, Any]:
         return {"jsonrpc": "2.0", "id": expected_id, "result": {"ok": True}}
+
+    def _policy_error_response(self, classification, request_id, *, in_flight_approval=None):
+        self.policy_calls += 1
+        return super()._policy_error_response(
+            classification,
+            request_id,
+            in_flight_approval=in_flight_approval,
+        )
 
 
 def _tool_call(tool: str) -> str:
@@ -103,21 +129,77 @@ def test_off_mode_forwards_undeclared_without_event():
     assert proxy.security_events == ()
 
 
-def test_observe_mode_forwards_undeclared_and_records_event():
-    proxy = _RecordingPassthrough(_config(mode="observe", allow=["list_*"]))
+def test_observe_mode_blocks_extra_downstream_tool_before_policy(tmp_path):
+    """P10A.1 fail-closes advertised-but-undeclared tools even in observe mode."""
+
+    store = ApprovalEvidenceStore(tmp_path / "evidence.sqlite")
+    try:
+        proxy = _RecordingPassthrough(
+            _config(mode="observe", allow=["list_*"]),
+            evidence_store=store,
+        )
+
+        responses = proxy.handle_client_line(_tool_call("delete_repo"))
+
+        assert proxy.forwarded == []
+        assert proxy.policy_calls == 0
+        error = responses[0]["error"]
+        assert error["code"] == JSONRPC_POLICY_BLOCKED
+        assert error["data"] == {
+            # claim-check: allow "blocked" as JSON-RPC status vocabulary.
+            "status": "blocked",
+            "reason": "extra_undeclared_downstream_tool",
+        }
+        extra_events = [
+            event for event in proxy.security_events
+            if event.get("type") == "action_gate_extra_downstream_tool"
+        ]
+        assert len(extra_events) == 1
+        records = store.list_records()
+        assert len(records) == 1
+        # claim-check: allow BLOCKED as stored approval-status enum value.
+        assert records[0].status == ApprovalStatus.BLOCKED.value
+        assert records[0].error_class == "extra_undeclared_downstream_tool"
+        metadata = parse_action_gate_metadata(records[0])
+        assert metadata is not None
+        assert metadata["declared_tool_surface"] == ["list_*"]
+        assert "delete_repo" in metadata["extra_undeclared_tools"]
+        assert metadata["action_family"] == "delete"
+        assert metadata["authority"] == "operator_declared_surface"
+        assert metadata["escalation_trigger"] == "extra_undeclared_downstream_tool"
+        assert metadata["execution_status"] == "not_reached"
+        assert SECRET_ARG not in json.dumps(metadata)
+        assert SECRET_ARG not in json.dumps(responses[0])
+        assert SECRET_ARG not in json.dumps(list(proxy.security_events))
+    finally:
+        store.close()
+
+
+def test_declared_downstream_tool_passes_action_gate():
+    proxy = _RecordingPassthrough(_config(mode="enforce", allow=["get_*"]))
 
     responses = proxy.handle_client_line(_tool_call("get_issue"))
 
-    # observe forwards downstream...
     assert [m["params"]["name"] for m in proxy.forwarded] == ["get_issue"]
     assert responses[0].get("result") == {"ok": True}
-    # ...and records a sanitized security event.
-    assert proxy.security_events == ({
-        "type": "undeclared_tool_call",
-        "action": "observed",
-        "reason": "undeclared_tool",
-        "tool": "get_issue",
-    },)
+    assert not any(
+        event.get("type") == "action_gate_extra_downstream_tool"
+        for event in proxy.security_events
+    )
+
+
+def test_surface_drift_quarantines_extra_downstream_tools():
+    proxy = _RecordingPassthrough(_config(mode="enforce", allow=["get_*"]))
+
+    quarantined = proxy._sync_downstream_surface_quarantine()
+
+    assert "delete_repo" in quarantined
+    assert "exfiltrate" in quarantined
+    assert "get_issue" not in quarantined
+    assert any(
+        event.get("type") == "action_gate_surface_drift"
+        for event in proxy.security_events
+    )
 
 
 def test_enforce_mode_blocks_undeclared_without_forwarding():
@@ -129,13 +211,19 @@ def test_enforce_mode_blocks_undeclared_without_forwarding():
     assert proxy.forwarded == []
     error = responses[0]["error"]
     assert error["code"] == JSONRPC_POLICY_BLOCKED
-    assert error["data"] == {"status": "blocked", "reason": "undeclared_tool"}  # claim-check: allow "blocked" is expected error data.
-    assert proxy.security_events == ({
-        "type": "undeclared_tool_call",
-        "action": "blocked",  # claim-check: allow "blocked" is expected event vocabulary.
-        "reason": "undeclared_tool",
+    assert error["data"] == {
+        # claim-check: allow "blocked" as JSON-RPC status vocabulary.
+        "status": "blocked",
+        "reason": "extra_undeclared_downstream_tool",
+    }
+    assert proxy.security_events[0] == {
+        "type": "action_gate_extra_downstream_tool",
+        "action": "blocked_pre_approval",
+        "reason": "extra_undeclared_downstream_tool",
         "tool": "delete_repo",
-    },)
+        "declared_surface_hash": proxy.security_events[0]["declared_surface_hash"],
+        "observed_surface_hash": proxy.security_events[0]["observed_surface_hash"],
+    }
 
 
 def test_enforce_allows_declared_exact_tool():

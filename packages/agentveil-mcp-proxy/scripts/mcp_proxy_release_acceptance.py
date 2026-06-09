@@ -31,6 +31,7 @@ from urllib.request import HTTPCookieProcessor, Request, build_opener
 REPO_ROOT = Path(__file__).resolve().parents[1]
 JSONRPC_APPROVAL_REQUIRED = -32011
 CSRF_RE = re.compile(r'name="csrf_token" value="([^"]+)"')
+ACCEPTANCE_ROLE_CHOICES = ("reviewer", "readonly", "implementer", "build")
 
 
 class AcceptanceError(RuntimeError):
@@ -296,6 +297,7 @@ def run_acceptance(args: argparse.Namespace) -> None:
             "--home", str(home),
             "--agent-name", agent_name,
             "--base-url", args.base_url,
+            "--role", args.role,
             "--passphrase-file", str(passphrase_file),
             "--quickstart-filesystem", str(sandbox),
             "--json",
@@ -422,6 +424,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--keep-tmp", action="store_true", help="Do not delete the temporary work directory")
     parser.add_argument("--python", default=sys.executable, help="Python executable used to build venvs")
     parser.add_argument("--base-url", default="https://agentveil.dev", help="Backend base URL for registration")
+    parser.add_argument(
+        "--role",
+        choices=ACCEPTANCE_ROLE_CHOICES,
+        default="build",
+        help="Role preset for init; build preserves read/list allow plus write approval path",
+    )
     parser.add_argument(
         "--agent-name-prefix",
         default="agentveil-mcp-proxy-release-acceptance",

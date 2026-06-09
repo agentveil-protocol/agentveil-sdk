@@ -35,6 +35,13 @@ from agentveil_mcp_proxy.approval import (
     HeadlessPolicy,
     HeadlessPolicyError,
 )
+from agentveil_mcp_proxy.approval.client import resolve_approval_server
+from agentveil_mcp_proxy.approval.persistent import (
+    PersistentApprovalCenterError,
+    build_manifest_for_server,
+    create_persistent_server,
+    save_manifest,
+)
 from agentveil_mcp_proxy.classification import ToolCallClassifier
 from agentveil_mcp_proxy.evidence import (
     ApprovalEvidenceError,
@@ -72,10 +79,37 @@ from agentveil_mcp_proxy.client_config import (
     build_run_args,
     format_client_config_json_payload,
     format_client_config_text,
+    read_role_preset_from_config,
     render_client_configs,
     resolve_proxy_command,
 )
 from agentveil_mcp_proxy.passthrough import DownstreamConfig, McpPassthrough, PassthroughError
+from agentveil_mcp_proxy.agent_templates import (
+    AGENT_TEMPLATE_NAMES,
+    AgentTemplateError,
+    build_agent_template_report,
+    build_template_commands,
+    format_agent_template_text,
+)
+from agentveil_mcp_proxy.config_wizard import (
+    ConfigWizardError,
+    build_safe_config_wizard_result,
+    build_wizard_summary,
+    format_safe_config_wizard_output,
+    load_mcp_client_document,
+    validate_mcp_client_document,
+)
+from agentveil_mcp_proxy.role_doctor import (
+    build_role_doctor_report,
+    format_role_doctor_report,
+)
+from agentveil_mcp_proxy.role_presets import (
+    ROLE_PRESET_NAMES,
+    RolePresetError,
+    apply_env_role_override_to_config,
+    apply_role_preset_to_config_payload,
+    resolve_role_preset,
+)
 from agentveil_mcp_proxy.runtime_gate import RuntimeGateClient
 
 
@@ -521,6 +555,7 @@ def _build_config_payload(
     agent_name: str,
     trusted_signer_dids: Iterable[str],
     policy_pack: str,
+    role_preset: str,
     downstream_config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     policy = builtin_policy_pack(policy_pack)
@@ -561,6 +596,7 @@ def _build_config_payload(
         "tool_surface": {"mode": "off", "allow": []},
         "downstream": dict(downstream_config or {}),
     }
+    payload = apply_role_preset_to_config_payload(payload, preset_name=role_preset)
     ProxyConfig.from_dict(payload)
     return payload
 
@@ -573,6 +609,7 @@ def init_proxy(
     agent_name: str = DEFAULT_AGENT_NAME,
     trusted_signer_dids: Iterable[str] | None = None,
     policy_pack: str = "default",
+    role_preset: str = "implementer",
     ttl_days: int = DEFAULT_CONTROL_GRANT_TTL_DAYS,
     allowed_categories: Iterable[str] = DEFAULT_ALLOWED_CATEGORIES,
     downstream_config: Mapping[str, Any] | None = None,
@@ -631,11 +668,17 @@ def init_proxy(
     verified_grant = verify_delegation(control_grant)
     expires_at = str(verified_grant["valid_until"])
 
+    try:
+        preset = resolve_role_preset(role_preset)
+    except RolePresetError as exc:
+        raise ProxyCliError(str(exc), exit_code=2) from exc
+
     config_payload = _build_config_payload(
         base_url=base_url,
         agent_name=agent_name,
         trusted_signer_dids=signers,
         policy_pack=policy_pack,
+        role_preset=preset.name,
         downstream_config=downstream_config,
     )
 
@@ -765,9 +808,13 @@ def load_proxy_config(path: Path) -> ProxyConfig:
 
     data = _read_json(path, "proxy config")
     try:
-        return ProxyConfig.from_dict(data)
+        config = ProxyConfig.from_dict(data)
     except ProxyConfigError as exc:
         raise ProxyCliError(f"proxy config invalid: {exc}", exit_code=1) from exc
+    try:
+        return apply_env_role_override_to_config(config)
+    except RolePresetError as exc:
+        raise ProxyCliError(str(exc), exit_code=2) from exc
 
 
 def _parse_grant_timestamp(grant: Mapping[str, Any], field: str) -> datetime:
@@ -1198,6 +1245,173 @@ def doctor_proxy(
         else:
             print(f"FAIL: {exc}", file=out)
         return 1
+
+
+def print_agent_templates(
+    *,
+    template_id: str | None = None,
+    home: Path | None = None,
+    sandbox_root: Path | None = None,
+    proxy_command: str | None = None,
+    out: TextIO | None = None,
+    output_json: bool = False,
+) -> int:
+    """Print copy-paste runnable starter commands for review/build/readonly agents."""
+
+    sink = out or sys.stdout
+    resolved_command = resolve_proxy_command(proxy_command)
+    try:
+        if output_json:
+            payload = build_agent_template_report(
+                template_id=template_id,
+                home=home,
+                sandbox_root=sandbox_root,
+                proxy_command=resolved_command,
+            )
+            _print_json({"ok": True, **payload}, sink)
+            return 0
+        if template_id is not None:
+            plan = build_template_commands(
+                template_id,
+                home=home,
+                sandbox_root=sandbox_root,
+                proxy_command=resolved_command,
+            )
+            sink.write(format_agent_template_text(plan, proxy_command=resolved_command))
+            return 0
+        for name in AGENT_TEMPLATE_NAMES:
+            plan = build_template_commands(
+                name,
+                home=home,
+                sandbox_root=sandbox_root,
+                proxy_command=resolved_command,
+            )
+            sink.write(format_agent_template_text(plan, proxy_command=resolved_command))
+            sink.write("\n")
+        return 0
+    except AgentTemplateError as exc:
+        raise ProxyCliError(str(exc), exit_code=2) from exc
+
+
+def print_config_wizard(
+    *,
+    template_id: str,
+    home: Path,
+    sandbox_root: Path,
+    client_id: str = "cursor",
+    server_name: str = DEFAULT_SERVER_NAME,
+    proxy_command: str | None = None,
+    ensure_initialized: bool = False,
+    out: TextIO | None = None,
+    output_json: bool = False,
+) -> int:
+    """Generate and validate proxy-routed MCP client config for one agent template."""
+
+    sink = out or sys.stdout
+    try:
+        result = build_safe_config_wizard_result(
+            template_id,
+            home=home,
+            sandbox_root=sandbox_root,
+            client_id=client_id,
+            server_name=server_name,
+            proxy_command=proxy_command,
+            ensure_initialized=ensure_initialized,
+        )
+    except ConfigWizardError as exc:
+        raise ProxyCliError(str(exc), exit_code=2) from exc
+
+    if output_json:
+        _print_json({
+            "ok": True,
+            "dry_run": True,
+            "writes_user_config": False,
+            "summary": build_wizard_summary(result),
+            "clients": result.rendered,
+        }, sink)
+        return 0
+
+    sink.write(format_safe_config_wizard_output(result))
+    return 0
+
+
+def validate_config_wizard(
+    *,
+    input_path: Path,
+    proxy_command: str | None = None,
+    config_path: Path | None = None,
+    out: TextIO | None = None,
+    output_json: bool = False,
+) -> int:
+    """Validate an MCP client config file routes configured tools through the proxy."""
+
+    sink = out or sys.stdout
+    try:
+        document = load_mcp_client_document(input_path)
+        resolved_proxy_command = resolve_proxy_command(proxy_command)
+        validation = validate_mcp_client_document(
+            document,
+            proxy_command=resolved_proxy_command,
+            config_path=config_path,
+        )
+    except ConfigWizardError as exc:
+        raise ProxyCliError(str(exc), exit_code=2) from exc
+
+    if not validation.ok:
+        message = "; ".join(validation.issues)
+        if output_json:
+            _print_json({
+                "ok": False,
+                "errors": [message],
+                "bypass_detected": validation.bypass_detected,
+                "guidance": validation.guidance,
+            }, sink)
+        else:
+            print(f"FAIL: {message}", file=sink)
+            if validation.guidance:
+                print(f"GUIDANCE: {validation.guidance}", file=sink)
+        return 2
+
+    payload = {
+        "ok": True,
+        "bypass_detected": False,
+        "proxy_routed": True,
+        "input_path": str(input_path.expanduser()),
+        "proxy_command": resolved_proxy_command,
+    }
+    if config_path is not None:
+        payload["config_path"] = str(config_path.expanduser())
+    if output_json:
+        _print_json(payload, sink)
+    else:
+        print(f"OK: MCP client config routes through {resolved_proxy_command}", file=sink)
+    return 0
+
+
+def explain_role_proxy(
+    *,
+    home: Path | None = None,
+    config_path: Path | None = None,
+    preset: str | None = None,
+    out: TextIO | None = None,
+    output_json: bool = False,
+) -> int:
+    """Print bounded role doctor guidance for one preset or the preset set."""
+
+    out = out or sys.stdout
+    paths = proxy_paths(home, config_path)
+    selected_preset = preset
+    if selected_preset is None:
+        selected_preset = read_role_preset_from_config(paths.config_path)
+    try:
+        report = build_role_doctor_report(preset_name=selected_preset)
+    except RolePresetError as exc:
+        raise ProxyCliError(str(exc)) from exc
+    if output_json:
+        _print_json({"ok": True, "role_doctor": report}, out)
+    else:
+        print(format_role_doctor_report(report), file=out)
+    return 0
 
 
 def _rewrite_proxy_identity_after_register(
@@ -1816,6 +2030,88 @@ def vacuum_events(
     return deleted
 
 
+def serve_approval_center(
+    *,
+    home: Path | None = None,
+    config_path: Path | None = None,
+    passphrase: str | None = None,
+    passphrase_file: Path | None = None,
+    port: int = 0,
+    err: TextIO | None = None,
+) -> int:
+    """Run the stable local Approval Center for any MCP client turn."""
+
+    err = err or sys.stderr
+    paths = proxy_paths(home, config_path)
+    config = load_proxy_config(paths.config_path)
+    identity_path = paths.identity_path(config.avp.agent_name)
+    identity = _read_json(identity_path, "agent identity")
+    identity_passphrase = _resolve_existing_identity_passphrase(
+        identity,
+        passphrase=passphrase,
+        passphrase_file=passphrase_file,
+    )
+    proxy_agent = _load_proxy_agent(
+        identity=identity,
+        config=config,
+        passphrase=identity_passphrase,
+    )
+    evidence_store = ApprovalEvidenceStore(paths.proxy_dir / "evidence.sqlite")
+    try:
+        approval_server = create_persistent_server(
+            proxy_dir=paths.proxy_dir,
+            evidence_store=evidence_store,
+            port=port,
+        )
+    except PersistentApprovalCenterError as exc:
+        raise ProxyCliError(str(exc), exit_code=1) from exc
+    try:
+        approval_grant_private_key_seed = bytes.fromhex(proxy_agent.private_key_hex)
+    except (AttributeError, TypeError, ValueError):
+        approval_grant_private_key_seed = None
+    approval_grant_agent_did = getattr(proxy_agent, "did", None)
+    if not isinstance(approval_grant_agent_did, str):
+        approval_grant_agent_did = None
+    downstream_name = DownstreamConfig.from_proxy_config(config).name
+    approval_manager = ApprovalManager(
+        evidence_store=evidence_store,
+        approval_server=approval_server,
+        config=config,
+        client_id=f"{downstream_name}:approval-center",
+        headless=True,
+        cli_out=err,
+        wait_for_decision=False,
+        approval_grant_private_key_seed=approval_grant_private_key_seed,
+        approval_grant_agent_did=approval_grant_agent_did,
+    )
+    _ = approval_manager
+    save_manifest(paths.proxy_dir, build_manifest_for_server(approval_server))
+    print(
+        f"Approval Center: {approval_server.approval_center_url()}",
+        file=err,
+    )
+    stop_event = threading.Event()
+
+    def _request_stop(_signum: int, _frame: Any) -> None:
+        stop_event.set()
+
+    previous_handlers: dict[int, Any] | None = None
+    if threading.current_thread() is threading.main_thread():
+        previous_handlers = {
+            signal.SIGINT: signal.signal(signal.SIGINT, _request_stop),
+            signal.SIGTERM: signal.signal(signal.SIGTERM, _request_stop),
+        }
+    try:
+        stop_event.wait()
+        return 0
+    finally:
+        if previous_handlers is not None:
+            signal.signal(signal.SIGINT, previous_handlers[signal.SIGINT])
+            signal.signal(signal.SIGTERM, previous_handlers[signal.SIGTERM])
+        approval_server.stop()
+        evidence_store.close()
+
+
 def run_proxy(
     *,
     home: Path | None = None,
@@ -1887,8 +2183,17 @@ def run_proxy(
             except HeadlessPolicyError as exc:
                 raise ProxyCliError(str(exc), exit_code=1) from exc
         evidence_store = ApprovalEvidenceStore(paths.proxy_dir / "evidence.sqlite")
-        approval_server = ApprovalServer()
-        approval_server.start()
+
+        def _start_ephemeral_approval_server() -> ApprovalServer:
+            server = ApprovalServer()
+            server.start()
+            return server
+
+        approval_server = resolve_approval_server(
+            paths.proxy_dir,
+            evidence_store=evidence_store,
+            fallback_factory=_start_ephemeral_approval_server,
+        )
         try:
             approval_grant_private_key_seed = bytes.fromhex(proxy_agent.private_key_hex)
         except (AttributeError, TypeError, ValueError):
@@ -1929,7 +2234,8 @@ def run_proxy(
             return 0
         finally:
             _restore_signal_handlers(previous_handlers)
-            approval_server.stop()
+            if getattr(approval_server, "owns_server_process", True):
+                approval_server.stop()
             evidence_store.close()
     except PassthroughError as exc:
         raise ProxyCliError(str(exc), exit_code=1) from exc
@@ -2012,10 +2318,17 @@ def print_client_configs(
         raise ProxyCliError(str(exc), exit_code=2) from exc
 
     if output_json:
+        preset = (
+            read_role_preset_from_config(config_path)
+            if config_path is not None
+            else None
+        )
         payload = format_client_config_json_payload(
             rendered,
             command=resolved_command,
             run_args=run_args,
+            config_path=config_path,
+            role_preset=preset,
         )
         _print_json(payload, out=sink)
         return
@@ -2036,6 +2349,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--policy-pack",
         default="default",
         choices=["default", "github", "filesystem", "shell", "git", "fetch"],
+    )
+    init.add_argument(
+        "--role",
+        required=True,
+        choices=list(ROLE_PRESET_NAMES),
+        help="Least Agency role preset written into generated role_authority config",
     )
     init.add_argument(
         "--quickstart-filesystem",
@@ -2069,6 +2388,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--full",
         action="store_true",
         help="Also launch downstream and verify MCP initialize/tools/list",
+    )
+
+    approval_center = subparsers.add_parser(
+        "approval-center",
+        help="Manage the stable local Approval Center",
+    )
+    approval_center_subparsers = approval_center.add_subparsers(
+        dest="approval_center_action",
+        required=True,
+    )
+    approval_center_serve = approval_center_subparsers.add_parser(
+        "serve",
+        help="Run the stable local Approval Center for any MCP client turn",
+    )
+    _add_common_path_args(approval_center_serve)
+    _add_passphrase_args(approval_center_serve)
+    approval_center_serve.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        help="Loopback port for the Approval Center (0 = reuse manifest or assign)",
     )
 
     run = subparsers.add_parser("run", help="Run stdio MCP passthrough")
@@ -2193,6 +2533,126 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_json_arg(client_config_print)
 
+    explain = subparsers.add_parser(
+        "explain",
+        help="Print bounded operator guidance without starting transport",
+    )
+    explain_subparsers = explain.add_subparsers(dest="explain_action", required=True)
+    explain_role = explain_subparsers.add_parser(
+        "role",
+        help="Show allowed, approval-required, and denied action families by role preset",
+    )
+    _add_common_path_args(explain_role)
+    explain_role.add_argument(
+        "--preset",
+        choices=list(ROLE_PRESET_NAMES),
+        default=None,
+        help="Explain one preset; default reads role_preset from config or the preset set",
+    )
+    _add_json_arg(explain_role)
+
+    templates = subparsers.add_parser(
+        "templates",
+        help="Print copy-paste runnable starter commands for review/build/readonly agents",
+    )
+    templates_subparsers = templates.add_subparsers(dest="templates_action", required=True)
+    templates_print = templates_subparsers.add_parser(
+        "print",
+        help="Render starter init/client-config/explain/run commands",
+    )
+    templates_print.add_argument(
+        "--template",
+        choices=[*AGENT_TEMPLATE_NAMES, "set"],
+        default="set",
+        help="Starter template to render (default: set)",
+    )
+    templates_print.add_argument(
+        "--home",
+        type=Path,
+        default=None,
+        help="Concrete AVP home path to embed in generated commands",
+    )
+    templates_print.add_argument(
+        "--sandbox",
+        type=Path,
+        default=None,
+        help="Concrete quickstart filesystem sandbox path to embed in generated commands",
+    )
+    templates_print.add_argument(
+        "--proxy-command",
+        default=None,
+        help="Path to agentveil-mcp-proxy executable (default: resolve from PATH)",
+    )
+    _add_json_arg(templates_print)
+
+    wizard = subparsers.add_parser(
+        "wizard",
+        help="Generate and validate MCP client config routed through the proxy",
+    )
+    wizard_subparsers = wizard.add_subparsers(dest="wizard_action", required=True)
+    wizard_print = wizard_subparsers.add_parser(
+        "print",
+        help="Render validated proxy-routed MCP client config for one agent template",
+    )
+    wizard_print.add_argument(
+        "--template",
+        required=True,
+        choices=list(AGENT_TEMPLATE_NAMES),
+        help="Agent template to render (review, build, readonly)",
+    )
+    wizard_print.add_argument("--home", type=Path, required=True, help="AVP home for the template")
+    wizard_print.add_argument(
+        "--sandbox",
+        type=Path,
+        required=True,
+        help="Quickstart filesystem sandbox path for the template",
+    )
+    wizard_print.add_argument(
+        "--client",
+        default="cursor",
+        choices=list(CLIENT_TARGETS),
+        help="Desktop MCP client target to render",
+    )
+    wizard_print.add_argument(
+        "--server-name",
+        default=DEFAULT_SERVER_NAME,
+        help="MCP server entry name inside mcpServers",
+    )
+    wizard_print.add_argument(
+        "--proxy-command",
+        default=None,
+        help="Path to agentveil-mcp-proxy executable (default: resolve from PATH)",
+    )
+    wizard_print.add_argument(
+        "--init",
+        action="store_true",
+        help="Run template init first when proxy config is missing",
+    )
+    _add_json_arg(wizard_print)
+
+    wizard_validate = wizard_subparsers.add_parser(
+        "validate",
+        help="Validate an MCP client config file routes through the proxy",
+    )
+    wizard_validate.add_argument(
+        "--input",
+        type=Path,
+        required=True,
+        help="Path to MCP client JSON config to validate",
+    )
+    wizard_validate.add_argument(
+        "--proxy-command",
+        default=None,
+        help="Expected proxy executable name/path for validation",
+    )
+    wizard_validate.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Expected proxy config path embedded in --config run args",
+    )
+    _add_json_arg(wizard_validate)
+
     return parser
 
 
@@ -2245,6 +2705,7 @@ def main(argv: list[str] | None = None) -> int:
                 agent_name=args.agent_name,
                 trusted_signer_dids=args.trusted_signer_did,
                 policy_pack=policy_pack,
+                role_preset=args.role,
                 ttl_days=args.ttl_days,
                 allowed_categories=args.allowed_category or DEFAULT_ALLOWED_CATEGORIES,
                 downstream_config=downstream_config,
@@ -2254,8 +2715,8 @@ def main(argv: list[str] | None = None) -> int:
                 err=io.StringIO() if args.json_output else sys.stderr,
                 force=args.force,
             )
+            config = load_proxy_config(result.config_path)
             if args.json_output:
-                config = load_proxy_config(result.config_path)
                 _print_json({
                     "ok": True,
                     "errors": [],
@@ -2266,6 +2727,12 @@ def main(argv: list[str] | None = None) -> int:
                     "config_path": str(result.config_path),
                     "control_grant_path": str(result.control_grant_path),
                     "control_grant_expires_at": result.control_grant_expires_at,
+                    "role_preset": config.role_preset,
+                    "role_authority": {
+                        "mode": config.role_authority.mode.value,
+                        "role": config.role_authority.role,
+                        "authority": config.role_authority.authority,
+                    },
                     "downstream": _downstream_info(config),
                     "evidence_count": _evidence_count(proxy_paths(args.home, args.config)),
                 })
@@ -2273,6 +2740,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Created MCP proxy identity: {result.agent_did}")
                 print(f"Identity: {result.identity_path}")
                 print(f"Config: {result.config_path}")
+                print(f"Role preset: {config.role_preset}")
                 print(f"Control grant: {result.control_grant_path}")
                 print(f"Control grant expires: {result.control_grant_expires_at}")
             return 0
@@ -2285,6 +2753,16 @@ def main(argv: list[str] | None = None) -> int:
                 check_backend=args.check_backend,
                 full=args.full,
                 output_json=args.json_output,
+            )
+        if args.command == "approval-center":
+            if args.approval_center_action != "serve":
+                raise ProxyCliError("approval-center action must be serve")
+            return serve_approval_center(
+                home=args.home,
+                config_path=args.config,
+                passphrase=args.passphrase,
+                passphrase_file=args.passphrase_file,
+                port=args.port,
             )
         if args.command == "run":
             return run_proxy(
@@ -2409,6 +2887,46 @@ def main(argv: list[str] | None = None) -> int:
                 output_json=args.json_output,
             )
             return 0
+        if args.command == "explain":
+            if args.explain_action != "role":
+                raise ProxyCliError("explain action must be role")
+            return explain_role_proxy(
+                home=args.home,
+                config_path=args.config,
+                preset=args.preset,
+                output_json=args.json_output,
+            )
+        if args.command == "templates":
+            if args.templates_action != "print":
+                raise ProxyCliError("templates action must be print")
+            template_id = None if args.template == "set" else args.template
+            return print_agent_templates(
+                template_id=template_id,
+                home=args.home,
+                sandbox_root=args.sandbox,
+                proxy_command=args.proxy_command,
+                output_json=args.json_output,
+            )
+        if args.command == "wizard":
+            if args.wizard_action == "print":
+                return print_config_wizard(
+                    template_id=args.template,
+                    home=args.home,
+                    sandbox_root=args.sandbox,
+                    client_id=args.client,
+                    server_name=args.server_name,
+                    proxy_command=args.proxy_command,
+                    ensure_initialized=args.init,
+                    output_json=args.json_output,
+                )
+            if args.wizard_action == "validate":
+                return validate_config_wizard(
+                    input_path=args.input,
+                    proxy_command=args.proxy_command,
+                    config_path=args.config,
+                    output_json=args.json_output,
+                )
+            raise ProxyCliError("wizard action must be print or validate")
     except (ProxyCliError, ApprovalEvidenceError, EvidenceExportError, EvidenceVerificationError) as exc:
         if getattr(args, "json_output", False):
             _print_json({

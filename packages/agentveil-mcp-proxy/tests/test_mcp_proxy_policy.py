@@ -19,6 +19,7 @@ from agentveil_mcp_proxy import (
     ProxyConfig,
     ProxyConfigError,
     RiskClass,
+    RoleAuthorityMode,
     ToolCallContext,
     ToolSurfaceConfig,
     ToolSurfaceMode,
@@ -596,3 +597,90 @@ def test_proxy_config_rejects_non_object_tool_surface():
     for bad in ([], "", 0):
         with pytest.raises(ProxyConfigError, match="tool_surface must be an object"):
             ProxyConfig.from_dict(_base_config(tool_surface=bad))
+
+
+def test_role_authority_requires_role_when_enforced():
+    with pytest.raises(ProxyConfigError, match="role_authority.role"):
+        ProxyConfig.from_dict(_base_config(role_authority={"mode": "enforce"}))
+
+
+def test_reviewer_role_blocks_implementation_action_family():
+    config = ProxyConfig.from_dict(_base_config(
+        role_authority={"mode": "enforce", "role": "reviewer", "authority": "review_only"},
+        policy={
+            "id": "role-authority-policy",
+            "policy_schema_version": 1,
+            "default_decision": "allow",
+            "default_risk_class": "read",
+            "rules": [],
+        },
+    ))
+    evaluation = PolicyEngine(config).evaluate(ToolCallContext(
+        server="fake-downstream",
+        tool="write_file",
+        action="fake-downstream.write_file",
+        risk_class=RiskClass.WRITE,
+        role="reviewer",
+        authority="review_only",
+        action_family="write",
+    ))
+    assert evaluation.decision is PolicyDecision.BLOCK
+    assert evaluation.policy_rule_id == "role_authority_reviewer_blocks_implementation"
+    assert evaluation.reason == "role_authority_denied"
+
+
+def test_reviewer_role_allows_read_action_family():
+    config = ProxyConfig.from_dict(_base_config(
+        role_authority={"mode": "enforce", "role": "reviewer", "authority": "review_only"},
+        policy={
+            "id": "role-authority-policy",
+            "policy_schema_version": 1,
+            "default_decision": "allow",
+            "default_risk_class": "read",
+            "rules": [],
+        },
+    ))
+    evaluation = PolicyEngine(config).evaluate(ToolCallContext(
+        server="fake-downstream",
+        tool="read_file",
+        action="fake-downstream.read_file",
+        risk_class=RiskClass.READ,
+        role="reviewer",
+        authority="review_only",
+        action_family="read",
+    ))
+    assert evaluation.decision is PolicyDecision.ALLOW
+
+
+def test_proxy_config_wires_role_authority():
+    config = ProxyConfig.from_dict(_base_config(
+        role_authority={"mode": "enforce", "role": "reviewer", "authority": "review_only"},
+    ))
+    assert config.role_authority.mode is RoleAuthorityMode.ENFORCE
+    assert config.role_authority.role == "reviewer"
+    assert config.role_authority.authority == "review_only"
+
+
+def test_readonly_role_blocks_mutation_action_family():
+    config = ProxyConfig.from_dict(_base_config(
+        role_authority={"mode": "enforce", "role": "readonly", "authority": "read_only"},
+        policy={
+            "id": "role-authority-policy",
+            "policy_schema_version": 1,
+            "default_decision": "allow",
+            "default_risk_class": "read",
+            "rules": [],
+        },
+    ))
+    evaluation = PolicyEngine(config).evaluate(ToolCallContext(
+        server="fake-downstream",
+        tool="write_file",
+        action="fake-downstream.write_file",
+        risk_class=RiskClass.WRITE,
+        role="readonly",
+        authority="read_only",
+        action_family="write",
+    ))
+    assert evaluation.decision is PolicyDecision.BLOCK
+    assert evaluation.policy_rule_id == "role_authority_readonly_blocks_mutation"
+    assert evaluation.reason == "role_authority_denied"
