@@ -134,6 +134,36 @@ def _assert_private(*parts: str) -> None:
     assert "stderr" not in blob.lower()
 
 
+def _find_controlled_path_metadata(
+    records: list,
+    *,
+    tool: str,
+    target_reached: bool,
+    policy_decision: str,
+    execution_status: str,
+) -> dict:
+    matches: list[dict] = []
+    for record in records:
+        metadata = parse_controlled_path_metadata(record)
+        if metadata is None:
+            continue
+        if metadata.get("tool") != tool:
+            continue
+        if metadata.get("target_reached") is not target_reached:
+            continue
+        if metadata.get("policy_decision") != policy_decision:
+            continue
+        if metadata.get("execution_status") != execution_status:
+            continue
+        matches.append(metadata)
+    assert len(matches) == 1, (
+        f"expected one metadata match for tool={tool!r}, target_reached={target_reached}, "
+        f"policy_decision={policy_decision!r}, execution_status={execution_status!r}; "
+        f"got {len(matches)}"
+    )
+    return matches[0]
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="avp-fake-target-smoke-") as tmp:
         root = Path(tmp)
@@ -170,8 +200,14 @@ def main() -> int:
         assert fake_target_reached(outcome_path)
 
         with ApprovalEvidenceStore(home / "mcp-proxy" / "evidence.sqlite") as store:
-            allow_meta = parse_controlled_path_metadata(store.list_records()[-1])
-            assert allow_meta is not None and allow_meta["target_reached"] is True
+            allow_meta = _find_controlled_path_metadata(
+                store.list_records(),
+                tool="read_file",
+                target_reached=True,
+                policy_decision="allow",
+                execution_status=ApprovalStatus.EXECUTED.value,
+            )
+            assert allow_meta["target_reached"] is True
 
         # BLOCK
         block_fixture = "smoke-block-write"
@@ -188,6 +224,15 @@ def main() -> int:
         block_response = _responses(block_out.getvalue())[0]
         assert block_response["error"]["data"]["reason"] == "local_policy_block"
         assert not fake_target_reached(outcome_path)
+        with ApprovalEvidenceStore(home / "mcp-proxy" / "evidence.sqlite") as store:
+            block_meta = _find_controlled_path_metadata(
+                store.list_records(),
+                tool="write_file",
+                target_reached=False,
+                policy_decision="block",
+                execution_status="not_reached",
+            )
+            assert block_meta["target_reached"] is False
 
         # APPROVAL pending + retry
         approval_fixture = "smoke-approval-write"
@@ -251,13 +296,14 @@ def main() -> int:
             assert fake_target_reached(outcome_path)
 
             with ApprovalEvidenceStore(home / "mcp-proxy" / "evidence.sqlite") as store:
-                executed = [
-                    row for row in store.list_records()
-                    if row.status == ApprovalStatus.EXECUTED.value
-                ]
-                assert len(executed) >= 1
-                retry_meta = parse_controlled_path_metadata(executed[-1])
-                assert retry_meta is not None and retry_meta["target_reached"] is True
+                retry_meta = _find_controlled_path_metadata(
+                    store.list_records(),
+                    tool="write_file",
+                    target_reached=True,
+                    policy_decision="approval",
+                    execution_status=ApprovalStatus.EXECUTED.value,
+                )
+                assert retry_meta["target_reached"] is True
                 bundle_text = json.dumps({
                     "records": [parse_controlled_path_metadata(row) for row in store.list_records()],
                 })

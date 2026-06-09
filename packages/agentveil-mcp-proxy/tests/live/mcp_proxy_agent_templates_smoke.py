@@ -57,6 +57,32 @@ def _evidence_store(home: Path) -> ApprovalEvidenceStore:
     return ApprovalEvidenceStore(home / "mcp-proxy" / "evidence.sqlite")
 
 
+def _find_controlled_path_metadata(
+    records: list,
+    *,
+    tool: str,
+    target_reached: bool,
+    role: str,
+) -> dict:
+    matches: list[dict] = []
+    for record in records:
+        metadata = parse_controlled_path_metadata(record)
+        if metadata is None:
+            continue
+        if metadata.get("tool") != tool:
+            continue
+        if metadata.get("target_reached") is not target_reached:
+            continue
+        if metadata.get("role") != role:
+            continue
+        matches.append(metadata)
+    assert len(matches) == 1, (
+        f"expected one metadata match for tool={tool!r}, target_reached={target_reached}, "
+        f"role={role!r}; got {len(matches)}"
+    )
+    return matches[0]
+
+
 def main() -> int:
     temp_root = Path(tempfile.mkdtemp(prefix="avp-agent-template-smoke-"))
     try:
@@ -98,7 +124,13 @@ def main() -> int:
         review_response = _responses(review_out.getvalue())[0]
         assert review_response["error"]["data"]["reason"] == "role_authority_denied"
         with _evidence_store(review_home) as store:
-            assert parse_controlled_path_metadata(store.list_records()[0])["target_reached"] is False
+            review_meta = _find_controlled_path_metadata(
+                store.list_records(),
+                tool="write_file",
+                target_reached=False,
+                role="reviewer",
+            )
+            assert review_meta["target_reached"] is False
 
         readonly_out = io.StringIO()
         assert run_proxy(
@@ -122,7 +154,13 @@ def main() -> int:
         build_response = _responses(build_out.getvalue())[0]
         assert "error" not in build_response
         with _evidence_store(build_home) as store:
-            assert parse_controlled_path_metadata(store.list_records()[-1])["target_reached"] is True
+            build_meta = _find_controlled_path_metadata(
+                store.list_records(),
+                tool="list_workspace",
+                target_reached=True,
+                role="implementer",
+            )
+            assert build_meta["target_reached"] is True
 
         combined = review_out.getvalue() + readonly_out.getvalue() + build_out.getvalue()
         assert SECRET not in combined
