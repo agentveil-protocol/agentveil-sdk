@@ -5,15 +5,14 @@ from __future__ import annotations
 import json
 import threading
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any, Callable
+
+import httpx
 
 from agentveil_mcp_proxy.approval.persistent import (
     ApprovalCenterManifest,
     load_manifest,
-    loopback_urlopen,
     manifest_is_reachable,
 )
 from agentveil_mcp_proxy.approval.server import (
@@ -83,20 +82,17 @@ class RemoteApprovalServer:
 
     def register(self, prompt: ApprovalPrompt) -> str:
         url = f"{self.base_url}/internal/register"
-        payload = json.dumps(approval_prompt_to_dict(prompt)).encode("utf-8")
-        request = urllib.request.Request(
-            url,
-            data=payload,
-            headers={
-                "Content-Type": "application/json",
-                INTERNAL_REGISTER_TOKEN_HEADER: self._manifest.internal_register_token,
-            },
-            method="POST",
-        )
         try:
-            with loopback_urlopen(request, timeout=REGISTER_TIMEOUT_SECONDS) as response:
-                body = response.read().decode("utf-8")
-        except urllib.error.URLError as exc:
+            with httpx.Client(trust_env=False, timeout=REGISTER_TIMEOUT_SECONDS) as client:
+                response = client.post(
+                    url,
+                    json=approval_prompt_to_dict(prompt),
+                    headers={
+                        INTERNAL_REGISTER_TOKEN_HEADER: self._manifest.internal_register_token,
+                    },
+                )
+                body = response.text
+        except httpx.HTTPError as exc:
             raise ApprovalServerError("persistent approval center is unavailable") from exc
         try:
             parsed = json.loads(body)

@@ -9,9 +9,9 @@ import os
 from pathlib import Path
 import secrets
 import time
-import urllib.error
-import urllib.request
 from typing import Any, Callable
+
+import httpx
 
 from agentveil_mcp_proxy.approval.server import ApprovalServer, ApprovalServerError
 
@@ -19,7 +19,6 @@ from agentveil_mcp_proxy.approval.server import ApprovalServer, ApprovalServerEr
 MANIFEST_FILENAME = "approval-center.manifest.json"
 MANIFEST_SCHEMA_VERSION = 2
 HEALTH_TIMEOUT_SECONDS = 2.0
-_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 class PersistentApprovalCenterError(RuntimeError):
@@ -122,22 +121,21 @@ def is_process_alive(pid: int | None) -> bool:
 
 def _health_check(manifest: ApprovalCenterManifest) -> bool:
     url = f"{manifest.approval_center_url()}/api/approvals"
-    request = urllib.request.Request(url, method="GET")
     try:
-        with loopback_urlopen(request, timeout=HEALTH_TIMEOUT_SECONDS) as response:
-            return int(response.status) == 200
-    except (urllib.error.URLError, TimeoutError, ValueError):
+        return loopback_get_status(url, timeout=HEALTH_TIMEOUT_SECONDS) == 200
+    except (httpx.HTTPError, OSError, TimeoutError, ValueError):
         return False
 
 
-def loopback_urlopen(
-    request: urllib.request.Request,
+def loopback_get_status(
+    url: str,
     *,
     timeout: float,
-) -> Any:
-    """Open a loopback Approval Center request without environment proxies."""
+) -> int:
+    """Fetch loopback Approval Center status without environment proxies."""
 
-    return _NO_PROXY_OPENER.open(request, timeout=timeout)
+    with httpx.Client(trust_env=False, timeout=timeout) as client:
+        return int(client.get(url).status_code)
 
 
 def manifest_is_reachable(manifest: ApprovalCenterManifest) -> bool:
@@ -205,7 +203,7 @@ __all__ = [
     "build_manifest_for_server",
     "create_persistent_server",
     "load_manifest",
-    "loopback_urlopen",
+    "loopback_get_status",
     "manifest_is_reachable",
     "manifest_path",
     "save_manifest",

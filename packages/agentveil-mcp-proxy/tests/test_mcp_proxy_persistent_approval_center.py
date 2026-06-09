@@ -130,17 +130,22 @@ def test_persistent_manifest_is_reachable(tmp_path):
         store.close()
 
 
-def test_manifest_health_check_ignores_global_urlopen(tmp_path, monkeypatch):
+def test_manifest_health_check_ignores_environment_proxies(tmp_path, monkeypatch):
     store, server, _manager, proxy_dir = _start_persistent_center(tmp_path)
 
-    def fail_global_urlopen(*_args, **_kwargs):
-        raise AssertionError("loopback health checks must not use global urlopen")
+    original_client = persistent_module.httpx.Client
+    seen_trust_env: list[bool | None] = []
 
-    monkeypatch.setattr(persistent_module.urllib.request, "urlopen", fail_global_urlopen)
+    def client_without_environment_proxy(*args, **kwargs):
+        seen_trust_env.append(kwargs.get("trust_env"))
+        return original_client(*args, **kwargs)
+
+    monkeypatch.setattr(persistent_module.httpx, "Client", client_without_environment_proxy)
     try:
         manifest = load_manifest(proxy_dir)
         assert manifest is not None
         assert manifest_is_reachable(manifest)
+        assert seen_trust_env == [False]
     finally:
         server.stop()
         store.close()
