@@ -102,9 +102,18 @@ def _proxy_command_matches(entry: Mapping[str, Any], *, proxy_command: str | Non
     if not isinstance(command, str):
         return False
     expected_command = resolve_proxy_command(proxy_command)
-    command_name = Path(command).name
-    expected_name = Path(expected_command).name
+    command_name = _proxy_executable_name(command)
+    expected_name = _proxy_executable_name(expected_command)
     return command_name == expected_name or command == expected_command
+
+
+def _proxy_executable_name(command: str) -> str:
+    """Return a comparable proxy executable name across POSIX and Windows paths."""
+
+    name = command.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return name
 
 
 def _is_incomplete_proxy_entry(

@@ -136,7 +136,7 @@ def test_review_template_init_client_config_and_deny_write(tmp_path, monkeypatch
     )
     client_config_text = client_out.getvalue()
     assert "run" in client_config_text
-    assert str(plan.config_path) in client_config_text
+    assert json.dumps(str(plan.config_path))[1:-1] in client_config_text
 
     class ExplodingAgent:
         def __init__(self, *args, **kwargs):

@@ -144,6 +144,27 @@ def test_accept_default_proxy_command_with_config(tmp_path):
     assert is_proxy_routed_mcp_entry(document["mcpServers"]["avp"], config_path=config_path)
 
 
+def test_accept_windows_proxy_exe_name_with_config(tmp_path, monkeypatch):
+    config_path = tmp_path / "proxy.json"
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.config_wizard.resolve_proxy_command",
+        lambda command=None: "C:\\Tools\\agentveil-mcp-proxy.EXE"
+        if command is None
+        else command,
+    )
+    document = {
+        "mcpServers": {
+            "avp": {
+                "command": "agentveil-mcp-proxy",
+                "args": ["run", "--config", str(config_path)],
+            }
+        }
+    }
+    validation = validate_mcp_client_document(document)
+    assert validation.ok is True
+    assert validation.bypass_detected is False
+
+
 def test_reject_proxy_run_with_empty_config_value():
     document = {
         "mcpServers": {
