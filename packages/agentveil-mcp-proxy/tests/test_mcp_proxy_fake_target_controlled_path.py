@@ -127,6 +127,16 @@ def _set_approval_policy(config_path: Path, *, server: str, tool: str, rule_id: 
     _write_json(config_path, config)
 
 
+def _set_role_authority(config_path: Path, *, role: str, authority: str) -> None:
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["role_authority"] = {
+        "mode": "enforce",
+        "role": role,
+        "authority": authority,
+    }
+    _write_json(config_path, config)
+
+
 def _tool_call(tool: str, *, call_id: str = "call-1") -> str:
     return _json_line({
         "jsonrpc": "2.0",
@@ -346,6 +356,7 @@ def test_approval_retry_reaches_fake_target_after_approve(tmp_path, monkeypatch)
     )
     _set_downstream(init.config_path, downstream, log_path=log_path, outcome_path=outcome_path, fixture_id=fixture_id)
     _set_approval_policy(init.config_path, server="fake-downstream", tool="write_file", rule_id=fixture_id)
+    _set_role_authority(init.config_path, role="implementer", authority="implement")
 
     class ExplodingAgent:
         def __init__(self, *args, **kwargs):
@@ -398,6 +409,10 @@ def test_approval_retry_reaches_fake_target_after_approve(tmp_path, monkeypatch)
                 time.sleep(0.02)
                 record = store.get_pending(pending_id)
             assert record.status == ApprovalStatus.APPROVED.value
+            pending_metadata = parse_controlled_path_metadata(record)
+            assert pending_metadata["role"] == "implementer"
+            assert pending_metadata["authority"] == "implement"
+            assert pending_metadata["action_family"] == "write"
 
         staged_in.release_next()
         worker.join(timeout=10)
@@ -423,6 +438,9 @@ def test_approval_retry_reaches_fake_target_after_approve(tmp_path, monkeypatch)
             metadata = parse_controlled_path_metadata(executed[0])
             assert metadata["target_reached"] is True
             assert metadata["execution_status"] == ApprovalStatus.EXECUTED.value
+            assert metadata["role"] == "implementer"
+            assert metadata["authority"] == "implement"
+            assert metadata["action_family"] == "write"
             _privacy_clean(
                 outcome_path=outcome_path,
                 evidence_text=json.dumps(build_evidence_bundle(store, proxy_identity_did=None, trusted_signer_dids=[])),

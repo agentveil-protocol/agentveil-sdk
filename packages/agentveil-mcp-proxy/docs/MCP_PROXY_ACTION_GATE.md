@@ -268,7 +268,7 @@ Each template emits bounded commands for:
 Template behavior:
 
 - `review` → reviewer preset blocks `write_file` before downstream target
-- `build` → implementer preset reaches allowed quickstart filesystem write
+- `build` → implementer preset reaches allowed quickstart read/list target; filesystem write goes to approval
 - `readonly` → readonly preset denies mutation before downstream target
 
 Verification:

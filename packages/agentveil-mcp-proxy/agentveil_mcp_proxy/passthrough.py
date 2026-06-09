@@ -1924,6 +1924,24 @@ class McpPassthrough:
             fields["authority"] = classification.authority
         return fields
 
+    @staticmethod
+    def _least_agency_metadata_fields_from_record(record: Any) -> dict[str, str]:
+        raw_metadata = getattr(record, "action_gate_metadata_jcs", None)
+        if not isinstance(raw_metadata, str) or not raw_metadata:
+            return {}
+        try:
+            metadata = json.loads(raw_metadata)
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(metadata, dict):
+            return {}
+        fields: dict[str, str] = {}
+        for name in ("action_family", "role", "authority"):
+            value = metadata.get(name)
+            if isinstance(value, str):
+                fields[name] = value
+        return fields
+
     def _annotate_pending_controlled_path(
         self,
         classification: ClassifiedToolCall,
@@ -1970,6 +1988,13 @@ class McpPassthrough:
         record = store.get_pending(outcome.request_id)
         if record is None:
             return
+        least_agency_fields = self._least_agency_metadata_fields_from_record(record)
+        if not least_agency_fields:
+            parent_request_id = getattr(record, "granted_by_request_id", None)
+            if isinstance(parent_request_id, str) and parent_request_id:
+                parent_record = store.get_pending(parent_request_id)
+                if parent_record is not None:
+                    least_agency_fields = self._least_agency_metadata_fields_from_record(parent_record)
         metadata = build_controlled_path_metadata(
             fixture_id=self._controlled_path_fixture_id_from_record(record),
             tool_name=record.tool_name,
@@ -1983,6 +2008,7 @@ class McpPassthrough:
             ),
             request_id=outcome.request_id,
             payload_hash=record.payload_hash,
+            **least_agency_fields,
         )
         try:
             store.annotate_controlled_path_metadata(
