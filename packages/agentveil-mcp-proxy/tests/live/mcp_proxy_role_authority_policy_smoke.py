@@ -50,6 +50,36 @@ def _tool_call(tool: str) -> str:
     })
 
 
+def _find_controlled_path_metadata(
+    records: list,
+    *,
+    tool: str,
+    target_reached: bool,
+    policy_decision: str,
+    execution_status: str,
+) -> dict:
+    matches: list[dict] = []
+    for record in records:
+        metadata = parse_controlled_path_metadata(record)
+        if metadata is None:
+            continue
+        if metadata.get("tool") != tool:
+            continue
+        if metadata.get("target_reached") is not target_reached:
+            continue
+        if metadata.get("policy_decision") != policy_decision:
+            continue
+        if metadata.get("execution_status") != execution_status:
+            continue
+        matches.append(metadata)
+    assert len(matches) == 1, (
+        f"expected one metadata match for tool={tool!r}, target_reached={target_reached}, "
+        f"policy_decision={policy_decision!r}, execution_status={execution_status!r}; "
+        f"got {len(matches)}"
+    )
+    return matches[0]
+
+
 def _configure(
     config_path: Path,
     *,
@@ -150,10 +180,26 @@ def main() -> int:
         with ApprovalEvidenceStore(home / "mcp-proxy" / "evidence.sqlite") as store:
             records = store.list_records()
             assert len(records) >= 2
-            denied = parse_controlled_path_metadata(records[-2])
-            allowed = parse_controlled_path_metadata(records[-1])
-            assert denied is not None and denied["target_reached"] is False
-            assert allowed is not None and allowed["target_reached"] is True
+            denied = _find_controlled_path_metadata(
+                records,
+                tool="write_file",
+                target_reached=False,
+                policy_decision="block",
+                execution_status="not_reached",
+            )
+            allowed = _find_controlled_path_metadata(
+                records,
+                tool="read_file",
+                target_reached=True,
+                policy_decision="allow",
+                execution_status="executed",
+            )
+            assert denied["role"] == "reviewer"
+            assert denied["authority"] == "review_only"
+            assert denied["action_family"] == "write"
+            assert allowed["role"] == "reviewer"
+            assert allowed["authority"] == "review_only"
+            assert allowed["action_family"] == "read"
             from agentveil_mcp_proxy.evidence import build_evidence_bundle
             bundle = build_evidence_bundle(store, proxy_identity_did=None, trusted_signer_dids=[])
             verify_evidence_bundle(bundle, trusted_signer_dids=[], strict=True)
