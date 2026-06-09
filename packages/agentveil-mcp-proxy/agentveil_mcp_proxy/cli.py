@@ -84,6 +84,14 @@ from agentveil_mcp_proxy.agent_templates import (
     build_template_commands,
     format_agent_template_text,
 )
+from agentveil_mcp_proxy.config_wizard import (
+    ConfigWizardError,
+    build_safe_config_wizard_result,
+    build_wizard_summary,
+    format_safe_config_wizard_output,
+    load_mcp_client_document,
+    validate_mcp_client_document,
+)
 from agentveil_mcp_proxy.role_doctor import (
     build_role_doctor_report,
     format_role_doctor_report,
@@ -1278,6 +1286,101 @@ def print_agent_templates(
         raise ProxyCliError(str(exc), exit_code=2) from exc
 
 
+def print_config_wizard(
+    *,
+    template_id: str,
+    home: Path,
+    sandbox_root: Path,
+    client_id: str = "cursor",
+    server_name: str = DEFAULT_SERVER_NAME,
+    proxy_command: str | None = None,
+    ensure_initialized: bool = False,
+    out: TextIO | None = None,
+    output_json: bool = False,
+) -> int:
+    """Generate and validate proxy-routed MCP client config for one agent template."""
+
+    sink = out or sys.stdout
+    try:
+        result = build_safe_config_wizard_result(
+            template_id,
+            home=home,
+            sandbox_root=sandbox_root,
+            client_id=client_id,
+            server_name=server_name,
+            proxy_command=proxy_command,
+            ensure_initialized=ensure_initialized,
+        )
+    except ConfigWizardError as exc:
+        raise ProxyCliError(str(exc), exit_code=2) from exc
+
+    if output_json:
+        _print_json({
+            "ok": True,
+            "dry_run": True,
+            "writes_user_config": False,
+            "summary": build_wizard_summary(result),
+            "clients": result.rendered,
+        }, sink)
+        return 0
+
+    sink.write(format_safe_config_wizard_output(result))
+    return 0
+
+
+def validate_config_wizard(
+    *,
+    input_path: Path,
+    proxy_command: str | None = None,
+    config_path: Path | None = None,
+    out: TextIO | None = None,
+    output_json: bool = False,
+) -> int:
+    """Validate an MCP client config file routes configured tools through the proxy."""
+
+    sink = out or sys.stdout
+    try:
+        document = load_mcp_client_document(input_path)
+        resolved_proxy_command = resolve_proxy_command(proxy_command)
+        validation = validate_mcp_client_document(
+            document,
+            proxy_command=resolved_proxy_command,
+            config_path=config_path,
+        )
+    except ConfigWizardError as exc:
+        raise ProxyCliError(str(exc), exit_code=2) from exc
+
+    if not validation.ok:
+        message = "; ".join(validation.issues)
+        if output_json:
+            _print_json({
+                "ok": False,
+                "errors": [message],
+                "bypass_detected": validation.bypass_detected,
+                "guidance": validation.guidance,
+            }, sink)
+        else:
+            print(f"FAIL: {message}", file=sink)
+            if validation.guidance:
+                print(f"GUIDANCE: {validation.guidance}", file=sink)
+        return 2
+
+    payload = {
+        "ok": True,
+        "bypass_detected": False,
+        "proxy_routed": True,
+        "input_path": str(input_path.expanduser()),
+        "proxy_command": resolved_proxy_command,
+    }
+    if config_path is not None:
+        payload["config_path"] = str(config_path.expanduser())
+    if output_json:
+        _print_json(payload, sink)
+    else:
+        print(f"OK: MCP client config routes through {resolved_proxy_command}", file=sink)
+    return 0
+
+
 def explain_role_proxy(
     *,
     home: Path | None = None,
@@ -2362,6 +2465,74 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_json_arg(templates_print)
 
+    wizard = subparsers.add_parser(
+        "wizard",
+        help="Generate and validate MCP client config routed through the proxy",
+    )
+    wizard_subparsers = wizard.add_subparsers(dest="wizard_action", required=True)
+    wizard_print = wizard_subparsers.add_parser(
+        "print",
+        help="Render validated proxy-routed MCP client config for one agent template",
+    )
+    wizard_print.add_argument(
+        "--template",
+        required=True,
+        choices=list(AGENT_TEMPLATE_NAMES),
+        help="Agent template to render (review, build, readonly)",
+    )
+    wizard_print.add_argument("--home", type=Path, required=True, help="AVP home for the template")
+    wizard_print.add_argument(
+        "--sandbox",
+        type=Path,
+        required=True,
+        help="Quickstart filesystem sandbox path for the template",
+    )
+    wizard_print.add_argument(
+        "--client",
+        default="cursor",
+        choices=list(CLIENT_TARGETS),
+        help="Desktop MCP client target to render",
+    )
+    wizard_print.add_argument(
+        "--server-name",
+        default=DEFAULT_SERVER_NAME,
+        help="MCP server entry name inside mcpServers",
+    )
+    wizard_print.add_argument(
+        "--proxy-command",
+        default=None,
+        help="Path to agentveil-mcp-proxy executable (default: resolve from PATH)",
+    )
+    wizard_print.add_argument(
+        "--init",
+        action="store_true",
+        help="Run template init first when proxy config is missing",
+    )
+    _add_json_arg(wizard_print)
+
+    wizard_validate = wizard_subparsers.add_parser(
+        "validate",
+        help="Validate an MCP client config file routes through the proxy",
+    )
+    wizard_validate.add_argument(
+        "--input",
+        type=Path,
+        required=True,
+        help="Path to MCP client JSON config to validate",
+    )
+    wizard_validate.add_argument(
+        "--proxy-command",
+        default=None,
+        help="Expected proxy executable name/path for validation",
+    )
+    wizard_validate.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Expected proxy config path embedded in --config run args",
+    )
+    _add_json_arg(wizard_validate)
+
     return parser
 
 
@@ -2606,6 +2777,26 @@ def main(argv: list[str] | None = None) -> int:
                 proxy_command=args.proxy_command,
                 output_json=args.json_output,
             )
+        if args.command == "wizard":
+            if args.wizard_action == "print":
+                return print_config_wizard(
+                    template_id=args.template,
+                    home=args.home,
+                    sandbox_root=args.sandbox,
+                    client_id=args.client,
+                    server_name=args.server_name,
+                    proxy_command=args.proxy_command,
+                    ensure_initialized=args.init,
+                    output_json=args.json_output,
+                )
+            if args.wizard_action == "validate":
+                return validate_config_wizard(
+                    input_path=args.input,
+                    proxy_command=args.proxy_command,
+                    config_path=args.config,
+                    output_json=args.json_output,
+                )
+            raise ProxyCliError("wizard action must be print or validate")
     except (ProxyCliError, ApprovalEvidenceError, EvidenceExportError, EvidenceVerificationError) as exc:
         if getattr(args, "json_output", False):
             _print_json({

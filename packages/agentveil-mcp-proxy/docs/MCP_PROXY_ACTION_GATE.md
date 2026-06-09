@@ -280,3 +280,42 @@ PYTHONPATH=.:packages/agentveil-mcp-proxy pytest \
 PYTHONPATH=.:packages/agentveil-mcp-proxy python3 \
   packages/agentveil-mcp-proxy/tests/live/mcp_proxy_agent_templates_smoke.py
 ```
+
+## P10A.7 safe config wizard / all tools through proxy
+
+P10A.7 generates and validates MCP desktop client config so configured MCP
+tools route through `agentveil-mcp-proxy run --config <proxy-config>`, not a
+direct downstream command in the desktop client.
+
+Boundary: this covers MCP tools represented in generated client config entries
+only. It does not claim host-wide shell control, terminal interception,
+provider-native enforcement, Secure Runtime, or bypass prevention outside the
+configured MCP client path.
+
+```bash
+agentveil-mcp-proxy wizard print --template review --home ~/.avp-review-agent --sandbox ~/.avp-review-sandbox --init
+agentveil-mcp-proxy wizard print --template build --home ~/.avp-build-agent --sandbox ~/.avp-build-sandbox --init
+agentveil-mcp-proxy wizard validate --input ./unsafe-mcp.json
+```
+
+Wizard output includes a bounded summary:
+
+- role preset
+- home/config path
+- proxy command
+- client target
+- bypass status
+
+Unsafe direct downstream configs (for example `npx @modelcontextprotocol/...` or
+`quickstart_filesystem.py` as the desktop client command) are detected and
+rejected with bounded guidance.
+
+Verification:
+
+```bash
+PYTHONPATH=.:packages/agentveil-mcp-proxy pytest \
+  packages/agentveil-mcp-proxy/tests/test_mcp_proxy_config_wizard.py -q
+
+PYTHONPATH=.:packages/agentveil-mcp-proxy python3 \
+  packages/agentveil-mcp-proxy/tests/live/mcp_proxy_config_wizard_smoke.py
+```
