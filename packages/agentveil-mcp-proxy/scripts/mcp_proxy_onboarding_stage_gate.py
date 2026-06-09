@@ -52,6 +52,7 @@ from mcp_proxy_acceptance_lib import (
 APPROVE_WRITE_NAME = "onboarding-approve.txt"
 DENY_WRITE_NAME = "onboarding-deny-probe.txt"
 WRITE_CONTENT = "onboarding stage gate write\n"
+ACCEPTANCE_ROLE_CHOICES = ("reviewer", "readonly", "implementer", "build")
 # Non-interactive approval UI: no browser tabs or OS notifications during gate runs.
 RUN_NONINTERACTIVE_UI_ARGS = ["--approval-ui-mode", "none"]
 
@@ -128,6 +129,8 @@ def run_stage_gate(args: argparse.Namespace) -> dict[str, Any]:
                 agent_name,
                 "--base-url",
                 args.base_url,
+                "--role",
+                args.role,
                 "--passphrase-file",
                 str(passphrase_file),
                 "--quickstart-filesystem",
@@ -444,6 +447,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--keep-tmp", action="store_true", help="Do not delete the temporary work directory")
     parser.add_argument("--python", default=sys.executable, help="Python executable used to build venvs")
     parser.add_argument("--base-url", default="https://agentveil.dev", help="Backend base URL for registration")
+    parser.add_argument(
+        "--role",
+        choices=ACCEPTANCE_ROLE_CHOICES,
+        default="build",
+        help="Role preset for init; build preserves read/list allow plus write approval path",
+    )
     parser.add_argument(
         "--agent-name-prefix",
         default="agentveil-mcp-proxy-onboarding-stage-gate",
