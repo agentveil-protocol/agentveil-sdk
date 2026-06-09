@@ -130,6 +130,22 @@ def test_persistent_manifest_is_reachable(tmp_path):
         store.close()
 
 
+def test_windows_process_alive_check_does_not_send_signal(monkeypatch):
+    def fail_kill(_pid, _signal):
+        raise AssertionError("Windows process check must not call os.kill(pid, 0)")
+
+    monkeypatch.setattr(persistent_module.os, "name", "nt")
+    monkeypatch.setattr(persistent_module.os, "kill", fail_kill)
+    monkeypatch.setattr(
+        persistent_module,
+        "_windows_process_alive",
+        lambda pid: pid == 12345,
+    )
+
+    assert persistent_module.is_process_alive(12345)
+    assert not persistent_module.is_process_alive(54321)
+
+
 def test_manifest_health_check_uses_direct_loopback_socket(tmp_path, monkeypatch):
     store, server, _manager, proxy_dir = _start_persistent_center(tmp_path)
 

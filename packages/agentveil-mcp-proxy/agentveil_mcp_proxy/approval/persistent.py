@@ -112,11 +112,35 @@ def save_manifest(proxy_dir: Path, manifest: ApprovalCenterManifest) -> None:
 def is_process_alive(pid: int | None) -> bool:
     if pid is None or pid <= 0:
         return False
+    if os.name == "nt":
+        return _windows_process_alive(pid)
     try:
         os.kill(pid, 0)
     except OSError:
         return False
     return True
+
+
+def _windows_process_alive(pid: int) -> bool:
+    if pid == os.getpid():
+        return True
+    try:
+        import ctypes
+    except ImportError:
+        return False
+
+    try:
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x00100000, False, int(pid))
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+    if not handle:
+        return False
+    try:
+        wait_timeout = 0x00000102
+        return kernel32.WaitForSingleObject(handle, 0) == wait_timeout
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def _health_check(manifest: ApprovalCenterManifest) -> bool:
