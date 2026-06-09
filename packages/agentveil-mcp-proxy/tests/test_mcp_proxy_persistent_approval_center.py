@@ -134,7 +134,7 @@ def test_windows_process_alive_check_does_not_send_signal(monkeypatch):
     def fail_kill(_pid, _signal):
         raise AssertionError("Windows process check must not call os.kill(pid, 0)")
 
-    monkeypatch.setattr(persistent_module.os, "name", "nt")
+    monkeypatch.setattr(persistent_module, "IS_WINDOWS", True)
     monkeypatch.setattr(persistent_module.os, "kill", fail_kill)
     monkeypatch.setattr(
         persistent_module,

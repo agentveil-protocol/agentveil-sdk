@@ -19,6 +19,7 @@ from agentveil_mcp_proxy.approval.server import ApprovalServer, ApprovalServerEr
 MANIFEST_FILENAME = "approval-center.manifest.json"
 MANIFEST_SCHEMA_VERSION = 2
 HEALTH_TIMEOUT_SECONDS = 2.0
+IS_WINDOWS = os.name == "nt"
 
 
 class PersistentApprovalCenterError(RuntimeError):
@@ -112,7 +113,7 @@ def save_manifest(proxy_dir: Path, manifest: ApprovalCenterManifest) -> None:
 def is_process_alive(pid: int | None) -> bool:
     if pid is None or pid <= 0:
         return False
-    if os.name == "nt":
+    if IS_WINDOWS:
         return _windows_process_alive(pid)
     try:
         os.kill(pid, 0)
