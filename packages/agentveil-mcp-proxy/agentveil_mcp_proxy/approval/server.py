@@ -78,6 +78,7 @@ class ApprovalPrompt:
     created_at: int
     expires_at: int
     csrf_token: str
+    action_gate_metadata: dict[str, Any] | None = None
     scope_expansion_allowed: bool = False
 
 
@@ -298,6 +299,7 @@ class ApprovalServer:
             policy_rule_id=prompt.policy_rule_id,
             created_at=prompt.created_at,
             expires_at=prompt.expires_at,
+            action_gate_metadata=prompt.action_gate_metadata,
         )
 
     def pending_approvals_api_payload(self) -> dict[str, Any]:
@@ -662,6 +664,7 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
             f'<div><dt>Created</dt><dd>{row["created_at"]}</dd></div>'
             f'<div><dt>Expires</dt><dd>{row["expires_at"]}</dd></div>'
             f'<div><dt>Payload hash</dt><dd class="approval-wrap">{escape(row["payload_hash"])}</dd></div>'
+            f"{self._render_level2_metadata(row.get('action_gate_metadata'))}"
             "</dl>"
             f'<p class="approval-request-id">request {escape(row["request_id"])}</p>'
             f'<p class="approval-card-actions">'
@@ -713,6 +716,7 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
 <dt>Risk</dt><dd>{escape(prompt.risk_class)}</dd>
 <dt>Payload hash</dt><dd>{escape(prompt.payload_hash)}</dd>
 <dt>Policy rule</dt><dd>{escape(prompt.policy_rule_id)}</dd>
+{self._render_level2_metadata(prompt.action_gate_metadata)}
 <dt>Created</dt><dd>{prompt.created_at}</dd>
 <dt>Expires</dt><dd>{prompt.expires_at}</dd>
 </dl>
@@ -726,6 +730,35 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
 {similar}
 """
         return self._page(title, body, page_kind="detail")
+
+    def _render_level2_metadata(self, metadata: Any) -> str:
+        if not isinstance(metadata, dict):
+            return ""
+        labels = (
+            ("role", "Role"),
+            ("authority", "Authority"),
+            ("action_family", "Action family"),
+            ("policy_decision", "Policy decision"),
+            ("approval_status", "Approval status"),
+            ("execution_status", "Execution status"),
+            ("target_reached", "Target reached"),
+            ("redirect_playbook_id", "Redirect"),
+        )
+        items = []
+        for key, label in labels:
+            if key not in metadata:
+                continue
+            value = metadata[key]
+            if isinstance(value, bool):
+                rendered = "true" if value else "false"
+            elif isinstance(value, str):
+                rendered = value
+            else:
+                continue
+            items.append(f"<dt>{escape(label)}</dt><dd>{escape(rendered)}</dd>")
+        if not items:
+            return ""
+        return "".join(items)
 
     def _security_notice_html(self) -> str:
         return (

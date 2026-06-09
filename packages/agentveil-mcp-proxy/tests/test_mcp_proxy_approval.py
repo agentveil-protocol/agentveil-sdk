@@ -87,8 +87,9 @@ def _config(
     on_timeout: str = "deny",
     ui_open_mode: str = "browser",
     policy_id: str = "approval-test",
+    role_authority: dict[str, Any] | None = None,
 ) -> ProxyConfig:
-    return ProxyConfig.from_dict({
+    payload = {
         "proxy_config_schema_version": 1,
         "avp": {
             "base_url": "https://agentveil.dev",
@@ -123,7 +124,10 @@ def _config(
             "rules": [policy_rule] if policy_rule is not None else [],
         },
         "downstream": {},
-    })
+    }
+    if role_authority is not None:
+        payload["role_authority"] = role_authority
+    return ProxyConfig.from_dict(payload)
 
 
 def _allow_run_terminal_cmd_rule() -> dict[str, Any]:
@@ -2938,6 +2942,50 @@ def test_api_approvals_returns_pending_json(tmp_path):
         store.close()
 
 
+def test_api_approvals_includes_bounded_level2_metadata(tmp_path):
+    config = _config(
+        policy_rule=_write_rule(),
+        role_authority={"mode": "enforce", "role": "implementer", "authority": "implement"},
+    )
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        wait_for_decision=False,
+    )
+    try:
+        outcome = manager.request_approval(
+            _classification(config),
+            reason="local_approval_required",
+        )
+        response = httpx.get(
+            f"{server.base_url}/approval/{server.session_token}/api/approvals",
+            timeout=2,
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        approval = next(item for item in payload["approvals"] if item["request_id"] == outcome.request_id)
+        metadata = approval["action_gate_metadata"]
+        assert metadata == {
+            "action_family": "create",
+            "policy_decision": "approval",
+            "approval_status": ApprovalStatus.PENDING.value,
+            "execution_status": "not_reached",
+            "target_reached": False,
+            "redirect_playbook_id": "request_approval",
+            "role": "implementer",
+            "authority": "implement",
+        }
+        rendered = json.dumps(payload)
+        _assert_t1_privacy_safe_text(rendered)
+        assert SECRET not in rendered
+        assert "ghp_private" not in rendered
+        assert "source_code" not in rendered
+        assert "session-1234567890" not in rendered
+    finally:
+        server.stop()
+        store.close()
+
+
 def test_api_approvals_forbidden_without_valid_token():
     server = ApprovalServer()
     server.start()
@@ -2986,6 +3034,51 @@ def test_dashboard_pending_cards_render_sanitized_fields(tmp_path):
         assert "approval-wrap" in text
         assert "Created" in text
         assert "Expires" in text
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_dashboard_and_detail_render_level2_metadata_without_raw_payload(tmp_path):
+    config = _config(
+        policy_rule=_write_rule(),
+        role_authority={"mode": "enforce", "role": "implementer", "authority": "implement"},
+    )
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        wait_for_decision=False,
+    )
+    try:
+        manager.request_approval(
+            _classification(config),
+            reason="local_approval_required",
+        )
+        prompt = server.pending_prompts()[0]
+        dashboard = httpx.get(server.approval_center_url()).text
+        detail = httpx.get(server.approval_url(prompt.request_id)).text
+        for text in (dashboard, detail):
+            assert "Role" in text
+            assert "implementer" in text
+            assert "Authority" in text
+            assert "implement" in text
+            assert "Action family" in text
+            assert "create" in text
+            assert "Policy decision" in text
+            assert "approval" in text
+            assert "Approval status" in text
+            assert "pending" in text
+            assert "Execution status" in text
+            assert "not_reached" in text
+            assert "Target reached" in text
+            assert "false" in text
+            assert "Redirect" in text
+            assert "request_approval" in text
+            _assert_t1_privacy_safe_text(text)
+            assert SECRET not in text
+            assert "ghp_private" not in text
+            assert "source_code" not in text
+            assert "session-1234567890" not in text
     finally:
         server.stop()
         store.close()

@@ -42,6 +42,7 @@ from agentveil_mcp_proxy.policy import (
     RiskClass,
     TimeoutAction,
 )
+from agentveil_mcp_proxy.role_doctor import build_approval_guidance
 from agentveil_mcp_proxy.runtime_gate import DEFAULT_RUNTIME_ENVIRONMENT, RuntimeGateDecision
 
 
@@ -711,6 +712,19 @@ class ApprovalManager:
             action_details = classification.action_plain
         if privacy.show_details_in_approval_ui and privacy.resource == "plain":
             resource_details = classification.resource_plain
+        approval_guidance = build_approval_guidance(classification, reason=reason)
+        action_gate_metadata: dict[str, Any] = {
+            "action_family": classification.action_family,
+            "policy_decision": classification.policy_evaluation.decision.value,
+            "approval_status": ApprovalStatus.PENDING.value,
+            "execution_status": "not_reached",
+            "target_reached": False,
+            "redirect_playbook_id": approval_guidance.redirect.redirect_playbook_id,
+        }
+        if classification.role is not None:
+            action_gate_metadata["role"] = classification.role
+        if classification.authority is not None:
+            action_gate_metadata["authority"] = classification.authority
         return ApprovalPrompt(
             request_id=request_id,
             client_id=self.client_id,
@@ -728,6 +742,7 @@ class ApprovalManager:
             created_at=created_at,
             expires_at=expires_at,
             csrf_token=secrets.token_urlsafe(24),
+            action_gate_metadata=action_gate_metadata,
             scope_expansion_allowed=scope_expansion_allowed,
         )
 

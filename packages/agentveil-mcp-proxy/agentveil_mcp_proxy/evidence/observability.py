@@ -24,11 +24,12 @@ def pending_approval_dict(
     policy_rule_id: str,
     created_at: int,
     expires_at: int,
+    action_gate_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a redacted JSON view for one loopback pending approval."""
 
     resource = resource_display if resource_display is not None else "none"
-    return {
+    payload = {
         "request_id": request_id,
         "client_id": client_id,
         "session_id_prefix": session_id[:8],
@@ -44,6 +45,9 @@ def pending_approval_dict(
         "created_at": created_at,
         "expires_at": expires_at,
     }
+    if action_gate_metadata is not None:
+        payload["action_gate_metadata"] = action_gate_metadata
+    return payload
 
 
 def execution_record_id_by_parent(
