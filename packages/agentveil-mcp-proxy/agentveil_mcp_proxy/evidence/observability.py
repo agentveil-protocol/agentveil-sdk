@@ -72,6 +72,44 @@ def parse_controlled_path_metadata(record: PendingApproval) -> dict[str, Any] | 
     return parse_action_gate_metadata(record)
 
 
+def terminal_state_for_record_status(status: str) -> str | None:
+    """Map durable evidence status to Approval Center terminal page state."""
+
+    if status == ApprovalStatus.APPROVED.value:
+        return "already_decided_approve"
+    if status == ApprovalStatus.DENIED.value:
+        return "already_decided_deny"
+    if status == ApprovalStatus.EXPIRED.value:
+        return "approval_expired"
+    return None
+
+
+def bounded_action_display(record: PendingApproval) -> str:
+    """Return a bounded action label for one evidence record."""
+
+    return f"{record.downstream_server}.{record.tool_name}"
+
+
+def bounded_resource_display(record: PendingApproval) -> str:
+    """Return a bounded resource label for one evidence record."""
+
+    if not record.resource_hash:
+        return "none"
+    return f"hash:{record.resource_hash[:12]}"
+
+
+def bounded_reason_for_record(record: PendingApproval) -> str:
+    """Return a bounded reason label for one evidence record."""
+
+    if record.error_class:
+        return record.error_class
+    if record.status == ApprovalStatus.APPROVED.value:
+        return "user_approved"
+    if record.status == ApprovalStatus.DENIED.value:
+        return "user_denied"
+    return "local_approval_required"
+
+
 def parse_action_gate_metadata(record: PendingApproval) -> dict[str, Any] | None:
     """Parse bounded action-gate metadata stored on one evidence record."""
 

@@ -35,6 +35,13 @@ from agentveil_mcp_proxy.approval import (
     HeadlessPolicy,
     HeadlessPolicyError,
 )
+from agentveil_mcp_proxy.approval.client import resolve_approval_server
+from agentveil_mcp_proxy.approval.persistent import (
+    PersistentApprovalCenterError,
+    build_manifest_for_server,
+    create_persistent_server,
+    save_manifest,
+)
 from agentveil_mcp_proxy.classification import ToolCallClassifier
 from agentveil_mcp_proxy.evidence import (
     ApprovalEvidenceError,
@@ -2023,6 +2030,88 @@ def vacuum_events(
     return deleted
 
 
+def serve_approval_center(
+    *,
+    home: Path | None = None,
+    config_path: Path | None = None,
+    passphrase: str | None = None,
+    passphrase_file: Path | None = None,
+    port: int = 0,
+    err: TextIO | None = None,
+) -> int:
+    """Run the stable local Approval Center for any MCP client turn."""
+
+    err = err or sys.stderr
+    paths = proxy_paths(home, config_path)
+    config = load_proxy_config(paths.config_path)
+    identity_path = paths.identity_path(config.avp.agent_name)
+    identity = _read_json(identity_path, "agent identity")
+    identity_passphrase = _resolve_existing_identity_passphrase(
+        identity,
+        passphrase=passphrase,
+        passphrase_file=passphrase_file,
+    )
+    proxy_agent = _load_proxy_agent(
+        identity=identity,
+        config=config,
+        passphrase=identity_passphrase,
+    )
+    evidence_store = ApprovalEvidenceStore(paths.proxy_dir / "evidence.sqlite")
+    try:
+        approval_server = create_persistent_server(
+            proxy_dir=paths.proxy_dir,
+            evidence_store=evidence_store,
+            port=port,
+        )
+    except PersistentApprovalCenterError as exc:
+        raise ProxyCliError(str(exc), exit_code=1) from exc
+    try:
+        approval_grant_private_key_seed = bytes.fromhex(proxy_agent.private_key_hex)
+    except (AttributeError, TypeError, ValueError):
+        approval_grant_private_key_seed = None
+    approval_grant_agent_did = getattr(proxy_agent, "did", None)
+    if not isinstance(approval_grant_agent_did, str):
+        approval_grant_agent_did = None
+    downstream_name = DownstreamConfig.from_proxy_config(config).name
+    approval_manager = ApprovalManager(
+        evidence_store=evidence_store,
+        approval_server=approval_server,
+        config=config,
+        client_id=f"{downstream_name}:approval-center",
+        headless=True,
+        cli_out=err,
+        wait_for_decision=False,
+        approval_grant_private_key_seed=approval_grant_private_key_seed,
+        approval_grant_agent_did=approval_grant_agent_did,
+    )
+    _ = approval_manager
+    save_manifest(paths.proxy_dir, build_manifest_for_server(approval_server))
+    print(
+        f"Approval Center: {approval_server.approval_center_url()}",
+        file=err,
+    )
+    stop_event = threading.Event()
+
+    def _request_stop(_signum: int, _frame: Any) -> None:
+        stop_event.set()
+
+    previous_handlers: dict[int, Any] | None = None
+    if threading.current_thread() is threading.main_thread():
+        previous_handlers = {
+            signal.SIGINT: signal.signal(signal.SIGINT, _request_stop),
+            signal.SIGTERM: signal.signal(signal.SIGTERM, _request_stop),
+        }
+    try:
+        stop_event.wait()
+        return 0
+    finally:
+        if previous_handlers is not None:
+            signal.signal(signal.SIGINT, previous_handlers[signal.SIGINT])
+            signal.signal(signal.SIGTERM, previous_handlers[signal.SIGTERM])
+        approval_server.stop()
+        evidence_store.close()
+
+
 def run_proxy(
     *,
     home: Path | None = None,
@@ -2094,8 +2183,17 @@ def run_proxy(
             except HeadlessPolicyError as exc:
                 raise ProxyCliError(str(exc), exit_code=1) from exc
         evidence_store = ApprovalEvidenceStore(paths.proxy_dir / "evidence.sqlite")
-        approval_server = ApprovalServer()
-        approval_server.start()
+
+        def _start_ephemeral_approval_server() -> ApprovalServer:
+            server = ApprovalServer()
+            server.start()
+            return server
+
+        approval_server = resolve_approval_server(
+            paths.proxy_dir,
+            evidence_store=evidence_store,
+            fallback_factory=_start_ephemeral_approval_server,
+        )
         try:
             approval_grant_private_key_seed = bytes.fromhex(proxy_agent.private_key_hex)
         except (AttributeError, TypeError, ValueError):
@@ -2136,7 +2234,8 @@ def run_proxy(
             return 0
         finally:
             _restore_signal_handlers(previous_handlers)
-            approval_server.stop()
+            if getattr(approval_server, "owns_server_process", True):
+                approval_server.stop()
             evidence_store.close()
     except PassthroughError as exc:
         raise ProxyCliError(str(exc), exit_code=1) from exc
@@ -2289,6 +2388,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--full",
         action="store_true",
         help="Also launch downstream and verify MCP initialize/tools/list",
+    )
+
+    approval_center = subparsers.add_parser(
+        "approval-center",
+        help="Manage the stable local Approval Center",
+    )
+    approval_center_subparsers = approval_center.add_subparsers(
+        dest="approval_center_action",
+        required=True,
+    )
+    approval_center_serve = approval_center_subparsers.add_parser(
+        "serve",
+        help="Run the stable local Approval Center for any MCP client turn",
+    )
+    _add_common_path_args(approval_center_serve)
+    _add_passphrase_args(approval_center_serve)
+    approval_center_serve.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        help="Loopback port for the Approval Center (0 = reuse manifest or assign)",
     )
 
     run = subparsers.add_parser("run", help="Run stdio MCP passthrough")
@@ -2633,6 +2753,16 @@ def main(argv: list[str] | None = None) -> int:
                 check_backend=args.check_backend,
                 full=args.full,
                 output_json=args.json_output,
+            )
+        if args.command == "approval-center":
+            if args.approval_center_action != "serve":
+                raise ProxyCliError("approval-center action must be serve")
+            return serve_approval_center(
+                home=args.home,
+                config_path=args.config,
+                passphrase=args.passphrase,
+                passphrase_file=args.passphrase_file,
+                port=args.port,
             )
         if args.command == "run":
             return run_proxy(

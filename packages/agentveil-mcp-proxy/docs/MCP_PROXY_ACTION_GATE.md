@@ -319,3 +319,39 @@ PYTHONPATH=.:packages/agentveil-mcp-proxy pytest \
 PYTHONPATH=.:packages/agentveil-mcp-proxy python3 \
   packages/agentveil-mcp-proxy/tests/live/mcp_proxy_config_wizard_smoke.py
 ```
+
+## P10A.9 persistent Approval Center / any-client UX
+
+P10A.9 makes the local Approval Center a stable product path for any MCP client
+turn. A one-shot `agentveil-mcp-proxy run` no longer owns the only loopback
+approval HTTP server.
+
+Start the stable center once per AVP home:
+
+```bash
+agentveil-mcp-proxy approval-center serve --home ~/.avp
+```
+
+Product behavior:
+
+- `agentveil-mcp-proxy run` reuses the stable Approval Center when its manifest
+  and process are alive.
+- Approval URLs point at the stable center port/token, not a transient per-run
+  server.
+- Terminal approved/denied pages render from durable local evidence when the
+  original in-memory prompt is gone.
+- Ephemeral in-process Approval Center remains the fallback when the stable
+  center is not running.
+
+Boundary: this is the MCP proxy any-client approval path. It does not depend on
+Agent Console, backend APIs, VPS deploy, or provider-native hooks.
+
+Verification:
+
+```bash
+PYTHONPATH=.:packages/agentveil-mcp-proxy pytest \
+  packages/agentveil-mcp-proxy/tests/test_mcp_proxy_persistent_approval_center.py -q
+
+PYTHONPATH=.:packages/agentveil-mcp-proxy python3 \
+  packages/agentveil-mcp-proxy/tests/live/mcp_proxy_persistent_approval_center_smoke.py
+```

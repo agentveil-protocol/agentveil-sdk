@@ -13,10 +13,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import secrets
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 from urllib.parse import parse_qs
 
-from agentveil_mcp_proxy.evidence.observability import pending_approval_dict
+from agentveil_mcp_proxy.evidence.observability import (
+    bounded_action_display,
+    bounded_reason_for_record,
+    bounded_resource_display,
+    pending_approval_dict,
+    terminal_state_for_record_status,
+)
 
 
 MAX_POST_BODY_BYTES = 8192
@@ -36,6 +42,7 @@ SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
 }
 COOKIE_NAME = "avp_approval_session"
+INTERNAL_REGISTER_TOKEN_HEADER = "X-AVP-Approval-Register-Token"
 APPROVAL_LOCAL_URL_WARNING = (
     "This local approval URL is a bearer-style session URL. Do not share it."
 )
@@ -127,16 +134,110 @@ class TerminalApprovalSnapshot:
             expires_at=prompt.expires_at,
         )
 
+    @classmethod
+    def from_pending_record(
+        cls,
+        record: Any,
+        *,
+        state: str | None = None,
+    ) -> TerminalApprovalSnapshot | None:
+        """Build a terminal snapshot from one durable evidence record."""
+
+        resolved_state = state or terminal_state_for_record_status(record.status)
+        if resolved_state is None:
+            return None
+        client_id = record.client_id if isinstance(record.client_id, str) and record.client_id else "-"
+        session_prefix = record.session_id[:8] if isinstance(record.session_id, str) else "-"
+        policy_rule_id = record.policy_rule_id if isinstance(record.policy_rule_id, str) else "-"
+        expires_at = record.expires_at if record.expires_at is not None else record.created_at
+        return cls(
+            request_id=record.request_id,
+            state=resolved_state,
+            client_id=client_id,
+            session_id_prefix=session_prefix,
+            downstream_server=record.downstream_server,
+            tool_name=record.tool_name,
+            risk_class=record.risk_class,
+            reason=bounded_reason_for_record(record),
+            action_display=bounded_action_display(record),
+            resource_display=bounded_resource_display(record),
+            policy_rule_id=policy_rule_id,
+            created_at=record.created_at,
+            expires_at=expires_at,
+        )
+
+
+def approval_prompt_to_dict(prompt: ApprovalPrompt) -> dict[str, Any]:
+    """Serialize one approval prompt for the persistent center register API."""
+
+    return {
+        "request_id": prompt.request_id,
+        "client_id": prompt.client_id,
+        "session_id": prompt.session_id,
+        "downstream_server": prompt.downstream_server,
+        "tool_name": prompt.tool_name,
+        "action_display": prompt.action_display,
+        "action_details": prompt.action_details,
+        "resource_display": prompt.resource_display,
+        "resource_details": prompt.resource_details,
+        "risk_class": prompt.risk_class,
+        "payload_hash": prompt.payload_hash,
+        "policy_rule_id": prompt.policy_rule_id,
+        "reason": prompt.reason,
+        "created_at": prompt.created_at,
+        "expires_at": prompt.expires_at,
+        "csrf_token": prompt.csrf_token,
+        "action_gate_metadata": prompt.action_gate_metadata,
+        "scope_expansion_allowed": prompt.scope_expansion_allowed,
+    }
+
+
+def approval_prompt_from_dict(data: Mapping[str, Any]) -> ApprovalPrompt:
+    """Deserialize one approval prompt from the persistent center register API."""
+
+    return ApprovalPrompt(
+        request_id=str(data["request_id"]),
+        client_id=str(data["client_id"]),
+        session_id=str(data["session_id"]),
+        downstream_server=str(data["downstream_server"]),
+        tool_name=str(data["tool_name"]),
+        action_display=str(data["action_display"]),
+        action_details=data.get("action_details"),
+        resource_display=data.get("resource_display"),
+        resource_details=data.get("resource_details"),
+        risk_class=str(data["risk_class"]),
+        payload_hash=str(data["payload_hash"]),
+        policy_rule_id=str(data["policy_rule_id"]),
+        reason=str(data["reason"]),
+        created_at=int(data["created_at"]),
+        expires_at=int(data["expires_at"]),
+        csrf_token=str(data["csrf_token"]),
+        action_gate_metadata=data.get("action_gate_metadata"),
+        scope_expansion_allowed=bool(data.get("scope_expansion_allowed", False)),
+    )
+
 
 class ApprovalServer:
     """Authenticated loopback HTTP server for local approval decisions."""
 
-    def __init__(self, *, host: str = "127.0.0.1", port: int = 0):
+    owns_server_process = True
+
+    def __init__(
+        self,
+        *,
+        host: str = "127.0.0.1",
+        port: int = 0,
+        session_token: str | None = None,
+        internal_register_token: str | None = None,
+        evidence_store: Any = None,
+    ):
         if host != "127.0.0.1":
             raise ApprovalServerError("approval server must bind to 127.0.0.1")
         self.host = host
         self.port = port
-        self.session_token = secrets.token_urlsafe(32)
+        self.session_token = session_token or secrets.token_urlsafe(32)
+        self.internal_register_token = internal_register_token
+        self.evidence_store = evidence_store
         self._hmac_key = secrets.token_bytes(32)
         self._cookie_nonce = secrets.token_urlsafe(16)
         self._lock = threading.RLock()
@@ -359,14 +460,25 @@ class ApprovalServer:
                 return snapshot
             decision = self._decisions.get(request_id)
             prompt = self._prompts.get(request_id)
-            if decision is None or prompt is None:
-                return None
-            state = TERMINAL_ALREADY_DECIDED
-            if decision.decision == "approve":
-                state = TERMINAL_ALREADY_DECIDED_APPROVE
-            elif decision.decision == "deny":
-                state = TERMINAL_ALREADY_DECIDED_DENY
-            return TerminalApprovalSnapshot.from_prompt(prompt, state=state)
+            if decision is not None and prompt is not None:
+                state = TERMINAL_ALREADY_DECIDED
+                if decision.decision == "approve":
+                    state = TERMINAL_ALREADY_DECIDED_APPROVE
+                elif decision.decision == "deny":
+                    state = TERMINAL_ALREADY_DECIDED_DENY
+                return TerminalApprovalSnapshot.from_prompt(prompt, state=state)
+        return self._terminal_snapshot_from_evidence(request_id)
+
+    def _terminal_snapshot_from_evidence(self, request_id: str) -> TerminalApprovalSnapshot | None:
+        """Load terminal context from durable evidence when in-memory state is gone."""
+
+        store = self.evidence_store
+        if store is None:
+            return None
+        record = store.get_pending(request_id)
+        if record is None:
+            return None
+        return TerminalApprovalSnapshot.from_pending_record(record)
 
     def submit_decision(self, request_id: str, decision: str, approval_scope: str) -> None:
         """Record a local approve/deny POST."""
@@ -411,6 +523,14 @@ class ApprovalServer:
         if morsel is None:
             return False
         return hmac.compare_digest(morsel.value, self._cookie_value())
+
+    def _valid_internal_register_token(self, raw_token: str | None) -> bool:
+        expected = self.internal_register_token
+        if not isinstance(expected, str) or not expected:
+            return False
+        if not isinstance(raw_token, str) or not raw_token:
+            return False
+        return hmac.compare_digest(raw_token, expected)
 
     def _terminal_retain_until(self, prompt: ApprovalPrompt | None) -> float:
         now = time.time()
@@ -465,6 +585,12 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         token, route, request_id = self._parse_path()
+        if route == "internal_register":
+            self._handle_internal_register()
+            return
+        if route == "legacy_internal_register":
+            self._send_text(HTTPStatus.FORBIDDEN, "forbidden")
+            return
         if route != "pending" or request_id is None or not self._token_ok(token):
             if route == "api_list":
                 self._send_text(HTTPStatus.FORBIDDEN, "forbidden")
@@ -561,15 +687,54 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
 
     def _parse_path(self) -> tuple[str | None, str | None, str | None]:
         parts = [part for part in self.path.split("?")[0].split("/") if part]
+        if len(parts) == 2 and parts[0] == "internal" and parts[1] == "register":
+            return None, "internal_register", None
         if len(parts) >= 2 and parts[0] == "approval":
             token = parts[1]
             if len(parts) == 2:
                 return token, "list", None
             if len(parts) == 4 and parts[2] == "api" and parts[3] == "approvals":
                 return token, "api_list", None
+            if len(parts) == 4 and parts[2] == "internal" and parts[3] == "register":
+                return token, "legacy_internal_register", None
             if len(parts) == 4 and parts[2] == "pending":
                 return token, "pending", parts[3]
         return None, None, None
+
+    def _handle_internal_register(self) -> None:
+        if not self.server_owner._valid_internal_register_token(
+            self.headers.get(INTERNAL_REGISTER_TOKEN_HEADER),
+        ):
+            self._send_text(HTTPStatus.FORBIDDEN, "forbidden")
+            return
+        raw_length = self.headers.get("Content-Length", "0") or "0"
+        try:
+            length = int(raw_length)
+        except ValueError:
+            self._send_text(HTTPStatus.BAD_REQUEST, "invalid content length")
+            return
+        if length < 0 or length > MAX_POST_BODY_BYTES:
+            self._send_text(HTTPStatus.BAD_REQUEST, "invalid content length")
+            return
+        body = self.rfile.read(length).decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            self._send_text(HTTPStatus.BAD_REQUEST, "invalid json")
+            return
+        if not isinstance(payload, dict):
+            self._send_text(HTTPStatus.BAD_REQUEST, "invalid json")
+            return
+        try:
+            prompt = approval_prompt_from_dict(payload)
+        except (KeyError, TypeError, ValueError):
+            self._send_text(HTTPStatus.BAD_REQUEST, "invalid prompt")
+            return
+        approval_url = self.server_owner.register(prompt)
+        self._send_json(
+            HTTPStatus.OK,
+            {"ok": True, "approval_url": approval_url},
+        )
 
     def _token_ok(self, token: str | None) -> bool:
         return bool(token) and hmac.compare_digest(token or "", self.server_owner.session_token)
@@ -985,6 +1150,7 @@ details {{ margin: 8px 0 12px; }}
 
 __all__ = [
     "APPROVAL_LOCAL_URL_WARNING",
+    "INTERNAL_REGISTER_TOKEN_HEADER",
     "ApprovalPrompt",
     "ApprovalServer",
     "ApprovalServerDecision",
