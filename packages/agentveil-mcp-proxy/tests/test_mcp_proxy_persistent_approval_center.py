@@ -130,22 +130,26 @@ def test_persistent_manifest_is_reachable(tmp_path):
         store.close()
 
 
-def test_manifest_health_check_ignores_environment_proxies(tmp_path, monkeypatch):
+def test_manifest_health_check_uses_direct_loopback_socket(tmp_path, monkeypatch):
     store, server, _manager, proxy_dir = _start_persistent_center(tmp_path)
 
-    original_client = persistent_module.httpx.Client
-    seen_trust_env: list[bool | None] = []
+    original_create_connection = persistent_module.socket.create_connection
+    seen_addresses: list[tuple[str, int]] = []
 
-    def client_without_environment_proxy(*args, **kwargs):
-        seen_trust_env.append(kwargs.get("trust_env"))
-        return original_client(*args, **kwargs)
+    def direct_loopback_connection(address, *args, **kwargs):
+        seen_addresses.append(address)
+        return original_create_connection(address, *args, **kwargs)
 
-    monkeypatch.setattr(persistent_module.httpx, "Client", client_without_environment_proxy)
+    monkeypatch.setattr(
+        persistent_module.socket,
+        "create_connection",
+        direct_loopback_connection,
+    )
     try:
         manifest = load_manifest(proxy_dir)
         assert manifest is not None
         assert manifest_is_reachable(manifest)
-        assert seen_trust_env == [False]
+        assert seen_addresses == [("127.0.0.1", server.port)]
     finally:
         server.stop()
         store.close()

@@ -8,10 +8,10 @@ import json
 import os
 from pathlib import Path
 import secrets
+import socket
 import time
 from typing import Any, Callable
-
-import httpx
+from urllib.parse import urlsplit
 
 from agentveil_mcp_proxy.approval.server import ApprovalServer, ApprovalServerError
 
@@ -123,7 +123,7 @@ def _health_check(manifest: ApprovalCenterManifest) -> bool:
     url = f"{manifest.approval_center_url()}/api/approvals"
     try:
         return loopback_get_status(url, timeout=HEALTH_TIMEOUT_SECONDS) == 200
-    except (httpx.HTTPError, OSError, TimeoutError, ValueError):
+    except (OSError, TimeoutError, ValueError):
         return False
 
 
@@ -132,10 +132,111 @@ def loopback_get_status(
     *,
     timeout: float,
 ) -> int:
-    """Fetch loopback Approval Center status without environment proxies."""
+    """Fetch loopback Approval Center status without HTTP proxy stacks."""
 
-    with httpx.Client(trust_env=False, timeout=timeout) as client:
-        return int(client.get(url).status_code)
+    status, _body = loopback_http_request("GET", url, timeout=timeout)
+    return status
+
+
+def loopback_json_post(
+    url: str,
+    *,
+    payload: dict[str, Any],
+    headers: dict[str, str] | None = None,
+    timeout: float,
+) -> dict[str, Any]:
+    """POST JSON to the loopback Approval Center without HTTP proxy stacks."""
+
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    request_headers = {"Content-Type": "application/json"}
+    if headers:
+        request_headers.update(headers)
+    status, response_body = loopback_http_request(
+        "POST",
+        url,
+        headers=request_headers,
+        body=body,
+        timeout=timeout,
+    )
+    if status >= 400:
+        raise OSError(f"loopback Approval Center returned HTTP {status}")
+    parsed = json.loads(response_body.decode("utf-8"))
+    if not isinstance(parsed, dict):
+        raise ValueError("loopback Approval Center returned non-object JSON")
+    return parsed
+
+
+def loopback_http_request(
+    method: str,
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    body: bytes = b"",
+    timeout: float,
+) -> tuple[int, bytes]:
+    """Make a minimal HTTP/1.1 request to 127.0.0.1 with bounded reads."""
+
+    parsed = urlsplit(url)
+    if parsed.scheme != "http" or parsed.hostname != "127.0.0.1":
+        raise ValueError("loopback Approval Center URL must be http://127.0.0.1")
+    port = parsed.port
+    if port is None:
+        raise ValueError("loopback Approval Center URL must include a port")
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    request_headers = {
+        "Host": f"127.0.0.1:{port}",
+        "Connection": "close",
+    }
+    if body:
+        request_headers["Content-Length"] = str(len(body))
+    if headers:
+        request_headers.update(headers)
+    header_lines = [f"{method} {path} HTTP/1.1"]
+    header_lines.extend(f"{key}: {value}" for key, value in request_headers.items())
+    request = ("\r\n".join(header_lines) + "\r\n\r\n").encode("ascii") + body
+    with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        sock.sendall(request)
+        response = _read_http_response(sock)
+    return _parse_http_response(response)
+
+
+def _read_http_response(sock: socket.socket) -> bytes:
+    response = b""
+    while b"\r\n\r\n" not in response:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        response += chunk
+    headers, separator, body = response.partition(b"\r\n\r\n")
+    if not separator:
+        raise OSError("loopback Approval Center returned incomplete HTTP headers")
+    content_length = _content_length_from_headers(headers)
+    while len(body) < content_length:
+        chunk = sock.recv(min(4096, content_length - len(body)))
+        if not chunk:
+            raise OSError("loopback Approval Center returned incomplete HTTP body")
+        body += chunk
+    return headers + separator + body[:content_length]
+
+
+def _content_length_from_headers(headers: bytes) -> int:
+    for raw_line in headers.splitlines()[1:]:
+        name, separator, value = raw_line.partition(b":")
+        if separator and name.strip().lower() == b"content-length":
+            return int(value.strip())
+    raise OSError("loopback Approval Center response missing Content-Length")
+
+
+def _parse_http_response(response: bytes) -> tuple[int, bytes]:
+    headers, _separator, body = response.partition(b"\r\n\r\n")
+    status_line = headers.splitlines()[0].decode("ascii", errors="replace")
+    parts = status_line.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        raise OSError("loopback Approval Center returned invalid status line")
+    return int(parts[1]), body
 
 
 def manifest_is_reachable(manifest: ApprovalCenterManifest) -> bool:
@@ -203,6 +304,8 @@ __all__ = [
     "build_manifest_for_server",
     "create_persistent_server",
     "load_manifest",
+    "loopback_http_request",
+    "loopback_json_post",
     "loopback_get_status",
     "manifest_is_reachable",
     "manifest_path",

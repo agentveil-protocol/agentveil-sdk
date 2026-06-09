@@ -2,17 +2,15 @@
 
 from __future__ import annotations
 
-import json
 import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
 
-import httpx
-
 from agentveil_mcp_proxy.approval.persistent import (
     ApprovalCenterManifest,
     load_manifest,
+    loopback_json_post,
     manifest_is_reachable,
 )
 from agentveil_mcp_proxy.approval.server import (
@@ -83,21 +81,16 @@ class RemoteApprovalServer:
     def register(self, prompt: ApprovalPrompt) -> str:
         url = f"{self.base_url}/internal/register"
         try:
-            with httpx.Client(trust_env=False, timeout=REGISTER_TIMEOUT_SECONDS) as client:
-                response = client.post(
-                    url,
-                    json=approval_prompt_to_dict(prompt),
-                    headers={
-                        INTERNAL_REGISTER_TOKEN_HEADER: self._manifest.internal_register_token,
-                    },
-                )
-                body = response.text
-        except httpx.HTTPError as exc:
+            parsed = loopback_json_post(
+                url,
+                payload=approval_prompt_to_dict(prompt),
+                headers={
+                    INTERNAL_REGISTER_TOKEN_HEADER: self._manifest.internal_register_token,
+                },
+                timeout=REGISTER_TIMEOUT_SECONDS,
+            )
+        except (OSError, TimeoutError, ValueError) as exc:
             raise ApprovalServerError("persistent approval center is unavailable") from exc
-        try:
-            parsed = json.loads(body)
-        except json.JSONDecodeError as exc:
-            raise ApprovalServerError("persistent approval center returned invalid json") from exc
         if not isinstance(parsed, dict) or not parsed.get("ok"):
             raise ApprovalServerError("persistent approval center rejected prompt registration")
         approval_url = parsed.get("approval_url")
