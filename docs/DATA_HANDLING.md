@@ -86,7 +86,8 @@ workflow input:
 
 - direct SDK execution parameters passed through `controlled_action(...)`,
   `execute(...)`, or `execute_after_approval(...)`;
-- messages, jobs, support requests, and similar hosted content workflows;
+- legacy or experimental hosted workflows, only when explicitly enabled;
+- support requests and similar hosted content workflows;
 - user-provided configuration or metadata fields.
 
 Do not describe these paths as metadata-only. Use them only when the content is
@@ -103,7 +104,7 @@ personal data, confidential business content, or sensitive customer payloads in:
 - policy fields;
 - denial reasons;
 - support messages;
-- job titles/descriptions/results;
+- legacy or experimental hosted workflow fields;
 - direct execution `params`.
 
 For sensitive actions, prefer resource IDs, content hashes, request hashes, and
@@ -124,9 +125,10 @@ metadata into raw MCP payload storage.
 
 ## Model Training and Sale
 
-AgentVeil does not use customer data, source code, prompts, messages, jobs,
-execution parameters, action metadata, receipts, or scan reports to train AI
-models. AgentVeil does not sell customer data.
+AgentVeil does not use customer data, source code, prompts, legacy or
+experimental hosted workflow content, execution parameters, action metadata,
+receipts, or scan reports to train AI models. AgentVeil does not sell customer
+data.
 
 ## Retention
 
