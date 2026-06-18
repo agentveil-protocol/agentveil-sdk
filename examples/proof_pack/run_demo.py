@@ -3,9 +3,9 @@ AVP Proof Pack — orchestrator.
 
 Runs the full story arc end-to-end against a LOCAL AVP stack:
 
-    register -> trust-check (allow) -> delegate -> negative attestation
-    -> recompute -> trust-check (deny) -> webhook alert -> audit trail
-    -> offline chain verification
+    register -> trust-check (allow) -> issue DelegationReceipt
+    -> negative attestation -> recompute -> trust-check (deny)
+    -> webhook alert -> audit trail -> offline chain verification
 
 Prerequisites:
     1. A local AVP backend up via docker compose, with
@@ -35,7 +35,7 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -57,17 +57,6 @@ def save(name: str, data: Any) -> Path:
 
 def section(n: int, title: str) -> None:
     print(f"\n{'=' * 60}\n[{n}] {title}\n{'=' * 60}")
-
-
-def jobs_request(agent: AVPAgent, method: str, path: str, body: bytes = b"") -> dict:
-    """Authenticated Jobs API call. Mirrors examples/jobs_demo.py:_jobs_request."""
-    headers = agent._auth_headers(method, path, body)
-    with httpx.Client(base_url=agent._base_url, timeout=15) as c:
-        r = c.get(path, headers=headers) if method == "GET" else c.post(
-            path, content=body, headers=headers
-        )
-    r.raise_for_status()
-    return r.json()
 
 
 def wait_for_receiver(url: str, timeout: float = 5.0) -> None:
@@ -199,21 +188,19 @@ def main() -> int:
     print(json.dumps(check_before, indent=2))
     save("02_initial_trust_check.json", check_before)
 
-    # ── Scene 3: real delegation via Jobs API ─────────────────────────
-    section(3, "Delegation: Alice publishes a job, Bob accepts + completes")
-    deadline = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
-    job_body = json.dumps({
-        "title": "Review demo snippet",
-        "description": "Proof Pack demo task — static review.",
-        "required_capabilities": ["code_review"],
-        "min_trust_score": 0.0,
-        "deadline": deadline,
-    }).encode()
-    job = jobs_request(alice, "POST", "/v1/jobs", job_body)
-    jobs_request(bob, "POST", f"/v1/jobs/{job['id']}/accept")
-    result_body = json.dumps({"result": "Reviewed: OK."}).encode()
-    completed = jobs_request(bob, "POST", f"/v1/jobs/{job['id']}/complete", result_body)
-    save("03_job_delegation.json", {"published": job, "completed": completed})
+    # ── Scene 3: delegation receipt for the controlled-action path ─────
+    section(3, "DelegationReceipt: Alice authorizes Bob for controlled action")
+    delegation = alice.issue_delegation_receipt(
+        agent_did=bob.did,
+        allowed_categories=["infrastructure"],
+        valid_for=timedelta(hours=1),
+        purpose="Proof Pack controlled-action delegation",
+    )
+    delegation_check = alice.verify_delegation_receipt(delegation)
+    save("03_delegation_receipt.json", {
+        "delegation_receipt": delegation,
+        "verification": delegation_check,
+    })
 
     # ── Scene 4: Alice subscribes to alert + issues negative attestation
     section(4, "Alice subscribes to alert, then gives Bob a NEGATIVE attestation")
@@ -238,7 +225,7 @@ def main() -> int:
     })
 
     # ── Scene 5: trigger real recompute via docker compose exec ───────
-    section(5, "Trigger reputation recompute (real job, via docker compose exec)")
+    section(5, "Trigger reputation recompute via docker compose exec")
     score_before = alice.get_reputation(bob.did)
     recompute_result = run_recompute(
         mode=args.recompute_mode,

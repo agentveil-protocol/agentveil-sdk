@@ -2,7 +2,7 @@
 
 One runnable local-backend evidence walkthrough for AgentVeil reputation evidence and audit verification:
 
-> **The demo shows a real local backend flow: registration → advisory check → Jobs API cycle → negative attestation → score recompute → advisory deny → webhook alert → audit trail verification.**
+> **The demo shows a real local backend flow: registration → advisory check → DelegationReceipt issuance → negative attestation → score recompute → advisory deny → webhook alert → audit trail verification.**
 
 This is the canonical proof-oriented demo for the SDK. For a quick visual overview, see the GIF at the top of the [main README](../../README.md). For a no-server tour of the SDK API, see [`standalone_demo.py`](../standalone_demo.py).
 
@@ -14,9 +14,9 @@ This is the canonical proof-oriented demo for the SDK. For a quick visual overvi
 |---|---|---|
 | 1 | `01_registration.json` | Two real DIDs, PoW + verify path |
 | 2 | `02_initial_trust_check.json` | `can_trust` returns `allowed=true` initially |
-| 3 | `03_job_delegation.json` | Real Jobs API cycle: publish → accept → complete |
+| 3 | `03_delegation_receipt.json` | Local DelegationReceipt issuance and offline verification for the controlled-action path |
 | 4 | `04_negative_attestation.json` | Real `POST /v1/attestations` with `outcome=negative` |
-| 5 | `05_score_drop.json` | Real EigenTrust recompute run via job runner; score before/after |
+| 5 | `05_score_drop.json` | Real EigenTrust recompute run; score before/after |
 | 6 | `06_trust_check_denied.json` | Same `can_trust` call now returns different tier / deny |
 | 7 | `07_webhook_alert.json` | Real dispatcher payload delivered via HTTP to local receiver |
 | 8 | `08_audit_trail.json` | Full audit chain for the worker agent |
@@ -131,8 +131,8 @@ audit trail JSON and independently verify per-entry integrity.
   no dependency on the `agentveil` SDK. It is intentionally a separate
   re-implementation of the audit hash-chain rule so anyone can verify a trail
   without trusting either the AVP backend or the SDK.
-- `run_demo.py` uses only the public `agentveil` SDK plus a small local
-  `jobs_request` helper. It does not depend on other example files.
+- `run_demo.py` uses only the public `agentveil` SDK plus HTTP calls for the
+  local webhook and audit endpoints. It does not depend on other example files.
 - `webhook_receiver.py` is a tiny stdlib HTTP sink — it has no AVP-specific
   logic; the payload it records is produced entirely by the AVP dispatcher.
 
@@ -146,7 +146,7 @@ audit trail JSON and independently verify per-entry integrity.
 - **`ENVIRONMENT=development`** is required in `.env` — production config
   rejects non-HTTPS webhook URLs.
 - **Recompute timing**: the dispatcher fires synchronously during the compute
-  job. If no alert lands in `07_webhook_alert.json`, check the job stdout
+  process. If no alert lands in `07_webhook_alert.json`, check the recompute stdout
   (saved in `05_score_drop.json.recompute.stdout_tail`).
 - **Threshold 0.99** is intentionally high so the demo's first negative
   attestation crosses it. Real deployments use a much lower value (around 0.5)
