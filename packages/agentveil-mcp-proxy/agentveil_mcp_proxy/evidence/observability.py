@@ -6,6 +6,7 @@ from collections.abc import Sequence
 import json
 from typing import Any
 
+from agentveil_mcp_proxy.authority_boundary import parse_authority_from_metadata
 from agentveil_mcp_proxy.evidence.store import ApprovalStatus, PendingApproval
 
 
@@ -47,6 +48,9 @@ def pending_approval_dict(
     }
     if action_gate_metadata is not None:
         payload["action_gate_metadata"] = action_gate_metadata
+        authority = parse_authority_from_metadata(action_gate_metadata)
+        if authority is not None:
+            payload["authority"] = authority
     return payload
 
 
@@ -123,6 +127,73 @@ def parse_action_gate_metadata(record: PendingApproval) -> dict[str, Any] | None
     return parsed if isinstance(parsed, dict) else None
 
 
+def parse_session_integrity_metadata(record: PendingApproval) -> dict[str, Any] | None:
+    """Parse first-class session-integrity metadata from one evidence record."""
+
+    metadata = parse_action_gate_metadata(record)
+    if metadata is None:
+        return None
+    if metadata.get("event_type") == "session_integrity_mismatch":
+        return metadata
+    return None
+
+
+def parse_redirect_automation_metadata(record: PendingApproval) -> dict[str, Any] | None:
+    """Parse redirect-automation fields from one evidence record."""
+
+    metadata = parse_action_gate_metadata(record)
+    if metadata is None:
+        return None
+    if "redirect_role" not in metadata and "redirect_playbook_id" not in metadata:
+        return None
+    return metadata
+
+
+def redirect_automation_link_valid(
+    original: PendingApproval,
+    follow_up: PendingApproval,
+) -> bool:
+    """Return True when bounded metadata links one follow-up to its original action."""
+
+    original_meta = parse_redirect_automation_metadata(original)
+    follow_meta = parse_redirect_automation_metadata(follow_up)
+    if original_meta is None or follow_meta is None:
+        return False
+    if original_meta.get("redirect_role") != "original":
+        return False
+    if follow_meta.get("redirect_role") != "follow_up":
+        return False
+    original_request_id = str(original.request_id)
+    if follow_meta.get("redirect_parent_request_id") != original_request_id:
+        return False
+    if follow_meta.get("original_request_id") != original_request_id:
+        return False
+    if original_meta.get("redirect_playbook_id") != follow_meta.get("redirect_playbook_id"):
+        return False
+    if original_meta.get("target_reached") is not False:
+        return False
+    return True
+
+
+def redirect_original_record_valid(
+    record: PendingApproval,
+    *,
+    redirect_playbook_id: str,
+) -> bool:
+    """Return True when one evidence record is an acceptable redirect original."""
+
+    metadata = parse_redirect_automation_metadata(record)
+    if metadata is None:
+        return False
+    if metadata.get("redirect_role") != "original":
+        return False
+    if metadata.get("redirect_playbook_id") != redirect_playbook_id:
+        return False
+    if metadata.get("target_reached") is not False:
+        return False
+    return True
+
+
 def event_record_dict(
     record: PendingApproval,
     *,
@@ -150,6 +221,9 @@ def event_record_dict(
         payload["controlled_path"] = controlled_path
         if "target_reached" in controlled_path:
             payload["target_reached"] = controlled_path["target_reached"]
+        authority = parse_authority_from_metadata(controlled_path)
+        if authority is not None:
+            payload["authority"] = authority
     return payload
 
 

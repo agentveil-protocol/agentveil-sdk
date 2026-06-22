@@ -7,10 +7,25 @@ calls without installing an external Node-based MCP server first.
 
 from __future__ import annotations
 
+import hashlib
 import json
-from pathlib import Path
+import os
+import shutil
 import sys
+from pathlib import Path
 from typing import Any, Mapping
+
+HASH_PREFIX = "sha256:"
+INSTRUCTION_SURFACE_RISK_MESSAGE = (
+    "Repo instruction files detected; risky changes need approval."
+)
+INSTRUCTION_SURFACE_RULE_ID = "instruction_surface_detected"
+_INSTRUCTION_SURFACE_BASENAMES = frozenset({
+    "agents.md",
+    "claude.md",
+    ".cursorrules",
+})
+_COPILOT_INSTRUCTIONS_PATH = (".github", "copilot-instructions.md")
 
 
 JSONRPC_VERSION = "2.0"
@@ -28,11 +43,98 @@ def _error(request_id: Any, code: int, message: str) -> dict[str, Any]:
     }
 
 
+def _instruction_surface_type_for_path(path: str) -> str | None:
+    normalized = path.replace("\\", "/")
+    parts = [
+        segment
+        for segment in normalized.split("/")
+        if segment and segment not in (".", "..")
+    ]
+    lowered = [segment.lower() for segment in parts]
+    if not lowered:
+        return None
+    basename = lowered[-1]
+    if basename in _INSTRUCTION_SURFACE_BASENAMES:
+        return basename.replace(".", "_")
+    if len(lowered) >= 2 and tuple(lowered[-2:]) == _COPILOT_INSTRUCTIONS_PATH:
+        return "github_copilot_instructions"
+    for index, segment in enumerate(lowered):
+        if (
+            segment == ".cursor"
+            and index + 1 < len(lowered)
+            and lowered[index + 1] == "rules"
+        ):
+            return "cursor_rules"
+    return None
+
+
+def _size_bucket(byte_count: int) -> str:
+    if byte_count <= 4096:
+        return "small"
+    if byte_count <= 65536:
+        return "medium"
+    return "large"
+
+
+def _scan_instruction_surfaces(root: Path) -> list[dict[str, str]]:
+    if not root.is_dir():
+        return []
+    surfaces: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in sorted(root.rglob("*")):
+        if not item.is_file():
+            continue
+        relative = item.relative_to(root).as_posix()
+        surface_type = _instruction_surface_type_for_path(relative)
+        if surface_type is None:
+            continue
+        stat = item.stat()
+        basename = item.name
+        ref = HASH_PREFIX + hashlib.sha256(
+            f"{surface_type}:{basename}:{stat.st_size}".encode("utf-8")
+        ).hexdigest()
+        key = (surface_type, basename)
+        if key in seen:
+            continue
+        seen.add(key)
+        surfaces.append({
+            "surface_type": surface_type,
+            "basename": basename,
+            "size_bucket": _size_bucket(stat.st_size),
+            "ref": ref,
+            "rule_id": INSTRUCTION_SURFACE_RULE_ID,
+        })
+    return surfaces
+
+
+def _summarize_instruction_surface_risk(surfaces: list[dict[str, str]]) -> dict[str, object]:
+    detected = bool(surfaces)
+    return {
+        "instruction_surfaces_detected": detected,
+        "instruction_surface_count": len(surfaces),
+        "instruction_surface_risk_message": (
+            INSTRUCTION_SURFACE_RISK_MESSAGE if detected else None
+        ),
+        "instruction_surfaces": list(surfaces),
+    }
+
+
 def _tools() -> list[dict[str, Any]]:
     return [
         {
             "name": "list_workspace",
             "description": "List files under the quickstart sandbox root.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "instruction_surface_status",
+            "description": (
+                "Return bounded metadata when repo instruction files are present."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -52,14 +154,134 @@ def _tools() -> list[dict[str, Any]]:
                 "additionalProperties": False,
             },
         },
+        {
+            "name": "delete_file",
+            "description": "Delete one file under the quickstart sandbox root.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "rmdir_tree",
+            "description": "Remove a directory tree under the quickstart sandbox root.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "move_file",
+            "description": "Move or rename one file within the quickstart sandbox root.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string"},
+                    "destination": {"type": "string"},
+                },
+                "required": ["source", "destination"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "copy_file",
+            "description": "Copy one file within the quickstart sandbox root.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string"},
+                    "destination": {"type": "string"},
+                },
+                "required": ["source", "destination"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "chmod_file",
+            "description": "Change file mode bits for one sandbox file.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "mode": {"type": "integer"},
+                },
+                "required": ["path", "mode"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "create_symlink",
+            "description": "Create a symlink under the quickstart sandbox root.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "target": {"type": "string"},
+                },
+                "required": ["path", "target"],
+                "additionalProperties": False,
+            },
+        },
     ]
 
 
+def _root_resolved(root: Path) -> Path:
+    return root.expanduser().resolve()
+
+
+def _path_parts(requested: str) -> list[str]:
+    normalized = requested.replace("\\", "/")
+    if normalized.startswith("/"):
+        raise ValueError("path escapes quickstart sandbox")
+    parts = [part for part in Path(normalized).parts if part not in (".",)]
+    for part in parts:
+        if part == "..":
+            raise ValueError("path escapes quickstart sandbox")
+    return parts
+
+
+def _resolved_inside_root(root: Path, parts: list[str]) -> Path:
+    root_resolved = _root_resolved(root)
+    current = root_resolved
+    for part in parts:
+        current = current / part
+        if current.exists() and current.is_symlink():
+            resolved = current.resolve()
+            if resolved != root_resolved and root_resolved not in resolved.parents:
+                raise ValueError("symlink escape denied")
+            current = resolved
+    final = (root_resolved / Path(*parts)).resolve()
+    if final != root_resolved and root_resolved not in final.parents:
+        raise ValueError("path escapes quickstart sandbox")
+    if final.exists() and final.is_symlink():
+        resolved = final.resolve()
+        if resolved != root_resolved and root_resolved not in resolved.parents:
+            raise ValueError("symlink escape denied")
+    return final
+
+
 def _safe_child(root: Path, requested: str) -> Path:
-    target = (root / requested).resolve()
-    if target == root or root in target.parents:
-        return target
-    raise ValueError("path escapes quickstart sandbox")
+    return _resolved_inside_root(root, _path_parts(requested))
+
+
+def _safe_symlink_target(root: Path, link_path: Path, target: str) -> None:
+    normalized = target.replace("\\", "/")
+    if normalized.startswith("/"):
+        raise ValueError("symlink target escapes quickstart sandbox")
+    target_parts = _path_parts(normalized)
+    root_resolved = _root_resolved(root)
+    anchor = link_path.parent
+    resolved_target = (anchor / Path(*target_parts)).resolve()
+    if resolved_target != root_resolved and root_resolved not in resolved_target.parents:
+        raise ValueError("symlink target escapes quickstart sandbox")
 
 
 def _handle_tools_call(root: Path, request_id: Any, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -74,6 +296,12 @@ def _handle_tools_call(root: Path, request_id: Any, params: Mapping[str, Any]) -
             if item.is_file()
         ]
         return _response(request_id, {"content": [{"type": "text", "text": "\n".join(files)}]})
+    if name == "instruction_surface_status":
+        summary = _summarize_instruction_surface_risk(_scan_instruction_surfaces(root))
+        return _response(
+            request_id,
+            {"content": [{"type": "text", "text": json.dumps(summary, separators=(",", ":"))}]},
+        )
     if name == "write_file":
         path = arguments.get("path")
         content = arguments.get("content")
@@ -90,6 +318,116 @@ def _handle_tools_call(root: Path, request_id: Any, params: Mapping[str, Any]) -
         return _response(
             request_id,
             {"content": [{"type": "text", "text": f"wrote {target.relative_to(root).as_posix()}"}]},
+        )
+    if name == "delete_file":
+        path = arguments.get("path")
+        if not isinstance(path, str) or not path:
+            return _error(request_id, -32602, "path must be a non-empty string")
+        try:
+            target = _safe_child(root, path)
+        except ValueError as exc:
+            return _error(request_id, -32602, str(exc))
+        if not target.is_file():
+            return _error(request_id, -32602, "file not found")
+        target.unlink()
+        return _response(
+            request_id,
+            {"content": [{"type": "text", "text": f"deleted {target.relative_to(root).as_posix()}"}]},
+        )
+    if name == "rmdir_tree":
+        path = arguments.get("path")
+        if not isinstance(path, str) or not path:
+            return _error(request_id, -32602, "path must be a non-empty string")
+        try:
+            target = _safe_child(root, path)
+        except ValueError as exc:
+            return _error(request_id, -32602, str(exc))
+        if not target.is_dir():
+            return _error(request_id, -32602, "directory not found")
+        if target == _root_resolved(root):
+            return _error(request_id, -32602, "cannot remove sandbox root")
+        shutil.rmtree(target)
+        return _response(
+            request_id,
+            {"content": [{"type": "text", "text": f"removed {target.relative_to(root).as_posix()}"}]},
+        )
+    if name == "move_file":
+        source = arguments.get("source")
+        destination = arguments.get("destination")
+        if not isinstance(source, str) or not source:
+            return _error(request_id, -32602, "source must be a non-empty string")
+        if not isinstance(destination, str) or not destination:
+            return _error(request_id, -32602, "destination must be a non-empty string")
+        try:
+            src = _safe_child(root, source)
+            dst = _safe_child(root, destination)
+        except ValueError as exc:
+            return _error(request_id, -32602, str(exc))
+        if not src.is_file():
+            return _error(request_id, -32602, "source file not found")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        src.replace(dst)
+        return _response(
+            request_id,
+            {"content": [{"type": "text", "text": "moved file"}]},
+        )
+    if name == "copy_file":
+        source = arguments.get("source")
+        destination = arguments.get("destination")
+        if not isinstance(source, str) or not source:
+            return _error(request_id, -32602, "source must be a non-empty string")
+        if not isinstance(destination, str) or not destination:
+            return _error(request_id, -32602, "destination must be a non-empty string")
+        try:
+            src = _safe_child(root, source)
+            dst = _safe_child(root, destination)
+        except ValueError as exc:
+            return _error(request_id, -32602, str(exc))
+        if not src.is_file():
+            return _error(request_id, -32602, "source file not found")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        return _response(
+            request_id,
+            {"content": [{"type": "text", "text": "copied file"}]},
+        )
+    if name == "chmod_file":
+        path = arguments.get("path")
+        mode = arguments.get("mode")
+        if not isinstance(path, str) or not path:
+            return _error(request_id, -32602, "path must be a non-empty string")
+        if not isinstance(mode, int) or isinstance(mode, bool):
+            return _error(request_id, -32602, "mode must be an integer")
+        try:
+            target = _safe_child(root, path)
+        except ValueError as exc:
+            return _error(request_id, -32602, str(exc))
+        if not target.is_file():
+            return _error(request_id, -32602, "file not found")
+        os.chmod(target, mode)
+        return _response(
+            request_id,
+            {"content": [{"type": "text", "text": "changed mode"}]},
+        )
+    if name == "create_symlink":
+        path = arguments.get("path")
+        target = arguments.get("target")
+        if not isinstance(path, str) or not path:
+            return _error(request_id, -32602, "path must be a non-empty string")
+        if not isinstance(target, str) or not target:
+            return _error(request_id, -32602, "target must be a non-empty string")
+        try:
+            link_path = _safe_child(root, path)
+            _safe_symlink_target(root, link_path, target)
+        except ValueError as exc:
+            return _error(request_id, -32602, str(exc))
+        link_path.parent.mkdir(parents=True, exist_ok=True)
+        if link_path.exists() or link_path.is_symlink():
+            return _error(request_id, -32602, "path already exists")
+        link_path.symlink_to(target)
+        return _response(
+            request_id,
+            {"content": [{"type": "text", "text": "created symlink"}]},
         )
     return _error(request_id, -32601, "unknown tool")
 

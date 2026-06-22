@@ -48,6 +48,57 @@ _REDIRECT_USE_READ_ONLY_TOOL = "use_read_only_tool"
 _REDIRECT_REQUEST_APPROVAL = "request_approval"
 _REDIRECT_STOP_AND_CLASSIFY = "stop_and_classify_unknown_action"
 
+REDIRECT_CONTEXT_ARG = "redirect_context"
+REDIRECT_ROLE_ORIGINAL = "original"
+REDIRECT_ROLE_FOLLOW_UP = "follow_up"
+INVALID_REDIRECT_CONTEXT = "invalid_redirect_context"
+UNSUPPORTED_REDIRECT_PLAYBOOK = "unsupported_redirect_playbook"
+
+
+@dataclass(frozen=True)
+class RedirectPlaybookSpec:
+    """Bounded redirect playbook definition for follow-up workflows."""
+
+    redirect_playbook_id: str
+    supports_follow_up: bool
+    allowed_follow_up_tools: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RedirectContext:
+    """Bounded redirect linkage carried on an explicit follow-up tools/call."""
+
+    original_request_id: str
+    redirect_playbook_id: str
+
+
+REDIRECT_PLAYBOOKS: dict[str, RedirectPlaybookSpec] = {
+    _REDIRECT_CREATE_IMPLEMENTER_TASK: RedirectPlaybookSpec(
+        redirect_playbook_id=_REDIRECT_CREATE_IMPLEMENTER_TASK,
+        supports_follow_up=True,
+        allowed_follow_up_tools=("read_file",),
+    ),
+    _REDIRECT_USE_READ_ONLY_TOOL: RedirectPlaybookSpec(
+        redirect_playbook_id=_REDIRECT_USE_READ_ONLY_TOOL,
+        supports_follow_up=True,
+        allowed_follow_up_tools=("read_file",),
+    ),
+    _REDIRECT_REQUEST_APPROVAL: RedirectPlaybookSpec(
+        redirect_playbook_id=_REDIRECT_REQUEST_APPROVAL,
+        supports_follow_up=True,
+        allowed_follow_up_tools=("write_file",),
+    ),
+    _REDIRECT_STOP_AND_CLASSIFY: RedirectPlaybookSpec(
+        redirect_playbook_id=_REDIRECT_STOP_AND_CLASSIFY,
+        supports_follow_up=False,
+    ),
+    _REDIRECT_SWITCH_TO_BUILD_AGENT: RedirectPlaybookSpec(
+        redirect_playbook_id=_REDIRECT_SWITCH_TO_BUILD_AGENT,
+        supports_follow_up=True,
+        allowed_follow_up_tools=("read_file",),
+    ),
+}
+
 
 @dataclass(frozen=True)
 class RedirectGuidance:
@@ -192,11 +243,111 @@ def redirect_fields(redirect: RedirectGuidance) -> dict[str, str]:
     }
 
 
+def playbook_spec(playbook_id: str) -> RedirectPlaybookSpec | None:
+    """Return a redirect playbook spec when ``playbook_id`` is known."""
+
+    return REDIRECT_PLAYBOOKS.get(playbook_id)
+
+
+def playbook_supports_follow_up(playbook_id: str) -> bool:
+    """Return True when a playbook allows explicit follow-up tool actions."""
+
+    spec = playbook_spec(playbook_id)
+    return spec is not None and spec.supports_follow_up
+
+
+def redirect_context_stub(
+    *,
+    original_request_id: str,
+    redirect_playbook_id: str,
+) -> dict[str, str]:
+    """Return bounded redirect_context for client follow-up tools/call args."""
+
+    return {
+        "original_request_id": original_request_id,
+        "redirect_playbook_id": redirect_playbook_id,
+    }
+
+
+def redirect_automation_status_fields(
+    *,
+    original_executed: bool,
+    follow_up_required: bool,
+) -> dict[str, bool]:
+    """Return bounded redirect automation status for user-visible responses."""
+
+    return {
+        "original_executed": original_executed,
+        "follow_up_required": follow_up_required,
+    }
+
+
+def parse_redirect_context(arguments: Any) -> tuple[RedirectContext | None, str | None]:
+    """Parse and validate bounded redirect_context from MCP tool arguments."""
+
+    if not isinstance(arguments, Mapping):
+        return None, None
+    raw = arguments.get(REDIRECT_CONTEXT_ARG)
+    if raw is None:
+        return None, None
+    if not isinstance(raw, Mapping):
+        return None, INVALID_REDIRECT_CONTEXT
+    original_request_id = raw.get("original_request_id")
+    redirect_playbook_id = raw.get("redirect_playbook_id")
+    if not isinstance(original_request_id, str) or not original_request_id.strip():
+        return None, INVALID_REDIRECT_CONTEXT
+    if not isinstance(redirect_playbook_id, str) or not redirect_playbook_id.strip():
+        return None, INVALID_REDIRECT_CONTEXT
+    if playbook_spec(redirect_playbook_id) is None:
+        return None, INVALID_REDIRECT_CONTEXT
+    return RedirectContext(
+        original_request_id=original_request_id.strip(),
+        redirect_playbook_id=redirect_playbook_id.strip(),
+    ), None
+
+
+def validate_follow_up_redirect(context: RedirectContext, tool_name: str) -> str | None:
+    """Return a bounded error reason when follow-up redirect cannot proceed."""
+
+    spec = playbook_spec(context.redirect_playbook_id)
+    if spec is None:
+        return INVALID_REDIRECT_CONTEXT
+    if not spec.supports_follow_up:
+        return UNSUPPORTED_REDIRECT_PLAYBOOK
+    if spec.allowed_follow_up_tools and tool_name not in spec.allowed_follow_up_tools:
+        return UNSUPPORTED_REDIRECT_PLAYBOOK
+    return None
+
+
+def strip_redirect_context(arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Return tool arguments with redirect_context removed before downstream."""
+
+    if REDIRECT_CONTEXT_ARG not in arguments:
+        return dict(arguments)
+    stripped = dict(arguments)
+    stripped.pop(REDIRECT_CONTEXT_ARG, None)
+    return stripped
+
+
+def redirect_playbook_id_for_classification(
+    classification: ClassifiedToolCall,
+    *,
+    reason: str,
+    outcome: Literal["deny", "approval"],
+) -> str:
+    """Return the redirect playbook id for one classified tool call."""
+
+    if outcome == "approval":
+        return build_approval_guidance(classification, reason=reason).redirect.redirect_playbook_id
+    return build_deny_guidance(classification, reason=reason).redirect.redirect_playbook_id
+
+
 def enrich_error_data(
     data: dict[str, Any],
     classification: ClassifiedToolCall | None,
     *,
     outcome: Literal["deny", "approval"],
+    original_request_id: str | None = None,
 ) -> dict[str, Any]:
     """Attach bounded explanation and redirect metadata to JSON-RPC error data."""
 
@@ -207,10 +358,20 @@ def enrich_error_data(
         guidance = build_approval_guidance(classification, reason=reason)
         data["explanation"] = guidance.explanation
         data.update(redirect_fields(guidance.redirect))
-        return data
-    guidance = build_deny_guidance(classification, reason=reason)
-    data["explanation"] = guidance.explanation
-    data.update(redirect_fields(guidance.redirect))
+    else:
+        guidance = build_deny_guidance(classification, reason=reason)
+        data["explanation"] = guidance.explanation
+        data.update(redirect_fields(guidance.redirect))
+    if original_request_id is not None:
+        data["original_request_id"] = original_request_id
+        data["redirect_context"] = redirect_context_stub(
+            original_request_id=original_request_id,
+            redirect_playbook_id=guidance.redirect.redirect_playbook_id,
+        )
+        data["redirect_automation"] = redirect_automation_status_fields(
+            original_executed=False,
+            follow_up_required=playbook_supports_follow_up(guidance.redirect.redirect_playbook_id),
+        )
     return data
 
 
@@ -317,10 +478,18 @@ def format_role_doctor_report(report: Mapping[str, Any]) -> str:
 __all__ = [
     "ApprovalGuidance",
     "DenyGuidance",
+    "INVALID_REDIRECT_CONTEXT",
     "MUTATION_ACTION_FAMILIES",
     "READ_ACTION_FAMILIES",
+    "REDIRECT_CONTEXT_ARG",
+    "REDIRECT_PLAYBOOKS",
+    "REDIRECT_ROLE_FOLLOW_UP",
+    "REDIRECT_ROLE_ORIGINAL",
+    "RedirectContext",
     "RedirectGuidance",
+    "RedirectPlaybookSpec",
     "RolePresetGuide",
+    "UNSUPPORTED_REDIRECT_PLAYBOOK",
     "blocked_error_message",
     "build_approval_guidance",
     "build_deny_guidance",
@@ -328,5 +497,13 @@ __all__ = [
     "build_role_preset_guide",
     "enrich_error_data",
     "format_role_doctor_report",
+    "parse_redirect_context",
+    "playbook_spec",
+    "playbook_supports_follow_up",
+    "redirect_automation_status_fields",
+    "redirect_context_stub",
     "redirect_fields",
+    "redirect_playbook_id_for_classification",
+    "strip_redirect_context",
+    "validate_follow_up_redirect",
 ]

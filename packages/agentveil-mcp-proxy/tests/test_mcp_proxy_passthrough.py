@@ -20,6 +20,9 @@ import webbrowser
 import agentveil_mcp_proxy.passthrough as passthrough_module
 import agentveil_mcp_proxy.cli as proxy_cli
 from agentveil_mcp_proxy.cli import ProxyCliError, init_proxy, run_proxy
+from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore
+from agentveil_mcp_proxy.evidence.observability import parse_controlled_path_metadata
+from agentveil_mcp_proxy.evidence.summary import evidence_summary_record
 from agentveil_mcp_proxy.policy import ProxyConfig
 from agentveil_mcp_proxy.passthrough import (
     JSONRPC_APPROVAL_REQUIRED,
@@ -32,7 +35,7 @@ from agentveil_mcp_proxy.passthrough import (
     McpPassthrough,
 )
 
-from mcp_fake_downstream import seed_tool_schemas, tool_entry, write_downstream
+from mcp_fake_downstream import fake_target_reached, seed_tool_schemas, tool_entry, write_downstream, write_github_downstream
 
 
 SECRET = "SECRET_DOWNSTREAM_TOKEN"
@@ -680,6 +683,187 @@ def test_run_passthrough_forwards_local_allow_without_backend_or_gate(tmp_path, 
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list", "tools/call"]
 
 
+def _action_gate_metadata(home: Path, *, index: int = -1) -> dict:
+    row = _evidence_records(home)[index]
+    raw = row.get("action_gate_metadata_jcs")
+    assert isinstance(raw, str) and raw
+    return json.loads(raw)
+
+
+def test_allow_read_path_attaches_read_only_authority_record(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    _set_downstream(init.config_path, _normal_downstream(tmp_path), log_path=log_path)
+    _set_allow_policy(init.config_path, server="fake-downstream", tool="read_file")
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("local allow must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line({
+            "jsonrpc": "2.0",
+            "id": "call-1",
+            "method": "tools/call",
+            "params": {"name": "read_file", "arguments": {"path": "a.txt"}},
+        })),
+        out=client_out,
+    ) == 0
+
+    metadata = _action_gate_metadata(home)
+    authority = metadata["authority_record"]
+    assert authority["authority_status"] == "allowed"
+    assert authority["authority_source"] == "read_only"
+    assert authority["target_reached"] is True
+    assert "safe_first_step" not in metadata
+    assert "safe_first_step" not in authority
+
+
+def test_approval_pending_attaches_missing_authority_record(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    _set_downstream(init.config_path, _normal_downstream(tmp_path), log_path=log_path)
+    _set_approval_policy(init.config_path, server="fake-downstream", tool="write_file")
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("local approval must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line({
+            "jsonrpc": "2.0",
+            "id": "call-1",
+            "method": "tools/call",
+            "params": {"name": "write_file", "arguments": {"path": "a.txt"}},
+        })),
+        out=client_out,
+    ) == 0
+
+    metadata = _action_gate_metadata(home)
+    authority = metadata["authority_record"]
+    assert authority["authority_status"] == "missing"
+    assert authority["authority_source"] == "none"
+    assert authority["target_reached"] is False
+    assert authority["safe_first_step_id"] == "request_approval"
+
+
+def test_policy_block_attaches_policy_block_authority_record(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    _set_downstream(init.config_path, _filesystem_schema_downstream(tmp_path), log_path=log_path)
+    _set_block_policy(init.config_path, server="fake-downstream", tool="write_file")
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("local block must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line({
+            "jsonrpc": "2.0",
+            "id": "call-1",
+            "method": "tools/call",
+            "params": {
+                "name": "write_file",
+                "arguments": {"path": "CLAUDE.md", "content": "x"},
+            },
+        })),
+        out=client_out,
+    ) == 0
+
+    metadata = _action_gate_metadata(home)
+    authority = metadata["authority_record"]
+    assert authority["authority_status"] == "blocked"  # claim-check: allow "blocked" as authority_status enum value.
+    assert authority["authority_source"] == "policy_block"
+    assert authority["target_reached"] is False
+    assert authority["authority_source"] != "policy_grant"
+
+
+def test_get_secret_block_exports_secret_authority_record(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    content_root = tmp_path / "content"
+    state_dir = tmp_path / "state"
+    outcome_log = tmp_path / "github-outcome.jsonl"
+    downstream = write_github_downstream(tmp_path, state_dir, content_root)
+    init_proxy(
+        home=home,
+        plaintext=True,
+        policy_pack="github",
+        downstream_config={
+            "name": "github",
+            "command": sys.executable,
+            "args": ["-u", str(downstream), str(state_dir), str(content_root)],
+            "env": {"GITHUB_OUTCOME_LOG": str(outcome_log)},
+        },
+    )
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("secret block must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line({
+            "jsonrpc": "2.0",
+            "id": "secret-1",
+            "method": "tools/call",
+            "params": {
+                "name": "get_secret",
+                "arguments": {
+                    "owner": "acme",
+                    "repo": "demo-repo",
+                    "repo_root": str(content_root),
+                    "secret_name": "DEPLOY_KEY",
+                },
+            },
+        })),
+        out=out,
+        approval_ui_mode="none",
+    ) == 0
+
+    with ApprovalEvidenceStore(home / "mcp-proxy" / "evidence.sqlite") as store:
+        records = store.list_records()
+        metadata_matches = [
+            parsed
+            for record in records
+            if (parsed := parse_controlled_path_metadata(record)) is not None
+            and parsed.get("tool") == "get_secret"
+        ]
+        assert metadata_matches
+        metadata = metadata_matches[-1]
+        secret_record = next(record for record in records if record.tool_name == "get_secret")
+
+    authority = metadata["authority_record"]
+    assert metadata["policy_rule"] == "github-secrets-block"
+    assert authority["authority_status"] == "blocked"  # claim-check: allow "blocked" as authority_status enum value.
+    assert authority["authority_source"] == "policy_block"
+    assert authority["authority_reason_id"] == "secret_access_blocked"
+    assert authority["risk_family"] == "secret"
+    assert authority["target_reached"] is False
+
+    summary = evidence_summary_record(secret_record)
+    assert summary["authority"]["authority_reason_id"] == "secret_access_blocked"
+    assert summary["authority"]["risk_family"] == "secret"
+    assert "safe_first_step" not in summary
+    assert "safe_first_step" not in summary["authority"]
+
+
 def test_run_returns_approval_required_without_waiting_or_forwarding(tmp_path, monkeypatch):
     home = tmp_path / "avp-home"
     init = init_proxy(home=home, agent_name="proxy", plaintext=True)
@@ -708,13 +892,18 @@ def test_run_returns_approval_required_without_waiting_or_forwarding(tmp_path, m
 
     response = _responses(client_out.getvalue())[0]
     assert response["error"]["code"] == JSONRPC_APPROVAL_REQUIRED
-    assert response["error"]["message"] == "approval required"
     assert response["error"]["data"]["status"] == "approval_required"
     assert response["error"]["data"]["reason"] == "local_approval_required"
     assert response["error"]["data"]["record_status"] == "pending"
     assert response["error"]["data"]["record_id"]
-    assert response["error"]["data"]["approval_url"].startswith("http://127.0.0.1:")
-    assert "retry" in response["error"]["data"]["instructions"]
+    approval_url = response["error"]["data"]["approval_url"]
+    assert approval_url.startswith("http://127.0.0.1:")
+    assert approval_url in response["error"]["message"]
+    assert "Approval required" in response["error"]["message"]
+    assert "approve or deny, then retry the same request" in response["error"]["message"]
+    assert response["error"]["data"]["instructions"] == (
+        "Approval required. Open approval_url, approve or deny, then retry the same request."
+    )
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
 
 
@@ -3181,3 +3370,573 @@ def test_package_manager_safe_command_allowed_with_allow_policy(tmp_path):
     assert response["result"] == {"content": [{"type": "text", "text": "pkg-ok"}]}
     assert _pending_approval_count(home) == 0
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list", "tools/call"]
+
+
+def _set_controlled_downstream(
+    config_path: Path,
+    script: Path,
+    *,
+    log_path: Path,
+    outcome_path: Path,
+    fixture_id: str,
+) -> None:
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["downstream"] = {
+        "name": "fake-downstream",
+        "command": sys.executable,
+        "args": ["-u", str(script)],
+        "env": {
+            "DOWNSTREAM_LOG": str(log_path),
+            "FAKE_TARGET_OUTCOME_LOG": str(outcome_path),
+            "FAKE_TARGET_FIXTURE": fixture_id,
+        },
+    }
+    _write_json(config_path, config)
+
+
+def _tool_call_args(tool: str, arguments: dict, *, call_id: str) -> dict:
+    return {
+        "jsonrpc": "2.0",
+        "id": call_id,
+        "method": "tools/call",
+        "params": {"name": tool, "arguments": arguments},
+    }
+
+
+def _redirect_metadata_for_request(home: Path, request_id: str) -> dict | None:
+    for row in _evidence_records(home):
+        if row["request_id"] != request_id:
+            continue
+        raw = row.get("action_gate_metadata_jcs")
+        if not isinstance(raw, str) or not raw:
+            return None
+        metadata = json.loads(raw)
+        return metadata if isinstance(metadata, dict) else None
+    return None
+
+
+def test_redirect_follow_up_read_reaches_downstream_after_reviewer_write_deny(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True, role_preset="reviewer")
+    log_path = tmp_path / "downstream.log"
+    outcome_path = tmp_path / "outcome.jsonl"
+    downstream = write_downstream(
+        tmp_path,
+        filename="redirect_allow_ds.py",
+        tools=[tool_entry("read_file"), tool_entry("write_file")],
+        controlled_path=True,
+    )
+    _set_controlled_downstream(
+        init.config_path,
+        downstream,
+        log_path=log_path,
+        outcome_path=outcome_path,
+        fixture_id="redirect-allow-read",
+    )
+    config = json.loads(init.config_path.read_text(encoding="utf-8"))
+    config["policy"] = {
+        "id": "redirect-allow",
+        "policy_schema_version": 1,
+        "default_decision": "allow",
+        "default_risk_class": "read",
+        "rules": [],
+    }
+    _write_json(init.config_path, config)
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("redirect follow-up must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+
+    deny_out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line(_tool_call_args(
+            "write_file",
+            {"path": "workspace/note.txt", "content": "probe"},
+            call_id="orig-write",
+        ))),
+        out=deny_out,
+        approval_ui_mode="none",
+    ) == 0
+    deny_response = _responses(deny_out.getvalue())[0]
+    deny_data = deny_response["error"]["data"]
+    assert deny_data["reason"] == "role_authority_denied"
+    assert deny_data["redirect_context"]["redirect_playbook_id"] == "create_implementer_task"
+    assert not fake_target_reached(outcome_path)
+    original_meta = _redirect_metadata_for_request(home, "orig-write")
+    assert original_meta is not None
+    assert original_meta["redirect_role"] == "original"
+    assert original_meta["target_reached"] is False
+
+    follow_out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line(_tool_call_args(
+            "read_file",
+            {
+                "path": "workspace/note.txt",
+                "redirect_context": {
+                    "original_request_id": "orig-write",
+                    "redirect_playbook_id": "create_implementer_task",
+                },
+            },
+            call_id="follow-read",
+        ))),
+        out=follow_out,
+        approval_ui_mode="none",
+    ) == 0
+    follow_response = _responses(follow_out.getvalue())[0]
+    assert "result" in follow_response
+    assert fake_target_reached(outcome_path)
+    follow_meta = _redirect_metadata_for_request(home, "follow-read")
+    assert follow_meta is not None
+    assert follow_meta["redirect_role"] == "follow_up"
+    assert follow_meta["target_reached"] is True
+    assert follow_meta["original_request_id"] == "orig-write"
+    assert SECRET not in follow_out.getvalue()
+
+
+def test_redirect_follow_up_policy_block_does_not_reach_downstream(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True, role_preset="reviewer")
+    log_path = tmp_path / "downstream.log"
+    outcome_path = tmp_path / "outcome.jsonl"
+    downstream = write_downstream(
+        tmp_path,
+        filename="redirect_block_ds.py",
+        tools=[tool_entry("read_file"), tool_entry("write_file")],
+        controlled_path=True,
+    )
+    _set_controlled_downstream(
+        init.config_path,
+        downstream,
+        log_path=log_path,
+        outcome_path=outcome_path,
+        fixture_id="redirect-block-read",
+    )
+    config = json.loads(init.config_path.read_text(encoding="utf-8"))
+    config["policy"] = {
+        "id": "redirect-block",
+        "policy_schema_version": 1,
+        "default_decision": "allow",
+        "default_risk_class": "read",
+        "rules": [{
+            "id": "block-read",
+            "source": "user",
+            "decision": "block",
+            "risk_class": "read",
+            "match": {"server": "fake-downstream", "tool": "read_file"},
+        }],
+    }
+    _write_json(init.config_path, config)
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("redirect block follow-up must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line(_tool_call_args(
+            "write_file",
+            {"path": "workspace/note.txt", "content": "probe"},
+            call_id="orig-write",
+        ))),
+        out=io.StringIO(),
+        approval_ui_mode="none",
+    ) == 0
+    block_out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line(_tool_call_args(
+            "read_file",
+            {
+                "path": "workspace/note.txt",
+                "redirect_context": {
+                    "original_request_id": "orig-write",
+                    "redirect_playbook_id": "create_implementer_task",
+                },
+            },
+            call_id="follow-read",
+        ))),
+        out=block_out,
+        approval_ui_mode="none",
+    ) == 0
+    block_response = _responses(block_out.getvalue())[0]
+    assert block_response["error"]["data"]["reason"] == "local_policy_block"
+    assert not fake_target_reached(outcome_path)
+    follow_meta = _redirect_metadata_for_request(home, "follow-read")
+    assert follow_meta is not None
+    assert follow_meta["redirect_role"] == "follow_up"
+    assert follow_meta["target_reached"] is False
+
+
+def test_redirect_malformed_context_fails_closed_without_downstream(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True, role_preset="reviewer")
+    log_path = tmp_path / "downstream.log"
+    outcome_path = tmp_path / "outcome.jsonl"
+    downstream = write_downstream(
+        tmp_path,
+        filename="redirect_malformed_ds.py",
+        tools=[tool_entry("read_file")],
+        controlled_path=True,
+    )
+    _set_controlled_downstream(
+        init.config_path,
+        downstream,
+        log_path=log_path,
+        outcome_path=outcome_path,
+        fixture_id="redirect-malformed",
+    )
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("malformed redirect must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line(_tool_call_args(
+            "read_file",
+            {
+                "path": "workspace/note.txt",
+                "redirect_context": {
+                    "original_request_id": "",
+                    "redirect_playbook_id": "create_implementer_task",
+                },
+            },
+            call_id="malformed-follow",
+        ))),
+        out=client_out,
+        approval_ui_mode="none",
+    ) == 0
+    response = _responses(client_out.getvalue())[0]
+    assert response["error"]["code"] == JSONRPC_INVALID_PARAMS
+    assert response["error"]["data"] == {
+        "status": "invalid_redirect_context",
+        "reason": "invalid_redirect_context",
+    }
+    assert not fake_target_reached(outcome_path)
+    assert "tools/call" not in log_path.read_text(encoding="utf-8")
+
+
+def test_redirect_unsupported_playbook_does_not_execute_follow_up(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True, role_preset="implementer")
+    log_path = tmp_path / "downstream.log"
+    outcome_path = tmp_path / "outcome.jsonl"
+    downstream = write_downstream(
+        tmp_path,
+        filename="redirect_unsupported_ds.py",
+        tools=[tool_entry("mystery_action"), tool_entry("read_file")],
+        controlled_path=True,
+    )
+    _set_controlled_downstream(
+        init.config_path,
+        downstream,
+        log_path=log_path,
+        outcome_path=outcome_path,
+        fixture_id="redirect-unsupported",
+    )
+    config = json.loads(init.config_path.read_text(encoding="utf-8"))
+    config["policy"] = {
+        "id": "redirect-unknown",
+        "policy_schema_version": 1,
+        "default_decision": "block",
+        "default_risk_class": "unknown",
+        "rules": [{
+            "id": "unknown-action",
+            "source": "user",
+            "decision": "block",
+            "risk_class": "unknown",
+            "match": {"server": "fake-downstream", "tool": "mystery_action"},
+        }],
+    }
+    _write_json(init.config_path, config)
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("unsupported redirect must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line(_tool_call_args("mystery_action", {}, call_id="orig-unknown"))),
+        out=io.StringIO(),
+        approval_ui_mode="none",
+    ) == 0
+    client_out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line(_tool_call_args(
+            "read_file",
+            {
+                "path": "workspace/note.txt",
+                "redirect_context": {
+                    "original_request_id": "orig-unknown",
+                    "redirect_playbook_id": "stop_and_classify_unknown_action",
+                },
+            },
+            call_id="unsupported-follow",
+        ))),
+        out=client_out,
+        approval_ui_mode="none",
+    ) == 0
+    response = _responses(client_out.getvalue())[0]
+    assert response["error"]["data"] == {
+        "status": "blocked",
+        "reason": "unsupported_redirect_playbook",
+    }
+    assert not fake_target_reached(outcome_path)
+
+
+STRICT_READ_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "properties": {"path": {"type": "string"}},
+    "required": ["path"],
+    "additionalProperties": False,
+}
+
+STRICT_WRITE_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "properties": {
+        "path": {"type": "string"},
+        "content": {"type": "string"},
+    },
+    "required": ["path", "content"],
+    "additionalProperties": False,
+}
+
+
+def test_redirect_strict_schema_follow_up_reaches_downstream(tmp_path, monkeypatch):
+    """Follow-up redirect_context must strip before strict schema validation."""
+
+    home = tmp_path / "home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True, role_preset="reviewer")
+    log_path = tmp_path / "downstream.log"
+    outcome_path = tmp_path / "outcome.jsonl"
+    downstream = write_downstream(
+        tmp_path,
+        filename="redirect_strict_ds.py",
+        tools=[
+            tool_entry("read_file", STRICT_READ_SCHEMA),
+            tool_entry("write_file", STRICT_WRITE_SCHEMA),
+        ],
+        controlled_path=True,
+    )
+    _set_controlled_downstream(
+        init.config_path,
+        downstream,
+        log_path=log_path,
+        outcome_path=outcome_path,
+        fixture_id="redirect-strict-schema",
+    )
+    config = json.loads(init.config_path.read_text(encoding="utf-8"))
+    config["policy"] = {
+        "id": "redirect-strict",
+        "policy_schema_version": 1,
+        "default_decision": "allow",
+        "default_risk_class": "read",
+        "rules": [],
+    }
+    _write_json(init.config_path, config)
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("strict-schema redirect must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line(_tool_call_args(
+            "write_file",
+            {"path": "workspace/note.txt", "content": "probe"},
+            call_id="orig-write",
+        ))),
+        out=io.StringIO(),
+        approval_ui_mode="none",
+    ) == 0
+    follow_out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line(_tool_call_args(
+            "read_file",
+            {
+                "path": "workspace/note.txt",
+                "redirect_context": {
+                    "original_request_id": "orig-write",
+                    "redirect_playbook_id": "create_implementer_task",
+                },
+            },
+            call_id="follow-read",
+        ))),
+        out=follow_out,
+        approval_ui_mode="none",
+    ) == 0
+    follow_response = _responses(follow_out.getvalue())[0]
+    assert "result" in follow_response, follow_response
+    assert fake_target_reached(outcome_path)
+    assert "tools/call" in log_path.read_text(encoding="utf-8")
+    follow_meta = _redirect_metadata_for_request(home, "follow-read")
+    assert follow_meta is not None
+    assert follow_meta["redirect_role"] == "follow_up"
+    assert follow_meta["target_reached"] is True
+    assert SECRET not in follow_out.getvalue()
+
+
+def test_redirect_follow_up_rejects_non_redirect_original_record(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True, role_preset="reviewer")
+    log_path = tmp_path / "downstream.log"
+    outcome_path = tmp_path / "outcome.jsonl"
+    downstream = write_downstream(
+        tmp_path,
+        filename="redirect_link_integrity_ds.py",
+        tools=[tool_entry("read_file"), tool_entry("write_file")],
+        controlled_path=True,
+    )
+    _set_controlled_downstream(
+        init.config_path,
+        downstream,
+        log_path=log_path,
+        outcome_path=outcome_path,
+        fixture_id="redirect-link-non-original",
+    )
+    config = json.loads(init.config_path.read_text(encoding="utf-8"))
+    config["policy"] = {
+        "id": "redirect-link",
+        "policy_schema_version": 1,
+        "default_decision": "allow",
+        "default_risk_class": "read",
+        "rules": [],
+    }
+    _write_json(init.config_path, config)
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("redirect link integrity must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line(_tool_call_args(
+            "read_file",
+            {"path": "workspace/note.txt"},
+            call_id="allow-baseline",
+        ))),
+        out=io.StringIO(),
+        approval_ui_mode="none",
+    ) == 0
+    assert fake_target_reached(outcome_path)
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line(_tool_call_args(
+            "write_file",
+            {"path": "workspace/note.txt", "content": "probe"},
+            call_id="orig-write",
+        ))),
+        out=io.StringIO(),
+        approval_ui_mode="none",
+    ) == 0
+
+    follow_out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line(_tool_call_args(
+            "read_file",
+            {
+                "path": "workspace/note.txt",
+                "redirect_context": {
+                    "original_request_id": "allow-baseline",
+                    "redirect_playbook_id": "create_implementer_task",
+                },
+            },
+            call_id="follow-bad-original",
+        ))),
+        out=follow_out,
+        approval_ui_mode="none",
+    ) == 0
+    follow_response = _responses(follow_out.getvalue())[0]
+    assert follow_response["error"]["data"]["reason"] == "invalid_redirect_context"
+    allow_meta = _redirect_metadata_for_request(home, "allow-baseline")
+    assert allow_meta is None or allow_meta.get("redirect_role") != "original"
+    assert _redirect_metadata_for_request(home, "follow-bad-original") is None
+
+
+def test_redirect_follow_up_rejects_mismatched_redirect_playbook(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True, role_preset="reviewer")
+    log_path = tmp_path / "downstream.log"
+    outcome_path = tmp_path / "outcome.jsonl"
+    downstream = write_downstream(
+        tmp_path,
+        filename="redirect_playbook_mismatch_ds.py",
+        tools=[tool_entry("read_file"), tool_entry("write_file")],
+        controlled_path=True,
+    )
+    _set_controlled_downstream(
+        init.config_path,
+        downstream,
+        log_path=log_path,
+        outcome_path=outcome_path,
+        fixture_id="redirect-link-playbook",
+    )
+    config = json.loads(init.config_path.read_text(encoding="utf-8"))
+    config["policy"] = {
+        "id": "redirect-link",
+        "policy_schema_version": 1,
+        "default_decision": "allow",
+        "default_risk_class": "read",
+        "rules": [],
+    }
+    _write_json(init.config_path, config)
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("redirect playbook mismatch must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+
+    deny_out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line(_tool_call_args(
+            "write_file",
+            {"path": "workspace/note.txt", "content": "probe"},
+            call_id="orig-write",
+        ))),
+        out=deny_out,
+        approval_ui_mode="none",
+    ) == 0
+    deny_data = _responses(deny_out.getvalue())[0]["error"]["data"]
+    assert deny_data["redirect_playbook_id"] == "create_implementer_task"
+
+    follow_out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line(_tool_call_args(
+            "read_file",
+            {
+                "path": "workspace/note.txt",
+                "redirect_context": {
+                    "original_request_id": "orig-write",
+                    "redirect_playbook_id": "use_read_only_tool",
+                },
+            },
+            call_id="follow-playbook-mismatch",
+        ))),
+        out=follow_out,
+        approval_ui_mode="none",
+    ) == 0
+    follow_response = _responses(follow_out.getvalue())[0]
+    assert follow_response["error"]["data"]["reason"] == "invalid_redirect_context"
+    assert _redirect_metadata_for_request(home, "follow-playbook-mismatch") is None

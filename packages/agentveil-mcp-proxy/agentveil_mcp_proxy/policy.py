@@ -17,6 +17,7 @@ from typing import Any, Deque, Iterable, Mapping, Sequence
 
 import jcs
 
+from agentveil_mcp_proxy.authority_boundary import attach_runtime_authority
 from agentveil_mcp_proxy.circuit_breaker import CircuitBreakerConfig
 
 
@@ -668,6 +669,8 @@ _ROLE_AUTHORITY_READONLY_RULE_ID = "role_authority_readonly_blocks_mutation"
 _ROLE_AUTHORITY_REASON = "role_authority_denied"
 _ROLE_AUTHORITY_AUTHORITY = "review_only"
 _ROLE_AUTHORITY_MUTATION_FAMILIES = _ROLE_AUTHORITY_REVIEWER_BLOCKED_FAMILIES
+SAFE_AUTOPILOT_SETUP_PROFILE = "safe_autopilot"
+PRODUCT_ROUTE_SETUP_PROFILE = "product_route"
 
 
 def _role_authority_match_patterns(
@@ -697,9 +700,15 @@ def _mutation_deny_rule(
     )
 
 
-def role_authority_builtin_rules(role_authority: RoleAuthorityConfig) -> tuple[PolicyRule, ...]:
+def role_authority_builtin_rules(
+    role_authority: RoleAuthorityConfig,
+    *,
+    setup_profile: str | None = None,
+) -> tuple[PolicyRule, ...]:
     """Return built-in Least Agency role/authority deny rules for one config."""
 
+    if setup_profile in (SAFE_AUTOPILOT_SETUP_PROFILE, PRODUCT_ROUTE_SETUP_PROFILE):
+        return ()
     if not role_authority.is_enforced() or role_authority.role is None:
         return ()
     authority_patterns = _role_authority_match_patterns(role_authority)
@@ -779,6 +788,241 @@ def build_controlled_path_metadata(
         metadata["authority"] = authority
     if action_family is not None:
         metadata["action_family"] = action_family
+    return attach_runtime_authority(metadata)
+
+
+SESSION_INTEGRITY_EVENT_TYPE = "session_integrity_mismatch"
+
+SESSION_INTEGRITY_TOOL_MISMATCH = "session_integrity_tool_mismatch"
+SESSION_INTEGRITY_SERVER_MISMATCH = "session_integrity_server_mismatch"
+SESSION_INTEGRITY_RESOURCE_MISMATCH = "session_integrity_resource_mismatch"
+SESSION_INTEGRITY_PAYLOAD_MISMATCH = "session_integrity_payload_mismatch"
+SESSION_INTEGRITY_ACTION_FAMILY_MISMATCH = "session_integrity_action_family_mismatch"
+SESSION_INTEGRITY_RISK_CLASS_MISMATCH = "session_integrity_risk_class_mismatch"
+SESSION_INTEGRITY_TOOL_SCHEMA_DRIFT = "session_integrity_tool_schema_drift"
+SESSION_INTEGRITY_DOWNSTREAM_STARTUP_DRIFT = "session_integrity_downstream_startup_drift"
+SESSION_INTEGRITY_CONSENT_LAUNDERING = "session_integrity_consent_laundering"
+
+
+_ACTION_FAMILY_RANK = {
+    "read": 0,
+    "fetch": 0,
+    "list": 0,
+    "inspect": 0,
+    "write": 1,
+    "install": 1,
+    "update": 1,
+    "delete": 2,
+    "remove": 2,
+    # claim-check: allow "production" is an action-family rank label, not a customer-readiness claim.
+    "production": 3,
+    "destructive": 4,
+}
+
+
+def build_session_bound_facts(
+    *,
+    classification_tool: str,
+    classification_server: str,
+    action_family: str,
+    resource_hash: str | None,
+    payload_hash: str,
+    risk_class: str,
+    tool_schema_fingerprint: str | None,
+    downstream_startup_fingerprint: str | None,
+    approval_id: str,
+    expires_at: int | None,
+    approval_actor_ref: str | None = None,
+    decision_actor_ref: str | None = None,
+) -> dict[str, Any]:
+    # claim-check: allow "approval-bound" names bounded facts verified by session-integrity tests.
+    """Build bounded approval-bound facts captured at pending/approval time."""
+
+    facts: dict[str, Any] = {
+        "approval_id": approval_id,
+        "approved_tool_name": classification_tool,
+        "approved_server": classification_server,
+        "approved_action_family": action_family,
+        "approved_resource_hash": resource_hash,
+        "approved_payload_hash": payload_hash,
+        "approved_risk_class": risk_class,
+        "tool_schema_fingerprint": tool_schema_fingerprint,
+        "downstream_startup_fingerprint": downstream_startup_fingerprint,
+    }
+    if expires_at is not None:
+        facts["expires_at"] = expires_at
+    if approval_actor_ref is not None:
+        facts["approval_actor_ref"] = approval_actor_ref
+    if decision_actor_ref is not None:
+        facts["decision_actor_ref"] = decision_actor_ref
+    return facts
+
+
+def build_executed_session_facts(
+    *,
+    classification_tool: str,
+    classification_server: str,
+    action_family: str,
+    resource_hash: str | None,
+    payload_hash: str,
+    risk_class: str,
+    tool_schema_fingerprint: str | None,
+    downstream_startup_fingerprint: str | None,
+    decision_actor_ref: str | None = None,
+) -> dict[str, Any]:
+    """Build bounded execution-time facts for session-integrity comparison."""
+
+    facts: dict[str, Any] = {
+        "executed_tool_name": classification_tool,
+        "executed_server": classification_server,
+        "executed_action_family": action_family,
+        "executed_resource_hash": resource_hash,
+        "executed_payload_hash": payload_hash,
+        "executed_risk_class": risk_class,
+        "tool_schema_fingerprint": tool_schema_fingerprint,
+        "downstream_startup_fingerprint": downstream_startup_fingerprint,
+    }
+    if decision_actor_ref is not None:
+        facts["decision_actor_ref"] = decision_actor_ref
+    return facts
+
+
+def detect_session_integrity_mismatch(
+    approved_facts: Mapping[str, Any],
+    executed_facts: Mapping[str, Any],
+) -> str | None:
+    """Return a bounded mismatch reason when execution facts diverge from approval."""
+
+    if approved_facts.get("approved_tool_name") != executed_facts.get("executed_tool_name"):
+        return SESSION_INTEGRITY_TOOL_MISMATCH
+    if approved_facts.get("approved_server") != executed_facts.get("executed_server"):
+        return SESSION_INTEGRITY_SERVER_MISMATCH
+    if approved_facts.get("approved_resource_hash") != executed_facts.get("executed_resource_hash"):
+        return SESSION_INTEGRITY_RESOURCE_MISMATCH
+    if approved_facts.get("approved_payload_hash") != executed_facts.get("executed_payload_hash"):
+        return SESSION_INTEGRITY_PAYLOAD_MISMATCH
+    if approved_facts.get("approved_action_family") != executed_facts.get("executed_action_family"):
+        return SESSION_INTEGRITY_ACTION_FAMILY_MISMATCH
+    approved_risk = approved_facts.get("approved_risk_class")
+    executed_risk = executed_facts.get("executed_risk_class")
+    if approved_risk != executed_risk:
+        approved_rank = _RISK_RANK.get(RiskClass(approved_risk), 99) if isinstance(approved_risk, str) else 99
+        executed_rank = _RISK_RANK.get(RiskClass(executed_risk), 99) if isinstance(executed_risk, str) else 99
+        if executed_rank > approved_rank:
+            return SESSION_INTEGRITY_CONSENT_LAUNDERING
+        return SESSION_INTEGRITY_RISK_CLASS_MISMATCH
+    approved_family = approved_facts.get("approved_action_family")
+    executed_family = executed_facts.get("executed_action_family")
+    if isinstance(approved_family, str) and isinstance(executed_family, str):
+        approved_family_rank = _ACTION_FAMILY_RANK.get(approved_family.lower(), 0)
+        executed_family_rank = _ACTION_FAMILY_RANK.get(executed_family.lower(), 0)
+        if executed_family_rank > approved_family_rank:
+            return SESSION_INTEGRITY_CONSENT_LAUNDERING
+    approved_schema = approved_facts.get("tool_schema_fingerprint")
+    executed_schema = executed_facts.get("tool_schema_fingerprint")
+    if approved_schema is not None and executed_schema is not None and approved_schema != executed_schema:
+        return SESSION_INTEGRITY_TOOL_SCHEMA_DRIFT
+    approved_startup = approved_facts.get("downstream_startup_fingerprint")
+    executed_startup = executed_facts.get("downstream_startup_fingerprint")
+    if (
+        approved_startup is not None
+        and executed_startup is not None
+        and approved_startup != executed_startup
+    ):
+        return SESSION_INTEGRITY_DOWNSTREAM_STARTUP_DRIFT
+    return None
+
+
+def build_session_integrity_metadata(
+    *,
+    approved_facts: Mapping[str, Any],
+    executed_facts: Mapping[str, Any],
+    mismatch_reason: str,
+    approval_id: str,
+    parent_approval_id: str | None,
+    request_id: str,
+    target_reached: bool = False,
+) -> dict[str, Any]:
+    """Build bounded first-class session-integrity evidence metadata."""
+
+    return {
+        "event_type": SESSION_INTEGRITY_EVENT_TYPE,
+        "mismatch_reason": mismatch_reason,
+        "approval_id": approval_id,
+        "parent_approval_id": parent_approval_id,
+        "request_id": request_id,
+        "target_reached": target_reached,
+        "approved_facts": {
+            "approved_tool_name": approved_facts.get("approved_tool_name"),
+            "approved_server": approved_facts.get("approved_server"),
+            "approved_action_family": approved_facts.get("approved_action_family"),
+            "approved_resource_hash": approved_facts.get("approved_resource_hash"),
+            "approved_payload_hash": approved_facts.get("approved_payload_hash"),
+            "approved_risk_class": approved_facts.get("approved_risk_class"),
+            "approval_actor_ref": approved_facts.get("approval_actor_ref"),
+            "decision_actor_ref": approved_facts.get("decision_actor_ref"),
+            "tool_schema_fingerprint": approved_facts.get("tool_schema_fingerprint"),
+            "downstream_startup_fingerprint": approved_facts.get("downstream_startup_fingerprint"),
+        },
+        "executed_facts": {
+            "executed_tool_name": executed_facts.get("executed_tool_name"),
+            "executed_server": executed_facts.get("executed_server"),
+            "executed_action_family": executed_facts.get("executed_action_family"),
+            "executed_resource_hash": executed_facts.get("executed_resource_hash"),
+            "executed_payload_hash": executed_facts.get("executed_payload_hash"),
+            "executed_risk_class": executed_facts.get("executed_risk_class"),
+            "decision_actor_ref": executed_facts.get("decision_actor_ref"),
+            "tool_schema_fingerprint": executed_facts.get("tool_schema_fingerprint"),
+            "downstream_startup_fingerprint": executed_facts.get("downstream_startup_fingerprint"),
+        },
+    }
+
+
+def build_redirect_automation_metadata(
+    *,
+    fixture_id: str,
+    tool_name: str,
+    policy_decision: str,
+    policy_rule_id: str | None,
+    approval_status: str,
+    execution_status: str,
+    target_reached: bool,
+    request_id: str,
+    request_chain: Iterable[str] | None = None,
+    payload_hash: str | None = None,
+    role: str | None = None,
+    authority: str | None = None,
+    action_family: str | None = None,
+    redirect_role: str | None = None,
+    redirect_playbook_id: str | None = None,
+    redirect_parent_request_id: str | None = None,
+    original_request_id: str | None = None,
+) -> dict[str, Any]:
+    """Build bounded redirect-automation metadata linked to controlled-path evidence."""
+
+    metadata = build_controlled_path_metadata(
+        fixture_id=fixture_id,
+        tool_name=tool_name,
+        policy_decision=policy_decision,
+        policy_rule_id=policy_rule_id,
+        approval_status=approval_status,
+        execution_status=execution_status,
+        target_reached=target_reached,
+        request_id=request_id,
+        request_chain=request_chain,
+        payload_hash=payload_hash,
+        role=role,
+        authority=authority,
+        action_family=action_family,
+    )
+    if redirect_role is not None:
+        metadata["redirect_role"] = redirect_role
+    if redirect_playbook_id is not None:
+        metadata["redirect_playbook_id"] = redirect_playbook_id
+    if redirect_parent_request_id is not None:
+        metadata["redirect_parent_request_id"] = redirect_parent_request_id
+    if original_request_id is not None:
+        metadata["original_request_id"] = original_request_id
     return metadata
 
 
@@ -828,7 +1072,7 @@ def build_action_gate_metadata(
         metadata["escalation_trigger"] = escalation_trigger
     if payload_hash is not None:
         metadata["payload_hash"] = payload_hash
-    return metadata
+    return attach_runtime_authority(metadata)
 
 
 @dataclass(frozen=True)
@@ -846,6 +1090,8 @@ class ProxyConfig:
     tool_surface: ToolSurfaceConfig = field(default_factory=ToolSurfaceConfig)
     role_authority: RoleAuthorityConfig = field(default_factory=RoleAuthorityConfig)
     role_preset: str | None = None
+    setup_profile: str | None = None
+    identity_passphrase_file: str | None = None
     downstream: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
 
     @classmethod
@@ -865,6 +1111,8 @@ class ProxyConfig:
                 "tool_surface",
                 "role_authority",
                 "role_preset",
+                "setup_profile",
+                "identity_passphrase_file",
                 "downstream",
             },
             "proxy config",
@@ -889,6 +1137,16 @@ class ProxyConfig:
                 None
                 if data.get("role_preset") is None
                 else _non_empty_str(data.get("role_preset"), "role_preset")
+            ),
+            setup_profile=(
+                None
+                if data.get("setup_profile") is None
+                else _non_empty_str(data.get("setup_profile"), "setup_profile")
+            ),
+            identity_passphrase_file=(
+                None
+                if data.get("identity_passphrase_file") is None
+                else _non_empty_str(data.get("identity_passphrase_file"), "identity_passphrase_file")
             ),
             downstream=MappingProxyType(dict(downstream)),
         )
@@ -961,7 +1219,10 @@ class PolicyEngine:
     def evaluate(self, context: ToolCallContext | Mapping[str, Any]) -> PolicyEvaluation:
         if isinstance(context, Mapping):
             context = ToolCallContext.from_dict(context)
-        rules = self.config.policy.rules + role_authority_builtin_rules(self.config.role_authority)
+        rules = self.config.policy.rules + role_authority_builtin_rules(
+            self.config.role_authority,
+            setup_profile=self.config.setup_profile,
+        )
         matching = tuple(rule for rule in rules if rule.matches(context))
         selected, override_applied = self._select_rule(matching)
         risk = self._risk_for(selected, context)
@@ -1087,17 +1348,28 @@ def builtin_policy_pack(name: str) -> PolicyConfig:
                 "risk_class": "read",
                 "match": {
                     "server": ["github", "github-*", "github_*", "*github*"],
-                    "tool": ["get_*", "list_*", "search_*", "read_*"],
+                    "tool": [
+                        "get_*",
+                        "list_*",
+                        "search_*",
+                        "read_*",
+                        "untrusted_*",
+                        "github_target_snapshot",
+                        "ci_repo_target_snapshot",
+                        "get_workflow",
+                        "get_ci_job",
+                        "get_package_metadata",
+                    ],
                 },
             },
             {
-                "id": "github-write",
+                "id": "github-secrets-block",
                 "source": "builtin",
-                "decision": "ask_backend",
-                "risk_class": "write",
+                "decision": "block",
+                "risk_class": "destructive",
                 "match": {
                     "server": ["github", "github-*", "github_*", "*github*"],
-                    "tool": ["create_*", "update_*", "merge_*", "request_*", "rerun_*", "mark_*"],
+                    "tool": ["get_secret*", "read_secret*", "*secret_value*", "get_env_secret"],
                 },
             },
             {
@@ -1109,11 +1381,36 @@ def builtin_policy_pack(name: str) -> PolicyConfig:
                     "server": ["github", "github-*", "github_*", "*github*"],
                     "tool": [
                         "delete_*",
-                        "remove_*",
                         "purge_*",
                         "drop_*",
                         "destroy_*",
                         "revoke_*",
+                        "cancel_*",
+                        "manage_*",
+                    ],
+                },
+            },
+            {
+                "id": "github-write",
+                "source": "builtin",
+                "decision": "approval",
+                "risk_class": "write",
+                "match": {
+                    "server": ["github", "github-*", "github_*", "*github*"],
+                    "tool": [
+                        "create_*",
+                        "update_*",
+                        "merge_*",
+                        "request_*",
+                        "rerun_*",
+                        "mark_*",
+                        "add_*",
+                        "remove_*",
+                        "close_*",
+                        "dispatch_*",
+                        "publish_*",
+                        "deploy_*",
+                        "run_remote_*",
                     ],
                 },
             },
@@ -1126,7 +1423,7 @@ def builtin_policy_pack(name: str) -> PolicyConfig:
                 "risk_class": "read",
                 "match": {
                     "server": ["filesystem", "fs", "*filesystem*"],
-                    "tool": ["read_*", "list_*", "stat_*"],
+                    "tool": ["read_*", "list_*", "stat_*", "instruction_surface_*"],
                 },
             },
             {
@@ -1136,7 +1433,15 @@ def builtin_policy_pack(name: str) -> PolicyConfig:
                 "risk_class": "write",
                 "match": {
                     "server": ["filesystem", "fs", "*filesystem*"],
-                    "tool": ["write_*", "edit_*", "move_*"],
+                    "tool": [
+                        "write_*",
+                        "edit_*",
+                        "move_*",
+                        "copy_*",
+                        "chmod_*",
+                        "create_symlink",
+                        "rename_*",
+                    ],
                 },
             },
             {
@@ -1193,13 +1498,14 @@ def builtin_policy_pack(name: str) -> PolicyConfig:
                         "git_diff_unstaged",
                         "git_show",
                         "git_branch",
+                        "instruction_surface_status",
                     ],
                 },
             },
             {
                 "id": "git-write",
                 "source": "builtin",
-                "decision": "ask_backend",
+                "decision": "approval",
                 "risk_class": "write",
                 "match": {
                     "server": ["git", "git-*", "git_*"],
@@ -1218,7 +1524,57 @@ def builtin_policy_pack(name: str) -> PolicyConfig:
                 "risk_class": "destructive",
                 "match": {
                     "server": ["git", "git-*", "git_*"],
-                    "tool": ["git_reset"],
+                    "tool": ["git_reset", "git_clean", "git_rebase"],
+                },
+            },
+            {
+                "id": "git-remote",
+                "source": "builtin",
+                "decision": "approval",
+                # claim-check: allow internal risk class string for remote git mutation policy.
+                "risk_class": "production",
+                "match": {
+                    "server": ["git", "git-*", "git_*"],
+                    "tool": ["git_push"],
+                    # claim-check: allow internal matcher value tested in test_mcp_proxy_policy.py.
+                    "risk_class": ["production"],
+                },
+            },
+        ],
+        # Python pip package-manager MCP surface. Ecosystem scope: pip only.
+        "package": [
+            {
+                "id": "package-read",
+                "source": "builtin",
+                "decision": "allow",
+                "risk_class": "read",
+                "match": {
+                    "server": ["package", "pip", "pip-*", "pip_*", "*package*"],
+                    "tool": [
+                        "package_list_manifest",
+                        "package_inspect_state",
+                        "package_risk_status",
+                    ],
+                },
+            },
+            {
+                "id": "package-write",
+                "source": "builtin",
+                "decision": "approval",
+                "risk_class": "write",
+                "match": {
+                    "server": ["package", "pip", "pip-*", "pip_*", "*package*"],
+                    "tool": ["pip_install", "pip_uninstall", "pip_update"],
+                },
+            },
+            {
+                "id": "package-script",
+                "source": "builtin",
+                "decision": "approval",
+                "risk_class": "destructive",
+                "match": {
+                    "server": ["package", "pip", "pip-*", "pip_*", "*package*"],
+                    "tool": ["pip_run_script"],
                 },
             },
         ],
@@ -1226,8 +1582,7 @@ def builtin_policy_pack(name: str) -> PolicyConfig:
         # network egress, so the two rules below discriminate on the risk class
         # produced by classification._network_fetch_risk for the SAME tool:
         #   - a benign public fetch classifies READ -> ask_backend, which keeps
-        #     the decision the proxy already returned for an unmatched fetch
-        #     (this slice only corrects the classification, not the posture);
+        #     the decision the proxy already returned for an unmatched fetch;
         #   - a fetch to cloud metadata / link-local (SSRF) classifies
         #     PRODUCTION -> block locally before approval.
         # claim-check: allow "PRODUCTION" and "production" are existing policy
@@ -1294,6 +1649,8 @@ __all__ = [
     "ProxyConfig",
     "ProxyConfigError",
     "RiskClass",
+    "SAFE_AUTOPILOT_SETUP_PROFILE",
+    "PRODUCT_ROUTE_SETUP_PROFILE",
     "RoleAuthorityConfig",
     "RoleAuthorityMode",
     "TimeoutAction",

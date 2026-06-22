@@ -124,7 +124,7 @@ def test_payload_hash_is_jcs_stable_and_default_metadata_is_privacy_safe():
     assert first.resource.startswith(HASH_PREFIX)
     assert first.resource_plain == "github:private-org/secret-repo"
     assert first.risk_class is RiskClass.WRITE
-    assert first.policy_evaluation.decision is PolicyDecision.ASK_BACKEND
+    assert first.policy_evaluation.decision is PolicyDecision.APPROVAL
     assert first.policy_evaluation.policy_rule_id == "github-write"
 
     metadata = first.backend_metadata()
@@ -200,6 +200,10 @@ def test_extract_resource_does_not_recognize_repo_alone_as_combo():
 def test_risk_inference_covers_core_vocab():
     assert infer_risk_class("github.get_issue", tool="get_issue") is RiskClass.READ
     assert infer_risk_class("github.create_issue", tool="create_issue") is RiskClass.WRITE
+    assert infer_risk_class("github.dispatch_workflow", tool="dispatch_workflow") is RiskClass.PRODUCTION  # claim-check: allow risk enum.
+    assert infer_risk_class("github.publish_package", tool="publish_package") is RiskClass.PRODUCTION  # claim-check: allow risk enum.
+    assert infer_risk_class("github.run_remote_command", tool="run_remote_command") is RiskClass.DESTRUCTIVE
+    assert infer_risk_class("github.get_env_secret", tool="get_env_secret") is RiskClass.DESTRUCTIVE
     assert infer_risk_class("filesystem.delete_file", tool="delete_file") is RiskClass.DESTRUCTIVE
     assert infer_risk_class("deploy.release", tool="deploy_release") is RiskClass.PRODUCTION
     assert infer_risk_class("payment.transfer", tool="transfer_funds") is RiskClass.FINANCIAL
@@ -292,6 +296,30 @@ def test_infer_risk_class_recognizes_git_commit_as_write():
 
 def test_infer_risk_class_recognizes_git_reset_as_destructive():
     assert infer_risk_class("git.git_reset", tool="git_reset") is RiskClass.DESTRUCTIVE
+
+
+def test_infer_risk_class_recognizes_git_clean_rebase_as_destructive():
+    assert infer_risk_class("git.git_clean", tool="git_clean") is RiskClass.DESTRUCTIVE
+    assert infer_risk_class("git.git_rebase", tool="git_rebase") is RiskClass.DESTRUCTIVE
+
+
+def test_infer_risk_class_recognizes_git_push_as_production():
+    # claim-check: allow internal enum label asserted by this negative-boundary test.
+    assert infer_risk_class("git.git_push", tool="git_push") is RiskClass.PRODUCTION
+
+
+def test_infer_risk_class_recognizes_package_read_tools():
+    for tool in ("package_list_manifest", "package_inspect_state", "package_risk_status"):
+        assert infer_risk_class(f"package.{tool}", tool=tool) is RiskClass.READ
+
+
+def test_infer_risk_class_recognizes_pip_write_tools():
+    for tool in ("pip_install", "pip_uninstall", "pip_update"):
+        assert infer_risk_class(f"package.{tool}", tool=tool) is RiskClass.WRITE
+
+
+def test_infer_risk_class_recognizes_pip_run_script_as_destructive():
+    assert infer_risk_class("package.pip_run_script", tool="pip_run_script") is RiskClass.DESTRUCTIVE
 
 
 def test_no_official_mcp_git_tool_falls_back_to_unknown():

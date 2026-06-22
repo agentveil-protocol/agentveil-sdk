@@ -27,6 +27,8 @@ from __future__ import annotations
 import threading
 from typing import Any, Iterable, Mapping
 
+from agentveil_mcp_proxy.classification import sha256_jcs
+
 
 _TYPE_CHECKS = {
     "string": lambda v: isinstance(v, str),
@@ -93,6 +95,38 @@ def validate_arguments(schema: Mapping[str, Any], arguments: Any) -> list[str]:
     return details
 
 
+def bounded_tool_schema_fingerprint(schema: Mapping[str, Any] | None) -> str | None:
+    """Return a stable hash for one advertised tool ``inputSchema`` shape."""
+
+    if schema is None:
+        return None
+    normalized = {
+        "type": schema.get("type"),
+        "required": sorted(
+            key for key in schema.get("required", [])
+            if isinstance(key, str)
+        ) if isinstance(schema.get("required"), list) else [],
+        "additionalProperties": schema.get("additionalProperties"),
+        "properties": sorted(
+            (
+                key,
+                {
+                    "type": prop.get("type")
+                    if isinstance(prop, Mapping) and isinstance(prop.get("type"), str)
+                    else None
+                },
+            )
+            for key, prop in sorted(
+                (schema.get("properties") or {}).items()
+                if isinstance(schema.get("properties"), Mapping)
+                else []
+            )
+            if isinstance(key, str)
+        ),
+    }
+    return sha256_jcs(normalized)
+
+
 class ToolSchemaCache:
     """Thread-safe cache of advertised MCP tool ``inputSchema`` objects,
     claim-check: allow "safe" is part of the standard "thread-safe" term.
@@ -148,6 +182,11 @@ class ToolSchemaCache:
             schema = self._schemas.get(tool_name)
             return dict(schema) if schema is not None else None
 
+    def fingerprint(self, tool_name: str) -> str | None:
+        """Return a bounded hash of the cached ``inputSchema`` for one tool."""
+
+        return bounded_tool_schema_fingerprint(self.get(tool_name))
+
     def is_advertised(self, tool_name: str) -> bool:
         """Return True iff ``tool_name`` was seen in a prior ``tools/list``
         advertisement. Used by the proxy to deny ``tools/call`` for absent
@@ -182,4 +221,8 @@ class ToolSchemaCache:
             self._quarantined_names.clear()
 
 
-__all__ = ["ToolSchemaCache", "validate_arguments"]
+__all__ = [
+    "ToolSchemaCache",
+    "bounded_tool_schema_fingerprint",
+    "validate_arguments",
+]

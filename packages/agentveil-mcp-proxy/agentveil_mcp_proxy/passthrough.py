@@ -38,7 +38,7 @@ import sys
 import threading
 import time
 import uuid
-from typing import Any, Callable, Deque, Mapping, TextIO
+from typing import Any, Callable, Deque, Literal, Mapping, TextIO
 
 from agentveil_mcp_proxy.approval import ApprovalFlowError, ApprovalOutcome
 from agentveil_mcp_proxy.classification import (
@@ -48,16 +48,48 @@ from agentveil_mcp_proxy.classification import (
     sha256_jcs,
 )
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceError, ApprovalStatus
+from agentveil_mcp_proxy.client_config import downstream_startup_fingerprint
+from agentveil_mcp_proxy.evidence.observability import (
+    parse_action_gate_metadata,
+    redirect_original_record_valid,
+)
 from agentveil_mcp_proxy.instruction_file_guard import (
+    HIDDEN_UNICODE_INSTRUCTION_FILE_BLOCKED,
+    contains_hidden_unicode,
     hidden_unicode_instruction_file_block_reason,
     instruction_file_write_reason,
     is_instruction_file_write_tool,
+    iter_tool_content_strings,
 )
 from agentveil_mcp_proxy.package_manager_guard import package_manager_action_reason
-from agentveil_mcp_proxy.role_doctor import blocked_error_message, enrich_error_data
+from agentveil_mcp_proxy.role_doctor import (
+    INVALID_REDIRECT_CONTEXT,
+    REDIRECT_ROLE_FOLLOW_UP,
+    REDIRECT_ROLE_ORIGINAL,
+    UNSUPPORTED_REDIRECT_PLAYBOOK,
+    RedirectContext,
+    blocked_error_message,
+    enrich_error_data,
+    parse_redirect_context,
+    redirect_playbook_id_for_classification,
+    strip_redirect_context,
+    validate_follow_up_redirect,
+)
 from agentveil_mcp_proxy.persistence_path_guard import (
     is_filesystem_mutation_tool,
     persistence_path_write_reason,
+    scan_instruction_surfaces,
+)
+from agentveil_mcp_proxy.authority_boundary import attach_runtime_authority
+from agentveil_mcp_proxy.redirect_playbooks import (
+    attach_redirect_playbook_fields,
+    attach_redirect_playbook_fields_for_evidence_record,
+    build_risk_family_guidance,
+    enrich_risk_family_error_data,
+    message_visible_approval_redirect,
+    message_visible_blocked_redirect,
+    redirect_playbook_id_for_risk_family,
+    uses_risk_family_redirects,
 )
 from agentveil_mcp_proxy.policy import (
     PolicyDecision,
@@ -68,7 +100,13 @@ from agentveil_mcp_proxy.policy import (
     _ACTION_GATE_POLICY_ID,
     build_action_gate_metadata,
     build_controlled_path_metadata,
+    build_executed_session_facts,
+    build_redirect_automation_metadata,
+    build_session_bound_facts,
+    build_session_integrity_metadata,
+    detect_session_integrity_mismatch,
     derive_target_reached,
+    SESSION_INTEGRITY_EVENT_TYPE,
 )
 from agentveil_mcp_proxy.tool_schema_validation import (
     ToolSchemaCache,
@@ -92,6 +130,18 @@ JSONRPC_INVALID_PARAMS = -32602
 JSONRPC_DOWNSTREAM_ERROR = -32000
 JSONRPC_POLICY_BLOCKED = -32010
 JSONRPC_APPROVAL_REQUIRED = -32011
+APPROVAL_REQUIRED_INSTRUCTIONS = (
+    "Approval required. Open approval_url, approve or deny, then retry the same request."
+)
+APPROVAL_REQUIRED_RETRY_SUFFIX = "approve or deny, then retry the same request."
+
+
+def actionable_approval_required_message(approval_url: str) -> str:
+    """Return a client-visible MCP error message that includes the approval URL."""
+
+    return f"Approval required. Open {approval_url}, {APPROVAL_REQUIRED_RETRY_SUFFIX}"
+
+
 JSONRPC_RUNTIME_GATE_UNAVAILABLE = -32012
 JSONRPC_RUNTIME_GATE_UNTRUSTED = -32013
 JSONRPC_DOWNSTREAM_TIMEOUT = -32014
@@ -109,6 +159,59 @@ _PRE_CLASSIFICATION_DENY_POLICY_ID = "mcp_proxy_pre_classification_guard"
 # Risk class recorded for pre-classification denies. The call is rejected before
 # classification, so the true risk class is genuinely unknown.
 _PRE_CLASSIFICATION_DENY_RISK_CLASS = "unknown"
+GIT_INSTRUCTION_SURFACE_RISK_MESSAGE = (
+    "Repo instruction surface detected; privileged Git action requires approval."
+)
+GITHUB_UNTRUSTED_TEXT_RISK_MESSAGE = (
+    "Untrusted GitHub text detected; privileged GitHub action requires approval."
+)
+CI_REPO_UNTRUSTED_TEXT_RISK_MESSAGE = (
+    "Untrusted CI/repo text detected; privileged CI action requires approval."
+)
+_GIT_PRIVILEGED_TOOL_LEAVES = frozenset({
+    "git_add",
+    "git_commit",
+    "git_checkout",
+    "git_create_branch",
+    "git_reset",
+    "git_clean",
+    "git_rebase",
+    "git_push",
+})
+_GIT_REPO_PATH_ARGUMENT_KEYS = ("repo_path", "repository", "repo")
+_GITHUB_PRIVILEGED_TOOL_LEAVES = frozenset({
+    "create_comment",
+    "create_issue",
+    "update_issue",
+    "add_labels",
+    "remove_labels",
+    "request_review",
+    "merge_pull_request",
+    "close_issue",
+    "delete_branch",
+    "create_release",
+    "update_repository_settings",
+    "manage_secret",
+    "rerun_workflow",
+    "cancel_workflow",
+    "dispatch_workflow",
+    "publish_package",
+    "deploy_release",
+    "run_remote_command",
+})
+_GITHUB_REPO_ROOT_ARGUMENT_KEYS = ("repo_root", "repository_root", "local_repo_path")
+_GITHUB_RISK_MANIFEST_BASENAME = ".github_pack_risk_manifest.json"
+_CI_REPO_RISK_MANIFEST_BASENAME = ".ci_repo_trust_manifest.json"
+PACKAGE_INSTALL_RISK_MESSAGE = (
+    "Package install risk surface detected; install/update/remove requires approval."
+)
+_PACKAGE_PRIVILEGED_TOOL_LEAVES = frozenset({
+    "pip_install",
+    "pip_uninstall",
+    "pip_update",
+    "pip_run_script",
+})
+_PACKAGE_PROJECT_PATH_ARGUMENT_KEYS = ("project_path", "root", "repo_path")
 _ENV_PASSTHROUGH_BLOCKED_PREFIXES = ("AVP_",)
 _FILE_PATH_TOOLS = frozenset({
     "read_file",
@@ -122,8 +225,19 @@ _FILE_PATH_TOOLS = frozenset({
     "list_directory_with_sizes",
     "directory_tree",
     "move_file",
+    "copy_file",
+    "chmod_file",
+    "create_symlink",
     "search_files",
     "get_file_info",
+})
+_INSTRUCTION_PATH_MUTATION_TOOL_LEAVES = frozenset({
+    "write_file",
+    "edit_file",
+    "move_file",
+    "copy_file",
+    "chmod_file",
+    "create_symlink",
 })
 # Destructive filesystem tool name prefixes whose path arguments must be guarded
 # too. Mirrors the repo's recognized destructive filesystem surface (the builtin
@@ -446,6 +560,177 @@ def _discard_line_remainder(client_in: TextIO) -> None:
             return
 
 
+def _git_repo_path_from_arguments(arguments: Mapping[str, Any]) -> Path | None:
+    for key in _GIT_REPO_PATH_ARGUMENT_KEYS:
+        value = arguments.get(key)
+        if isinstance(value, str) and value.strip():
+            return Path(value.strip())
+    return None
+
+
+def _github_repo_root_from_arguments(arguments: Mapping[str, Any]) -> Path | None:
+    for key in _GITHUB_REPO_ROOT_ARGUMENT_KEYS:
+        value = arguments.get(key)
+        if isinstance(value, str) and value.strip():
+            return Path(value.strip())
+    return None
+
+
+def _github_risk_manifest(repo_root: Path) -> Mapping[str, Any] | None:
+    manifest_path = repo_root / _GITHUB_RISK_MANIFEST_BASENAME
+    if not manifest_path.is_file():
+        return None
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, Mapping) else None
+
+
+def _ci_repo_risk_manifest(repo_root: Path) -> Mapping[str, Any] | None:
+    manifest_path = repo_root / _CI_REPO_RISK_MANIFEST_BASENAME
+    if not manifest_path.is_file():
+        return None
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, Mapping) else None
+
+
+def _package_project_path_from_arguments(arguments: Mapping[str, Any]) -> Path | None:
+    for key in _PACKAGE_PROJECT_PATH_ARGUMENT_KEYS:
+        value = arguments.get(key)
+        if isinstance(value, str) and value.strip():
+            return Path(value.strip())
+    return None
+
+
+def _package_script_markers_present(project_path: Path) -> bool:
+    manifest = project_path / "pyproject.toml"
+    if not manifest.is_file():
+        return False
+    try:
+        text = manifest.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return "[project.scripts]" in text
+
+
+def _redirect_outcome_for_block(reason: str) -> Literal["deny", "approval", "block"]:
+    if reason == "local_approval_required":
+        return "approval"
+    return "block"
+
+
+def _enrich_redirect_error_data(
+    data: dict[str, Any],
+    classification: ClassifiedToolCall | None,
+    *,
+    outcome: Literal["deny", "approval", "block"],
+    original_request_id: str | None = None,
+) -> dict[str, Any]:
+    if classification is None:
+        return data
+    if uses_risk_family_redirects(classification):
+        return enrich_risk_family_error_data(
+            data,
+            classification,
+            outcome=outcome,
+            original_request_id=original_request_id,
+        )
+    role_outcome: Literal["deny", "approval"] = (
+        "approval" if outcome == "approval" else "deny"
+    )
+    return enrich_error_data(
+        data,
+        classification,
+        outcome=role_outcome,
+        original_request_id=original_request_id,
+    )
+
+
+def _redirect_playbook_id_for_classification(
+    classification: ClassifiedToolCall,
+    *,
+    reason: str,
+    outcome: Literal["deny", "approval", "block"],
+) -> str:
+    if uses_risk_family_redirects(classification):
+        return redirect_playbook_id_for_risk_family(
+            classification,
+            outcome=outcome,
+            reason=reason,
+        )
+    role_outcome: Literal["deny", "approval"] = (
+        "approval" if outcome == "approval" else "deny"
+    )
+    return redirect_playbook_id_for_classification(
+        classification,
+        reason=reason,
+        outcome=role_outcome,
+    )
+
+
+def _blocked_redirect_message(
+    classification: ClassifiedToolCall | None,
+    *,
+    reason: str,
+    default_message: str,
+) -> str:
+    if classification is not None and uses_risk_family_redirects(classification):
+        guidance = build_risk_family_guidance(
+            classification,
+            outcome=_redirect_outcome_for_block(reason),
+            reason=reason,
+        )
+        return message_visible_blocked_redirect(guidance)
+    return blocked_error_message(
+        classification,
+        reason=reason,
+        default_message=default_message,
+    )
+
+
+def _approval_redirect_message(
+    classification: ClassifiedToolCall | None,
+    data: Mapping[str, Any],
+    *,
+    default_message: str,
+) -> str:
+    if classification is None or not uses_risk_family_redirects(classification):
+        return default_message
+    approval_url = data.get("approval_url")
+    if not isinstance(approval_url, str) or not approval_url:
+        return default_message
+    guidance = build_risk_family_guidance(
+        classification,
+        outcome="approval",
+        reason=str(data.get("reason", "")),
+    )
+    return message_visible_approval_redirect(guidance, approval_url=approval_url)
+
+
+def _risk_family_redirect_metadata_fields(
+    classification: ClassifiedToolCall,
+    *,
+    reason: str,
+    outcome: Literal["deny", "approval", "block"],
+) -> dict[str, str]:
+    if not uses_risk_family_redirects(classification):
+        return {}
+    guidance = build_risk_family_guidance(
+        classification,
+        outcome=outcome,
+        reason=reason,
+    )
+    return {
+        "risk_family": guidance.risk_family,
+        "redirect_playbook": guidance.redirect_playbook,
+        "safe_first_step_id": guidance.safe_first_step_id,
+    }
+
+
 def _blocked_error(
     request_id: Any,
     message: str,
@@ -461,8 +746,16 @@ def _blocked_error(
         if decision.audit_id is not None:
             data["audit_id"] = decision.audit_id
     if enrich_guidance:
-        data = enrich_error_data(data, classification, outcome="deny")
-        message = blocked_error_message(
+        block_outcome: Literal["deny", "approval", "block"] = (
+            "block" if reason != "role_authority_denied" else "deny"
+        )
+        data = _enrich_redirect_error_data(
+            data,
+            classification,
+            outcome=block_outcome,
+            original_request_id=str(request_id) if request_id is not None else None,
+        )
+        message = _blocked_redirect_message(
             classification,
             reason=reason,
             default_message=message,
@@ -511,11 +804,25 @@ def _approval_required_error(
         data["record_status"] = approval_outcome.status
         if approval_outcome.approval_url is not None:
             data["approval_url"] = approval_outcome.approval_url
-            data["instructions"] = (
-                "Open approval_url to approve or deny, then retry the MCP tool call if approved."
-            )
+            data["instructions"] = APPROVAL_REQUIRED_INSTRUCTIONS
+            message = actionable_approval_required_message(approval_outcome.approval_url)
     if enrich_guidance:
-        data = enrich_error_data(data, classification, outcome="approval")
+        redirect_original_id = (
+            approval_outcome.request_id
+            if approval_outcome is not None
+            else str(request_id) if request_id is not None else None
+        )
+        data = _enrich_redirect_error_data(
+            data,
+            classification,
+            outcome="approval",
+            original_request_id=redirect_original_id,
+        )
+        message = _approval_redirect_message(
+            classification,
+            data,
+            default_message=message,
+        )
     return jsonrpc_error(request_id, JSONRPC_APPROVAL_REQUIRED, message, data=data)
 
 
@@ -586,8 +893,10 @@ class McpPassthrough:
         self._timed_out_response_ids: dict[str, float] = {}
         self._tool_schemas = ToolSchemaCache()
         self._schema_request_counter = 0
+        self._current_tool_arguments: Mapping[str, Any] | None = None
         self._downstream_tool_calls_forwarded = 0
         self._windows_job: _WindowsJobObject | None = None
+        self._active_redirect_context: RedirectContext | None = None
 
     @property
     def stderr_bytes_drained(self) -> int:
@@ -794,10 +1103,20 @@ class McpPassthrough:
             return [unknown_error] if has_id else []
 
         try:
+            redirect_error = self._redirect_automation_precheck(message, request_id)
+            if redirect_error is not None:
+                return [redirect_error] if has_id else []
+            message = self._message_without_redirect_context(message)
             invalid_error = self._invalid_arguments_error(message, request_id)
             if invalid_error is not None:
                 return [invalid_error] if has_id else []
             classification = self._classify_for_local_metadata(message)
+            params = message.get("params")
+            if isinstance(params, Mapping):
+                arguments = params.get("arguments")
+                self._current_tool_arguments = arguments if isinstance(arguments, Mapping) else None
+            else:
+                self._current_tool_arguments = None
             path_error = self._unsafe_file_path_error_response(
                 message, request_id, classification
             )
@@ -856,6 +1175,22 @@ class McpPassthrough:
             )
             if policy_error is not None:
                 return [policy_error] if has_id else []
+            if (
+                approval_outcome is not None
+                and approval_outcome.approved
+                and isinstance(classification, ClassifiedToolCall)
+            ):
+                session_error = self._session_integrity_block_response(
+                    classification,
+                    request_id,
+                    approval_outcome,
+                )
+                if session_error is not None:
+                    self._record_approval_error(
+                        approval_outcome,
+                        session_error["error"]["data"].get("reason", "session_integrity_mismatch"),
+                    )
+                    return [session_error] if has_id else []
             response_key = (
                 self._register_inflight_id(request_id, method=message.get("method"))
                 if has_id
@@ -906,6 +1241,109 @@ class McpPassthrough:
                 JSONRPC_DOWNSTREAM_ERROR,
                 "downstream MCP server unavailable",
             )]
+        finally:
+            self._active_redirect_context = None
+
+    @staticmethod
+    def _message_without_redirect_context(message: Mapping[str, Any]) -> dict[str, Any]:
+        """Return a copy of ``message`` with redirect_context stripped from tool args."""
+
+        if message.get("method") != "tools/call":
+            return dict(message)
+        params = message.get("params")
+        if not isinstance(params, Mapping):
+            return dict(message)
+        arguments = params.get("arguments")
+        if not isinstance(arguments, Mapping):
+            return dict(message)
+        sanitized = strip_redirect_context(arguments)
+        if sanitized == dict(arguments):
+            return dict(message)
+        new_message = dict(message)
+        new_params = dict(params)
+        new_params["arguments"] = sanitized
+        new_message["params"] = new_params
+        return new_message
+
+    def _redirect_context_error_response(
+        self,
+        request_id: Any,
+        *,
+        reason: str,
+        message: str,
+    ) -> dict[str, Any]:
+        code = (
+            JSONRPC_INVALID_PARAMS
+            if reason == INVALID_REDIRECT_CONTEXT
+            else JSONRPC_POLICY_BLOCKED
+        )
+        # claim-check: allow bounded error status; negative tests assert no downstream execution.
+        status = (
+            "invalid_redirect_context"
+            if reason == INVALID_REDIRECT_CONTEXT
+            else "blocked"  # claim-check: allow bounded error status; negative tests cover no downstream.
+        )
+        return jsonrpc_error(
+            request_id,
+            code,
+            message,
+            data={"status": status, "reason": reason},
+        )
+
+    def _redirect_automation_precheck(
+        self,
+        message: Mapping[str, Any],
+        request_id: Any,
+    ) -> dict[str, Any] | None:
+        """Validate redirect_context on follow-up tools/call requests."""
+
+        self._active_redirect_context = None
+        if message.get("method") != "tools/call":
+            return None
+        params = message.get("params")
+        if not isinstance(params, Mapping):
+            return None
+        tool = params.get("name")
+        if not isinstance(tool, str) or not tool:
+            return None
+        arguments = params.get("arguments", {})
+        if not isinstance(arguments, Mapping):
+            arguments = {}
+        context, parse_error = parse_redirect_context(arguments)
+        if parse_error is not None:
+            return self._redirect_context_error_response(
+                request_id,
+                reason=parse_error,
+                message="invalid redirect_context",
+            )
+        if context is None:
+            return None
+        follow_up_error = validate_follow_up_redirect(context, tool)
+        if follow_up_error is not None:
+            return self._redirect_context_error_response(
+                request_id,
+                reason=follow_up_error,
+                message="unsupported redirect playbook",
+            )
+        store = self._controlled_path_store()
+        if store is None:
+            return self._redirect_context_error_response(
+                request_id,
+                reason=INVALID_REDIRECT_CONTEXT,
+                message="invalid redirect_context",
+            )
+        original = store.get_pending(context.original_request_id)
+        if original is None or not redirect_original_record_valid(
+            original,
+            redirect_playbook_id=context.redirect_playbook_id,
+        ):
+            return self._redirect_context_error_response(
+                request_id,
+                reason=INVALID_REDIRECT_CONTEXT,
+                message="invalid redirect_context",
+            )
+        self._active_redirect_context = context
+        return None
 
     def _tool_surface_error_response(
         self,
@@ -1260,6 +1698,32 @@ class McpPassthrough:
             return _policy_denied_error(request_id, reason=reason)
         return None
 
+    def _is_instruction_path_mutation_tool(self, tool: str) -> bool:
+        leaf = tool.rsplit(".", 1)[-1]
+        return leaf in _INSTRUCTION_PATH_MUTATION_TOOL_LEAVES or is_instruction_file_write_tool(tool)
+
+    def _extended_hidden_unicode_instruction_block_reason(
+        self,
+        tool: str,
+        arguments: Mapping[str, Any],
+    ) -> str | None:
+        hidden_unicode_reason = hidden_unicode_instruction_file_block_reason(
+            tool,
+            arguments,
+        )
+        if hidden_unicode_reason is not None:
+            return hidden_unicode_reason
+        if not self._is_instruction_path_mutation_tool(tool):
+            return None
+        if not any(
+            instruction_file_write_reason(candidate) is not None
+            for candidate in self._candidate_file_paths(arguments)
+        ):
+            return None
+        if not any(contains_hidden_unicode(text) for text in iter_tool_content_strings(arguments)):
+            return None
+        return HIDDEN_UNICODE_INSTRUCTION_FILE_BLOCKED
+
     def _instruction_file_write_policy_response(
         self,
         message: Mapping[str, Any],
@@ -1280,14 +1744,14 @@ class McpPassthrough:
         tool = params.get("name")
         if not isinstance(tool, str) or not tool:
             return None, None
-        if not is_instruction_file_write_tool(tool):
+        if not self._is_instruction_path_mutation_tool(tool):
             return None, None
         arguments = params.get("arguments")
         if not isinstance(arguments, Mapping):
             return None, None
         if classification.policy_evaluation.decision is PolicyDecision.BLOCK:
             return None, None
-        hidden_unicode_reason = hidden_unicode_instruction_file_block_reason(
+        hidden_unicode_reason = self._extended_hidden_unicode_instruction_block_reason(
             tool,
             arguments,
         )
@@ -1505,7 +1969,7 @@ class McpPassthrough:
                 policy_context_hash=policy_context_hash,
                 created_at=int(time.time()),
                 reason=reason,
-                action_gate_metadata_jcs=json.dumps(metadata, separators=(",", ":"), sort_keys=True),
+                action_gate_metadata_jcs=self._metadata_jcs(metadata),
             )
         except ApprovalEvidenceError:
             self._record_security_event({
@@ -1690,15 +2154,19 @@ class McpPassthrough:
                 request_id,
                 block_reason=block_reason,
             )
-            return _blocked_error(
-                request_id,
-                "blocked by local MCP policy",
-                reason=block_reason,
-                classification=classification,
-                enrich_guidance=True,
+            return self._apply_policy_risk_surface_metadata(
+                _blocked_error(
+                    request_id,
+                    # claim-check: allow literal JSON-RPC deny message covered by policy/passthrough tests.
+                    "blocked by local MCP policy",
+                    reason=block_reason,
+                    classification=classification,
+                    enrich_guidance=True,
+                ),
+                classification,
             ), None
         if decision is PolicyDecision.APPROVAL:
-            return self._approval_flow_response(
+            error, outcome = self._approval_flow_response(
                 classification,
                 request_id,
                 reason="local_approval_required",
@@ -1706,24 +2174,236 @@ class McpPassthrough:
                 coalesce_in_flight=True,
                 enrich_guidance=True,
             )
+            return self._apply_policy_risk_surface_metadata(error, classification), outcome
         if decision is PolicyDecision.ASK_BACKEND:
             if self.runtime_gate_factory is None:
                 # Local policy deferred to the Runtime Gate, but no gate factory
                 # claim-check: allow describes the no-gate-configured block branch; verified in tests/test_mcp_proxy_passthrough_concurrent.py
                 # is configured. Fail closed rather than forward an unevaluated
                 # tools/call downstream (embedded/library usage without a gate).
-                return _blocked_error(
-                    request_id,
-                    # claim-check: allow "blocked" is the literal JSON-RPC error message string
-                    "blocked by MCP proxy: Runtime Gate required but not configured",
-                    reason="runtime_gate_not_configured",
+                return self._apply_policy_risk_surface_metadata(
+                    _blocked_error(
+                        request_id,
+                        # claim-check: allow "blocked" is the literal JSON-RPC error message string
+                        "blocked by MCP proxy: Runtime Gate required but not configured",
+                        reason="runtime_gate_not_configured",
+                    ),
+                    classification,
                 ), None
-            return self._runtime_gate_error_response(classification, request_id)
-        return _blocked_error(
-            request_id,
-            "blocked by MCP policy",
-            reason="unknown_policy_decision",
+            error, outcome = self._runtime_gate_error_response(classification, request_id)
+            return self._apply_policy_risk_surface_metadata(error, classification), outcome
+        return self._apply_policy_risk_surface_metadata(
+            _blocked_error(
+                request_id,
+                # claim-check: allow literal JSON-RPC fallback deny message for unknown policy decisions.
+                "blocked by MCP policy",
+                reason="unknown_policy_decision",
+            ),
+            classification,
         ), None
+
+    def _git_instruction_surface_fields(
+        self,
+        classification: ClassifiedToolCall,
+    ) -> dict[str, Any]:
+        tool = classification.tool or ""
+        leaf = tool.rsplit(".", 1)[-1]
+        if leaf not in _GIT_PRIVILEGED_TOOL_LEAVES:
+            return {}
+        arguments = self._current_tool_arguments
+        if not isinstance(arguments, Mapping):
+            return {}
+        repo_path = _git_repo_path_from_arguments(arguments)
+        if repo_path is None or not repo_path.is_dir():
+            return {}
+        surfaces = scan_instruction_surfaces(repo_path)
+        if not surfaces:
+            return {}
+        basenames = [
+            item["basename"]
+            for item in surfaces
+            if isinstance(item, dict) and isinstance(item.get("basename"), str)
+        ]
+        return {
+            "instruction_surface_present": True,
+            "instruction_surface_risk_message": GIT_INSTRUCTION_SURFACE_RISK_MESSAGE,
+            "instruction_surface_count": len(surfaces),
+            "instruction_surface_basenames": basenames[:3],
+        }
+
+    def _github_untrusted_text_fields(
+        self,
+        classification: ClassifiedToolCall,
+    ) -> dict[str, Any]:
+        tool = classification.tool or ""
+        leaf = tool.rsplit(".", 1)[-1]
+        if leaf not in _GITHUB_PRIVILEGED_TOOL_LEAVES:
+            return {}
+        arguments = self._current_tool_arguments
+        if not isinstance(arguments, Mapping):
+            return {}
+        repo_root = _github_repo_root_from_arguments(arguments)
+        if repo_root is None or not repo_root.is_dir():
+            return {}
+        manifest = _github_risk_manifest(repo_root)
+        ci_manifest = _ci_repo_risk_manifest(repo_root)
+        instruction_surfaces = scan_instruction_surfaces(repo_root)
+        untrusted_present = False
+        instruction_present = bool(instruction_surfaces)
+        ci_untrusted_present = False
+        ci_surface_present = False
+        issue_number = None
+        pull_number = None
+        workflow_name = None
+        if isinstance(manifest, Mapping):
+            untrusted_present = manifest.get("untrusted_text_surface_present") is True
+            instruction_present = (
+                instruction_present
+                or manifest.get("instruction_surface_present") is True
+            )
+            raw_issue = manifest.get("issue_number")
+            raw_pull = manifest.get("pull_number")
+            if isinstance(raw_issue, int) and not isinstance(raw_issue, bool):
+                issue_number = raw_issue
+            if isinstance(raw_pull, int) and not isinstance(raw_pull, bool):
+                pull_number = raw_pull
+        if isinstance(ci_manifest, Mapping):
+            ci_untrusted_present = ci_manifest.get("untrusted_ci_text_surface_present") is True
+            ci_surface_present = (
+                ci_untrusted_present
+                or ci_manifest.get("workflow_surface_present") is True
+            )
+            raw_workflow = ci_manifest.get("workflow_name")
+            if isinstance(raw_workflow, str) and raw_workflow.strip():
+                workflow_name = raw_workflow.strip()
+            raw_issue = ci_manifest.get("issue_number")
+            raw_pull = ci_manifest.get("pull_number")
+            if isinstance(raw_issue, int) and not isinstance(raw_issue, bool):
+                issue_number = issue_number or raw_issue
+            if isinstance(raw_pull, int) and not isinstance(raw_pull, bool):
+                pull_number = pull_number or raw_pull
+        if not untrusted_present and not instruction_present and not ci_surface_present:
+            return {}
+        basenames = [
+            item["basename"]
+            for item in instruction_surfaces
+            if isinstance(item, dict) and isinstance(item.get("basename"), str)
+        ]
+        fields: dict[str, Any] = {
+            "untrusted_text_surface_present": untrusted_present or ci_untrusted_present,
+            "instruction_surface_present": instruction_present or ci_surface_present,
+        }
+        if ci_surface_present:
+            fields["ci_repo_trust_surface_present"] = True
+            fields["ci_repo_untrusted_text_risk_message"] = CI_REPO_UNTRUSTED_TEXT_RISK_MESSAGE
+        elif untrusted_present or instruction_present:
+            fields["github_untrusted_text_risk_message"] = GITHUB_UNTRUSTED_TEXT_RISK_MESSAGE
+        if issue_number is not None:
+            fields["issue_number"] = issue_number
+        if pull_number is not None:
+            fields["pull_number"] = pull_number
+        if workflow_name is not None:
+            fields["workflow_name"] = workflow_name
+        if basenames:
+            fields["instruction_surface_basenames"] = basenames[:3]
+        return fields
+
+    def _package_install_risk_fields(
+        self,
+        classification: ClassifiedToolCall,
+    ) -> dict[str, Any]:
+        tool = classification.tool or ""
+        leaf = tool.rsplit(".", 1)[-1]
+        if leaf not in _PACKAGE_PRIVILEGED_TOOL_LEAVES:
+            return {}
+        arguments = self._current_tool_arguments
+        if not isinstance(arguments, Mapping):
+            return {}
+        project_path = _package_project_path_from_arguments(arguments)
+        if project_path is None or not project_path.is_dir():
+            return {}
+        surfaces = scan_instruction_surfaces(project_path)
+        script_markers = _package_script_markers_present(project_path)
+        if not surfaces and not script_markers:
+            return {}
+        basenames = [
+            item["basename"]
+            for item in surfaces
+            if isinstance(item, dict) and isinstance(item.get("basename"), str)
+        ]
+        fields: dict[str, Any] = {
+            "package_risk_surface_present": True,
+            "package_install_risk_message": PACKAGE_INSTALL_RISK_MESSAGE,
+        }
+        if surfaces:
+            fields["instruction_surface_count"] = len(surfaces)
+            fields["instruction_surface_basenames"] = basenames[:3]
+        if script_markers:
+            fields["package_script_markers_present"] = True
+        return fields
+
+    def _apply_policy_risk_surface_metadata(
+        self,
+        error: dict[str, Any] | None,
+        classification: ClassifiedToolCall | None,
+    ) -> dict[str, Any] | None:
+        error = self._apply_git_instruction_surface_metadata(error, classification)
+        error = self._apply_github_untrusted_text_metadata(error, classification)
+        return self._apply_package_install_risk_metadata(error, classification)
+
+    def _apply_package_install_risk_metadata(
+        self,
+        error: dict[str, Any] | None,
+        classification: ClassifiedToolCall | None,
+    ) -> dict[str, Any] | None:
+        if error is None or classification is None:
+            return error
+        fields = self._package_install_risk_fields(classification)
+        if not fields:
+            return error
+        error_payload = error.get("error")
+        if not isinstance(error_payload, dict):
+            return error
+        data = error_payload.get("data")
+        if isinstance(data, dict):
+            data.update(fields)
+        return error
+
+    def _apply_git_instruction_surface_metadata(
+        self,
+        error: dict[str, Any] | None,
+        classification: ClassifiedToolCall | None,
+    ) -> dict[str, Any] | None:
+        if error is None or classification is None:
+            return error
+        fields = self._git_instruction_surface_fields(classification)
+        if not fields:
+            return error
+        error_payload = error.get("error")
+        if not isinstance(error_payload, dict):
+            return error
+        data = error_payload.get("data")
+        if isinstance(data, dict):
+            data.update(fields)
+        return error
+
+    def _apply_github_untrusted_text_metadata(
+        self,
+        error: dict[str, Any] | None,
+        classification: ClassifiedToolCall | None,
+    ) -> dict[str, Any] | None:
+        if error is None or classification is None:
+            return error
+        fields = self._github_untrusted_text_fields(classification)
+        if not fields:
+            return error
+        error_payload = error.get("error")
+        if not isinstance(error_payload, dict):
+            return error
+        data = error_payload.get("data")
+        if isinstance(data, dict):
+            data.update(fields)
+        return error
 
     def _runtime_gate_error_response(
         self,
@@ -1836,6 +2516,12 @@ class McpPassthrough:
         coalesce_in_flight: bool = False,
         enrich_guidance: bool = False,
     ) -> tuple[dict[str, Any] | None, ApprovalOutcome | None]:
+        if not enrich_guidance and uses_risk_family_redirects(classification):
+            enrich_guidance = True
+
+        def _with_risk_metadata(error: dict[str, Any] | None) -> dict[str, Any] | None:
+            return self._apply_policy_risk_surface_metadata(error, classification)
+
         if (
             coalesce_in_flight
             and in_flight_approval is not None
@@ -1843,14 +2529,14 @@ class McpPassthrough:
         ):
             return None, in_flight_approval
         if self.approval_manager is None:
-            return _approval_required_error(
+            return _with_risk_metadata(_approval_required_error(
                 request_id,
                 reason=reason,
                 message=message,
                 decision=runtime_decision,
                 classification=classification,
                 enrich_guidance=enrich_guidance,
-            ), None
+            )), None
         try:
             outcome = self.approval_manager.request_approval(
                 classification,
@@ -1858,17 +2544,24 @@ class McpPassthrough:
                 reason=reason,
             )
         except ApprovalFlowError:
-            return jsonrpc_error(
+            return _with_risk_metadata(jsonrpc_error(
                 request_id,
                 JSONRPC_APPROVAL_REQUIRED,
                 "approval unavailable",
                 data={"status": "blocked", "reason": "approval_evidence_unavailable"},
-            ), None
+            )), None
         if outcome.approved:
             return None, outcome
         if outcome.status == "pending":
             self._annotate_pending_controlled_path(classification, outcome)
-            return _approval_required_error(
+            reuse_block = self._session_integrity_reuse_block_response(
+                classification,
+                request_id,
+                pending_request_id=outcome.request_id,
+            )
+            if reuse_block is not None:
+                return _with_risk_metadata(reuse_block), None
+            return _with_risk_metadata(_approval_required_error(
                 request_id,
                 reason=outcome.reason,
                 message=message,
@@ -1876,19 +2569,19 @@ class McpPassthrough:
                 approval_outcome=outcome,
                 classification=classification,
                 enrich_guidance=enrich_guidance,
-            ), None
+            )), None
         if outcome.status == "expired":
-            return jsonrpc_error(
+            return _with_risk_metadata(jsonrpc_error(
                 request_id,
                 JSONRPC_APPROVAL_REQUIRED,
                 "approval timed out",
                 data={"status": "timeout", "reason": outcome.reason},
-            ), None
-        return _blocked_error(
+            )), None
+        return _with_risk_metadata(_blocked_error(
             request_id,
             "blocked by approval decision",
             reason=outcome.reason,
-        ), None
+        )), None
 
     def _record_approval_result(
         self,
@@ -1912,8 +2605,34 @@ class McpPassthrough:
             return None
         return getattr(manager, "evidence_store", None)
 
-    def _metadata_jcs(self, metadata: Mapping[str, Any]) -> str:
-        return json.dumps(metadata, separators=(",", ":"), sort_keys=True)
+    def _metadata_jcs(
+        self,
+        metadata: Mapping[str, Any],
+        classification: ClassifiedToolCall | None = None,
+        *,
+        risk_class: str | None = None,
+    ) -> str:
+        finalized = dict(metadata)
+        if classification is not None:
+            for fields in (
+                self._git_instruction_surface_fields(classification),
+                self._github_untrusted_text_fields(classification),
+            ):
+                if fields:
+                    finalized.update({
+                        key: value
+                        for key, value in fields.items()
+                        if not str(key).endswith("_message")
+                    })
+            if risk_class is None:
+                risk_class = classification.risk_class.value
+            attach_redirect_playbook_fields(
+                finalized,
+                classification,
+                reason=str(finalized.get("block_reason", finalized.get("reason", ""))),
+            )
+        attach_runtime_authority(finalized, risk_class=risk_class)
+        return json.dumps(finalized, separators=(",", ":"), sort_keys=True)
 
     @staticmethod
     def _least_agency_metadata_fields(classification: ClassifiedToolCall) -> dict[str, str]:
@@ -1942,6 +2661,295 @@ class McpPassthrough:
                 fields[name] = value
         return fields
 
+    @staticmethod
+    def _redirect_automation_fields_from_record(record: Any) -> dict[str, Any]:
+        raw_metadata = getattr(record, "action_gate_metadata_jcs", None)
+        if not isinstance(raw_metadata, str) or not raw_metadata:
+            return {}
+        try:
+            metadata = json.loads(raw_metadata)
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(metadata, dict):
+            return {}
+        fields: dict[str, Any] = {}
+        for name in (
+            "redirect_role",
+            "redirect_playbook_id",
+            "redirect_parent_request_id",
+            "original_request_id",
+            "request_chain",
+        ):
+            if name in metadata:
+                fields[name] = metadata[name]
+        return fields
+
+    def _downstream_config_mapping(self) -> Mapping[str, Any]:
+        downstream = getattr(self.config, "downstream", None)
+        return downstream if isinstance(downstream, Mapping) else {}
+
+    def _downstream_startup_fingerprint(self) -> str | None:
+        return downstream_startup_fingerprint(self._downstream_config_mapping())
+
+    def _approval_actor_ref(self) -> str | None:
+        manager = self.approval_manager
+        if manager is None:
+            return None
+        session_id = getattr(manager, "session_id", None)
+        if isinstance(session_id, str) and session_id:
+            return f"session:{session_id[:8]}"
+        return None
+
+    def _build_session_bound_facts(
+        self,
+        classification: ClassifiedToolCall,
+        *,
+        approval_id: str,
+        expires_at: int | None,
+        decision_actor_ref: str | None = None,
+    ) -> dict[str, Any]:
+        return build_session_bound_facts(
+            classification_tool=classification.tool,
+            classification_server=classification.server,
+            action_family=classification.action_family,
+            resource_hash=classification.resource_hash,
+            payload_hash=classification.payload_hash,
+            risk_class=classification.risk_class.value,
+            tool_schema_fingerprint=self._tool_schemas.fingerprint(classification.tool),
+            downstream_startup_fingerprint=self._downstream_startup_fingerprint(),
+            approval_id=approval_id,
+            expires_at=expires_at,
+            approval_actor_ref=self._approval_actor_ref(),
+            decision_actor_ref=decision_actor_ref,
+        )
+
+    def _build_executed_session_facts(
+        self,
+        classification: ClassifiedToolCall,
+        *,
+        decision_actor_ref: str | None = None,
+    ) -> dict[str, Any]:
+        return build_executed_session_facts(
+            classification_tool=classification.tool,
+            classification_server=classification.server,
+            action_family=classification.action_family,
+            resource_hash=classification.resource_hash,
+            payload_hash=classification.payload_hash,
+            risk_class=classification.risk_class.value,
+            tool_schema_fingerprint=self._tool_schemas.fingerprint(classification.tool),
+            downstream_startup_fingerprint=self._downstream_startup_fingerprint(),
+            decision_actor_ref=decision_actor_ref,
+        )
+
+    def _session_integrity_anchor_record(self, record: Any) -> Any | None:
+        store = self._controlled_path_store()
+        if store is None or record is None:
+            return None
+        parent_id = getattr(record, "granted_by_request_id", None)
+        if isinstance(parent_id, str) and parent_id:
+            return store.get_pending(parent_id)
+        return record
+
+    def _session_bound_facts_from_record(self, record: Any) -> dict[str, Any] | None:
+        metadata = parse_action_gate_metadata(record)
+        if metadata is None:
+            return None
+        facts = metadata.get("session_bound_facts")
+        return facts if isinstance(facts, dict) else None
+
+    def _session_integrity_anchor_already_challenged(self, anchor: Any) -> bool:
+        store = self._controlled_path_store()
+        if store is None:
+            return False
+        anchor_id = getattr(anchor, "request_id", None)
+        if not isinstance(anchor_id, str) or not anchor_id:
+            return False
+        for record in store.list_records(since_timestamp=getattr(anchor, "created_at", None)):
+            if getattr(record, "granted_by_request_id", None) == anchor_id:
+                return True
+            metadata = parse_action_gate_metadata(record)
+            if not isinstance(metadata, dict):
+                continue
+            if metadata.get("event_type") != SESSION_INTEGRITY_EVENT_TYPE:
+                continue
+            if metadata.get("approval_id") == anchor_id or metadata.get("parent_approval_id") == anchor_id:
+                return True
+        return False
+
+    def _find_session_integrity_reuse_anchor(
+        self,
+        classification: ClassifiedToolCall,
+        *,
+        exclude_request_id: str,
+    ) -> Any | None:
+        store = self._controlled_path_store()
+        if store is None:
+            return None
+        manager = self.approval_manager
+        timeout = (
+            manager.config.approval.approval_timeout_seconds
+            if manager is not None
+            else 300
+        )
+        now = int(time.time())
+        for record in reversed(store.list_records(since_timestamp=now - timeout)):
+            if record.request_id == exclude_request_id:
+                continue
+            if record.status != ApprovalStatus.APPROVED.value:
+                continue
+            if record.downstream_server != classification.server:
+                continue
+            if self._session_integrity_anchor_already_challenged(record):
+                continue
+            approved_facts = self._session_bound_facts_from_record(record)
+            if approved_facts is None:
+                continue
+            executed_facts = self._build_executed_session_facts(
+                classification,
+                decision_actor_ref=getattr(record, "approval_decided_by", None),
+            )
+            if detect_session_integrity_mismatch(approved_facts, executed_facts) is None:
+                continue
+            return record
+        return None
+
+    def _session_integrity_reuse_block_response(
+        self,
+        classification: ClassifiedToolCall,
+        request_id: Any,
+        *,
+        pending_request_id: str,
+    ) -> dict[str, Any] | None:
+        anchor = self._find_session_integrity_reuse_anchor(
+            classification,
+            exclude_request_id=pending_request_id,
+        )
+        if anchor is None:
+            return None
+        return self._session_integrity_mismatch_block_response(
+            classification,
+            request_id,
+            anchor=anchor,
+            parent_approval_id=anchor.request_id,
+            decision_actor_ref=getattr(anchor, "approval_decided_by", None),
+        )
+
+    def _session_integrity_block_response(
+        self,
+        classification: ClassifiedToolCall,
+        request_id: Any,
+        outcome: ApprovalOutcome,
+    ) -> dict[str, Any] | None:
+        store = self._controlled_path_store()
+        if store is None:
+            return None
+        record = store.get_pending(outcome.request_id)
+        if record is None:
+            return None
+        anchor = self._session_integrity_anchor_record(record)
+        if anchor is None:
+            return None
+        return self._session_integrity_mismatch_block_response(
+            classification,
+            request_id,
+            anchor=anchor,
+            parent_approval_id=getattr(record, "granted_by_request_id", None),
+            decision_actor_ref=getattr(record, "approval_decided_by", None),
+        )
+
+    def _session_integrity_mismatch_block_response(
+        self,
+        classification: ClassifiedToolCall,
+        request_id: Any,
+        *,
+        anchor: Any,
+        parent_approval_id: str | None,
+        decision_actor_ref: str | None,
+    ) -> dict[str, Any] | None:
+        store = self._controlled_path_store()
+        if store is None:
+            return None
+        approved_facts = self._session_bound_facts_from_record(anchor)
+        if approved_facts is None:
+            approved_facts = self._build_session_bound_facts(
+                classification,
+                approval_id=anchor.request_id,
+                expires_at=getattr(anchor, "expires_at", None),
+                decision_actor_ref=decision_actor_ref,
+            )
+        executed_facts = self._build_executed_session_facts(
+            classification,
+            decision_actor_ref=decision_actor_ref,
+        )
+        mismatch_reason = detect_session_integrity_mismatch(approved_facts, executed_facts)
+        if mismatch_reason is None:
+            return None
+        request_id_text = str(request_id) if request_id is not None else str(uuid.uuid4())
+        session_metadata = build_session_integrity_metadata(
+            approved_facts=approved_facts,
+            executed_facts=executed_facts,
+            mismatch_reason=mismatch_reason,
+            approval_id=anchor.request_id,
+            parent_approval_id=parent_approval_id,
+            request_id=request_id_text,
+            target_reached=False,
+        )
+        metadata = build_redirect_automation_metadata(
+            fixture_id=self._controlled_path_fixture_id(classification),
+            tool_name=classification.tool,
+            policy_decision=PolicyDecision.APPROVAL.value,
+            policy_rule_id=classification.policy_evaluation.policy_rule_id,
+            # claim-check: allow "blocked" is bounded session-integrity status, not a broad security guarantee.
+            approval_status=ApprovalStatus.BLOCKED.value,
+            execution_status="blocked_pre_downstream",
+            target_reached=False,
+            request_id=request_id_text,
+            payload_hash=classification.payload_hash,
+            **self._least_agency_metadata_fields(classification),
+        )
+        metadata.update(session_metadata)
+        manager = self.approval_manager
+        self._record_security_event({
+            "type": SESSION_INTEGRITY_EVENT_TYPE,
+            "action": "blocked_pre_downstream",
+            "reason": mismatch_reason,
+            "tool": classification.tool,
+            "approval_id": anchor.request_id,
+        })
+        try:
+            store.record_terminal_deny(
+                request_id=request_id_text,
+                session_id=getattr(manager, "session_id", None) or str(uuid.uuid4()),
+                client_id=getattr(manager, "client_id", None),
+                downstream_server=classification.server,
+                tool_name=classification.tool,
+                risk_class=classification.risk_class.value,
+                resource_hash=classification.resource_hash,
+                payload_hash=classification.payload_hash,
+                policy_id=classification.policy_evaluation.policy_id,
+                policy_rule_id=classification.policy_evaluation.policy_rule_id,
+                policy_context_hash=classification.policy_evaluation.policy_context_hash,
+                created_at=int(time.time()),
+                reason=mismatch_reason,
+                action_gate_metadata_jcs=self._metadata_jcs(metadata, classification),
+            )
+        except ApprovalEvidenceError:
+            pass
+        return jsonrpc_error(
+            request_id,
+            JSONRPC_POLICY_BLOCKED,
+            # claim-check: allow "blocked" describes this pre-downstream mismatch response only.
+            "blocked by MCP proxy: session integrity mismatch",
+            data={
+                # claim-check: allow "blocked" is the machine status for this evidence event.
+                "status": "blocked",
+                "reason": mismatch_reason,
+                "event_type": SESSION_INTEGRITY_EVENT_TYPE,
+                "approval_id": anchor.request_id,
+                "target_reached": False,
+            },
+        )
+
     def _annotate_pending_controlled_path(
         self,
         classification: ClassifiedToolCall,
@@ -1950,22 +2958,58 @@ class McpPassthrough:
         store = self._controlled_path_store()
         if store is None:
             return
-        metadata = build_controlled_path_metadata(
-            fixture_id=self._controlled_path_fixture_id(classification),
-            tool_name=classification.tool,
-            policy_decision=classification.policy_evaluation.decision.value,
-            policy_rule_id=classification.policy_evaluation.policy_rule_id,
-            approval_status=ApprovalStatus.PENDING.value,
-            execution_status="not_reached",
-            target_reached=False,
-            request_id=outcome.request_id,
-            payload_hash=classification.payload_hash,
-            **self._least_agency_metadata_fields(classification),
+        redirect_context = self._active_redirect_context
+        if redirect_context is not None:
+            metadata = build_redirect_automation_metadata(
+                fixture_id=self._controlled_path_fixture_id(classification),
+                tool_name=classification.tool,
+                policy_decision=classification.policy_evaluation.decision.value,
+                policy_rule_id=classification.policy_evaluation.policy_rule_id,
+                approval_status=ApprovalStatus.PENDING.value,
+                execution_status="not_reached",
+                target_reached=False,
+                request_id=outcome.request_id,
+                request_chain=[redirect_context.original_request_id, outcome.request_id],
+                payload_hash=classification.payload_hash,
+                redirect_role=REDIRECT_ROLE_FOLLOW_UP,
+                redirect_playbook_id=redirect_context.redirect_playbook_id,
+                redirect_parent_request_id=redirect_context.original_request_id,
+                original_request_id=redirect_context.original_request_id,
+                **self._least_agency_metadata_fields(classification),
+            )
+        else:
+            metadata = build_redirect_automation_metadata(
+                fixture_id=self._controlled_path_fixture_id(classification),
+                tool_name=classification.tool,
+                policy_decision=classification.policy_evaluation.decision.value,
+                policy_rule_id=classification.policy_evaluation.policy_rule_id,
+                approval_status=ApprovalStatus.PENDING.value,
+                execution_status="not_reached",
+                target_reached=False,
+                request_id=outcome.request_id,
+                payload_hash=classification.payload_hash,
+                redirect_role=REDIRECT_ROLE_ORIGINAL,
+                redirect_playbook_id=_redirect_playbook_id_for_classification(
+                    classification,
+                    reason="local_approval_required",
+                    outcome="approval",
+                ),
+                original_request_id=outcome.request_id,
+                **self._least_agency_metadata_fields(classification),
+            )
+        manager = self.approval_manager
+        expires_at = None
+        if manager is not None:
+            expires_at = int(time.time()) + manager.config.approval.approval_timeout_seconds
+        metadata["session_bound_facts"] = self._build_session_bound_facts(
+            classification,
+            approval_id=outcome.request_id,
+            expires_at=expires_at,
         )
         try:
             store.annotate_controlled_path_metadata(
                 outcome.request_id,
-                metadata_jcs=self._metadata_jcs(metadata),
+                metadata_jcs=self._metadata_jcs(metadata, classification),
             )
         except ApprovalEvidenceError:
             return
@@ -1995,25 +3039,77 @@ class McpPassthrough:
                 parent_record = store.get_pending(parent_request_id)
                 if parent_record is not None:
                     least_agency_fields = self._least_agency_metadata_fields_from_record(parent_record)
-        metadata = build_controlled_path_metadata(
-            fixture_id=self._controlled_path_fixture_id_from_record(record),
-            tool_name=record.tool_name,
-            policy_decision="approval",
-            policy_rule_id=record.policy_rule_id,
-            approval_status=ApprovalStatus.APPROVED.value,
+        redirect_context = self._active_redirect_context
+        redirect_fields = self._redirect_automation_fields_from_record(record)
+        target_reached = derive_target_reached(
             execution_status=execution_status,
-            target_reached=derive_target_reached(
-                execution_status=execution_status,
-                downstream_tool_call_seen=self.downstream_tool_calls_forwarded > 0,
-            ),
-            request_id=outcome.request_id,
-            payload_hash=record.payload_hash,
-            **least_agency_fields,
+            downstream_tool_call_seen=self.downstream_tool_calls_forwarded > 0,
         )
+        if redirect_context is not None:
+            metadata = build_redirect_automation_metadata(
+                fixture_id=self._controlled_path_fixture_id_from_record(record),
+                tool_name=record.tool_name,
+                policy_decision="approval",
+                policy_rule_id=record.policy_rule_id,
+                approval_status=ApprovalStatus.APPROVED.value,
+                execution_status=execution_status,
+                target_reached=target_reached,
+                request_id=outcome.request_id,
+                request_chain=[redirect_context.original_request_id, outcome.request_id],
+                payload_hash=record.payload_hash,
+                redirect_role=REDIRECT_ROLE_FOLLOW_UP,
+                redirect_playbook_id=redirect_context.redirect_playbook_id,
+                redirect_parent_request_id=redirect_context.original_request_id,
+                original_request_id=redirect_context.original_request_id,
+                **least_agency_fields,
+            )
+        elif redirect_fields.get("redirect_role"):
+            request_chain = redirect_fields.get("request_chain")
+            if not isinstance(request_chain, list):
+                request_chain = [redirect_fields.get("original_request_id", outcome.request_id), outcome.request_id]
+            metadata = build_redirect_automation_metadata(
+                fixture_id=self._controlled_path_fixture_id_from_record(record),
+                tool_name=record.tool_name,
+                policy_decision="approval",
+                policy_rule_id=record.policy_rule_id,
+                approval_status=ApprovalStatus.APPROVED.value,
+                execution_status=execution_status,
+                target_reached=target_reached,
+                request_id=outcome.request_id,
+                request_chain=request_chain,
+                payload_hash=record.payload_hash,
+                redirect_role=str(redirect_fields["redirect_role"]),
+                redirect_playbook_id=redirect_fields.get("redirect_playbook_id"),
+                redirect_parent_request_id=redirect_fields.get("redirect_parent_request_id"),
+                original_request_id=redirect_fields.get("original_request_id"),
+                **least_agency_fields,
+            )
+        else:
+            metadata = build_controlled_path_metadata(
+                fixture_id=self._controlled_path_fixture_id_from_record(record),
+                tool_name=record.tool_name,
+                policy_decision="approval",
+                policy_rule_id=record.policy_rule_id,
+                approval_status=ApprovalStatus.APPROVED.value,
+                execution_status=execution_status,
+                target_reached=target_reached,
+                request_id=outcome.request_id,
+                payload_hash=record.payload_hash,
+                **least_agency_fields,
+            )
         try:
+            attach_redirect_playbook_fields_for_evidence_record(
+                metadata,
+                policy_id=getattr(record, "policy_id", None),
+                tool_name=record.tool_name,
+                outcome="approval",
+            )
             store.annotate_controlled_path_metadata(
                 outcome.request_id,
-                metadata_jcs=self._metadata_jcs(metadata),
+                metadata_jcs=self._metadata_jcs(
+                    metadata,
+                    risk_class=getattr(record, "risk_class", None),
+                ),
             )
         except ApprovalEvidenceError:
             return
@@ -2039,19 +3135,47 @@ class McpPassthrough:
             return
         manager = self.approval_manager
         request_id_text = str(request_id) if request_id is not None else str(uuid.uuid4())
-        metadata = build_controlled_path_metadata(
-            fixture_id=self._controlled_path_fixture_id(classification),
-            tool_name=classification.tool,
-            policy_decision=PolicyDecision.BLOCK.value,
-            policy_rule_id=classification.policy_evaluation.policy_rule_id,
-            # claim-check: allow enum value; this records a local policy deny status.
-            approval_status=ApprovalStatus.BLOCKED.value,
-            execution_status="not_reached",
-            target_reached=False,
-            request_id=request_id_text,
-            payload_hash=classification.payload_hash,
-            **self._least_agency_metadata_fields(classification),
-        )
+        redirect_context = self._active_redirect_context
+        # claim-check: allow evidence enum; tests verify target_reached=false.
+        if redirect_context is not None:
+            metadata = build_redirect_automation_metadata(
+                fixture_id=self._controlled_path_fixture_id(classification),
+                tool_name=classification.tool,
+                policy_decision=PolicyDecision.BLOCK.value,
+                policy_rule_id=classification.policy_evaluation.policy_rule_id,
+                approval_status=ApprovalStatus.BLOCKED.value,  # claim-check: allow evidence enum; target_reached=false.
+                execution_status="not_reached",
+                target_reached=False,
+                request_id=request_id_text,
+                request_chain=[redirect_context.original_request_id, request_id_text],
+                payload_hash=classification.payload_hash,
+                redirect_role=REDIRECT_ROLE_FOLLOW_UP,
+                redirect_playbook_id=redirect_context.redirect_playbook_id,
+                redirect_parent_request_id=redirect_context.original_request_id,
+                original_request_id=redirect_context.original_request_id,
+                **self._least_agency_metadata_fields(classification),
+            )
+        else:
+            metadata = build_redirect_automation_metadata(
+                fixture_id=self._controlled_path_fixture_id(classification),
+                tool_name=classification.tool,
+                policy_decision=PolicyDecision.BLOCK.value,
+                policy_rule_id=classification.policy_evaluation.policy_rule_id,
+                approval_status=ApprovalStatus.BLOCKED.value,  # claim-check: allow evidence enum; target_reached=false.
+                execution_status="not_reached",
+                target_reached=False,
+                request_id=request_id_text,
+                payload_hash=classification.payload_hash,
+                redirect_role=REDIRECT_ROLE_ORIGINAL,
+                redirect_playbook_id=_redirect_playbook_id_for_classification(
+                    classification,
+                    reason=block_reason,
+                    outcome="block",
+                ),
+                original_request_id=request_id_text,
+                **self._least_agency_metadata_fields(classification),
+            )
+        metadata["block_reason"] = block_reason
         try:
             store.record_terminal_deny(
                 request_id=request_id_text,
@@ -2067,7 +3191,7 @@ class McpPassthrough:
                 policy_context_hash=classification.policy_evaluation.policy_context_hash,
                 created_at=int(time.time()),
                 reason=block_reason,
-                action_gate_metadata_jcs=self._metadata_jcs(metadata),
+                action_gate_metadata_jcs=self._metadata_jcs(metadata, classification),
             )
         except ApprovalEvidenceError:
             return
@@ -2087,21 +3211,44 @@ class McpPassthrough:
             return
         request_id_text = str(request_id) if request_id is not None else str(uuid.uuid4())
         execution_status = ApprovalStatus.EXECUTED.value
-        metadata = build_controlled_path_metadata(
-            fixture_id=self._controlled_path_fixture_id(classification),
-            tool_name=classification.tool,
-            policy_decision=classification.policy_evaluation.decision.value,
-            policy_rule_id=classification.policy_evaluation.policy_rule_id,
-            approval_status=ApprovalStatus.EXECUTED.value,
-            execution_status=execution_status,
-            target_reached=derive_target_reached(
+        redirect_context = self._active_redirect_context
+        if redirect_context is not None:
+            metadata = build_redirect_automation_metadata(
+                fixture_id=self._controlled_path_fixture_id(classification),
+                tool_name=classification.tool,
+                policy_decision=classification.policy_evaluation.decision.value,
+                policy_rule_id=classification.policy_evaluation.policy_rule_id,
+                approval_status=ApprovalStatus.EXECUTED.value,
                 execution_status=execution_status,
-                downstream_tool_call_seen=self.downstream_tool_calls_forwarded > 0,
-            ),
-            request_id=request_id_text,
-            payload_hash=classification.payload_hash,
-            **self._least_agency_metadata_fields(classification),
-        )
+                target_reached=derive_target_reached(
+                    execution_status=execution_status,
+                    downstream_tool_call_seen=self.downstream_tool_calls_forwarded > 0,
+                ),
+                request_id=request_id_text,
+                request_chain=[redirect_context.original_request_id, request_id_text],
+                payload_hash=classification.payload_hash,
+                redirect_role=REDIRECT_ROLE_FOLLOW_UP,
+                redirect_playbook_id=redirect_context.redirect_playbook_id,
+                redirect_parent_request_id=redirect_context.original_request_id,
+                original_request_id=redirect_context.original_request_id,
+                **self._least_agency_metadata_fields(classification),
+            )
+        else:
+            metadata = build_controlled_path_metadata(
+                fixture_id=self._controlled_path_fixture_id(classification),
+                tool_name=classification.tool,
+                policy_decision=classification.policy_evaluation.decision.value,
+                policy_rule_id=classification.policy_evaluation.policy_rule_id,
+                approval_status=ApprovalStatus.EXECUTED.value,
+                execution_status=execution_status,
+                target_reached=derive_target_reached(
+                    execution_status=execution_status,
+                    downstream_tool_call_seen=self.downstream_tool_calls_forwarded > 0,
+                ),
+                request_id=request_id_text,
+                payload_hash=classification.payload_hash,
+                **self._least_agency_metadata_fields(classification),
+            )
         try:
             store.record_allow_execution(
                 request_id=request_id_text,
@@ -2118,7 +3265,7 @@ class McpPassthrough:
                 policy_context_hash=classification.policy_evaluation.policy_context_hash,
                 created_at=int(time.time()),
                 result_hash=sha256_jcs(response.get("result", {})),
-                action_gate_metadata_jcs=self._metadata_jcs(metadata),
+                action_gate_metadata_jcs=self._metadata_jcs(metadata, classification),
             )
         except ApprovalEvidenceError:
             return

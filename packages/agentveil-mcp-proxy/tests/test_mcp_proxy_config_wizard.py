@@ -382,3 +382,518 @@ def test_wizard_print_json_summary_is_bounded(tmp_path, capsys):
     assert payload["summary"]["bypass_detected"] is False
     assert payload["summary"]["role_preset"] == "reviewer"
     assert SECRET not in json.dumps(payload)
+
+
+def _review_inventory_path(tmp_path: Path) -> Path:
+    inventory_path = tmp_path / "inventory.json"
+    inventory_path.write_text(
+        json.dumps([
+            {"tool_name": "read_file", "server_label": "filesystem", "capabilities": ["read"]},
+            {"tool_name": "write_file", "server_label": "filesystem", "capabilities": ["write"]},
+            {"tool_name": "git_status", "server_label": "git", "capabilities": ["read"]},
+            {"tool_name": "git_push", "server_label": "git", "capabilities": ["write"]},
+        ]),
+        encoding="utf-8",
+    )
+    return inventory_path
+
+
+def test_setup_normal_path_writes_valid_proxy_and_routed_client_config(tmp_path):
+    home = tmp_path / "setup-home"
+    proxy_command = tmp_path / "agentveil-mcp-proxy"
+    proxy_command.write_text("", encoding="utf-8")
+    inventory_path = _review_inventory_path(tmp_path)
+
+    from agentveil_mcp_proxy.config_wizard import (
+        derive_setup_status,
+        resolve_setup_paths,
+        run_setup_wizard,
+    )
+    from agentveil_mcp_proxy.policy import ProxyConfig
+
+    inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+    from agentveil_mcp_proxy.config_wizard import parse_tool_inventory
+
+    result = run_setup_wizard(
+        home=home,
+        inventory=parse_tool_inventory(inventory),
+        requested_mode="review",
+        proxy_command=str(proxy_command),
+    )
+    paths = resolve_setup_paths(home)
+    assert result.proxy_config_written is True
+    assert result.client_config_written is True
+    assert result.setup_status == "protected"
+    assert result.summary["mode"] == "review"
+    assert result.summary["role_preset"] == "reviewer"
+    assert result.summary["client_config_routes_through_agentveil"] is True
+
+    proxy_payload = json.loads(paths.proxy_config_path.read_text(encoding="utf-8"))
+    ProxyConfig.from_dict(proxy_payload)
+    assert proxy_payload["role_preset"] == "reviewer"
+
+    client_document = json.loads(paths.client_config_path.read_text(encoding="utf-8"))
+    entry = client_document["mcpServers"]["agentveil-mcp-proxy"]
+    assert entry["command"] == str(proxy_command)
+    assert entry["args"] == ["run", "--home", str(home), "--config", str(paths.proxy_config_path)]
+
+    status = derive_setup_status(home=home, proxy_command=str(proxy_command))
+    assert status.setup_status == "protected"
+    assert status.proxy_config_valid is True
+    assert status.client_config_routes_through_agentveil is True
+    assert SECRET not in json.dumps(result.summary)
+
+
+def test_setup_summary_matches_generated_configs(tmp_path):
+    home = tmp_path / "setup-home"
+    proxy_command = tmp_path / "agentveil-mcp-proxy"
+    proxy_command.write_text("", encoding="utf-8")
+    from agentveil_mcp_proxy.config_wizard import parse_tool_inventory, resolve_setup_paths, run_setup_wizard
+
+    inventory = parse_tool_inventory(json.loads(_review_inventory_path(tmp_path).read_text(encoding="utf-8")))
+    result = run_setup_wizard(
+        home=home,
+        inventory=inventory,
+        requested_mode="review",
+        proxy_command=str(proxy_command),
+    )
+    paths = resolve_setup_paths(home)
+    proxy_payload = json.loads(paths.proxy_config_path.read_text(encoding="utf-8"))
+    client_document = json.loads(paths.client_config_path.read_text(encoding="utf-8"))
+
+    assert result.summary["role_preset"] == proxy_payload["role_preset"]
+    assert result.summary["proxy_config_valid"] is True
+    assert "mode=review" in "\n".join(result.summary["summary_lines"])
+    entry = client_document["mcpServers"]["agentveil-mcp-proxy"]
+    assert str(paths.proxy_config_path) in entry["args"]
+
+
+def test_setup_status_reports_bypass_for_direct_downstream_client_config(tmp_path):
+    home = tmp_path / "setup-home"
+    proxy_command = tmp_path / "agentveil-mcp-proxy"
+    proxy_command.write_text("", encoding="utf-8")
+    from agentveil_mcp_proxy.config_wizard import derive_setup_status, parse_tool_inventory, resolve_setup_paths, run_setup_wizard
+
+    inventory = parse_tool_inventory(json.loads(_review_inventory_path(tmp_path).read_text(encoding="utf-8")))
+    run_setup_wizard(
+        home=home,
+        inventory=inventory,
+        requested_mode="review",
+        proxy_command=str(proxy_command),
+    )
+    paths = resolve_setup_paths(home)
+    paths.client_config_path.write_text(
+        json.dumps({
+            "mcpServers": {
+                "filesystem": {
+                    "command": "npx",
+                    "args": ["-y", "@modelcontextprotocol/server-filesystem", str(tmp_path)],
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+    status = derive_setup_status(home=home, proxy_command=str(proxy_command))
+    assert status.setup_status == "bypass"
+    assert status.client_config_routes_through_agentveil is False
+    assert status.direct_downstream_entries_count == 1
+
+
+def test_setup_backup_and_restore_bytes(tmp_path):
+    home = tmp_path / "setup-home"
+    proxy_command = tmp_path / "agentveil-mcp-proxy"
+    proxy_command.write_text("", encoding="utf-8")
+    from agentveil_mcp_proxy.config_wizard import (
+        derive_setup_status,
+        parse_tool_inventory,
+        resolve_setup_paths,
+        restore_setup_files,
+        run_setup_wizard,
+    )
+
+    inventory = parse_tool_inventory(json.loads(_review_inventory_path(tmp_path).read_text(encoding="utf-8")))
+    first = run_setup_wizard(
+        home=home,
+        inventory=inventory,
+        requested_mode="review",
+        proxy_command=str(proxy_command),
+    )
+    paths = resolve_setup_paths(home)
+    first_proxy_bytes = paths.proxy_config_path.read_bytes()
+
+    second = run_setup_wizard(
+        home=home,
+        inventory=inventory,
+        requested_mode="build",
+        proxy_command=str(proxy_command),
+    )
+    assert second.proxy_config_written is True
+    assert second.backup_refs
+    assert paths.proxy_config_path.read_bytes() != first_proxy_bytes
+
+    # claim-check: allow "all" is a restore target enum value, not a coverage claim.
+    restore = restore_setup_files(home=home, target="all")
+    assert restore.ok is True
+    assert paths.proxy_config_path.read_bytes() == first_proxy_bytes
+
+    proxy_payload = json.loads(paths.proxy_config_path.read_text(encoding="utf-8"))
+    status = derive_setup_status(home=home, proxy_command=str(proxy_command))
+    assert status.role_preset == proxy_payload["role_preset"]
+    assert status.mode == "review"
+    assert status.setup_status == "protected"
+
+
+def test_setup_status_aligns_with_proxy_config_after_restore_cli(tmp_path, capsys):
+    home = tmp_path / "setup-home"
+    proxy_command = tmp_path / "agentveil-mcp-proxy"
+    proxy_command.write_text("", encoding="utf-8")
+    inventory_path = _review_inventory_path(tmp_path)
+
+    assert main([
+        "setup",
+        "run",
+        "--home",
+        str(home),
+        "--inventory",
+        str(inventory_path),
+        "--mode",
+        "review",
+        "--proxy-command",
+        str(proxy_command),
+        "--json",
+    ]) == 0
+    capsys.readouterr()
+
+    assert main([
+        "setup",
+        "run",
+        "--home",
+        str(home),
+        "--inventory",
+        str(inventory_path),
+        "--mode",
+        "build",
+        "--proxy-command",
+        str(proxy_command),
+        "--json",
+    ]) == 0
+    capsys.readouterr()
+
+    assert main([
+        "setup",
+        "restore",
+        "--home",
+        str(home),
+        "--target",
+        # claim-check: allow "all" is a restore target enum value, not a coverage claim.
+        "all",
+        "--json",
+    ]) == 0
+    capsys.readouterr()
+
+    proxy_payload = json.loads((home / "mcp-proxy" / "config.json").read_text(encoding="utf-8"))
+    assert proxy_payload["role_preset"] == "reviewer"
+
+    assert main([
+        "setup",
+        "status",
+        "--home",
+        str(home),
+        "--proxy-command",
+        str(proxy_command),
+        "--json",
+    ]) == 0
+    status_payload = json.loads(capsys.readouterr().out)
+    assert status_payload["role_preset"] == proxy_payload["role_preset"]
+    assert status_payload["mode"] == "review"
+    assert status_payload["setup_status"] == "protected"
+
+
+def test_setup_write_failure_leaves_old_config_intact(tmp_path, monkeypatch):
+    home = tmp_path / "setup-home"
+    proxy_command = tmp_path / "agentveil-mcp-proxy"
+    proxy_command.write_text("", encoding="utf-8")
+    from agentveil_mcp_proxy.config_wizard import (
+        _atomic_write_bytes,
+        parse_tool_inventory,
+        resolve_setup_paths,
+        run_setup_wizard,
+    )
+
+    inventory = parse_tool_inventory(json.loads(_review_inventory_path(tmp_path).read_text(encoding="utf-8")))
+    first = run_setup_wizard(
+        home=home,
+        inventory=inventory,
+        requested_mode="review",
+        proxy_command=str(proxy_command),
+    )
+    paths = resolve_setup_paths(home)
+    original_proxy = paths.proxy_config_path.read_bytes()
+    original_client = paths.client_config_path.read_bytes()
+
+    real_atomic = _atomic_write_bytes
+
+    def flaky_atomic(target_path, content, *, backup_dir):
+        if target_path.name.endswith("-mcp.json"):
+            raise OSError("simulated client write failure")
+        return real_atomic(target_path, content, backup_dir=backup_dir)
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.config_wizard._atomic_write_bytes",
+        flaky_atomic,
+    )
+    failed = run_setup_wizard(
+        home=home,
+        inventory=inventory,
+        requested_mode="build",
+        proxy_command=str(proxy_command),
+    )
+    assert failed.ok is False
+    assert failed.client_config_written is False
+    assert paths.proxy_config_path.read_bytes() == original_proxy
+    assert paths.client_config_path.read_bytes() == original_client
+
+
+def test_setup_json_output_does_not_leak_local_paths(tmp_path, capsys):
+    home = tmp_path / "setup-home"
+    proxy_command = tmp_path / "agentveil-mcp-proxy"
+    proxy_command.write_text("", encoding="utf-8")
+    inventory_path = _review_inventory_path(tmp_path)
+
+    assert main([
+        "setup",
+        "run",
+        "--home",
+        str(home),
+        "--inventory",
+        str(inventory_path),
+        "--mode",
+        "review",
+        "--proxy-command",
+        str(proxy_command),
+        "--json",
+    ]) == 0
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    serialized = json.dumps(payload)
+
+    assert "proxy_config_path" not in payload["summary"]
+    assert "proxy_config_ref" in payload["summary"]
+    assert payload["summary"]["proxy_config_ref"]["basename"] == "config.json"
+    assert payload["summary"]["proxy_config_ref"]["hash"].startswith("sha256:")
+    for forbidden in (str(tmp_path), str(home), "/private/", "/var/folders/", "/Users/"):
+        assert forbidden not in serialized
+
+
+def test_restore_json_and_human_output_do_not_leak_local_paths(tmp_path, capsys):
+    home = tmp_path / "setup-home"
+    proxy_command = tmp_path / "agentveil-mcp-proxy"
+    proxy_command.write_text("", encoding="utf-8")
+    inventory_path = _review_inventory_path(tmp_path)
+
+    assert main([
+        "setup",
+        "run",
+        "--home",
+        str(home),
+        "--inventory",
+        str(inventory_path),
+        "--mode",
+        "review",
+        "--proxy-command",
+        str(proxy_command),
+        "--json",
+    ]) == 0
+    capsys.readouterr()
+
+    assert main([
+        "setup",
+        "run",
+        "--home",
+        str(home),
+        "--inventory",
+        str(inventory_path),
+        "--mode",
+        "build",
+        "--proxy-command",
+        str(proxy_command),
+        "--json",
+    ]) == 0
+    capsys.readouterr()
+
+    assert main([
+        "setup",
+        "restore",
+        "--home",
+        str(home),
+        "--target",
+        # claim-check: allow "all" is a restore target enum value, not a coverage claim.
+        "all",
+        "--json",
+    ]) == 0
+    restore_json = capsys.readouterr().out
+    restore_payload = json.loads(restore_json)
+    assert restore_payload["restored_targets"] == ["proxy", "client"]
+    assert restore_payload["restored_refs"][0]["target"] == "proxy"
+    assert restore_payload["restored_refs"][0]["basename"] == "config.json"
+    for forbidden in (str(tmp_path), str(home), "/private/", "/var/folders/", "/Users/"):
+        assert forbidden not in restore_json
+
+    assert main([
+        "setup",
+        "restore",
+        "--home",
+        str(home),
+        "--target",
+        "all",
+    ]) == 0
+    restore_human = capsys.readouterr().out
+    assert "restored: proxy" in restore_human
+    assert "restored: client" in restore_human
+    for forbidden in (str(tmp_path), str(home), "/private/", "/var/folders/", "/Users/"):
+        assert forbidden not in restore_human
+
+
+def _assert_no_local_path_leaks(serialized: str, *, tmp_path: Path, home: Path) -> None:
+    for forbidden in (str(tmp_path), str(home), "/private/", "/var/folders/", "/Users/"):
+        assert forbidden not in serialized
+
+
+def test_setup_missing_inventory_json_error_is_bounded(tmp_path, capsys):
+    home = tmp_path / "setup-home"
+    missing_inventory = tmp_path / "missing-inventory.json"
+
+    assert main([
+        "setup",
+        "run",
+        "--home",
+        str(home),
+        "--inventory",
+        str(missing_inventory),
+        "--mode",
+        "review",
+        "--json",
+    ]) == 2
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["ok"] is False
+    assert payload["target"] == "inventory"
+    assert payload["basename"] == "missing-inventory.json"
+    assert "unable to read tool inventory" in payload["error"]
+    _assert_no_local_path_leaks(captured.out + captured.err, tmp_path=tmp_path, home=home)
+
+
+def test_setup_missing_inventory_human_error_is_bounded(tmp_path, capsys):
+    home = tmp_path / "setup-home"
+    missing_inventory = tmp_path / "missing-inventory.json"
+
+    assert main([
+        "setup",
+        "run",
+        "--home",
+        str(home),
+        "--inventory",
+        str(missing_inventory),
+        "--mode",
+        "review",
+    ]) == 2
+    captured = capsys.readouterr()
+    assert "unable to read tool inventory: missing-inventory.json" in captured.err
+    _assert_no_local_path_leaks(captured.out + captured.err, tmp_path=tmp_path, home=home)
+
+
+def test_restore_missing_backup_errors_are_bounded(tmp_path, capsys):
+    home = tmp_path / "setup-home"
+    proxy_command = tmp_path / "agentveil-mcp-proxy"
+    proxy_command.write_text("", encoding="utf-8")
+    inventory_path = _review_inventory_path(tmp_path)
+
+    assert main([
+        "setup",
+        "run",
+        "--home",
+        str(home),
+        "--inventory",
+        str(inventory_path),
+        "--mode",
+        "review",
+        "--proxy-command",
+        str(proxy_command),
+        "--json",
+    ]) == 0
+    capsys.readouterr()
+    assert main([
+        "setup",
+        "run",
+        "--home",
+        str(home),
+        "--inventory",
+        str(inventory_path),
+        "--mode",
+        "build",
+        "--proxy-command",
+        str(proxy_command),
+        "--json",
+    ]) == 0
+    capsys.readouterr()
+
+    from agentveil_mcp_proxy.config_wizard import resolve_setup_paths
+
+    paths = resolve_setup_paths(home)
+    for backup_file in paths.backup_dir.glob("*.bak"):
+        backup_file.unlink()
+
+    assert main([
+        "setup",
+        "restore",
+        "--home",
+        str(home),
+        "--target",
+        # claim-check: allow "all" is a restore target enum value, not a coverage claim.
+        "all",
+        "--json",
+    ]) == 2
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["ok"] is False
+    assert "backup not found" in " ".join(payload["errors"])
+    _assert_no_local_path_leaks(captured.out + captured.err, tmp_path=tmp_path, home=home)
+
+    assert main([
+        "setup",
+        "restore",
+        "--home",
+        str(home),
+        "--target",
+        # claim-check: allow "all" is a restore target enum value, not a coverage claim.
+        "all",
+    ]) == 2
+    captured = capsys.readouterr()
+    assert "backup not found" in captured.out
+    _assert_no_local_path_leaks(captured.out + captured.err, tmp_path=tmp_path, home=home)
+
+
+def test_non_validatable_setup_does_not_write_protected_config(tmp_path):
+    home = tmp_path / "setup-home"
+    proxy_command = tmp_path / "agentveil-mcp-proxy"
+    proxy_command.write_text("", encoding="utf-8")
+    from agentveil_mcp_proxy.config_wizard import derive_setup_status, parse_tool_inventory, resolve_setup_paths, run_setup_wizard
+
+    inventory = parse_tool_inventory([
+        {"tool_name": "write_file", "server_label": "filesystem", "capabilities": ["write"]},
+    ])
+    result = run_setup_wizard(
+        home=home,
+        inventory=inventory,
+        requested_mode="build",
+        overlays=["docs_write_only"],
+        proxy_command=str(proxy_command),
+    )
+    paths = resolve_setup_paths(home)
+    assert result.setup_status == "incomplete"
+    assert result.proxy_config_written is False
+    assert result.client_config_written is False
+    assert "docs_write_only" in result.errors[0]
+    status = derive_setup_status(home=home, proxy_command=str(proxy_command))
+    assert status.setup_status == "incomplete"
+    assert not paths.proxy_config_path.is_file() or status.proxy_config_valid is False

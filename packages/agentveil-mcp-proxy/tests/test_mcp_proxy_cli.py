@@ -1226,7 +1226,7 @@ def test_doctor_full_smokes_downstream(tmp_path):
 
     assert code == 0
     assert "OK: downstream filesystem configured" in out.getvalue()
-    assert "OK: downstream filesystem answered initialize/tools/list (2 tools)" in out.getvalue()
+    assert "OK: downstream filesystem answered initialize/tools/list (9 tools)" in out.getvalue()
 
 
 def test_doctor_json_reports_downstream_and_evidence_count(tmp_path):
@@ -1250,7 +1250,7 @@ def test_doctor_json_reports_downstream_and_evidence_count(tmp_path):
     assert payload["ok"] is True
     assert payload["errors"] == []
     assert payload["downstream"]["name"] == "filesystem"
-    assert payload["downstream"]["tool_count"] == 2
+    assert payload["downstream"]["tool_count"] == 9
     assert payload["evidence_count"] == 1
 
 
@@ -1287,7 +1287,7 @@ def test_smoke_proxy_smokes_downstream(tmp_path):
     result = smoke_proxy(home=home, out=out)
 
     assert result.downstream_name == "filesystem"
-    assert result.tool_count == 2
+    assert result.tool_count == 9
     assert "OK: downstream filesystem answered initialize/tools/list" in out.getvalue()
 
 
@@ -1305,11 +1305,11 @@ def test_smoke_json_reports_machine_readable_result(tmp_path):
     result = smoke_proxy(home=home, output_json=True, out=out)
 
     payload = json.loads(out.getvalue())
-    assert result.tool_count == 2
+    assert result.tool_count == 9
     assert payload["ok"] is True
     assert payload["errors"] == []
     assert payload["downstream"]["name"] == "filesystem"
-    assert payload["downstream"]["tool_count"] == 2
+    assert payload["downstream"]["tool_count"] == 9
     assert payload["evidence_count"] == 0
 
 
@@ -1334,9 +1334,18 @@ def test_events_list_and_summary_are_privacy_safe(tmp_path):
 
     summary_out = io.StringIO()
     summary = evidence_summary(home=home, out=summary_out)
+    rendered_summary = summary_out.getvalue()
     assert summary["record_count"] == 1
     assert summary["receipt_present_count"] == 1
-    assert "req-events" not in summary_out.getvalue()
+    assert summary["records"][0]["request_id"] == "req-events"
+    if summary["downstream"].get("configured"):
+        assert summary["downstream"]["command_ref"]
+        assert summary["downstream"]["command_basename"]
+        assert "command" not in summary["downstream"]
+        assert "args" not in summary["downstream"]
+    else:
+        assert summary["downstream"] == {"configured": False}
+    assert "/tmp/" not in rendered_summary
 
 
 def test_events_list_json_is_machine_readable_and_privacy_safe(tmp_path):
@@ -1359,7 +1368,11 @@ def test_events_list_json_is_machine_readable_and_privacy_safe(tmp_path):
     assert count == 1
     assert payload["ok"] is True
     assert payload["evidence_count"] == 1
-    assert payload["downstream"]["name"] == "filesystem"
+    assert payload["downstream"]["downstream_kind"] == "filesystem"
+    assert payload["downstream"]["command_ref"]
+    assert payload["downstream"]["command_basename"]
+    assert "command" not in payload["downstream"]
+    assert "args" not in payload["downstream"]
     assert payload["events"] == [{
         "timestamp": "2023-11-14T22:13:20Z",
         "server": "github",
@@ -1371,6 +1384,108 @@ def test_events_list_json_is_machine_readable_and_privacy_safe(tmp_path):
         "record_id": "req-events-json",
     }]
     assert "b" * 64 not in events_out.getvalue()
+
+
+def test_main_init_quickstart_filesystem_without_role_uses_safe_autopilot(tmp_path, capsys):
+    home = tmp_path / "avp-home"
+    sandbox = tmp_path / "sandbox"
+
+    assert main([
+        "init",
+        "--quickstart-filesystem", str(sandbox),
+        "--home", str(home),
+        "--agent-name", "proxy",
+        "--plaintext",
+        "--json",
+    ]) == 0
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    config = _load(proxy_paths(home).config_path)
+    assert payload["setup_profile"] == "safe_autopilot"
+    # claim-check: allow product label; this test verifies bounded first-run output.
+    assert payload["setup_label"] == "Safe Autopilot"
+    assert config["setup_profile"] == "safe_autopilot"
+    assert config["role_preset"] == "reviewer"
+    assert config["policy"]["id"] == "filesystem"
+    assert sandbox.is_dir()
+    assert "identity_path" not in payload
+    assert payload["identity_ref"]["basename"] == "proxy.json"
+    serialized = captured.out
+    assert "/private/" not in serialized
+    assert "/var/folders/" not in serialized
+    assert "/Users/" not in serialized
+    assert str(home) not in serialized
+
+
+def test_main_init_explicit_reviewer_quickstart_persists_advanced_role_and_blocks_write(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    home = tmp_path / "avp-home"
+    sandbox = tmp_path / "sandbox"
+
+    assert main([
+        "init",
+        "--quickstart-filesystem", str(sandbox),
+        "--role", "reviewer",
+        "--home", str(home),
+        "--agent-name", "proxy",
+        "--plaintext",
+        "--json",
+    ]) == 0
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    config = _load(proxy_paths(home).config_path)
+    assert payload["setup_profile"] == "advanced_role"
+    assert config["setup_profile"] == "advanced_role"
+    assert config["role_preset"] == "reviewer"
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("reviewer quickstart must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+    write_call = json.dumps({
+        "jsonrpc": "2.0",
+        "id": "write-1",
+        "method": "tools/call",
+        "params": {"name": "write_file", "arguments": {"path": "probe.txt", "content": "x"}},
+    }) + "\n"
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(write_call),
+        out=client_out,
+        approval_ui_mode="none",
+    ) == 0
+    response = json.loads(client_out.getvalue().strip().splitlines()[-1])
+    assert response["error"]["data"]["reason"] == "role_authority_denied"
+    assert not (sandbox / "probe.txt").exists()
+
+
+def test_main_init_quickstart_filesystem_human_output_is_privacy_bounded(tmp_path, capsys):
+    home = tmp_path / "avp-home"
+    sandbox = tmp_path / "sandbox"
+
+    assert main([
+        "init",
+        "--quickstart-filesystem", str(sandbox),
+        "--home", str(home),
+        "--agent-name", "proxy",
+        "--plaintext",
+    ]) == 0
+
+    out = capsys.readouterr().out
+    # claim-check: allow product label; this test rejects role-choice wording.
+    assert "Safe Autopilot" in out
+    assert "/private/" not in out
+    assert "/var/folders/" not in out
+    assert "/Users/" not in out
+    assert str(home) not in out
+    assert "proxy.json" in out
 
 
 def test_main_init_json_supports_noninteractive_downstream_flags(tmp_path, capsys):
@@ -1403,7 +1518,63 @@ def test_main_init_json_supports_noninteractive_downstream_flags(tmp_path, capsy
     assert payload["errors"] == []
     assert payload["downstream"]["name"] == "filesystem"
     assert payload["evidence_count"] == 0
-    assert _load(proxy_paths(home).config_path)["downstream"]["args"][-1] == str(sandbox)
+    config_payload = _load(proxy_paths(home).config_path)
+    assert config_payload["downstream"]["args"][-1] == str(sandbox)
+    assert config_payload["identity_passphrase_file"] == str(passphrase_file)
+
+
+def test_client_config_infers_stored_passphrase_file_for_encrypted_quickstart(tmp_path, capsys):
+    home = tmp_path / "avp-home"
+    sandbox = tmp_path / "sandbox"
+    passphrase_file = tmp_path / "passphrase.txt"
+    passphrase_file.write_text(TEST_PASSPHRASE, encoding="utf-8")
+    os.chmod(passphrase_file, 0o600)
+
+    assert main([
+        "init",
+        "--quickstart-filesystem", str(sandbox),
+        "--home", str(home),
+        "--passphrase-file", str(passphrase_file),
+        "--json",
+    ]) == 0
+    capsys.readouterr()
+
+    assert main([
+        "client-config",
+        "print",
+        "--home", str(home),
+        "--client", "cursor",
+        "--json",
+    ]) == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    entry = payload["clients"]["cursor"]["local_client_config"]["mcpServers"]["agentveil-mcp-proxy"]
+    assert "--passphrase-file" in entry["args"]
+    flag_index = entry["args"].index("--passphrase-file")
+    assert entry["args"][flag_index + 1] == str(passphrase_file)
+    assert TEST_PASSPHRASE not in captured.out
+
+
+def test_doctor_infers_stored_passphrase_file_for_encrypted_quickstart(tmp_path, capsys):
+    home = tmp_path / "avp-home"
+    sandbox = tmp_path / "sandbox"
+    passphrase_file = tmp_path / "passphrase.txt"
+    passphrase_file.write_text(TEST_PASSPHRASE, encoding="utf-8")
+    os.chmod(passphrase_file, 0o600)
+
+    assert main([
+        "init",
+        "--quickstart-filesystem", str(sandbox),
+        "--home", str(home),
+        "--passphrase-file", str(passphrase_file),
+        "--json",
+    ]) == 0
+    capsys.readouterr()
+
+    assert main(["doctor", "--home", str(home), "--full", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["errors"] == []
 
 
 def test_main_init_policy_pack_git_writes_git_policy_id(tmp_path):
@@ -1496,6 +1667,46 @@ def test_configure_downstream_named_fetch_preserves_explicit_fetch_policy(tmp_pa
     assert config["downstream"]["name"] == "fetch"
 
 
+def test_main_init_policy_pack_package_json_writes_package_policy_and_downstream(tmp_path, capsys):
+    home = tmp_path / "avp-home"
+    downstream_script = tmp_path / "package_downstream.py"
+    project_root = tmp_path / "project"
+    target_venv = tmp_path / "target-venv"
+    project_root.mkdir()
+    target_venv.mkdir()
+    downstream_script.write_text("print('stub')\n", encoding="utf-8")
+
+    exit_code = main([
+        "init",
+        "--role", "implementer",
+        "--home", str(home),
+        "--agent-name", "proxy",
+        "--policy-pack", "package",
+        "--downstream-name", "package",
+        "--downstream-command", sys.executable,
+        "--downstream-arg", str(downstream_script),
+        "--downstream-arg", str(project_root),
+        "--downstream-arg", str(target_venv),
+        "--plaintext",
+        "--json",
+    ])
+    out, err = capsys.readouterr()
+
+    assert exit_code == 0
+    assert err == ""
+    payload = json.loads(out)
+    assert payload["ok"] is True
+    assert payload["errors"] == []
+    assert payload["downstream"]["name"] == "package"
+    config_payload = _load(proxy_paths(home).config_path)
+    assert config_payload["policy"]["id"] == "package"
+    assert config_payload["downstream"]["args"] == [
+        str(downstream_script),
+        str(project_root),
+        str(target_venv),
+    ]
+
+
 def test_reissue_grant_creates_new_grant_with_default_ttl(tmp_path):
     home = tmp_path / "avp-home"
     result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
@@ -1585,7 +1796,7 @@ def test_main_init_doctor_and_run_exit_codes(tmp_path, capsys):
         TEST_PASSPHRASE,
     ]) == 0
     created = capsys.readouterr()
-    assert "Created MCP proxy identity:" in created.out
+    assert "Created protected agent connection:" in created.out
     secret = _secret_material(_load(proxy_paths(home).identity_path("proxy")))
     assert secret not in created.out
 
@@ -1600,3 +1811,84 @@ def test_main_init_doctor_and_run_exit_codes(tmp_path, capsys):
     assert "downstream.command" in run.err
     assert secret not in run.out
     assert secret not in run.err
+
+
+def test_setup_cli_run_status_and_restore(tmp_path, capsys):
+    home = tmp_path / "setup-home"
+    proxy_command = tmp_path / "agentveil-mcp-proxy"
+    proxy_command.write_text("", encoding="utf-8")
+    inventory_path = tmp_path / "inventory.json"
+    inventory_path.write_text(
+        json.dumps([
+            {"tool_name": "read_file", "server_label": "filesystem", "capabilities": ["read"]},
+            {"tool_name": "git_status", "server_label": "git", "capabilities": ["read"]},
+        ]),
+        encoding="utf-8",
+    )
+
+    assert main([
+        "setup",
+        "run",
+        "--home",
+        str(home),
+        "--inventory",
+        str(inventory_path),
+        "--mode",
+        "review",
+        "--proxy-command",
+        str(proxy_command),
+        "--json",
+    ]) == 0
+    run_payload = json.loads(capsys.readouterr().out)
+    assert run_payload["setup_status"] == "protected"
+    assert run_payload["proxy_config_written"] is True
+    assert run_payload["summary"]["role_preset"] == "reviewer"
+
+    first_proxy = (home / "mcp-proxy" / "config.json").read_bytes()
+    assert main([
+        "setup",
+        "run",
+        "--home",
+        str(home),
+        "--inventory",
+        str(inventory_path),
+        "--mode",
+        "build",
+        "--proxy-command",
+        str(proxy_command),
+        "--json",
+    ]) == 0
+    capsys.readouterr()
+    assert (home / "mcp-proxy" / "config.json").read_bytes() != first_proxy
+
+    assert main([
+        "setup",
+        "status",
+        "--home",
+        str(home),
+        "--proxy-command",
+        str(proxy_command),
+        "--json",
+    ]) == 0
+    status_payload = json.loads(capsys.readouterr().out)
+    assert status_payload["setup_status"] == "protected"
+
+    assert main([
+        "setup",
+        "restore",
+        "--home",
+        str(home),
+        "--target",
+        # claim-check: allow "all" is a restore target enum value, not a coverage claim.
+        "all",
+        "--json",
+    ]) == 0
+    restore_payload = json.loads(capsys.readouterr().out)
+    assert restore_payload["ok"] is True
+    assert restore_payload["restored_targets"] == ["proxy", "client"]
+    assert (home / "mcp-proxy" / "config.json").read_bytes() == first_proxy
+    restore_text = json.dumps(restore_payload)
+    assert str(home) not in restore_text
+    assert "/private/" not in restore_text
+    assert "/var/folders/" not in restore_text
+    assert "/Users/" not in restore_text
