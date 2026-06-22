@@ -11,8 +11,10 @@ from typing import Any, Literal, Mapping
 
 from agentveil_mcp_proxy.client_config import (
     ClientConfigError,
+    DEFAULT_SERVER_NAME,
     build_generated_launch_spec,
     generated_command_is_available,
+    parse_codex_mcp_server_entry,
     render_client_configs,
     resolve_proxy_command,
 )
@@ -150,8 +152,13 @@ def _launch_spec_matches_rendered_config(
         return False
     if config_surface in {"codex_config_toml_manual", "codex_config_toml"}:
         manual = str(document.get("manual_config_toml", ""))
-        # claim-check: allow all() validates generated args are present in one manual config snippet.
-        return command in manual and all(str(arg) in manual for arg in args)
+        entry = parse_codex_mcp_server_entry(manual, server_name=DEFAULT_SERVER_NAME)
+        if entry is None:
+            return False
+        entry_env = entry.get("env", {})
+        if entry_env is None:
+            entry_env = {}
+        return entry.get("command") == command and entry.get("args") == args and entry_env == env
     servers = document.get("mcpServers")
     if not isinstance(servers, Mapping) or not servers:
         return False
