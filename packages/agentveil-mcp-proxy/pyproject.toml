@@ -1,16 +1,16 @@
 [project]
 name = "agentveil-mcp-proxy"
 version = "0.7.21"
-description = "Source-available MCP transport proxy for AgentVeil Runtime Gate, approval routing, and local evidence"
+description = "Source-available MCP route for approval and local evidence on routed MCP tool calls"
 readme = {file = "README.md", content-type = "text/markdown"}
 requires-python = ">=3.10"
 license = "BUSL-1.1"
 license-files = ["LICENSE"]
 authors = [{name = "Oleg Boiko", email = "ob@agentveil.dev"}]
 maintainers = [{name = "Oleg Boiko", email = "ob@agentveil.dev"}]
-keywords = ["ai", "agents", "agent-control", "runtime-gate", "mcp", "mcp-proxy", "approval", "evidence"]
+keywords = ["ai", "agents", "agent-control", "runtime-gate", "mcp", "mcp-proxy", "approval", "evidence", "routed-actions"]
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Topic :: Software Development :: Libraries",
     "Programming Language :: Python :: 3",

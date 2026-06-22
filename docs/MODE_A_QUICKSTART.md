@@ -1,95 +1,49 @@
 # Mode A Quickstart
 
-Mode A is the Project Owner path for AgentVeil. It is for teams using Cursor,
+Mode A is the project-owner path for AgentVeil. It is for teams using Cursor,
 Claude, MCP servers, CrewAI, GitHub Actions, or similar automation inside a
-project and asking: what can these tools do, which actions are risky, and what
-should be allowed?
+project and asking: what can these tools do, which actions are risky, and which
+paths should be routed through AgentVeil?
 
-AgentVeil is one Action Control system. Reputation, identity, delegation,
-approvals, and receipts are decision inputs and evidence mechanisms, not
-separate products.
+AgentVeil is one action-control system. Identity, delegation, approvals,
+receipts, and reputation signals are decision inputs and evidence mechanisms,
+not separate public product promises.
 
-## Step 1 — Check Agent Capabilities Before Deployment
+## Step 1 - Check Agent Capabilities Before Deployment
 
-Lurkr is the local pre-runtime scanner for risky AI-agent capabilities. It is
-the first Project Owner entry point.
+Lurkr is a local pre-runtime scanner for risky AI-agent capabilities.
 
 ```bash
 pip install lurkr
 lurkr scan --path ./your-agent-project
 ```
 
-Lurkr reports risky agent and automation surfaces such as deploy actions, shell
-execution, credential access, undeclared tool registrations, dynamic prompt
-construction, and missing approval boundaries. Treat the report as a triage input
-before wiring runtime controls.
+Treat the report as a triage input before wiring runtime controls.
 
-## Step 2 — Define Local Policy (planned for v0.8 / Phase 3)
+## Step 2 - Route One Action Path
 
-Local policy initialization is planned for v0.8 / Phase 3.
+The public routed path available today is MCP Proxy:
 
 ```bash
-agentveil policy init  # (planned for v0.8 / Phase 3)
+pip install agentveil-mcp-proxy
+agentveil-mcp-proxy init --quickstart-filesystem ./sandbox
+agentveil-mcp-proxy doctor --full
+agentveil-mcp-proxy run
 ```
 
-Expected starter policy shape:
+MCP Proxy controls only MCP calls routed through the proxy. Actions outside the
+proxy are not classified or logged.
 
-```json
-{
-  "version": "agentveil.policy/v1",
-  "defaults": {
-    "unknown": "approval_required",
-    "production": "approval_required"
-  },
-  "rules": [
-    {
-      "action": "deploy.release",
-      "resource": "service:*",
-      "environment": "production",
-      "decision": "approval_required"
-    },
-    {
-      "action": "read.files",
-      "resource": "repo:*",
-      "environment": "development",
-      "decision": "allow"
-    }
-  ]
-}
-```
+## Step 3 - Produce Evidence For The Routed Path
 
-## Step 3 — Evaluate Actions Before Execution (planned for v0.8 / Phase 3)
-
-Pure local evaluation is planned for v0.8 / Phase 3. It will let a project
-owner check an action against local policy without registration or backend
-connectivity.
-
-```python
-from agentveil import evaluate_action  # (planned for v0.8 / Phase 3)
-
-decision = evaluate_action(
-    action="deploy.release",
-    resource="service:critical",
-    environment="production",
-    policy_file="./.agentveil/policy.json",
-)
-
-print(decision.status)  # allow / approval_required / block
-```
-
-Until that ships, use the backend-connected `controlled_action(...)` path for
-runtime decisions and signed evidence.
-
-## Step 4 — Produce Signed Evidence (works today)
-
-The backend-connected SDK path works today:
+For backend-connected SDK paths:
 
 1. Register or load an agent identity.
-2. Receive a DelegationReceipt from the workflow owner.
-3. Call `controlled_action(...)`.
-4. If approval is required, route through `approve(...)` and
-   `execute_after_approval(...)`.
-5. Export a Proof Packet and verify it offline.
+2. Receive a delegation receipt from the workflow owner.
+3. Call `controlled_action(...)` before the sensitive action.
+4. If approval is required, route approval to the principal and resume after
+   approval.
+5. Store receipt text or a proof packet for later review.
 
 Relevant guides:
 
@@ -99,22 +53,24 @@ Relevant guides:
 - [Proof Packet Guide](PROOF_PACKET.md)
 - [Error Handling](ERRORS.md)
 
-## End-State Roadmap
+## Current / Preview Status
 
-| Milestone | Status |
+| Capability | Status |
 |---|---|
-| Mode A v0.1: Lurkr pre-runtime check as project entry point | Built; available as `lurkr` |
-| Mode A v0.8: local policy file and `evaluate_action(...)` | (planned for v0.8 / Phase 3) |
-| Mode A CLI: `agentveil policy init` and `agentveil check-action` | (planned for Phase 4) |
-| MCP Proxy and signed local receipts | Built; available through the separate `agentveil-mcp-proxy` package |
-| Managed or customer-hosted gateway enforcement | (planned for Phase 5) |
+| Lurkr pre-runtime check | Available as `lurkr` |
+| MCP Proxy routed MCP calls | Available as `agentveil-mcp-proxy` |
+| SDK controlled-action calls | Available for integrated application paths |
+| Local policy CLI | Planned |
+| Credential custody boundary | Preview/design-partner pattern |
+| Egress boundary | Preview/design-partner pattern |
+| API gate boundary | Preview/design-partner pattern |
 
-Public claims should track this table. If a capability is listed as planned, do
-not treat it as shipped behavior.
+Public claims should track this table. If a capability is listed as planned or
+preview, do not treat it as shipped behavior.
 
-## Advanced Agent Network Features
+## Advanced Protocol Primitives
 
-Agent identity, reputation, attestations, W3C credentials, and agent discovery
-remain available as advanced features and decision inputs. See
-[Agent Network (Advanced)](ADVANCED_AGENT_NETWORK.md) when you need those
-primitives directly.
+Agent identity, reputation credentials, delegation receipts, credential
+helpers, and optional framework adapter modules remain available as advanced protocol
+primitives when their framework dependencies are installed. See [Agent Network (Advanced)](ADVANCED_AGENT_NETWORK.md) when you
+need those primitives directly.
