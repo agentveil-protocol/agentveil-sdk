@@ -55,6 +55,7 @@ def _isolated_cursor_connect_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     cursor_user_data = tmp_path / "cursor-user-data"
     cursor_user_data.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.setenv("CURSOR_USER_DATA_DIR", str(cursor_user_data))
     return home
 
