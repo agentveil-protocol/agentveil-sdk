@@ -36,7 +36,7 @@ from agentveil_mcp_proxy.passthrough import (
     JSONRPC_RUNTIME_GATE_UNTRUSTED,
     McpPassthrough,
 )
-from agentveil_mcp_proxy.policy import ProxyConfig, builtin_policy_pack
+from agentveil_mcp_proxy.policy import ProxyConfig
 from agentveil_mcp_proxy.runtime_gate import (
     RuntimeGateClient,
     RuntimeGateDecision,
@@ -65,30 +65,21 @@ def _responses(text: str) -> list[dict]:
     return [json.loads(line) for line in text.splitlines() if line.strip()]
 
 
-def _policy_to_dict(name: str) -> dict:
-    policy = builtin_policy_pack(name)
-    rules = []
-    for rule in policy.rules:
-        match = {}
-        if rule.match.server:
-            match["server"] = list(rule.match.server)
-        if rule.match.tool:
-            match["tool"] = list(rule.match.tool)
-        item = {
-            "id": rule.id,
-            "source": rule.source,
-            "decision": rule.decision.value,
-            "match": match,
-        }
-        if rule.risk_class is not None:
-            item["risk_class"] = rule.risk_class.value
-        rules.append(item)
+def _runtime_gate_policy_to_dict() -> dict:
     return {
-        "id": policy.id,
-        "policy_schema_version": policy.policy_schema_version,
-        "default_decision": policy.default_decision.value,
-        "default_risk_class": policy.default_risk_class.value,
-        "rules": rules,
+        "id": "runtime-gate-test",
+        "policy_schema_version": 1,
+        "default_decision": "ask_backend",
+        "default_risk_class": "write",
+        "rules": [
+            {
+                "id": "ask-runtime-gate-create-issue",
+                "source": "user",
+                "decision": "ask_backend",
+                "match": {"server": ["github"], "tool": ["create_issue"]},
+                "risk_class": "write",
+            }
+        ],
     }
 
 
@@ -116,7 +107,7 @@ def _config(*, privacy: dict | None = None, fallback: dict | None = None) -> Pro
             "unknown": "approval",
         },
         "approval": {},
-        "policy": _policy_to_dict("github"),
+        "policy": _runtime_gate_policy_to_dict(),
         "downstream": {},
     })
 

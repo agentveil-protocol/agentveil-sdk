@@ -30,6 +30,11 @@ from agentveil_mcp_proxy.evidence import (
     verify_evidence_bundle_legacy,
 )
 from agentveil_mcp_proxy.evidence.proof import _bundle_records, verify_evidence_bundle_file
+from agentveil_mcp_proxy.evidence.verify_output import (
+    VERIFY_FAILED_UNEXPECTED,
+    VERIFY_PASSED,
+    VERIFY_REQUIRES_TRUST_ROOTS,
+)
 
 
 PAYLOAD_HASH = "sha256:" + "a" * 64
@@ -935,7 +940,7 @@ def test_verify_human_and_json_output_formats(tmp_path):
     assert verify_evidence(
         bundle_path=bundle_path, trusted_signer_dids=[BACKEND_DID], out=human
     ) == 0
-    assert "OK: bundle integrity verified" in human.getvalue()
+    assert "VERIFY: passed" in human.getvalue()
 
     structured = io.StringIO()
     assert verify_evidence(
@@ -945,6 +950,7 @@ def test_verify_human_and_json_output_formats(tmp_path):
         out=structured,
     ) == 0
     payload = json.loads(structured.getvalue())
+    assert payload["contract"] == VERIFY_PASSED
     assert payload["status"] == "ok"
     assert payload["unverified_receipt_count"] == 0
     assert payload["warnings"] == []
@@ -970,10 +976,8 @@ def test_verify_cli_fails_closed_when_trusted_signer_did_absent_human(tmp_path):
     out = io.StringIO()
     assert verify_evidence(bundle_path=bundle_path, out=out) == 1
 
-    assert (
-        "FAIL: strict verification requires externally supplied trusted_signer_dids"
-        in out.getvalue()
-    )
+    assert "VERIFY: requires_trust_roots" in out.getvalue()
+    assert "trusted signer DIDs" in out.getvalue()
 
 
 def test_verify_cli_fails_closed_when_trusted_signer_did_absent_json(tmp_path):
@@ -987,8 +991,9 @@ def test_verify_cli_fails_closed_when_trusted_signer_did_absent_json(tmp_path):
     assert verify_evidence(bundle_path=bundle_path, output_format="json", out=out) == 1
     payload = json.loads(out.getvalue())
 
-    assert payload["status"] == "invalid"
-    assert "trusted_signer_dids" in payload["error"]
+    assert payload["contract"] == VERIFY_REQUIRES_TRUST_ROOTS
+    assert payload["status"] == "requires_trust_roots"
+    assert payload["reason_code"] == "signed_receipts_require_trust_roots"
 
 
 def test_verify_cli_no_warning_when_explicit_trusted_signer_did_provided(tmp_path):
@@ -1025,8 +1030,8 @@ def test_verify_cli_fails_on_missing_referenced_receipt_human(tmp_path):
         out=out,
     ) == 1
 
-    assert "FAIL: strict verification failed:" in out.getvalue()
-    assert "missing from bundle" in out.getvalue()
+    assert "VERIFY: failed_unexpected" in out.getvalue()
+    assert "Reason code: signed_receipts_missing" in out.getvalue()
 
 
 def test_verify_cli_fails_on_missing_referenced_receipt_json(tmp_path):
@@ -1046,8 +1051,9 @@ def test_verify_cli_fails_on_missing_referenced_receipt_json(tmp_path):
     ) == 1
     payload = json.loads(out.getvalue())
 
+    assert payload["contract"] == VERIFY_FAILED_UNEXPECTED
     assert payload["status"] == "invalid"
-    assert "missing from bundle" in payload["error"]
+    assert payload["reason_code"] == "signed_receipts_missing"
 
 
 def test_verify_does_not_leak_payload_data_in_error_messages(tmp_path):
