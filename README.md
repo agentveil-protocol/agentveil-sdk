@@ -10,9 +10,9 @@
 [![License](https://img.shields.io/badge/License-MIT%20%2B%20BUSL-informational)](LICENSING.md)
 [![Glama MCP Directory](https://img.shields.io/badge/Glama-MCP%20Directory-blue)](https://glama.ai/mcp/servers/agentveil-protocol/avp-sdk)
 
-**Action control for autonomous agents — check pre-runtime risk, gate risky actions, prove execution.**
+**Routed action control for risky AI-agent actions.**
 
-[Quick Start](#quick-start) · [Comparison](#comparison) · [Examples](examples/) · [Docs](docs/)
+[Quick Start](#quick-start) · [Scope](#scope) · [Comparison](#comparison) · [Examples](examples/) · [Docs](docs/)
 
 </div>
 
@@ -20,47 +20,61 @@
 pip install agentveil
 ```
 
-**PyPI**: [agentveil](https://pypi.org/project/agentveil/) | **API**: [agentveil.dev](https://agentveil.dev) | **Network**: [Live Network](https://agentveil.dev/live)
+**PyPI**: [agentveil](https://pypi.org/project/agentveil/) | **Website**: [agentveil.dev](https://agentveil.dev) | **Proxy package**: [`agentveil-mcp-proxy`](packages/agentveil-mcp-proxy/)
 
-> [Why agent trust infrastructure matters](docs/SECURITY_CONTEXT.md) — verified CVEs, market data, and the structural problem AgentVeil addresses.
-
-> **[AVPProvider merged into Microsoft Agent Governance Toolkit (PR #1010).](https://github.com/microsoft/agent-governance-toolkit/pull/1010)** AgentVeil can be connected to Microsoft AGT / AgentMesh as an external trust and reputation integration.
-
-> **Paper:** Boiko, O. (2026). *[Why AI Agent Reputation Needs Both Link Analysis and Flow-Based Gating](https://zenodo.org/records/19730525)*. Zenodo.
-
-> **MCP transport proxy:** wrap downstream MCP servers (filesystem, github, shell) with AgentVeil Action Control Plane gating, approval routing, durable signed evidence, and replay defense. The proxy is a separately packaged source-available component under [`packages/agentveil-mcp-proxy/`](packages/agentveil-mcp-proxy/) and is not covered by the root MIT license. See [Licensing](LICENSING.md).
+> **MCP transport proxy:** route downstream MCP server calls (filesystem, github, shell) through AgentVeil policy, approval routing, and bounded local evidence. The proxy controls calls routed through it; actions outside the proxy are not classified or logged. It is a separately packaged source-available component under [`packages/agentveil-mcp-proxy/`](packages/agentveil-mcp-proxy/) and is not covered by the root MIT license. See [Licensing](LICENSING.md).
 
 <p align="center">
-  <img src="docs/demo.gif" alt="AgentVeil SDK demo — preflight, runtime gate, approval, controlled execution, offline proof" width="720">
+  <img src="docs/demo.gif" alt="AgentVeil SDK demo — preflight, runtime gate, approval, routed action, offline evidence" width="720">
 </p>
 
-> **Visual overview:** preflight → runtime gate → approval → controlled execution → offline proof.
+> **Visual overview:** preflight → runtime gate → approval → routed action → offline evidence.
 >
-> **Audit chain walkthrough:** [`examples/proof_pack/`](examples/proof_pack/) — local-backend demo proving offline audit-trail integrity verification. End-to-end flow: signed events → tamper-resistant chain → offline verify (stdlib only, no SDK dependency).
+> **Audit chain walkthrough:** [`examples/proof_pack/`](examples/proof_pack/) — local-backend demo for offline audit-trail integrity checks. Flow: signed events → hash chain → offline verify (stdlib only, no SDK dependency).
 >
 > **Controlled-action proof packets:** Runtime Gate flows can export signed proof packets with `agent.build_proof_packet(...)`; see [Customer Integration](docs/CUSTOMER_INTEGRATION.md).
 >
 > **Data handling:** AgentVeil does not train models on customer data or sell customer data. Runtime Gate is designed for bounded metadata and hashes; MCP Proxy keeps raw MCP arguments local by default. See [Data Handling](docs/DATA_HANDLING.md).
 
-```python
-from datetime import timedelta
-from agentveil import AVPAgent
-
-owner = AVPAgent.create(mock=True, name="workflow-owner")
-agent = AVPAgent.create(mock=True, name="demo-agent")
-agent.register(display_name="Demo Agent")
-
-delegation = owner.issue_delegation_receipt(
-    agent_did=agent.did,
-    allowed_categories=["deploy"],
-    valid_for=timedelta(minutes=15),
-)
-print(agent.verify_delegation_receipt(delegation)["valid"])
+```bash
+pip install agentveil-mcp-proxy
+agentveil-mcp-proxy init --quickstart-filesystem ./sandbox
+agentveil-mcp-proxy doctor --full
+agentveil-mcp-proxy run
 ```
+
+## Scope
+
+AgentVeil controls only actions that are explicitly routed through an AgentVeil
+boundary.
+
+- Available today: MCP Proxy for routed MCP tool calls.
+- Preview/design-partner boundary patterns: credential custody, egress boundary,
+  and API gate.
+- Not host-wide: AgentVeil does not monitor or control your whole machine.
+- Not a Cursor, Codex, or Claude host lock.
+- MCP Proxy does not control IDE-native edits, direct shell commands, direct
+  git/pip calls, or actions that bypass the proxy.
+- Actions not routed through AgentVeil are not classified or logged.
+
 
 ## Quick Start
 
-### Run locally — no server required
+### Route one local MCP path
+
+```bash
+pip install agentveil-mcp-proxy
+agentveil-mcp-proxy init --quickstart-filesystem ./sandbox
+agentveil-mcp-proxy doctor --full
+agentveil-mcp-proxy run
+```
+
+This starts with the public AgentVeil route available today: MCP tool calls that
+are explicitly pointed at `agentveil-mcp-proxy`. See the
+[MCP Proxy README](packages/agentveil-mcp-proxy/README.md) for client
+configuration and local evidence export.
+
+### Run SDK-only protocol primitives locally
 
 ```python
 from datetime import timedelta
@@ -81,9 +95,9 @@ print("delegation valid:", verification["valid"])
 print("scope:", verification["scope"][0]["value"])
 ```
 
-For production identity, Runtime Gate, approvals, and signed receipts, see [Customer Integration](docs/CUSTOMER_INTEGRATION.md).
+For hosted Runtime Gate, approvals, and receipt records, see [Customer Integration](docs/CUSTOMER_INTEGRATION.md).
 
-### Production integration shape
+### Integrated application shape
 
 ```python
 from agentveil import AVPAgent
@@ -109,14 +123,14 @@ elif outcome.status == "blocked":
     raise RuntimeError(outcome.reason)
 ```
 
-### Verify trust offline — no SDK required
+### Verify advanced credentials offline
 
 ```bash
 # Get a W3C Verifiable Credential (VC v2.0)
 curl https://agentveil.dev/v1/reputation/{agent_did}/credential?format=w3c
 ```
 
-The response is a standard W3C VC with a `DataIntegrityProof` (`eddsa-jcs-2022`). Verify it with any VC library — Veramo, SpruceID, Digital Bazaar, or your own Ed25519 implementation. No AgentVeil SDK needed.
+The response is a verifiable credential. This is an advanced protocol primitive; check it with a VC library or your own Ed25519 implementation when you use the identity/reputation layer directly.
 
 ```python
 # Or verify with the SDK:
@@ -128,8 +142,8 @@ assert AVPAgent.verify_w3c_credential(cred)  # offline, no API call
 
 ## Mode A Quickstart
 
-Project owners can use AgentVeil as an action-control path for agents, tools,
-workflows, MCP servers, and CI jobs inside one project.
+Project owners can use AgentVeil as a routed action-control path for agents,
+tools, workflows, MCP servers, and CI jobs inside one project.
 
 1. Check the agent project with Lurkr before deployment:
 
@@ -172,8 +186,7 @@ Instead, it makes agent actions constrained, auditable, and reversible within a
 declared action vocabulary and policy subset: each gated decision is bound to
 explicit risk, resource, environment, and payload evidence.
 
-See [Security Context](docs/SECURITY_CONTEXT.md) for verified CVEs, market data,
-and the structural problem AgentVeil addresses.
+See [Security Context](docs/SECURITY_CONTEXT.md) for background on agent action-control risk.
 
 ---
 
@@ -182,9 +195,9 @@ and the structural problem AgentVeil addresses.
 |  | Without AgentVeil | With AgentVeil |
 |---|---|---|
 | **Risky capability discovery** | Found in incident review | Pre-runtime posture check finds bypass paths, exposed credentials, missing approvals |
-| **Risky action execution** | Agent calls `deploy` / `transfer` / `delete` directly | Evaluated before execution → allow / approval_required / block |
+| **Risky action execution** | Agent calls `deploy` / `transfer` / `delete` directly | Routed action is evaluated before execution → allow / approval_required / block |
 | **Approval on critical steps** | Rubber-stamped or skipped | Signed approval receipt — single-use, expiring, bound to exact action/resource/env |
-| **Audit evidence** | "Agent triggered X" in app logs | Signed receipt with action hash, decision hash, approval hash, timestamp — verifiable offline by audit / customer / partner |
+| **Audit evidence** | "Agent triggered X" in app logs | Receipt record with action hash, decision hash, approval hash, timestamp — checkable offline by audit / customer / partner |
 
 ---
 
@@ -232,8 +245,8 @@ def review_code(pr_url: str) -> str:
 **Action control surface**
 
 - **Pre-runtime Checks** — inspect agent identity, status, delegation evidence, and risk signals before runtime
-- **Runtime Gate** — evaluate risky actions before execution and return allow / approval required / block
-- **Signed Receipts** — keep tamper-evident proof for gate decisions, approvals, and execution
+- **Runtime Gate** — evaluate routed risky actions and return allow / approval required / block
+- **Receipt records** — keep evidence for gate decisions, approvals, and routed actions
 - **W3C VC v2.0 Credentials** — export offline-verifiable credentials with `eddsa-jcs-2022` Data Integrity proofs
 - **Webhook Alerts** — score-change notifications to any HTTP endpoint ([setup guide](docs/WEBHOOKS.md))
 - **Framework Integrations** — SDK tools for CrewAI, LangGraph, AutoGen, OpenAI, Claude MCP, Paperclip, and more
@@ -256,12 +269,12 @@ def review_code(pr_url: str) -> str:
 | **AutoGen** | `pip install agentveil autogen-core` | `avp_reputation_tools()` |
 | **OpenAI** | `pip install agentveil openai` | `avp_tool_definitions()` + `handle_avp_tool_call(...)` from `agentveil.tools.openai` |
 | **MCP clients** | `pip install 'agentveil[mcp]'` | `agentveil-mcp` toolbox for explicit Runtime Gate evaluation, approvals, receipts, reputation, identity lookup, and audit. It does not intercept or gate other MCP tools. ([docs](agentveil_mcp/README.md)) |
-| **MCP transport proxy** | `pip install agentveil-mcp-proxy` | `agentveil-mcp-proxy` wraps downstream MCP servers (filesystem, github, shell) with Action Control Plane gating, approval routing, durable signed evidence, and replay defense for Claude Desktop, Cursor, Cline, Windsurf, and VS Code ([docs](packages/agentveil-mcp-proxy/README.md)) |
+| **MCP transport proxy** | `pip install agentveil-mcp-proxy` | `agentveil-mcp-proxy` gates downstream MCP calls routed through the proxy with approval routing and bounded local evidence for MCP clients ([docs](packages/agentveil-mcp-proxy/README.md)) |
 | **Gemini** | `pip install agentveil google-generativeai` | Function-calling example: [`examples/gemini_example.py`](examples/gemini_example.py) |
 | **PydanticAI** | `pip install agentveil pydantic-ai` | Tool example: [`examples/pydantic_ai_example.py`](examples/pydantic_ai_example.py) |
 | **Paperclip** | `pip install agentveil` | `avp_should_delegate(...)`, `avp_evaluate_team(...)`, `avp_plugin_tools()` |
 | **AWS Bedrock** | `pip install agentveil boto3` | Converse API example: [`examples/aws_bedrock.py`](examples/aws_bedrock.py) |
-| **Microsoft AGT / AgentMesh** | `pip install agentmesh-avp` | `agentmesh-avp` integration package for Agent Governance Toolkit / AgentMesh |
+| **Microsoft AGT / AgentMesh** | `pip install agentmesh-avp` | External/community adapter path for Agent Governance Toolkit / AgentMesh |
 
 Full integration guides: [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md)
 
@@ -341,13 +354,32 @@ Negative attestations require both `context` and a 64-character lowercase hex
 | [`proof_packet_export.py`](examples/proof_packet_export.py) | **Proof packet export** — build, save, reload, verify offline (mock mode) |
 | [`registration/`](examples/registration/) | **Registration patterns** — first-time setup, verification state, encrypted reload |
 | [`delegation/`](examples/delegation/) | **DelegationReceipt patterns** — issue, verify offline, persist/reload, multi-scope |
-| [`proof_pack/`](examples/proof_pack/) | **Offline audit verification** — local-backend demo: signed events → tamper-resistant chain → independent offline verification (no SDK or AVP API needed). Local backend required. |
+| [`proof_pack/`](examples/proof_pack/) | **Offline audit verification** — local-backend demo: signed events → hash chain → independent offline verification (no SDK or AVP API needed). Local backend required. |
 | [`standalone_demo.py`](examples/standalone_demo.py) | **Agent network primitives** — registration, peer attestations, scoring (mock mode, no server). Advanced internal surface. For action control, see [Mode A Quickstart](docs/MODE_A_QUICKSTART.md). |
 | [`quickstart.py`](examples/quickstart.py) | Register, publish card, check reputation |
 | [`two_agents.py`](examples/two_agents.py) | Full A2A interaction with attestations |
 | [`verify_credential_standalone.py`](examples/verify_credential_standalone.py) | Offline credential verification (no SDK needed) |
 
 Framework examples: [CrewAI](examples/crewai_example.py) · [LangGraph](examples/langgraph_example.py) · [AutoGen](examples/autogen_example.py) · [OpenAI](examples/openai_example.py) · [Claude MCP](examples/claude_mcp_example.py) · [Paperclip](examples/paperclip_example.py)
+
+---
+
+## Advanced Protocol Primitives
+
+The public SDK also includes protocol primitives that can support custom
+integrations: local `did:key` identity, delegation receipts, credential
+helpers, reputation credential access, receipt helpers, and optional
+framework adapter modules under `agentveil.tools.*` when their framework
+dependencies are installed.
+
+These primitives are not the main product path in this README. For direct use,
+start with [Agent Network (Advanced)](docs/ADVANCED_AGENT_NETWORK.md),
+[DelegationReceipt Guide](docs/DELEGATION_RECEIPT.md), and
+[Proof Packet Guide](docs/PROOF_PACKET.md).
+
+Microsoft AGT / AgentMesh support is presented as an external/community adapter
+path, not as an endorsement claim. Research background remains available in
+[Security Context](docs/SECURITY_CONTEXT.md).
 
 ---
 
