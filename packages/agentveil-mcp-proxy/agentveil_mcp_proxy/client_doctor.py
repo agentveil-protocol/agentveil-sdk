@@ -109,6 +109,10 @@ def _path_basename(value: str) -> str:
     return re.split(r"[\\/]", str(value))[-1]
 
 
+def _is_windows_batch_command(command: str) -> bool:
+    return os.name == "nt" and Path(command).suffix.lower() in {".bat", ".cmd"}
+
+
 def _entry_routes_through_proxy(entry: Mapping[str, Any], *, proxy_command: str) -> bool:
     command = entry.get("command")
     if not isinstance(command, str) or not command.strip():
@@ -192,12 +196,19 @@ def _run_generated_config_probe(
                 proc_env[key] = value
 
     try:
+        command_line = [command, *args]
+        run_args: list[str] | str = command_line
+        use_shell = False
+        if _is_windows_batch_command(command):
+            run_args = subprocess.list2cmdline(command_line)
+            use_shell = True
         completed = subprocess.run(
-            [command, *args],
+            run_args,
             input=_client_doctor_probe_input(include_routed_read=include_routed_read),
             capture_output=True,
             text=True,
             env=proc_env,
+            shell=use_shell,
             timeout=GENERATED_CONFIG_PROBE_TIMEOUT_SECONDS,
             check=False,
         )
