@@ -25,10 +25,10 @@ pip install agentveil
 > **MCP transport proxy:** route downstream MCP server calls (filesystem, github, shell) through AgentVeil policy, approval routing, and bounded local evidence. The proxy controls calls routed through it; actions outside the proxy are not classified or logged. It is a separately packaged source-available component under [`packages/agentveil-mcp-proxy/`](packages/agentveil-mcp-proxy/) and is not covered by the root MIT license. See [Licensing](LICENSING.md).
 
 <p align="center">
-  <img src="docs/demo.gif" alt="AgentVeil SDK demo — preflight, runtime gate, approval, routed action, offline evidence" width="720">
+  <img src="docs/routed-action-control.png" alt="AgentVeil routed action control flow" width="840">
 </p>
 
-> **Visual overview:** preflight → runtime gate → approval → routed action → offline evidence.
+> **Visual overview:** request → AgentVeil boundary → redirect / approval / block → bounded evidence. Enforcement applies only to actions routed through an AgentVeil boundary.
 >
 > **Audit chain walkthrough:** [`examples/proof_pack/`](examples/proof_pack/) — local-backend demo for offline audit-trail integrity checks. Flow: signed events → hash chain → offline verify (stdlib only, no SDK dependency).
 >
