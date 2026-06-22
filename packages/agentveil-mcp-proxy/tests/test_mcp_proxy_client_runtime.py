@@ -132,9 +132,8 @@ def test_primary_clients_return_explicit_unsupported_runtime_attach(
 
 
 def _write_fake_codex(directory: Path) -> Path:
-    command = directory / "codex"
-    command.write_text(
-        f"#!{sys.executable}\n"
+    script = directory / "codex.py"
+    script.write_text(
         "import json, pathlib, sys\n"
         "if 'exec' in sys.argv:\n"
         "    prompt = sys.argv[-1]\n"
@@ -157,14 +156,19 @@ def _write_fake_codex(directory: Path) -> Path:
         "print(json.dumps([{'name':'agentveil','transport':{'type':'stdio','command':command,'args':args}}]))\n",
         encoding="utf-8",
     )
+    if os.name == "nt":
+        command = directory / "codex.cmd"
+        command.write_text(f"@echo off\r\n\"{sys.executable}\" \"{script}\" %*\r\n", encoding="utf-8")
+        return command
+    command = directory / "codex"
+    command.write_text(f"#!{sys.executable}\n" + script.read_text(encoding="utf-8"), encoding="utf-8")
     command.chmod(0o755)
     return command
 
 
 def _write_fake_proxy(directory: Path) -> Path:
-    command = directory / "agentveil-mcp-proxy"
-    command.write_text(
-        f"#!{sys.executable}\n"
+    script = directory / "agentveil_mcp_proxy_fake.py"
+    script.write_text(
         "import json, pathlib, sys\n"
         "if sys.argv[1:4] == ['events', 'list', '--home'] or sys.argv[1:3] == ['events', 'list']:\n"
         "    marker = pathlib.Path('agentveil-evidence-marker.json')\n"
@@ -180,6 +184,12 @@ def _write_fake_proxy(directory: Path) -> Path:
         "raise SystemExit(2)\n",
         encoding="utf-8",
     )
+    if os.name == "nt":
+        command = directory / "agentveil-mcp-proxy.cmd"
+        command.write_text(f"@echo off\r\n\"{sys.executable}\" \"{script}\" %*\r\n", encoding="utf-8")
+        return command
+    command = directory / "agentveil-mcp-proxy"
+    command.write_text(f"#!{sys.executable}\n" + script.read_text(encoding="utf-8"), encoding="utf-8")
     command.chmod(0o755)
     return command
 

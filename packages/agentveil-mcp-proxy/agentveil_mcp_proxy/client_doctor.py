@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
+import re
 from typing import Any, Literal, Mapping
 
 from agentveil_mcp_proxy.client_config import (
@@ -104,11 +105,15 @@ def _tool_count_from_tools_list(response: Mapping[str, Any]) -> int:
     return len(tools)
 
 
+def _path_basename(value: str) -> str:
+    return re.split(r"[\\/]", str(value))[-1]
+
+
 def _entry_routes_through_proxy(entry: Mapping[str, Any], *, proxy_command: str) -> bool:
     command = entry.get("command")
     if not isinstance(command, str) or not command.strip():
         return False
-    if Path(command.strip()).name != Path(proxy_command).name:
+    if _path_basename(command.strip()) != _path_basename(proxy_command):
         return False
     args = entry.get("args", [])
     return isinstance(args, list) and args and args[0] == "run"

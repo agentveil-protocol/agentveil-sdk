@@ -35,6 +35,10 @@ def _bounded_ref(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
 
 
+def _path_basename(value: str) -> str:
+    return re.split(r"[\\/]", str(value))[-1]
+
+
 def _resource_ref(resource_hash: str | None) -> str | None:
     if not resource_hash:
         return None
@@ -58,7 +62,7 @@ def bounded_downstream_info(config: ProxyConfig) -> dict[str, Any]:
         "configured": True,
         "downstream_kind": downstream.name,
         "command_ref": _bounded_ref(downstream.command),
-        "command_basename": downstream.command.rsplit("/", 1)[-1],
+        "command_basename": _path_basename(downstream.command),
         "args_count": len(downstream.args),
         "has_env": bool(env or downstream.env_passthrough),
         "env_keys_count": len(env) + len(downstream.env_passthrough),

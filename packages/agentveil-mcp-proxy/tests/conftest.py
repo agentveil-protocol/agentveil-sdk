@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -13,10 +14,19 @@ def write_runnable_proxy_command(directory: Path) -> Path:
     """Create an executable wrapper that runs the in-tree CLI via ``python -m``."""
 
     directory.mkdir(parents=True, exist_ok=True)
-    command = directory / "agentveil-mcp-proxy"
     proxy_root = Path(__file__).resolve().parents[1]
     repo_root = proxy_root.parents[1]
-    pythonpath = f"{repo_root}:{proxy_root}"
+    pythonpath = os.pathsep.join((str(repo_root), str(proxy_root)))
+    if os.name == "nt":
+        command = directory / "agentveil-mcp-proxy.cmd"
+        command.write_text(
+            "@echo off\r\n"
+            f"set \"PYTHONPATH={pythonpath}\"\r\n"
+            f"\"{sys.executable}\" -m agentveil_mcp_proxy.cli %*\r\n",
+            encoding="utf-8",
+        )
+        return command
+    command = directory / "agentveil-mcp-proxy"
     command.write_text(
         "#!/bin/sh\n"
         f"PYTHONPATH={json.dumps(pythonpath)} "
