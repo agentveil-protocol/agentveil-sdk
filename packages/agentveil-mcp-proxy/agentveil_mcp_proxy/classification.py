@@ -33,6 +33,9 @@ _RESOURCE_KEYS = (
     "uri",
     "url",
     "path",
+    "paths",
+    "source",
+    "destination",
     "file",
     "filename",
     "repo",
@@ -56,6 +59,9 @@ _WRITE_PREFIXES = (
     "commit",
     "open",
     "close",
+    "move",
+    "copy",
+    "chmod",
 )
 _DESTRUCTIVE_PREFIXES = (
     "delete",
@@ -94,6 +100,68 @@ _GIT_TOOL_RISK_CLASSES: Mapping[str, RiskClass] = {
     "git_checkout": RiskClass.WRITE,
     "git_create_branch": RiskClass.WRITE,
     "git_reset": RiskClass.DESTRUCTIVE,
+    "git_clean": RiskClass.DESTRUCTIVE,
+    "git_rebase": RiskClass.DESTRUCTIVE,
+    # claim-check: allow internal risk enum label, verified by git pack policy/classification tests.
+    "git_push": RiskClass.PRODUCTION,
+    "instruction_surface_status": RiskClass.READ,
+}
+
+# Python package-manager MCP tool surface. Ecosystem scope: pip only.
+# GitHub MCP-style tool catalog for routed GitHub pack behavior. Tool names
+# follow common GitHub MCP server conventions; risk classes align with the
+# github-read / github-write / github-destructive / github-secrets-block pack.
+_GITHUB_TOOL_RISK_CLASSES: Mapping[str, RiskClass] = {
+    "get_repository": RiskClass.READ,
+    "list_issues": RiskClass.READ,
+    "get_issue": RiskClass.READ,
+    "list_pull_requests": RiskClass.READ,
+    "get_pull_request": RiskClass.READ,
+    "list_comments": RiskClass.READ,
+    "list_branches": RiskClass.READ,
+    "list_files": RiskClass.READ,
+    "list_secret_names": RiskClass.READ,
+    "get_repository_settings": RiskClass.READ,
+    "list_workflow_runs": RiskClass.READ,
+    "list_workflows": RiskClass.READ,
+    "get_workflow": RiskClass.READ,
+    "list_ci_jobs": RiskClass.READ,
+    "get_ci_job": RiskClass.READ,
+    "get_package_metadata": RiskClass.READ,
+    "untrusted_context_status": RiskClass.READ,
+    "github_target_snapshot": RiskClass.READ,
+    "ci_repo_target_snapshot": RiskClass.READ,
+    "create_comment": RiskClass.WRITE,
+    "create_issue": RiskClass.WRITE,
+    "update_issue": RiskClass.WRITE,
+    "add_labels": RiskClass.WRITE,
+    "remove_labels": RiskClass.WRITE,
+    "request_review": RiskClass.WRITE,
+    # claim-check: allow "PRODUCTION" is a risk-class enum for GitHub mutation policy, not a release-readiness claim.
+    "merge_pull_request": RiskClass.PRODUCTION,
+    "close_issue": RiskClass.DESTRUCTIVE,
+    "delete_branch": RiskClass.DESTRUCTIVE,
+    "create_release": RiskClass.PRODUCTION,  # claim-check: allow "PRODUCTION" is a risk-class enum for GitHub mutation policy, not a release-readiness claim.
+    "update_repository_settings": RiskClass.PRODUCTION,  # claim-check: allow "PRODUCTION" is a risk-class enum for GitHub mutation policy, not a release-readiness claim.
+    "manage_secret": RiskClass.DESTRUCTIVE,
+    "rerun_workflow": RiskClass.PRODUCTION,  # claim-check: allow "PRODUCTION" is a risk-class enum for GitHub mutation policy, not a release-readiness claim.
+    "cancel_workflow": RiskClass.DESTRUCTIVE,
+    "dispatch_workflow": RiskClass.PRODUCTION,  # claim-check: allow "PRODUCTION" is a risk-class enum for GitHub mutation policy, not a release-readiness claim.
+    "publish_package": RiskClass.PRODUCTION,  # claim-check: allow "PRODUCTION" is a risk-class enum for GitHub mutation policy, not a release-readiness claim.
+    "deploy_release": RiskClass.PRODUCTION,  # claim-check: allow "PRODUCTION" is a risk-class enum for GitHub mutation policy, not a release-readiness claim.
+    "run_remote_command": RiskClass.DESTRUCTIVE,
+    "get_secret": RiskClass.DESTRUCTIVE,
+    "get_env_secret": RiskClass.DESTRUCTIVE,
+}
+
+_PACKAGE_TOOL_RISK_CLASSES: Mapping[str, RiskClass] = {
+    "package_list_manifest": RiskClass.READ,
+    "package_inspect_state": RiskClass.READ,
+    "package_risk_status": RiskClass.READ,
+    "pip_install": RiskClass.WRITE,
+    "pip_uninstall": RiskClass.WRITE,
+    "pip_update": RiskClass.WRITE,
+    "pip_run_script": RiskClass.DESTRUCTIVE,
 }
 
 # Fetch/network MCP tools (e.g. the official MCP "fetch" server's `fetch` tool)
@@ -315,6 +383,10 @@ def extract_resource(arguments: Mapping[str, Any]) -> str | None:
         value = arguments.get(key)
         if isinstance(value, str) and value:
             return f"{key}:{value}"
+        if key == "paths" and isinstance(value, list):
+            for item in value:
+                if isinstance(item, str) and item:
+                    return f"paths:{item}"
         if isinstance(value, int) and not isinstance(value, bool):
             return f"{key}:{value}"
     return None
@@ -360,6 +432,14 @@ def infer_risk_class(
     git_risk = _GIT_TOOL_RISK_CLASSES.get(tool)
     if git_risk is not None:
         return git_risk
+
+    github_risk = _GITHUB_TOOL_RISK_CLASSES.get(tool)
+    if github_risk is not None:
+        return github_risk
+
+    package_risk = _PACKAGE_TOOL_RISK_CLASSES.get(tool)
+    if package_risk is not None:
+        return package_risk
 
     network_risk = _network_fetch_risk(tool, arguments)
     if network_risk is not None:

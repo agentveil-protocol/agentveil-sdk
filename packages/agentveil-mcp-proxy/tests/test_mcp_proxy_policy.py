@@ -26,6 +26,12 @@ from agentveil_mcp_proxy import (
     builtin_policy_pack,
     policy_context_hash,
 )
+from agentveil_mcp_proxy.cli import quickstart_filesystem_downstream
+from agentveil_mcp_proxy.policy import (
+    PRODUCT_ROUTE_SETUP_PROFILE,
+    SAFE_AUTOPILOT_SETUP_PROFILE,
+    build_controlled_path_metadata,
+)
 
 
 TRUSTED_SIGNER_DID = "did:key:z6MktrustedSigner"
@@ -391,7 +397,7 @@ def test_builtin_policy_packs_are_metadata_only_and_match_expected_rules():
     destructive = PolicyEngine(cfg).evaluate({"server": "github", "tool": "delete_branch"})
     assert read.decision is PolicyDecision.ALLOW
     assert read.risk_class is RiskClass.READ
-    assert write.decision is PolicyDecision.ASK_BACKEND
+    assert write.decision is PolicyDecision.APPROVAL
     assert write.risk_class is RiskClass.WRITE
     assert destructive.decision is PolicyDecision.APPROVAL
     assert destructive.risk_class is RiskClass.DESTRUCTIVE
@@ -448,6 +454,62 @@ def test_filesystem_pack_blocks_clean_tools():
     assert result.policy_rule_id == "filesystem-delete"
 
 
+def test_github_pack_blocks_secret_value_reads():
+    result = _evaluate_builtin_pack("github", server="github", tool="get_secret")
+    assert result.decision is PolicyDecision.BLOCK
+    assert result.policy_rule_id == "github-secrets-block"
+
+
+def test_github_pack_approval_required_for_create_comment():
+    result = _evaluate_builtin_pack("github", server="github", tool="create_comment")
+    assert result.decision is PolicyDecision.APPROVAL
+    assert result.policy_rule_id == "github-write"
+
+
+def test_github_pack_approval_required_for_merge_pull_request():
+    result = _evaluate_builtin_pack("github", server="github", tool="merge_pull_request")
+    assert result.decision is PolicyDecision.APPROVAL
+    assert result.policy_rule_id == "github-write"
+
+
+def test_github_pack_allows_list_secret_names():
+    result = _evaluate_builtin_pack("github", server="github", tool="list_secret_names")
+    assert result.decision is PolicyDecision.ALLOW
+    assert result.policy_rule_id == "github-read"
+
+
+def test_github_pack_blocks_env_secret_reads():
+    result = _evaluate_builtin_pack("github", server="github", tool="get_env_secret")
+    assert result.decision is PolicyDecision.BLOCK
+    assert result.policy_rule_id == "github-secrets-block"
+
+
+@pytest.mark.parametrize("tool", [
+    "dispatch_workflow",
+    "publish_package",
+    "deploy_release",
+    "run_remote_command",
+])
+def test_github_pack_approval_required_for_ci_repo_privileged_tools(tool: str):
+    result = _evaluate_builtin_pack("github", server="github", tool=tool)
+    assert result.decision is PolicyDecision.APPROVAL
+    assert result.policy_rule_id == "github-write"
+
+
+def test_github_pack_allows_ci_repo_read_tools():
+    for tool in (
+        "list_workflows",
+        "get_workflow",
+        "list_ci_jobs",
+        "get_ci_job",
+        "get_package_metadata",
+        "ci_repo_target_snapshot",
+    ):
+        result = _evaluate_builtin_pack("github", server="github", tool=tool)
+        assert result.decision is PolicyDecision.ALLOW, tool
+        assert result.policy_rule_id == "github-read", tool
+
+
 def test_github_pack_approval_required_for_revoke_tools():
     result = _evaluate_builtin_pack("github", server="github", tool="revoke_token")
     assert result.decision is PolicyDecision.APPROVAL
@@ -474,19 +536,30 @@ def test_git_pack_allows_status_and_log_read_tools():
         assert result.policy_rule_id == "git-read", tool
 
 
-def test_git_pack_ask_backend_for_add_and_commit_write_tools():
+def test_git_pack_approval_required_for_add_and_commit_write_tools():
     for tool in ("git_add", "git_commit", "git_checkout", "git_create_branch"):
         result = _evaluate_builtin_pack("git", server="git", tool=tool)
-        assert result.decision is PolicyDecision.ASK_BACKEND, tool
+        assert result.decision is PolicyDecision.APPROVAL, tool
         assert result.risk_class is RiskClass.WRITE, tool
         assert result.policy_rule_id == "git-write", tool
 
 
 def test_git_pack_approval_required_for_reset_destructive_tool():
-    result = _evaluate_builtin_pack("git", server="git", tool="git_reset")
+    for tool in ("git_reset", "git_clean", "git_rebase"):
+        result = _evaluate_builtin_pack("git", server="git", tool=tool)
+        assert result.decision is PolicyDecision.APPROVAL, tool
+        assert result.risk_class is RiskClass.DESTRUCTIVE, tool
+        assert result.policy_rule_id == "git-destructive", tool
+
+
+def test_git_pack_approval_required_for_push_remote_tool():
+    result = PolicyEngine(_pack_config("git")).evaluate(
+        # claim-check: allow internal risk class input for remote git policy.
+        {"server": "git", "tool": "git_push", "risk_class": "production"}
+    )
     assert result.decision is PolicyDecision.APPROVAL
-    assert result.risk_class is RiskClass.DESTRUCTIVE
-    assert result.policy_rule_id == "git-destructive"
+    assert result.risk_class is RiskClass.PRODUCTION
+    assert result.policy_rule_id == "git-remote"
 
 
 def test_git_pack_server_glob_does_not_shadow_github_pack():
@@ -494,6 +567,29 @@ def test_git_pack_server_glob_does_not_shadow_github_pack():
     # "github" server name.
     result = _evaluate_builtin_pack("git", server="github", tool="git_status")
     assert result.policy_rule_id != "git-read"
+
+
+def test_package_pack_allows_manifest_and_state_read_tools():
+    for tool in ("package_list_manifest", "package_inspect_state", "package_risk_status"):
+        result = _evaluate_builtin_pack("package", server="package", tool=tool)
+        assert result.decision is PolicyDecision.ALLOW, tool
+        assert result.risk_class is RiskClass.READ, tool
+        assert result.policy_rule_id == "package-read", tool
+
+
+def test_package_pack_approval_required_for_pip_write_tools():
+    for tool in ("pip_install", "pip_uninstall", "pip_update"):
+        result = _evaluate_builtin_pack("package", server="package", tool=tool)
+        assert result.decision is PolicyDecision.APPROVAL, tool
+        assert result.risk_class is RiskClass.WRITE, tool
+        assert result.policy_rule_id == "package-write", tool
+
+
+def test_package_pack_approval_required_for_pip_run_script():
+    result = _evaluate_builtin_pack("package", server="package", tool="pip_run_script")
+    assert result.decision is PolicyDecision.APPROVAL
+    assert result.risk_class is RiskClass.DESTRUCTIVE
+    assert result.policy_rule_id == "package-script"
 
 
 def test_fetch_pack_ask_backend_for_public_read():
@@ -629,6 +725,181 @@ def test_reviewer_role_blocks_implementation_action_family():
     assert evaluation.reason == "role_authority_denied"
 
 
+def test_persisted_safe_autopilot_setup_profile_enables_write_approval(tmp_path):
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    payload = _base_config(
+        setup_profile=SAFE_AUTOPILOT_SETUP_PROFILE,
+        role_preset="reviewer",
+        role_authority={"mode": "enforce", "role": "reviewer", "authority": "review_only"},
+        policy={
+            "id": "filesystem",
+            "policy_schema_version": 1,
+            "default_decision": "ask_backend",
+            "default_risk_class": "unknown",
+            "rules": [
+                {
+                    "id": "filesystem-write",
+                    "source": "builtin",
+                    "decision": "approval",
+                    "risk_class": "write",
+                    "match": {
+                        "server": ["filesystem", "fs", "*filesystem*"],
+                        "tool": ["write_*"],
+                    },
+                },
+            ],
+        },
+        downstream=quickstart_filesystem_downstream(sandbox),
+    )
+    config = ProxyConfig.from_dict(payload)
+    assert config.setup_profile == SAFE_AUTOPILOT_SETUP_PROFILE
+    evaluation = PolicyEngine(config).evaluate(ToolCallContext(
+        server="filesystem",
+        tool="write_file",
+        action="filesystem.write_file",
+        risk_class=RiskClass.WRITE,
+        role="reviewer",
+        authority="review_only",
+        action_family="write",
+    ))
+    assert evaluation.decision is PolicyDecision.APPROVAL
+    assert evaluation.policy_rule_id == "filesystem-write"
+
+
+def test_persisted_product_route_setup_profile_ignores_enforced_reviewer_role():
+    from agentveil_mcp_proxy.product_route import build_product_route_policy
+
+    pack = build_product_route_policy()
+
+    def match_dict(rule):
+        data = {}
+        if rule.match.server:
+            data["server"] = list(rule.match.server)
+        if rule.match.tool:
+            data["tool"] = list(rule.match.tool)
+        if rule.match.action:
+            data["action"] = list(rule.match.action)
+        if rule.match.risk_class:
+            data["risk_class"] = [risk.value for risk in rule.match.risk_class]
+        return data
+
+    config = ProxyConfig.from_dict(_base_config(
+        setup_profile=PRODUCT_ROUTE_SETUP_PROFILE,
+        role_preset="reviewer",
+        role_authority={"mode": "enforce", "role": "reviewer", "authority": "review_only"},
+        policy={
+            "id": pack.id,
+            "policy_schema_version": 1,
+            "default_decision": pack.default_decision.value,
+            "default_risk_class": pack.default_risk_class.value,
+            "rules": [
+                {
+                    "id": rule.id,
+                    "source": rule.source,
+                    "decision": rule.decision.value,
+                    "risk_class": rule.risk_class.value if rule.risk_class else None,
+                    "match": match_dict(rule),
+                }
+                for rule in pack.rules
+            ],
+        },
+    ))
+    evaluation = PolicyEngine(config).evaluate(ToolCallContext(
+        server="product",
+        tool="git_add",
+        action="git.git_add",
+        risk_class=RiskClass.WRITE,
+        role="reviewer",
+        authority="review_only",
+        action_family="write",
+    ))
+    assert evaluation.decision is PolicyDecision.APPROVAL
+    assert evaluation.policy_rule_id == "product_route::git::git_add"
+
+
+def test_reviewer_quickstart_without_safe_autopilot_setup_profile_still_blocks_write(tmp_path):
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    config = ProxyConfig.from_dict(_base_config(
+        role_preset="reviewer",
+        role_authority={"mode": "enforce", "role": "reviewer", "authority": "review_only"},
+        policy={
+            "id": "filesystem",
+            "policy_schema_version": 1,
+            "default_decision": "ask_backend",
+            "default_risk_class": "unknown",
+            "rules": [
+                {
+                    "id": "filesystem-write",
+                    "source": "builtin",
+                    "decision": "approval",
+                    "risk_class": "write",
+                    "match": {
+                        "server": ["filesystem", "fs", "*filesystem*"],
+                        "tool": ["write_*"],
+                    },
+                },
+            ],
+        },
+        downstream=quickstart_filesystem_downstream(sandbox),
+    ))
+    assert config.setup_profile is None
+    evaluation = PolicyEngine(config).evaluate(ToolCallContext(
+        server="filesystem",
+        tool="write_file",
+        action="filesystem.write_file",
+        risk_class=RiskClass.WRITE,
+        role="reviewer",
+        authority="review_only",
+        action_family="write",
+    ))
+    assert evaluation.decision is PolicyDecision.BLOCK
+    assert evaluation.policy_rule_id == "role_authority_reviewer_blocks_implementation"
+    assert evaluation.reason == "role_authority_denied"
+
+
+def test_safe_autopilot_quickstart_write_requires_approval_not_role_block(tmp_path):
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    config = ProxyConfig.from_dict(_base_config(
+        setup_profile=SAFE_AUTOPILOT_SETUP_PROFILE,
+        role_preset="reviewer",
+        role_authority={"mode": "enforce", "role": "reviewer", "authority": "review_only"},
+        policy={
+            "id": "filesystem",
+            "policy_schema_version": 1,
+            "default_decision": "ask_backend",
+            "default_risk_class": "unknown",
+            "rules": [
+                {
+                    "id": "filesystem-write",
+                    "source": "builtin",
+                    "decision": "approval",
+                    "risk_class": "write",
+                    "match": {
+                        "server": ["filesystem", "fs", "*filesystem*"],
+                        "tool": ["write_*"],
+                    },
+                },
+            ],
+        },
+        downstream=quickstart_filesystem_downstream(sandbox),
+    ))
+    evaluation = PolicyEngine(config).evaluate(ToolCallContext(
+        server="filesystem",
+        tool="write_file",
+        action="filesystem.write_file",
+        risk_class=RiskClass.WRITE,
+        role="reviewer",
+        authority="review_only",
+        action_family="write",
+    ))
+    assert evaluation.decision is PolicyDecision.APPROVAL
+    assert evaluation.policy_rule_id == "filesystem-write"
+    assert evaluation.reason is None
+
+
 def test_reviewer_role_allows_read_action_family():
     config = ProxyConfig.from_dict(_base_config(
         role_authority={"mode": "enforce", "role": "reviewer", "authority": "review_only"},
@@ -684,3 +955,23 @@ def test_readonly_role_blocks_mutation_action_family():
     assert evaluation.decision is PolicyDecision.BLOCK
     assert evaluation.policy_rule_id == "role_authority_readonly_blocks_mutation"
     assert evaluation.reason == "role_authority_denied"
+
+
+def test_controlled_path_metadata_includes_authority_record():
+    metadata = build_controlled_path_metadata(
+        fixture_id="allow-tool",
+        tool_name="read_file",
+        policy_decision="allow",
+        policy_rule_id="allow-tool",
+        approval_status="executed",
+        execution_status="executed",
+        target_reached=True,
+        request_id="req-read-1",
+        action_family="read",
+    )
+
+    authority = metadata["authority_record"]
+    assert authority["authority_status"] == "allowed"
+    assert authority["authority_source"] == "read_only"
+    assert authority["safe_first_step_id"] == "read_only_review"
+    assert "safe_first_step" not in metadata

@@ -17,6 +17,13 @@ class RolePresetError(ValueError):
 
 ROLE_PRESET_NAMES: tuple[str, ...] = ("reviewer", "readonly", "implementer", "build")
 ROLE_PRESET_ENV_VAR = "AVP_PROXY_ROLE"
+SAFE_AUTOPILOT_SETUP_PROFILE = "safe_autopilot"
+PRODUCT_ROUTE_SETUP_PROFILE = "product_route"
+ADVANCED_ROLE_SETUP_PROFILE = "advanced_role"
+# claim-check: allow product label; behavior is bounded by first-run tests.
+SAFE_AUTOPILOT_USER_LABEL = "Safe Autopilot"
+PRODUCT_ROUTE_USER_LABEL = "Product route"
+DEFAULT_SAFE_AUTOPILOT_ROLE_PRESET = "reviewer"
 
 
 @dataclass(frozen=True)
@@ -112,14 +119,45 @@ def apply_env_role_override_to_config(config: ProxyConfig) -> ProxyConfig:
     )
 
 
+def resolve_init_role_preset(role: str | None) -> tuple[str, bool]:
+    """Return preset name and whether the operator explicitly chose a role."""
+
+    if role is None or not str(role).strip():
+        return DEFAULT_SAFE_AUTOPILOT_ROLE_PRESET, False
+    return normalize_role_preset_name(role), True
+
+
+def init_setup_profile(*, explicit_role: bool) -> str:
+    if explicit_role:
+        return "advanced_role"
+    return SAFE_AUTOPILOT_SETUP_PROFILE
+
+
+def user_facing_setup_label(*, role_preset: str, explicit_role: bool, setup_profile: str | None = None) -> str:
+    if setup_profile == PRODUCT_ROUTE_SETUP_PROFILE:
+        return PRODUCT_ROUTE_USER_LABEL
+    if not explicit_role:
+        return SAFE_AUTOPILOT_USER_LABEL
+    return f"Advanced role preset: {role_preset}"
+
+
 __all__ = [
+    "ADVANCED_ROLE_SETUP_PROFILE",
+    "DEFAULT_SAFE_AUTOPILOT_ROLE_PRESET",
+    "PRODUCT_ROUTE_SETUP_PROFILE",
+    "PRODUCT_ROUTE_USER_LABEL",
     "ROLE_PRESET_ENV_VAR",
     "ROLE_PRESET_NAMES",
+    "SAFE_AUTOPILOT_SETUP_PROFILE",
+    "SAFE_AUTOPILOT_USER_LABEL",
     "RolePreset",
     "RolePresetError",
     "apply_env_role_override_to_config",
     "apply_role_preset_to_config_payload",
+    "init_setup_profile",
     "normalize_role_preset_name",
+    "resolve_init_role_preset",
     "resolve_role_preset",
     "role_authority_dict_for_preset",
+    "user_facing_setup_label",
 ]

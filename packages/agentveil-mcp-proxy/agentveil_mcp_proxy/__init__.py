@@ -7,6 +7,18 @@ Runtime Gate calls use an in-memory circuit breaker for sustained backend
 failures.
 """
 
+from importlib.metadata import PackageNotFoundError, version
+
+
+def _package_version() -> str:
+    try:
+        return version("agentveil-mcp-proxy")
+    except PackageNotFoundError:
+        return "0.0.0+dev"
+
+
+__version__ = _package_version()
+
 from agentveil_mcp_proxy.approval import (
     ApprovalFlowError,
     ApprovalManager,
@@ -105,6 +117,7 @@ from agentveil_mcp_proxy.runtime_gate import (
 )
 
 __all__ = [
+    "__version__",
     "ApprovalConfig",
     "ApprovalEvidenceCapacityError",
     "ApprovalEvidenceDuplicateError",

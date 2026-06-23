@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import json
 import secrets
 import sys
 import threading
 import time
-from typing import Any, Callable, TextIO
+from typing import Any, Callable, Mapping, TextIO
 import uuid
 import webbrowser
 
@@ -35,12 +36,17 @@ from agentveil_mcp_proxy.evidence.approval_grant import (
     ApprovalGrantError,
     build_approval_grant,
 )
+from agentveil_mcp_proxy.evidence.observability import parse_action_gate_metadata
 from agentveil_mcp_proxy.policy import (
     ApprovalUiOpenMode,
     PolicyRule,
     ProxyConfig,
     RiskClass,
     TimeoutAction,
+)
+from agentveil_mcp_proxy.permission_doctor import (
+    build_blast_radius_preview,
+    format_blast_radius_summary,
 )
 from agentveil_mcp_proxy.role_doctor import build_approval_guidance
 from agentveil_mcp_proxy.runtime_gate import DEFAULT_RUNTIME_ENVIRONMENT, RuntimeGateDecision
@@ -509,6 +515,10 @@ class ApprovalManager:
                 user_decision_timestamp=decided_at,
                 approval_grant_jcs=approval_grant_jcs,
             )
+            self._annotate_session_bound_decision_actor(
+                request_id,
+                decided_by=decided_by,
+            )
             self.approval_server.unregister(
                 request_id,
                 terminal_state=TERMINAL_ALREADY_DECIDED_APPROVE,
@@ -571,6 +581,34 @@ class ApprovalManager:
             )
             return None
 
+    def _annotate_session_bound_decision_actor(
+        self,
+        request_id: str,
+        *,
+        decided_by: str,
+    ) -> None:
+        record = self.evidence_store.get_pending(request_id)
+        if record is None:
+            return
+        metadata = parse_action_gate_metadata(record)
+        if metadata is None:
+            return
+        facts = metadata.get("session_bound_facts")
+        if not isinstance(facts, dict):
+            return
+        updated = dict(metadata)
+        updated_facts = dict(facts)
+        updated_facts["decision_actor_ref"] = decided_by
+        updated_facts.setdefault("approval_actor_ref", f"client:{self.client_id[:8]}")
+        updated["session_bound_facts"] = updated_facts
+        try:
+            self.evidence_store.annotate_controlled_path_metadata(
+                request_id,
+                metadata_jcs=json.dumps(updated, sort_keys=True, separators=(",", ":")),
+            )
+        except ApprovalEvidenceError:
+            return
+
     def _deny(self, request_id: str, reason: str) -> ApprovalOutcome:
         with self._finalize_lock:
             current = self.evidence_store.get_pending(request_id)
@@ -631,9 +669,16 @@ class ApprovalManager:
         self._approval_ui_browser_opened = True
 
     def _notify(self, prompt: ApprovalPrompt, url: str) -> None:
+        blast_summary = ""
+        metadata = prompt.action_gate_metadata
+        if isinstance(metadata, Mapping):
+            blast_radius = metadata.get("blast_radius")
+            if isinstance(blast_radius, Mapping):
+                blast_summary = "; " + format_blast_radius_summary(blast_radius)
         summary = (
             f"approval pending: {prompt.client_id} session {prompt.session_id[:8]} "
             f"{prompt.downstream_server}.{prompt.tool_name} {prompt.risk_class}"
+            f"{blast_summary}"
         )
         self._print_approval_fallback(prompt, url, summary)
         self._maybe_open_approval_browser()
@@ -713,6 +758,11 @@ class ApprovalManager:
         if privacy.show_details_in_approval_ui and privacy.resource == "plain":
             resource_details = classification.resource_plain
         approval_guidance = build_approval_guidance(classification, reason=reason)
+        blast_radius = build_blast_radius_preview(
+            classification,
+            reason=approval_guidance.explanation,
+            config=self.config,
+        )
         action_gate_metadata: dict[str, Any] = {
             "action_family": classification.action_family,
             "policy_decision": classification.policy_evaluation.decision.value,
@@ -720,6 +770,7 @@ class ApprovalManager:
             "execution_status": "not_reached",
             "target_reached": False,
             "redirect_playbook_id": approval_guidance.redirect.redirect_playbook_id,
+            "blast_radius": blast_radius,
         }
         if classification.role is not None:
             action_gate_metadata["role"] = classification.role

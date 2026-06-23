@@ -119,6 +119,18 @@ def test_init_role_preset_writes_role_authority(tmp_path, preset_name, expected_
     assert SECRET not in result.config_path.read_text(encoding="utf-8")
 
 
+def test_resolve_init_role_preset_defaults_to_safe_autopilot_reviewer():
+    from agentveil_mcp_proxy.role_presets import resolve_init_role_preset
+
+    preset, explicit = resolve_init_role_preset(None)
+    assert preset == "reviewer"
+    assert explicit is False
+
+    preset, explicit = resolve_init_role_preset("build")
+    assert preset == "build"
+    assert explicit is True
+
+
 @pytest.mark.parametrize(
     ("preset_name", "expected_role", "expected_authority"),
     [
@@ -149,17 +161,41 @@ def test_main_init_role_flag_writes_expected_preset_config(
     assert config["role_authority"]["authority"] == expected_authority
 
 
-def test_main_init_requires_role_flag(tmp_path, capsys):
+def test_main_init_defaults_to_safe_autopilot_without_role(tmp_path, capsys):
     home = tmp_path / "home"
-    with pytest.raises(SystemExit):
-        main([
-            "init",
-            "--home", str(home),
-            "--agent-name", "proxy",
-            "--plaintext",
-        ])
-    err = capsys.readouterr().err
-    assert "--role" in err
+    sandbox = tmp_path / "sandbox"
+    assert main([
+        "init",
+        "--quickstart-filesystem", str(sandbox),
+        "--home", str(home),
+        "--agent-name", "proxy",
+        "--plaintext",
+        "--json",
+    ]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["setup_profile"] == "safe_autopilot"
+    # claim-check: allow product label; behavior is asserted in this test.
+    assert payload["setup_label"] == "Safe Autopilot"
+    assert payload["role_preset"] == "reviewer"
+    assert payload["role_authority"]["authority"] == "review_only"
+
+
+def test_main_init_quickstart_filesystem_human_output_uses_safe_autopilot_label(tmp_path, capsys):
+    home = tmp_path / "home"
+    sandbox = tmp_path / "sandbox"
+    assert main([
+        "init",
+        "--quickstart-filesystem", str(sandbox),
+        "--home", str(home),
+        "--agent-name", "proxy",
+        "--plaintext",
+    ]) == 0
+    out = capsys.readouterr().out
+    # claim-check: allow product label; this test rejects role-choice wording.
+    assert "Safe Autopilot" in out
+    assert "choose role" not in out.lower()
+    assert "Role preset:" not in out
 
 
 def test_client_config_points_at_generated_preset_config(tmp_path, capsys):
@@ -174,11 +210,17 @@ def test_client_config_points_at_generated_preset_config(tmp_path, capsys):
         out=out,
     )
     payload = json.loads(out.getvalue())
-    assert payload["config_path"] == str(result.config_path)
-    assert payload["role_preset"] == "reviewer"
-    run_args = payload["args"]
+    serialized = out.getvalue()
+    assert payload["summary"]["config_ref"]["basename"] == "config.json"
+    assert payload["summary"]["role_preset"] == "reviewer"
+    assert "/private/" not in json.dumps(payload["summary"])
+    cursor = payload["clients"]["cursor"]
+    entry = next(iter(cursor["local_client_config"]["mcpServers"].values()))
+    run_args = entry["args"]
     assert "--config" in run_args
     assert str(result.config_path) in run_args
+    # claim-check: allow Python all() type guard; not a coverage claim.
+    assert all(isinstance(item, str) for item in run_args)
     rendered = json.dumps(payload)
     assert SECRET not in rendered
 

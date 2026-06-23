@@ -303,6 +303,12 @@ def _post_decision(client: httpx.Client, url: str, *, decision: str, csrf: str, 
     })
 
 
+def _dashboard_list_html(server: ApprovalServer) -> str:
+    response = httpx.get(server.approval_center_url(), follow_redirects=False)
+    assert response.status_code == 200
+    return response.text
+
+
 def _request_and_post(
     manager: ApprovalManager,
     server: ApprovalServer,
@@ -1083,6 +1089,10 @@ def test_notification_chain_falls_through_to_cli_when_browser_unavailable(tmp_pa
         while not server.pending_prompts() and time.monotonic() < deadline:
             time.sleep(0.01)
         assert "approval pending:" in cli.getvalue()
+        assert "blast radius:" in cli.getvalue()
+        prompt = server.pending_prompts()[0]
+        metadata = prompt.action_gate_metadata or {}
+        assert isinstance(metadata.get("blast_radius"), dict)
     finally:
         prompt = server.pending_prompts()[0]
         url = server.approval_url(prompt.request_id)
@@ -2173,7 +2183,7 @@ def _wait_for_status(store, request_id, status, *, timeout=2.0):
 
 
 def test_immediate_retry_after_approve_post_matches_live_console(tmp_path):
-    """Regression for VPS/console race: POST approve then retry immediately.
+    """Regression for approval-center race: POST approve then retry immediately.
 
     Do not wait for the parent evidence row to reach APPROVED before retrying.
     Prior tests that called ``_wait_for_status`` masked this race.
@@ -2711,7 +2721,7 @@ def test_t1_browser_open_budget_uses_injected_mock_only(
     auto_deny,
     expected_browser_open_calls,
 ):
-    """T1 acceptance: browser spam fix through injected browser_open."""
+    """Browser spam fix through injected browser_open."""
 
     opened_urls: list[str] = []
     config = _config(ui_open_mode=ui_open_mode)
@@ -2740,7 +2750,7 @@ def test_t1_browser_open_budget_uses_injected_mock_only(
 
 
 def test_t1_default_approval_list_and_detail_html_exclude_raw_secrets(tmp_path):
-    """T1 acceptance: default HTML surfaces stay redacted; no raw arg preview."""
+    """Default HTML surfaces stay redacted; no raw arg preview."""
 
     cmd_config = _config(policy_rule=_run_terminal_cmd_approval_rule())
     manager, store, server, _cli = _manager(
@@ -2775,7 +2785,7 @@ def test_t1_default_approval_list_and_detail_html_exclude_raw_secrets(tmp_path):
 
 
 def test_t1_center_output_lines_exclude_raw_payload(tmp_path):
-    """T1 acceptance: CLI fallback/center output omits raw MCP payload."""
+    """CLI fallback/center output omits raw MCP payload."""
 
     cli = _tty_cli()
     config = _config(
@@ -2965,15 +2975,23 @@ def test_api_approvals_includes_bounded_level2_metadata(tmp_path):
         payload = response.json()
         approval = next(item for item in payload["approvals"] if item["request_id"] == outcome.request_id)
         metadata = approval["action_gate_metadata"]
-        assert metadata == {
-            "action_family": "create",
-            "policy_decision": "approval",
-            "approval_status": ApprovalStatus.PENDING.value,
-            "execution_status": "not_reached",
-            "target_reached": False,
-            "redirect_playbook_id": "request_approval",
-            "role": "implementer",
-            "authority": "implement",
+        assert metadata["action_family"] == "create"
+        assert metadata["policy_decision"] == "approval"
+        assert metadata["approval_status"] == ApprovalStatus.PENDING.value
+        assert metadata["execution_status"] == "not_reached"
+        assert metadata["target_reached"] is False
+        assert metadata["redirect_playbook_id"] == "request_approval"
+        assert metadata["role"] == "implementer"
+        assert metadata["authority"] == "implement"
+        blast_radius = metadata.get("blast_radius")
+        assert isinstance(blast_radius, dict)
+        assert isinstance(blast_radius.get("capabilities"), dict)
+        assert blast_radius.get("credential_posture") in {
+            "visible_static_key",
+            "short_lived_token",
+            "brokered",
+            "hardware_bound",
+            "unknown",
         }
         rendered = json.dumps(payload)
         _assert_t1_privacy_safe_text(rendered)
@@ -3021,8 +3039,12 @@ def test_dashboard_pending_cards_render_sanitized_fields(tmp_path):
             _command_classification(config, command="pip list"),
             reason="local_approval_required",
         )
+        manager.request_approval(
+            _command_classification(config, command="pip show setuptools"),
+            reason="local_approval_required",
+        )
         assert outcome.status == ApprovalStatus.PENDING.value
-        text = httpx.get(server.approval_center_url()).text
+        text = _dashboard_list_html(server)
         assert "approval-card" in text
         assert "fake-downstream" in text
         assert "run_terminal_cmd" in text
@@ -3054,8 +3076,12 @@ def test_dashboard_and_detail_render_level2_metadata_without_raw_payload(tmp_pat
             _classification(config),
             reason="local_approval_required",
         )
+        manager.request_approval(
+            _classification(config),
+            reason="local_approval_required",
+        )
         prompt = server.pending_prompts()[0]
-        dashboard = httpx.get(server.approval_center_url()).text
+        dashboard = _dashboard_list_html(server)
         detail = httpx.get(server.approval_url(prompt.request_id)).text
         for text in (dashboard, detail):
             assert "Role" in text
@@ -3099,7 +3125,11 @@ def test_dashboard_excludes_raw_secrets_and_long_plaintext(tmp_path):
             ),
             reason="package_manager_action_requires_approval",
         )
-        text = httpx.get(server.approval_center_url()).text
+        manager.request_approval(
+            _command_classification(config, command="pip list"),
+            reason="local_approval_required",
+        )
+        text = _dashboard_list_html(server)
         _assert_t1_privacy_safe_text(text)
         assert "sha256:" in text
     finally:
@@ -3116,6 +3146,68 @@ def test_dashboard_hides_terminal_prompts():
         text = httpx.get(server.approval_center_url()).text
         assert "No pending approvals" in text
         assert "req-terminal" not in text
+    finally:
+        server.stop()
+
+
+def test_approval_center_redirects_to_actionable_detail_when_single_pending(tmp_path):
+    config = _config(policy_rule=_write_rule())
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        wait_for_decision=False,
+    )
+    try:
+        outcome = manager.request_approval(
+            _classification(config),
+            reason="local_approval_required",
+        )
+        assert outcome.approval_url is not None
+        with httpx.Client(follow_redirects=False) as client:
+            response = client.get(server.approval_center_url())
+            assert response.status_code == 302
+            assert response.headers["location"].endswith(f"/pending/{outcome.request_id}")
+            detail = client.get(server.approval_center_url(), follow_redirects=True)
+        assert "Approve" in detail.text
+        assert "Deny" in detail.text
+        assert 'name="csrf_token"' in detail.text
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_approval_center_list_includes_inline_approve_deny_for_multiple_pending(tmp_path):
+    config = _config(policy_rule=_write_rule())
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        wait_for_decision=False,
+    )
+    try:
+        manager.request_approval(_classification(config), reason="local_approval_required")
+        manager.request_approval(_classification(config), reason="local_approval_required")
+        with httpx.Client() as client:
+            response = client.get(server.approval_center_url())
+        assert response.status_code == 200
+        assert response.text.count('name="decision" value="approve"') >= 2
+        assert response.text.count('name="decision" value="deny"') >= 2
+        assert "Review &amp; decide" in response.text
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_post_decision_page_instructs_retry():
+    server = ApprovalServer()
+    server.start()
+    try:
+        url = server.register(_prompt_not_expired("req-retry-hint"))
+        with httpx.Client() as client:
+            csrf = _get_csrf(client, url)
+            response = _post_decision(client, url, decision="approve", csrf=csrf)
+        assert response.status_code == 200
+        assert "Decision recorded" in response.text
+        assert "Retry the same request" in response.text
     finally:
         server.stop()
 
@@ -3149,10 +3241,11 @@ def test_dashboard_detail_approve_deny_flow_still_works(tmp_path):
         deadline = time.monotonic() + 2
         while not server.pending_prompts() and time.monotonic() < deadline:
             time.sleep(0.01)
-        dashboard = httpx.get(server.approval_center_url()).text
-        assert "approval-card" in dashboard
         prompt = server.pending_prompts()[0]
         detail_url = server.approval_url(prompt.request_id)
+        center_detail = httpx.get(server.approval_center_url(), follow_redirects=True).text
+        assert "Approve" in center_detail
+        assert "Deny" in center_detail
         detail = httpx.get(detail_url).text
         assert "Approve" in detail
         assert "Deny" in detail
@@ -3244,11 +3337,15 @@ def test_api_approvals_json_excludes_raw_secrets_and_html_still_works(tmp_path):
             ),
             reason="package_manager_action_requires_approval",
         )
+        manager.request_approval(
+            _command_classification(config, command="pip list"),
+            reason="local_approval_required",
+        )
         api_url = f"{server.base_url}/approval/{server.session_token}/api/approvals"
         payload = httpx.get(api_url).json()
         _assert_t1_privacy_safe_text(json.dumps(payload))
 
-        list_html = httpx.get(server.approval_center_url()).text
+        list_html = _dashboard_list_html(server)
         assert "Pending approvals" in list_html
         assert "approval-card" in list_html
         _assert_t1_privacy_safe_text(list_html)

@@ -72,16 +72,57 @@ from agentveil_mcp_proxy.policy import (
     ProxyConfigError,
     builtin_policy_pack,
 )
+from agentveil_mcp_proxy.product_route import (
+    PRODUCT_ROUTE_SETUP_PROFILE,
+    build_product_route_downstream_config,
+    build_product_route_policy,
+    initialize_product_route_profile,
+)
 from agentveil_mcp_proxy.client_config import (
     CLIENT_TARGETS,
     ClientConfigError,
     DEFAULT_SERVER_NAME,
+    assert_proxy_cli_json_is_privacy_safe,
+    bounded_path_ref,
     build_run_args,
     format_client_config_json_payload,
     format_client_config_text,
     read_role_preset_from_config,
     render_client_configs,
     resolve_proxy_command,
+    sanitize_json_paths,
+)
+from agentveil_mcp_proxy.client_doctor import (
+    ClientDoctorError,
+    build_client_doctor_report,
+    format_client_doctor_report,
+)
+from agentveil_mcp_proxy.client_guidance import (
+    build_client_guidance_payload,
+    build_client_guidance_set_payload,
+    format_client_guidance_text,
+)
+from agentveil_mcp_proxy.client_packs import (
+    CLIENT_PACK_IDS,
+    ClientPackError,
+    build_client_packs_payload,
+)
+from agentveil_mcp_proxy.client_runtime import (
+    ClientRuntimeError,
+    build_client_runtime_payload,
+    format_client_runtime_payload,
+)
+from agentveil_mcp_proxy.client_connect import (
+    ALL_CLIENTS_TARGET,
+    ClientConnectError,
+    build_connect_all_payload,
+    build_connect_payload,
+    build_connect_status_all_payload,
+    build_connect_status_payload,
+    build_disconnect_all_payload,
+    build_disconnect_payload,
+    format_connect_payload,
+    is_connect_all_target,
 )
 from agentveil_mcp_proxy.passthrough import DownstreamConfig, McpPassthrough, PassthroughError
 from agentveil_mcp_proxy.agent_templates import (
@@ -93,22 +134,46 @@ from agentveil_mcp_proxy.agent_templates import (
 )
 from agentveil_mcp_proxy.config_wizard import (
     ConfigWizardError,
+    assert_setup_output_is_privacy_safe,
     build_safe_config_wizard_result,
     build_wizard_summary,
+    derive_setup_status,
     format_safe_config_wizard_output,
+    format_setup_error_payload,
     load_mcp_client_document,
+    load_tool_inventory_file,
+    restore_setup_files,
+    run_setup_wizard,
+    setup_restore_to_dict,
+    setup_status_to_dict,
     validate_mcp_client_document,
+)
+from agentveil_mcp_proxy.control_surface import (
+    ControlSurfaceError,
+    build_control_status,
+    build_control_timeline,
+    format_control_status_human,
+    format_control_timeline_human,
+)
+from agentveil_mcp_proxy.permission_doctor import (
+    PermissionDoctorError,
+    build_permission_doctor_report,
+    format_permission_doctor_report,
 )
 from agentveil_mcp_proxy.role_doctor import (
     build_role_doctor_report,
     format_role_doctor_report,
 )
 from agentveil_mcp_proxy.role_presets import (
+    ADVANCED_ROLE_SETUP_PROFILE,
     ROLE_PRESET_NAMES,
     RolePresetError,
     apply_env_role_override_to_config,
     apply_role_preset_to_config_payload,
+    init_setup_profile,
+    resolve_init_role_preset,
     resolve_role_preset,
+    user_facing_setup_label,
 )
 from agentveil_mcp_proxy.runtime_gate import RuntimeGateClient
 
@@ -236,6 +301,41 @@ def _print_json(payload: Mapping[str, Any], out: TextIO | None = None) -> None:
     print(json.dumps(dict(payload), sort_keys=True), file=out or sys.stdout)
 
 
+def _print_operator_json(payload: Mapping[str, Any], out: TextIO | None = None) -> None:
+    assert_proxy_cli_json_is_privacy_safe(payload)
+    _print_json(payload, out)
+
+
+def _artifact_refs(
+    *,
+    identity_path: Path,
+    config_path: Path,
+    control_grant_path: Path,
+) -> dict[str, dict[str, str | None]]:
+    return {
+        "identity_ref": bounded_path_ref(identity_path),
+        "config_ref": bounded_path_ref(config_path),
+        "control_grant_ref": bounded_path_ref(control_grant_path),
+    }
+
+
+def _bound_downstream_payload(downstream: Mapping[str, Any]) -> dict[str, Any]:
+    if not downstream.get("configured"):
+        return dict(downstream)
+    bounded = dict(downstream)
+    command = str(bounded.get("command") or "")
+    if command:
+        ref = bounded_path_ref(command)
+        bounded["command"] = ref["basename"] or command
+    if "args" in bounded:
+        bounded["args"] = sanitize_json_paths(list(bounded.get("args") or []))
+    return bounded
+
+
+def _downstream_info_bounded(config: ProxyConfig) -> dict[str, Any]:
+    return _bound_downstream_payload(_downstream_info(config))
+
+
 def _downstream_info(config: ProxyConfig) -> dict[str, Any]:
     """Return a stable, machine-readable downstream summary."""
 
@@ -270,6 +370,34 @@ def _downstream_info_if_available(config_path: Path) -> dict[str, Any] | None:
         return _downstream_info(load_proxy_config(config_path))
     except ProxyCliError:
         return None
+
+
+def _bounded_downstream_info_if_available(config_path: Path) -> dict[str, Any] | None:
+    from agentveil_mcp_proxy.evidence.summary import bounded_downstream_info
+
+    try:
+        return bounded_downstream_info(load_proxy_config(config_path))
+    except ProxyCliError:
+        return None
+
+
+def _stored_passphrase_file(config: ProxyConfig | None) -> Path | None:
+    if config is None or not config.identity_passphrase_file:
+        return None
+    return Path(config.identity_passphrase_file).expanduser()
+
+
+def _effective_passphrase_file(
+    *,
+    explicit_passphrase: str | None,
+    explicit_passphrase_file: Path | None,
+    config: ProxyConfig | None,
+) -> Path | None:
+    if explicit_passphrase is not None or explicit_passphrase_file is not None:
+        return explicit_passphrase_file
+    if os.environ.get("AVP_PROXY_PASSPHRASE"):
+        return None
+    return _stored_passphrase_file(config)
 
 
 def _event_record_dict(
@@ -556,9 +684,15 @@ def _build_config_payload(
     trusted_signer_dids: Iterable[str],
     policy_pack: str,
     role_preset: str,
+    setup_profile: str | None = ADVANCED_ROLE_SETUP_PROFILE,
     downstream_config: Mapping[str, Any] | None = None,
+    identity_passphrase_file: Path | None = None,
 ) -> dict[str, Any]:
-    policy = builtin_policy_pack(policy_pack)
+    policy = (
+        build_product_route_policy()
+        if policy_pack == "product_route"
+        else builtin_policy_pack(policy_pack)
+    )
     payload = {
         "proxy_config_schema_version": PROXY_CONFIG_SCHEMA_VERSION,
         "avp": {
@@ -596,7 +730,12 @@ def _build_config_payload(
         "tool_surface": {"mode": "off", "allow": []},
         "downstream": dict(downstream_config or {}),
     }
-    payload = apply_role_preset_to_config_payload(payload, preset_name=role_preset)
+    if identity_passphrase_file is not None:
+        payload["identity_passphrase_file"] = str(identity_passphrase_file.expanduser())
+    if setup_profile is not None:
+        payload["setup_profile"] = setup_profile
+    if setup_profile != PRODUCT_ROUTE_SETUP_PROFILE:
+        payload = apply_role_preset_to_config_payload(payload, preset_name=role_preset)
     ProxyConfig.from_dict(payload)
     return payload
 
@@ -610,6 +749,7 @@ def init_proxy(
     trusted_signer_dids: Iterable[str] | None = None,
     policy_pack: str = "default",
     role_preset: str = "implementer",
+    setup_profile: str | None = ADVANCED_ROLE_SETUP_PROFILE,
     ttl_days: int = DEFAULT_CONTROL_GRANT_TTL_DAYS,
     allowed_categories: Iterable[str] = DEFAULT_ALLOWED_CATEGORIES,
     downstream_config: Mapping[str, Any] | None = None,
@@ -679,7 +819,9 @@ def init_proxy(
         trusted_signer_dids=signers,
         policy_pack=policy_pack,
         role_preset=preset.name,
+        setup_profile=setup_profile,
         downstream_config=downstream_config,
+        identity_passphrase_file=passphrase_file if not plaintext else None,
     )
 
     _secure_write_json(identity_path, identity_payload, force=force)
@@ -1049,10 +1191,10 @@ def smoke_proxy(
     paths = proxy_paths(home, config_path)
     config = load_proxy_config(paths.config_path)
     result = run_downstream_smoke(config)
-    downstream = _downstream_info(config)
+    downstream = _downstream_info_bounded(config)
     downstream["tool_count"] = result.tool_count
     if output_json:
-        _print_json({
+        _print_operator_json({
             "ok": True,
             "errors": [],
             "warnings": [],
@@ -1095,6 +1237,11 @@ def doctor_proxy(
     downstream: dict[str, Any] = {"configured": False}
     try:
         config = load_proxy_config(paths.config_path)
+        effective_passphrase_file = _effective_passphrase_file(
+            explicit_passphrase=passphrase,
+            explicit_passphrase_file=passphrase_file,
+            config=config,
+        )
         downstream = _downstream_info(config)
         identity_path = paths.identity_path(config.avp.agent_name)
         grant_path = paths.control_grant_path(config.avp.agent_name)
@@ -1106,9 +1253,9 @@ def doctor_proxy(
         if not config.avp.trusted_signer_dids:
             failures.append("trusted signer DID set is empty")
         if not _owner_only(identity_path):
-            failures.append(f"agent identity permissions must be 0600: {identity_path}")
+            failures.append(f"agent identity permissions must be 0600: {identity_path.name}")
         if not _owner_only(grant_path):
-            failures.append(f"control grant permissions must be 0600: {grant_path}")
+            failures.append(f"control grant permissions must be 0600: {grant_path.name}")
         if identity.get("did") is None:
             failures.append("agent identity missing DID")
         if config.downstream and downstream.get("error"):
@@ -1122,7 +1269,7 @@ def doctor_proxy(
             identity_passphrase = _resolve_existing_identity_passphrase(
                 identity,
                 passphrase=passphrase,
-                passphrase_file=passphrase_file,
+                passphrase_file=effective_passphrase_file,
             )
             agent = _load_proxy_agent(
                 identity=identity,
@@ -1175,11 +1322,11 @@ def doctor_proxy(
 
         if failures:
             if output_json:
-                _print_json({
+                _print_operator_json({
                     "ok": False,
                     "errors": failures,
                     "warnings": warnings,
-                    "downstream": downstream,
+                    "downstream": _downstream_info_bounded(config) if config.downstream else downstream,
                     "backend": {"checked": check_backend, "ok": backend_ok},
                     "evidence_count": _evidence_count(paths),
                 }, out)
@@ -1192,22 +1339,24 @@ def doctor_proxy(
             downstream["tool_count"] = downstream_smoke.tool_count
             downstream["smoke_ok"] = True
         if output_json:
-            _print_json({
+            _print_operator_json({
                 "ok": True,
                 "errors": [],
                 "warnings": warnings,
-                "downstream": downstream,
+                "downstream": _bound_downstream_payload(downstream),
                 "backend": {"checked": check_backend, "ok": backend_ok},
                 "evidence_count": _evidence_count(paths),
-                "config_path": str(paths.config_path),
-                "identity_path": str(identity_path),
-                "control_grant_path": str(grant_path),
+                **_artifact_refs(
+                    identity_path=identity_path,
+                    config_path=paths.config_path,
+                    control_grant_path=grant_path,
+                ),
                 "trusted_signer_count": len(config.avp.trusted_signer_dids),
             }, out)
         else:
-            print(f"OK: config {paths.config_path}", file=out)
-            print(f"OK: identity {identity_path}", file=out)
-            print(f"OK: control grant {grant_path}", file=out)
+            print(f"OK: config {paths.config_path.name}", file=out)
+            print(f"OK: identity {identity_path.name}", file=out)
+            print(f"OK: control grant {grant_path.name}", file=out)
             print(f"OK: trusted signers {len(config.avp.trusted_signer_dids)}", file=out)
             print(
                 "OK: circuit breaker thresholds "
@@ -1333,6 +1482,208 @@ def print_config_wizard(
 
     sink.write(format_safe_config_wizard_output(result))
     return 0
+
+
+def run_setup_wizard_cli(
+    *,
+    home: Path,
+    inventory_path: Path,
+    mode: str = "review",
+    overlays: list[str] | None = None,
+    client_id: str = "cursor",
+    server_name: str = DEFAULT_SERVER_NAME,
+    proxy_command: str | None = None,
+    agent_name: str = "adaptive-setup",
+    trusted_signer_did: str = "did:key:z6MktrustedSigner",
+    out: TextIO | None = None,
+    output_json: bool = False,
+) -> int:
+    """Run adaptive setup and write proxy/client config with backup."""
+
+    sink = out or sys.stdout
+    try:
+        inventory = load_tool_inventory_file(inventory_path)
+        result = run_setup_wizard(
+            home=home,
+            inventory=inventory,
+            requested_mode=mode,
+            overlays=tuple(overlays or ()),
+            client_id=client_id,
+            server_name=server_name,
+            proxy_command=proxy_command,
+            agent_name=agent_name,
+            trusted_signer_did=trusted_signer_did,
+        )
+        payload = {
+            "ok": result.ok,
+            "setup_status": result.setup_status,
+            "summary": result.summary,
+            "proxy_config_written": result.proxy_config_written,
+            "client_config_written": result.client_config_written,
+            "backup_refs": [
+                {
+                    "basename": ref.basename,
+                    "hash": f"sha256:{ref.hash}" if ref.hash else "",
+                    "created_at": ref.created_at,
+                }
+                for ref in result.backup_refs
+            ],
+            "errors": list(result.errors),
+        }
+        assert_setup_output_is_privacy_safe(payload)
+    except ConfigWizardError as exc:
+        error_payload = format_setup_error_payload(exc)
+        assert_setup_output_is_privacy_safe(error_payload)
+        if output_json:
+            _print_json(error_payload, sink)
+        else:
+            print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    if output_json:
+        _print_json(payload, sink)
+    else:
+        sink.write(f"Setup status: {result.setup_status}\n")
+        sink.write(f"Proxy config written: {result.proxy_config_written}\n")
+        sink.write(f"Client config written: {result.client_config_written}\n")
+        for line in result.summary.get("summary_lines", ()):
+            sink.write(f"{line}\n")
+        for error in result.errors:
+            sink.write(f"ERROR: {error}\n")
+    return 0 if result.ok or result.setup_status == "incomplete" else 2
+
+
+def print_setup_status_cli(
+    *,
+    home: Path,
+    client_id: str = "cursor",
+    proxy_command: str | None = None,
+    config_path: Path | None = None,
+    out: TextIO | None = None,
+    output_json: bool = False,
+) -> int:
+    """Print structured setup status derived from actual config files."""
+
+    sink = out or sys.stdout
+    status = derive_setup_status(
+        home=home,
+        client_id=client_id,
+        proxy_command=proxy_command,
+        proxy_config_path=config_path,
+    )
+    payload = setup_status_to_dict(status)
+    assert_setup_output_is_privacy_safe(payload)
+    if output_json:
+        _print_json(payload, sink)
+    else:
+        for key, value in payload.items():
+            sink.write(f"{key}={value}\n")
+    return 0
+
+
+def print_control_status_cli(
+    *,
+    home: Path,
+    client_id: str = "cursor",
+    proxy_command: str | None = None,
+    config_path: Path | None = None,
+    out: TextIO | None = None,
+    output_json: bool = False,
+) -> int:
+    """Print daily control status derived from setup files and evidence."""
+
+    sink = out or sys.stdout
+    payload = build_control_status(
+        home=home,
+        client_id=client_id,
+        proxy_config_path=config_path,
+        proxy_command=proxy_command,
+    )
+    if output_json:
+        _print_json(payload, sink)
+    else:
+        sink.write(format_control_status_human(payload))
+        sink.write("\n")
+    return 0 if payload.get("ok", True) else 2
+
+
+def print_control_timeline_cli(
+    *,
+    home: Path,
+    config_path: Path | None = None,
+    limit: int = 20,
+    out: TextIO | None = None,
+    output_json: bool = False,
+) -> int:
+    """Print daily control timeline derived from durable evidence records."""
+
+    sink = out or sys.stdout
+    payload = build_control_timeline(
+        home=home,
+        proxy_config_path=config_path,
+        limit=limit,
+    )
+    if output_json:
+        _print_json(payload, sink)
+    else:
+        sink.write(format_control_timeline_human(payload))
+        sink.write("\n")
+    return 0
+
+
+def print_permission_doctor_cli(
+    *,
+    home: Path,
+    client_id: str = "cursor",
+    proxy_command: str | None = None,
+    config_path: Path | None = None,
+    out: TextIO | None = None,
+    output_json: bool = False,
+) -> int:
+    """Print permission doctor setup mode and blast-radius boundaries."""
+
+    sink = out or sys.stdout
+    payload = build_permission_doctor_report(
+        home=home,
+        client_id=client_id,
+        proxy_command=proxy_command,
+        proxy_config_path=config_path,
+    )
+    if output_json:
+        _print_json(payload, sink)
+    else:
+        sink.write(format_permission_doctor_report(payload))
+        sink.write("\n")
+    return 0 if payload.get("ok", True) else 2
+
+
+def restore_setup_cli(
+    *,
+    home: Path,
+    # claim-check: allow "all" is a restore target enum value, not a coverage claim.
+    target: str = "all",
+    client_id: str = "cursor",
+    out: TextIO | None = None,
+    output_json: bool = False,
+) -> int:
+    """Restore setup-managed config files from backups."""
+
+    sink = out or sys.stdout
+    # claim-check: allow "all" is a restore target enum value, not a coverage claim.
+    if target not in {"proxy", "client", "all"}:
+        # claim-check: allow "all" is a restore target enum value, not a coverage claim.
+        raise ProxyCliError("restore target must be one of: proxy, client, all", exit_code=2)
+    result = restore_setup_files(home=home, target=target, client_id=client_id)
+    payload = setup_restore_to_dict(result)
+    assert_setup_output_is_privacy_safe(payload)
+    if output_json:
+        _print_json(payload, sink)
+    else:
+        for target_name in result.restored_targets:
+            sink.write(f"restored: {target_name}\n")
+        for error in result.errors:
+            sink.write(f"ERROR: {error}\n")
+    return 0 if result.ok else 2
 
 
 def validate_config_wizard(
@@ -1767,8 +2118,21 @@ def verify_evidence(
     failure rather than a warning.
     """
 
+    from agentveil_mcp_proxy.evidence.verify_output import (
+        VERIFY_FAILED_UNEXPECTED,
+        build_verify_failure_payload,
+        build_verify_success_payload,
+        bundle_parse_summary,
+        classify_verify_error,
+        reason_code_for_error,
+        render_verify_human,
+    )
+
     out = out or sys.stdout
-    explicit_trusted_signers = tuple(trusted_signer_dids or ())
+    explicit_trusted_signers = tuple(
+        did for did in (trusted_signer_dids or ()) if isinstance(did, str) and did
+    )
+    parse_summary = bundle_parse_summary(bundle_path)
     try:
         result = verify_evidence_bundle_file(
             bundle_path,
@@ -1776,32 +2140,39 @@ def verify_evidence(
             strict=True,
         )
     except EvidenceVerificationError as exc:
-        if output_format == "json":
-            print(
-                json.dumps({"status": "invalid", "error": str(exc)}, sort_keys=True),
-                file=out,
-            )
-        else:
-            print(f"FAIL: {exc}", file=out)
-        return 1
-    warnings = list(result.warnings)
-    if output_format == "json":
-        print(json.dumps({
-            "status": "ok",
-            "record_count": result.record_count,
-            "signed_receipt_count": result.signed_receipt_count,
-            "unverified_receipt_count": result.unverified_receipt_count,
-            "warnings": warnings,
-            "chain_root_hash": result.chain_root_hash,
-        }, sort_keys=True), file=out)
-    else:
-        print(
-            "OK: bundle integrity verified, "
-            f"{result.record_count} records, {result.signed_receipt_count} signed receipts",
-            file=out,
+        contract = classify_verify_error(exc)
+        payload = build_verify_failure_payload(
+            contract=contract,
+            parse_summary=parse_summary,
+            trusted_signer_dids=explicit_trusted_signers,
+            reason_code=reason_code_for_error(exc),
         )
-        for warning in warnings:
-            print(f"WARN: {warning}", file=out)
+        if output_format == "json":
+            print(json.dumps(payload, sort_keys=True), file=out)
+        else:
+            print(render_verify_human(payload), file=out)
+        return 1
+    except Exception:
+        payload = build_verify_failure_payload(
+            contract=VERIFY_FAILED_UNEXPECTED,
+            parse_summary=parse_summary,
+            trusted_signer_dids=explicit_trusted_signers,
+            reason_code="verification_failed",
+        )
+        if output_format == "json":
+            print(json.dumps(payload, sort_keys=True), file=out)
+        else:
+            print(render_verify_human(payload), file=out)
+        return 1
+    payload = build_verify_success_payload(
+        result=result,
+        parse_summary=parse_summary,
+        trusted_signer_dids=explicit_trusted_signers,
+    )
+    if output_format == "json":
+        print(json.dumps(payload, sort_keys=True), file=out)
+    else:
+        print(render_verify_human(payload), file=out)
     return 0
 
 
@@ -1863,7 +2234,7 @@ def list_events(
             "ok": True,
             "errors": [],
             "warnings": [],
-            "downstream": _downstream_info_if_available(paths.config_path),
+            "downstream": _bounded_downstream_info_if_available(paths.config_path),
             "evidence_count": len(records),
             "events": [
                 _event_record_dict(
@@ -1917,7 +2288,7 @@ def tail_events(
                 "ok": True,
                 "errors": [],
                 "warnings": [],
-                "downstream": _downstream_info_if_available(paths.config_path),
+                "downstream": _bounded_downstream_info_if_available(paths.config_path),
                 "evidence_count": len(records),
                 "events": [
                     _event_record_dict(
@@ -1976,32 +2347,31 @@ def evidence_summary(
 ) -> dict[str, Any]:
     """Print aggregate local evidence counts without raw payload details."""
 
+    from agentveil_mcp_proxy.evidence.store import ApprovalEvidenceError
+    from agentveil_mcp_proxy.evidence.summary import (
+        bounded_evidence_summary_error,
+        build_evidence_summary,
+    )
+    import sqlite3
+
     out = out or sys.stdout
     paths = proxy_paths(home, config_path)
-    with ApprovalEvidenceStore(paths.proxy_dir / "evidence.sqlite") as store:
-        records = store.list_records()
-    by_status: dict[str, int] = {}
-    receipt_present = 0
-    receipt_missing = 0
-    for record in records:
-        by_status[record.status] = by_status.get(record.status, 0) + 1
-        if record.decision_receipt_sha256:
-            receipt_present += 1
-        elif record.decision_audit_id:
-            receipt_missing += 1
+    try:
+        with ApprovalEvidenceStore(paths.proxy_dir / "evidence.sqlite") as store:
+            records = store.list_records()
+    except (ApprovalEvidenceError, OSError, ValueError, sqlite3.Error):
+        summary = bounded_evidence_summary_error(code="evidence_store_unavailable")
+        print(json.dumps(summary, sort_keys=True), file=out)
+        return summary
     latest = max((record.created_at for record in records), default=None)
-    summary = {
-        "ok": True,
-        "errors": [],
-        "warnings": [],
-        "downstream": _downstream_info_if_available(paths.config_path),
-        "record_count": len(records),
-        "evidence_count": len(records),
-        "by_status": by_status,
-        "receipt_present_count": receipt_present,
-        "receipt_missing_count": receipt_missing,
-        "latest_record_at": None if latest is None else _event_timestamp(latest),
-    }
+    downstream = _bounded_downstream_info_if_available(paths.config_path)
+    if downstream is None:
+        downstream = {"configured": False}
+    summary = build_evidence_summary(
+        records,
+        downstream=downstream,
+        latest_record_at=None if latest is None else _event_timestamp(latest),
+    )
     print(json.dumps(summary, sort_keys=True), file=out)
     return summary
 
@@ -2258,7 +2628,12 @@ def _add_passphrase_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_json_arg(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--json", dest="json_output", action="store_true", help="Emit JSON output")
+    parser.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        help="Emit structured JSON (see command help for privacy vs runnable surfaces)",
+    )
 
 
 def _add_downstream_set_args(parser: argparse.ArgumentParser) -> None:
@@ -2299,6 +2674,15 @@ def print_client_configs(
     """Print copy-paste MCP client config without writing desktop config files."""
 
     sink = out or sys.stdout
+    paths = proxy_paths(home, config_path)
+    config: ProxyConfig | None = None
+    try:
+        config = load_proxy_config(paths.config_path)
+    except ProxyCliError:
+        config = None
+    effective_passphrase_file = (
+        passphrase_file if passphrase_file is not None else _stored_passphrase_file(config)
+    )
     try:
         rendered = render_client_configs(
             clients=clients,
@@ -2306,29 +2690,28 @@ def print_client_configs(
             command=command,
             home=home,
             config_path=config_path,
-            passphrase_file=passphrase_file,
+            passphrase_file=effective_passphrase_file,
         )
         resolved_command = resolve_proxy_command(command)
         run_args = build_run_args(
             home=home,
             config_path=config_path,
-            passphrase_file=passphrase_file,
+            passphrase_file=effective_passphrase_file,
         )
     except ClientConfigError as exc:
         raise ProxyCliError(str(exc), exit_code=2) from exc
 
     if output_json:
-        preset = (
-            read_role_preset_from_config(config_path)
-            if config_path is not None
-            else None
-        )
+        preset = config.role_preset if config is not None else None
+        downstream_payload = dict(config.downstream) if config is not None and config.downstream else None
         payload = format_client_config_json_payload(
             rendered,
             command=resolved_command,
             run_args=run_args,
             config_path=config_path,
+            home=home,
             role_preset=preset,
+            downstream=downstream_payload,
         )
         _print_json(payload, out=sink)
         return
@@ -2336,11 +2719,294 @@ def print_client_configs(
     sink.write(format_client_config_text(rendered))
 
 
+def print_client_packs_cli(
+    *,
+    clients: list[str] | None = None,
+    out: TextIO | None = None,
+    output_json: bool = False,
+) -> int:
+    """Print bounded metadata for client compatibility packs."""
+
+    sink = out or sys.stdout
+    try:
+        payload = build_client_packs_payload(client_ids=clients)
+    except ClientPackError as exc:
+        raise ProxyCliError(str(exc), exit_code=2) from exc
+    if output_json:
+        _print_json(payload, out=sink)
+        return 0
+    lines = ["AgentVeil client compatibility packs", ""]
+    for client_id, pack in payload["packs"].items():
+        lines.extend([
+            f"{pack['display_name']} ({client_id})",
+            f"  support_status: {pack['support_status']}",
+            f"  config_surface: {pack['config_surface']}",
+            f"  guidance: {pack['guidance_summary']}",
+            "",
+        ])
+    sink.write("\n".join(lines))
+    return 0
+
+
+def print_client_guidance_cli(
+    *,
+    clients: list[str] | None = None,
+    out: TextIO | None = None,
+    output_json: bool = False,
+) -> int:
+    """Print bounded action-routing guidance for one or more client packs."""
+
+    sink = out or sys.stdout
+    selected = clients or list(CLIENT_PACK_IDS)
+    try:
+        if len(selected) == 1:
+            payload = build_client_guidance_payload(client_id=selected[0])
+            if output_json:
+                _print_json(payload, out=sink)
+                return 0
+            sink.write(format_client_guidance_text(payload))
+            return 0
+        payload = build_client_guidance_set_payload(client_ids=selected)
+    except ClientPackError as exc:
+        raise ProxyCliError(str(exc), exit_code=2) from exc
+    if output_json:
+        _print_json(payload, out=sink)
+        return 0
+    blocks: list[str] = []
+    for client_payload in payload["clients"].values():
+        blocks.append(format_client_guidance_text(client_payload))
+    sink.write("\n".join(blocks))
+    return 0
+
+
+def run_client_doctor_cli(
+    *,
+    client_id: str,
+    home: Path | None = None,
+    config_path: Path | None = None,
+    passphrase_file: Path | None = None,
+    proxy_command: str | None = None,
+    list_only: bool = False,
+    out: TextIO | None = None,
+    output_json: bool = False,
+) -> int:
+    """Run optional client-pack health check through generated config + proxy path proof."""
+
+    sink = out or sys.stdout
+    paths = proxy_paths(home, config_path)
+    config: ProxyConfig | None = None
+    try:
+        config = load_proxy_config(paths.config_path)
+    except ProxyCliError:
+        config = None
+    effective_passphrase_file = (
+        passphrase_file if passphrase_file is not None else _stored_passphrase_file(config)
+    )
+    try:
+        payload = build_client_doctor_report(
+            client_id=client_id,
+            home=paths.home,
+            config_path=paths.config_path,
+            passphrase_file=effective_passphrase_file,
+            proxy_command=proxy_command,
+            list_only=list_only,
+        )
+    except (ClientDoctorError, ClientPackError) as exc:
+        raise ProxyCliError(str(exc), exit_code=2) from exc
+    if output_json:
+        _print_json(payload, out=sink)
+    else:
+        sink.write(format_client_doctor_report(payload))
+    return 0 if payload.get("ok") else 1
+
+
+def run_client_run_cli(
+    *,
+    client_id: str,
+    home: Path | None = None,
+    config_path: Path | None = None,
+    passphrase_file: Path | None = None,
+    proxy_command: str | None = None,
+    launch: bool = False,
+    prompt: str | None = None,
+    output_json: bool = False,
+    out: TextIO | None = None,
+) -> int:
+    sink = out or sys.stdout
+    home_path = home or Path(os.environ.get("AVP_HOME", "~/.avp")).expanduser()
+    try:
+        payload = build_client_runtime_payload(
+            client_id=client_id,
+            home=home_path,
+            config_path=config_path,
+            passphrase_file=passphrase_file,
+            proxy_command=proxy_command,
+            launch=launch,
+            prompt=prompt,
+            cwd=Path.cwd(),
+        )
+    except (ClientRuntimeError, ClientConfigError, ClientPackError) as exc:
+        raise ProxyCliError(str(exc), exit_code=2) from exc
+    if output_json:
+        _print_json(payload, out=sink)
+    else:
+        sink.write(format_client_runtime_payload(payload))
+    return 0
+
+
+def run_connect_cli(
+    *,
+    client_id: str,
+    home: Path | None = None,
+    config_path: Path | None = None,
+    passphrase_file: Path | None = None,
+    proxy_command: str | None = None,
+    server_name: str = DEFAULT_SERVER_NAME,
+    project_root: Path | None = None,
+    write: bool = False,
+    output_json: bool = False,
+    out: TextIO | None = None,
+) -> int:
+    sink = out or sys.stdout
+    home_path = home or Path(os.environ.get("AVP_HOME", "~/.avp")).expanduser()
+    try:
+        if is_connect_all_target(client_id):
+            payload = build_connect_all_payload(
+                home=home_path,
+                config_path=config_path,
+                passphrase_file=passphrase_file,
+                proxy_command=proxy_command,
+                server_name=server_name,
+                project_root=project_root,
+                write=write,
+            )
+        else:
+            payload = build_connect_payload(
+                client_id=client_id,
+                home=home_path,
+                config_path=config_path,
+                passphrase_file=passphrase_file,
+                proxy_command=proxy_command,
+                server_name=server_name,
+                project_root=project_root,
+                write=write,
+            )
+    except (ClientConnectError, ClientConfigError, ClientPackError) as exc:
+        raise ProxyCliError(str(exc), exit_code=2) from exc
+    if output_json:
+        _print_json(payload, out=sink)
+    else:
+        sink.write(format_connect_payload(payload))
+    return 0 if payload.get("ok") else 1
+
+
+def run_disconnect_cli(
+    *,
+    client_id: str,
+    home: Path | None = None,
+    config_path: Path | None = None,
+    server_name: str = DEFAULT_SERVER_NAME,
+    project_root: Path | None = None,
+    write: bool = False,
+    output_json: bool = False,
+    out: TextIO | None = None,
+) -> int:
+    sink = out or sys.stdout
+    home_path = home or Path(os.environ.get("AVP_HOME", "~/.avp")).expanduser()
+    try:
+        if is_connect_all_target(client_id):
+            payload = build_disconnect_all_payload(
+                home=home_path,
+                config_path=config_path,
+                server_name=server_name,
+                project_root=project_root,
+                write=write,
+            )
+        else:
+            payload = build_disconnect_payload(
+                client_id=client_id,
+                home=home_path,
+                config_path=config_path,
+                server_name=server_name,
+                project_root=project_root,
+                write=write,
+            )
+    except (ClientConnectError, ClientConfigError, ClientPackError) as exc:
+        raise ProxyCliError(str(exc), exit_code=2) from exc
+    if output_json:
+        _print_json(payload, out=sink)
+    else:
+        sink.write(format_connect_payload(payload))
+    return 0 if payload.get("ok") else 1
+
+
+def run_connect_status_cli(
+    *,
+    client_id: str,
+    home: Path | None = None,
+    config_path: Path | None = None,
+    passphrase_file: Path | None = None,
+    proxy_command: str | None = None,
+    server_name: str = DEFAULT_SERVER_NAME,
+    project_root: Path | None = None,
+    output_json: bool = False,
+    out: TextIO | None = None,
+) -> int:
+    sink = out or sys.stdout
+    home_path = home or Path(os.environ.get("AVP_HOME", "~/.avp")).expanduser()
+    try:
+        if is_connect_all_target(client_id):
+            payload = build_connect_status_all_payload(
+                home=home_path,
+                config_path=config_path,
+                passphrase_file=passphrase_file,
+                proxy_command=proxy_command,
+                server_name=server_name,
+                project_root=project_root,
+            )
+        else:
+            payload = build_connect_status_payload(
+                client_id=client_id,
+                home=home_path,
+                config_path=config_path,
+                passphrase_file=passphrase_file,
+                proxy_command=proxy_command,
+                server_name=server_name,
+                project_root=project_root,
+            )
+    except (ClientConnectError, ClientConfigError, ClientPackError) as exc:
+        raise ProxyCliError(str(exc), exit_code=2) from exc
+    if output_json:
+        _print_json(payload, out=sink)
+    else:
+        sink.write(format_connect_payload(payload))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
+    from agentveil_mcp_proxy import __version__ as package_version
+
     parser = argparse.ArgumentParser(prog="agentveil-mcp-proxy")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {package_version}",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    init = subparsers.add_parser("init", help="Create local proxy identity, config, and control grant")
+    init = subparsers.add_parser(
+        "init",
+        # claim-check: allow product label; bounded first-run tests cover this output.
+        help="Safe Autopilot first-run: create local identity, config, and control grant",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        # claim-check: allow product label in init --help epilog; verified by P10C smokes.
+        epilog=(
+            "Default user path (no --role):\n"
+            "  agentveil-mcp-proxy init --quickstart-filesystem ./sandbox\n"
+            "  agentveil-mcp-proxy client-config print\n"
+            "Advanced: pass --role reviewer|readonly|implementer|build for preset policy packs."
+        ),
+    )
     _add_common_path_args(init)
     init.add_argument("--base-url", default=DEFAULT_BASE_URL)
     init.add_argument("--agent-name", default=DEFAULT_AGENT_NAME)
@@ -2348,19 +3014,27 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument(
         "--policy-pack",
         default="default",
-        choices=["default", "github", "filesystem", "shell", "git", "fetch"],
+        choices=["default", "github", "filesystem", "shell", "git", "fetch", "package", "product_route"],
     )
     init.add_argument(
         "--role",
-        required=True,
+        default=None,
         choices=list(ROLE_PRESET_NAMES),
-        help="Least Agency role preset written into generated role_authority config",
+        # claim-check: allow product label; this describes UX, not a safety guarantee.
+        help="Advanced role preset; default first-run uses Safe Autopilot without role selection",
     )
     init.add_argument(
         "--quickstart-filesystem",
         type=Path,
         default=None,
-        help="Configure the built-in filesystem quickstart downstream rooted at this path",
+        # claim-check: allow product label; default quickstart path verified by P10C smokes.
+        help="Safe Autopilot default: built-in sandboxed filesystem downstream at this path",
+    )
+    init.add_argument(
+        "--product-route-profile",
+        type=Path,
+        default=None,
+        help="Initialize the composite local product route fixtures and downstream at this profile root",
     )
     init.add_argument("--downstream-name", default=None, help="Downstream MCP server name")
     init.add_argument("--downstream-command", default=None, help="Downstream MCP server command")
@@ -2372,7 +3046,18 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--plaintext", action="store_true", help="Store the proxy private key unencrypted")
     init.add_argument("--force", action="store_true")
 
-    doctor = subparsers.add_parser("doctor", help="Validate local proxy config and files")
+    doctor = subparsers.add_parser(
+        "doctor",
+        help="Validate local proxy setup before connecting your MCP client",
+        description="Validate local proxy setup before connecting your MCP client.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        # claim-check: allow product label in doctor --help epilog; default quickstart path.
+        epilog=(
+            # claim-check: allow product label; help text names the default path.
+            "Use after `init --quickstart-filesystem` on the default Safe Autopilot path.\n"
+            "Add --full to launch the downstream and verify MCP initialize/tools/list."
+        ),
+    )
     _add_common_path_args(doctor)
     _add_passphrase_args(doctor)
     _add_json_arg(doctor)
@@ -2453,7 +3138,16 @@ def build_parser() -> argparse.ArgumentParser:
     _add_downstream_set_args(downstream_set)
     _add_json_arg(downstream_set)
 
-    smoke = subparsers.add_parser("smoke", help="Launch downstream and verify MCP initialize/tools/list")
+    smoke = subparsers.add_parser(
+        "smoke",
+        help="Quick check: launch downstream and verify MCP initialize/tools/list",
+        description="Quick check: launch downstream and verify MCP initialize/tools/list.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Run after `init --quickstart-filesystem` and optional `doctor --full` "
+            "on the default Safe Autopilot quickstart path."
+        ),  # claim-check: allow product label in smoke --help epilog; default quickstart path.
+    )
     _add_common_path_args(smoke)
     _add_json_arg(smoke)
 
@@ -2495,9 +3189,58 @@ def build_parser() -> argparse.ArgumentParser:
     )
     events.add_argument("--before", default=None, help="Prune terminal records before UTC timestamp")
 
+    control = subparsers.add_parser(
+        "control",
+        help="Daily control surface for routed MCP status and evidence timeline",
+    )
+    control_subparsers = control.add_subparsers(dest="control_action", required=True)
+    control_status = control_subparsers.add_parser(
+        "status",
+        help="Show setup, redirect coverage, and evidence summary",
+    )
+    _add_common_path_args(control_status)
+    control_status.add_argument(
+        "--client",
+        default="cursor",
+        choices=list(CLIENT_TARGETS),
+        help="Desktop MCP client target to inspect for routing status",
+    )
+    control_status.add_argument(
+        "--proxy-command",
+        default=None,
+        help="Expected proxy executable name/path for routing validation",
+    )
+    _add_json_arg(control_status)
+
+    control_timeline = control_subparsers.add_parser(
+        "timeline",
+        help="Show recent approval, deny, and redirect evidence events",
+    )
+    _add_common_path_args(control_timeline)
+    control_timeline.add_argument("--limit", type=int, default=20)
+    _add_json_arg(control_timeline)
+
+    permission_doctor = subparsers.add_parser(
+        "permission-doctor",
+        help="Show setup mode, control boundaries, and redirect coverage",
+    )
+    _add_common_path_args(permission_doctor)
+    permission_doctor.add_argument(
+        "--client",
+        default="cursor",
+        choices=list(CLIENT_TARGETS),
+        help="Desktop MCP client target to inspect for routing status",
+    )
+    permission_doctor.add_argument(
+        "--proxy-command",
+        default=None,
+        help="Expected proxy executable name/path for routing validation",
+    )
+    _add_json_arg(permission_doctor)
+
     client_config = subparsers.add_parser(
         "client-config",
-        help="Print copy-paste MCP client config (dry-run; does not edit IDE files)",
+        help="Print runnable MCP client config for desktop agents (dry-run)",
     )
     client_config_subparsers = client_config.add_subparsers(
         dest="client_config_action",
@@ -2505,7 +3248,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     client_config_print = client_config_subparsers.add_parser(
         "print",
-        help="Render MCP client config JSON for supported desktop clients",
+        help="Render runnable local client config JSON (human default)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        # claim-check: allow privacy/runnable split wording in client-config --help epilog.
+        epilog=(
+            "Human output: privacy-bounded header plus runnable local client config JSON "
+            "(local paths allowed in JSON).\n"
+            "With --json: structured payload separates privacy-bounded summary from "
+            "clients.*.local_client_config (copy paste from local_client_config, not summary)."
+        ),
     )
     _add_common_path_args(client_config_print)
     client_config_print.add_argument(
@@ -2532,6 +3283,202 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include --passphrase-file in run args (file path only; passphrase content is not printed)",
     )
     _add_json_arg(client_config_print)
+
+    client_config_packs = client_config_subparsers.add_parser(
+        "packs",
+        help="List client compatibility pack metadata",
+    )
+    client_config_packs.add_argument(
+        "--client",
+        action="append",
+        default=None,
+        choices=[*CLIENT_PACK_IDS, "all"],  # claim-check: allow "all" is a selector enum.
+        help="Client pack to describe (repeatable; default: all packs)",  # claim-check: allow "all" is a selector enum.
+    )
+    _add_json_arg(client_config_packs)
+
+    client_config_guidance = client_config_subparsers.add_parser(
+        "guidance",
+        help="Print bounded action-routing guidance for client packs",
+    )
+    client_config_guidance.add_argument(
+        "--client",
+        action="append",
+        default=None,
+        choices=[*CLIENT_PACK_IDS, "all"],  # claim-check: allow "all" is a selector enum.
+        help="Client pack to describe (repeatable; default: all packs)",  # claim-check: allow "all" is a selector enum.
+    )
+    _add_json_arg(client_config_guidance)
+
+    client_doctor = subparsers.add_parser(
+        "client-doctor",
+        help="Optional client-pack health check for generated MCP config + proxy path",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Proves generated-config/proxy-path behavior, not provider-native client proof.\n"
+            "Use after init and client-config print. Add --list-only for tools/list-only diagnostics."
+        ),
+    )
+    _add_common_path_args(client_doctor)
+    client_doctor.add_argument(
+        "--client",
+        required=True,
+        choices=list(CLIENT_PACK_IDS),
+        help="Client compatibility pack to check",
+    )
+    client_doctor.add_argument(
+        "--proxy-command",
+        default=None,
+        help="Expected proxy executable name/path for config rendering",
+    )
+    client_doctor.add_argument(
+        "--passphrase-file",
+        type=Path,
+        default=None,
+        help="Passphrase file for encrypted proxy identity",
+    )
+    client_doctor.add_argument(
+        "--list-only",
+        action="store_true",
+        help="Verify tools/list only and return bounded list-only diagnostic",
+    )
+    _add_json_arg(client_doctor)
+
+    connect = subparsers.add_parser(
+        "connect",
+        help="Preview or write guided MCP client native config connect",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            # claim-check: allow "all" below is a CLI target literal, not a coverage claim.
+            "Default is dry-run preview. Use --write to apply after backup.\n"
+            "Example:\n"
+            "  agentveil-mcp-proxy connect cursor\n"
+            "  agentveil-mcp-proxy connect cursor --write\n"
+            "  agentveil-mcp-proxy connect all\n"  # claim-check: allow "all" is a CLI target literal.
+            "  agentveil-mcp-proxy connect all --write\n"  # claim-check: allow "all" is a CLI target literal.
+            "  agentveil-mcp-proxy connect status cursor\n"
+            "  agentveil-mcp-proxy connect status all"  # claim-check: allow "all" is a CLI target literal.
+        ),
+    )
+    connect.add_argument(
+        "client",
+        nargs="?",
+        choices=[*CLIENT_PACK_IDS, ALL_CLIENTS_TARGET],
+        # claim-check: allow "all" below is a CLI target literal, not a coverage claim.
+        help="Client to connect (cursor, claude_code, codex, all)",
+    )
+    _add_common_path_args(connect)
+    _add_passphrase_args(connect)
+    connect.add_argument(
+        "--proxy-command",
+        default=None,
+        help="Proxy executable for generated client config",
+    )
+    connect.add_argument(
+        "--server-name",
+        default=DEFAULT_SERVER_NAME,
+        help="MCP server entry name inside client config",
+    )
+    connect.add_argument(
+        "--project-root",
+        type=Path,
+        default=None,
+        help="Project root for client config placement (default: current directory)",
+    )
+    connect.add_argument(
+        "--status",
+        action="store_true",
+        help="Report whether AgentVeil MCP entry is present in client config",
+    )
+    connect.add_argument(
+        "--write",
+        action="store_true",
+        help="Write client config after backup (default: dry-run preview only)",
+    )
+    connect.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Explicit dry-run preview (default when --write is omitted)",
+    )
+    _add_json_arg(connect)
+
+    disconnect = subparsers.add_parser(
+        "disconnect",
+        help="Preview or write removal of the AgentVeil MCP client entry",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Default is dry-run preview. Use --write to apply after backup.\n"
+            "Example:\n"
+            "  agentveil-mcp-proxy disconnect cursor\n"
+            "  agentveil-mcp-proxy disconnect cursor --write\n"
+            "  agentveil-mcp-proxy disconnect all\n"  # claim-check: allow "all" is a CLI target literal.
+            "  agentveil-mcp-proxy disconnect all --write"  # claim-check: allow "all" is a CLI target literal.
+        ),
+    )
+    disconnect.add_argument(
+        "client",
+        choices=[*CLIENT_PACK_IDS, ALL_CLIENTS_TARGET],
+        # claim-check: allow "all" below is a CLI target literal, not a coverage claim.
+        help="Client to disconnect (cursor, claude_code, codex, all)",
+    )
+    _add_common_path_args(disconnect)
+    disconnect.add_argument(
+        "--server-name",
+        default=DEFAULT_SERVER_NAME,
+        help="MCP server entry name to remove",
+    )
+    disconnect.add_argument(
+        "--project-root",
+        type=Path,
+        default=None,
+        help="Project root for client config placement (default: current directory)",
+    )
+    disconnect.add_argument(
+        "--write",
+        action="store_true",
+        help="Write client config after backup (default: dry-run preview only)",
+    )
+    _add_json_arg(disconnect)
+
+    client_run = subparsers.add_parser(
+        "client-run",
+        help="Plan non-invasive runtime attach for a supported MCP client",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Default is dry-run planning only; AgentVeil does not write client configs.\n"
+            "Example:\n"
+            "  agentveil-mcp-proxy client-run codex --json\n"
+            "  agentveil-mcp-proxy client-run cursor --json\n"
+            "  agentveil-mcp-proxy client-run some_unknown_client --json"
+        ),
+    )
+    client_run.add_argument(
+        "client",
+        help="Client id (cursor, claude_code, codex, or any unknown id for generic route)",
+    )
+    _add_common_path_args(client_run)
+    _add_passphrase_args(client_run)
+    client_run.add_argument(
+        "--proxy-command",
+        default=None,
+        help="Proxy executable for the generic MCP route package",
+    )
+    client_run.add_argument(
+        "--exec",
+        action="store_true",
+        help="Execute runtime attach when supported (never default)",
+    )
+    client_run.add_argument(
+        "--launch",
+        action="store_true",
+        help="Alias for --exec",
+    )
+    client_run.add_argument(
+        "--prompt",
+        default=None,
+        help="Prompt to pass to Codex when --exec/--launch is used",
+    )
+    _add_json_arg(client_run)
 
     explain = subparsers.add_parser(
         "explain",
@@ -2653,7 +3600,120 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_json_arg(wizard_validate)
 
+    setup = subparsers.add_parser(
+        "setup",
+        help="Adaptive setup wizard for proxy and MCP client config",
+    )
+    setup_subparsers = setup.add_subparsers(dest="setup_action", required=True)
+    setup_run = setup_subparsers.add_parser(
+        "run",
+        help="Plan adaptive setup and write proxy/client config with backup",
+    )
+    setup_run.add_argument("--home", type=Path, required=True, help="AVP home for setup output")
+    setup_run.add_argument(
+        "--inventory",
+        type=Path,
+        required=True,
+        help="Path to metadata-only tool inventory JSON",
+    )
+    setup_run.add_argument(
+        "--mode",
+        default="review",
+        choices=["readonly", "review", "build"],
+        help="Requested setup mode",
+    )
+    setup_run.add_argument(
+        "--overlay",
+        action="append",
+        default=[],
+        dest="overlays",
+        help="Optional setup overlay id (repeatable)",
+    )
+    setup_run.add_argument(
+        "--client",
+        default="cursor",
+        choices=list(CLIENT_TARGETS),
+        help="Desktop MCP client target to write",
+    )
+    setup_run.add_argument(
+        "--server-name",
+        default=DEFAULT_SERVER_NAME,
+        help="MCP server entry name inside mcpServers",
+    )
+    setup_run.add_argument(
+        "--proxy-command",
+        default=None,
+        help="Path to agentveil-mcp-proxy executable (default: resolve from PATH)",
+    )
+    setup_run.add_argument(
+        "--agent-name",
+        default="adaptive-setup",
+        help="AVP agent name embedded in generated proxy config",
+    )
+    setup_run.add_argument(
+        "--trusted-signer-did",
+        default="did:key:z6MktrustedSigner",
+        help="Trusted signer DID for generated proxy config validation",
+    )
+    _add_json_arg(setup_run)
+
+    setup_status = setup_subparsers.add_parser(
+        "status",
+        help="Report setup status from actual proxy and client config files",
+    )
+    setup_status.add_argument("--home", type=Path, required=True, help="AVP home to inspect")
+    setup_status.add_argument(
+        "--client",
+        default="cursor",
+        choices=list(CLIENT_TARGETS),
+        help="Desktop MCP client target to inspect",
+    )
+    setup_status.add_argument(
+        "--proxy-command",
+        default=None,
+        help="Expected proxy executable name/path for routing validation",
+    )
+    setup_status.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Proxy config path to inspect (default: <home>/mcp-proxy/config.json)",
+    )
+    _add_json_arg(setup_status)
+
+    setup_restore = setup_subparsers.add_parser(
+        "restore",
+        help="Restore setup-managed config files from backups",
+    )
+    setup_restore.add_argument("--home", type=Path, required=True, help="AVP home to restore")
+    setup_restore.add_argument(
+        "--target",
+        # claim-check: allow "all" is a restore target enum value, not a coverage claim.
+        default="all",
+        # claim-check: allow "all" is a restore target enum value, not a coverage claim.
+        choices=["proxy", "client", "all"],
+        help="Which setup-managed files to restore",
+    )
+    setup_restore.add_argument(
+        "--client",
+        default="cursor",
+        choices=list(CLIENT_TARGETS),
+        help="Desktop MCP client target to restore",
+    )
+    _add_json_arg(setup_restore)
+
     return parser
+
+
+def _normalize_connect_argv(argv: list[str]) -> list[str]:
+    """Support ``connect status <client>`` without a nested argparse subparser."""
+
+    if len(argv) >= 3 and argv[0] == "connect" and argv[1] == "status":
+        client = argv[2]
+        if client not in (*CLIENT_PACK_IDS, ALL_CLIENTS_TARGET):
+            return argv
+        return ["connect", client, "--status", *argv[3:]]
+    return argv
 
 
 def _normalize_downstream_arg_values(argv: list[str]) -> list[str]:
@@ -2676,12 +3736,29 @@ def _normalize_downstream_arg_values(argv: list[str]) -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     parse_argv = sys.argv[1:] if argv is None else argv
-    args = parser.parse_args(_normalize_downstream_arg_values(parse_argv))
+    args = parser.parse_args(
+        _normalize_connect_argv(_normalize_downstream_arg_values(parse_argv))
+    )
     try:
         if args.command == "init":
             downstream_config = None
             policy_pack = args.policy_pack
-            if args.quickstart_filesystem is not None:
+            setup_profile = init_setup_profile(explicit_role=False)
+            if args.product_route_profile is not None:
+                if args.quickstart_filesystem is not None:
+                    raise ProxyCliError(
+                        "--product-route-profile cannot be combined with --quickstart-filesystem"
+                    )
+                if args.downstream_name or args.downstream_command or args.downstream_arg:
+                    raise ProxyCliError(
+                        "--product-route-profile cannot be combined with downstream options"
+                    )
+                profile_root = args.product_route_profile.expanduser().resolve()
+                initialize_product_route_profile(profile_root)
+                downstream_config = build_product_route_downstream_config(profile_root)
+                policy_pack = "product_route"
+                setup_profile = PRODUCT_ROUTE_SETUP_PROFILE
+            elif args.quickstart_filesystem is not None:
                 if args.downstream_name or args.downstream_command or args.downstream_arg:
                     raise ProxyCliError(
                         "--quickstart-filesystem cannot be combined with downstream options"
@@ -2697,6 +3774,9 @@ def main(argv: list[str] | None = None) -> int:
                 )
             elif args.downstream_name or args.downstream_arg:
                 raise ProxyCliError("--downstream-command is required with downstream options")
+            role_preset, explicit_role = resolve_init_role_preset(args.role)
+            if args.product_route_profile is None:
+                setup_profile = init_setup_profile(explicit_role=explicit_role)
             json_warnings = [PLAINTEXT_WARNING] if args.json_output and args.plaintext else []
             result = init_proxy(
                 home=args.home,
@@ -2705,7 +3785,8 @@ def main(argv: list[str] | None = None) -> int:
                 agent_name=args.agent_name,
                 trusted_signer_dids=args.trusted_signer_did,
                 policy_pack=policy_pack,
-                role_preset=args.role,
+                role_preset=role_preset,
+                setup_profile=setup_profile,
                 ttl_days=args.ttl_days,
                 allowed_categories=args.allowed_category or DEFAULT_ALLOWED_CATEGORIES,
                 downstream_config=downstream_config,
@@ -2716,32 +3797,43 @@ def main(argv: list[str] | None = None) -> int:
                 force=args.force,
             )
             config = load_proxy_config(result.config_path)
+            setup_label = user_facing_setup_label(
+                role_preset=config.role_preset,
+                explicit_role=explicit_role,
+                setup_profile=setup_profile,
+            )
             if args.json_output:
-                _print_json({
+                init_json_payload: dict[str, Any] = {
                     "ok": True,
                     "errors": [],
                     "warnings": json_warnings,
                     "agent_name": result.agent_name,
                     "agent_did": result.agent_did,
-                    "identity_path": str(result.identity_path),
-                    "config_path": str(result.config_path),
-                    "control_grant_path": str(result.control_grant_path),
+                    **_artifact_refs(
+                        identity_path=result.identity_path,
+                        config_path=result.config_path,
+                        control_grant_path=result.control_grant_path,
+                    ),
                     "control_grant_expires_at": result.control_grant_expires_at,
-                    "role_preset": config.role_preset,
-                    "role_authority": {
+                    "setup_profile": setup_profile,
+                    "setup_label": setup_label,
+                    "downstream": _downstream_info_bounded(config),
+                    "evidence_count": _evidence_count(proxy_paths(args.home, args.config)),
+                }
+                if setup_profile != PRODUCT_ROUTE_SETUP_PROFILE:
+                    init_json_payload["role_preset"] = config.role_preset
+                    init_json_payload["role_authority"] = {
                         "mode": config.role_authority.mode.value,
                         "role": config.role_authority.role,
                         "authority": config.role_authority.authority,
-                    },
-                    "downstream": _downstream_info(config),
-                    "evidence_count": _evidence_count(proxy_paths(args.home, args.config)),
-                })
+                    }
+                _print_operator_json(init_json_payload)
             else:
-                print(f"Created MCP proxy identity: {result.agent_did}")
-                print(f"Identity: {result.identity_path}")
-                print(f"Config: {result.config_path}")
-                print(f"Role preset: {config.role_preset}")
-                print(f"Control grant: {result.control_grant_path}")
+                print(f"Created protected agent connection: {result.agent_did}")
+                print(f"Setup: {setup_label}")
+                print(f"Identity file: {result.identity_path.name}")
+                print(f"Config file: {result.config_path.name}")
+                print(f"Control grant file: {result.control_grant_path.name}")
                 print(f"Control grant expires: {result.control_grant_expires_at}")
             return 0
         if args.command == "doctor":
@@ -2874,19 +3966,114 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 raise ProxyCliError("events action must be list, tail, or vacuum")
             return 0
+        if args.command == "control":
+            if args.control_action == "status":
+                return print_control_status_cli(
+                    home=args.home,
+                    client_id=args.client,
+                    proxy_command=args.proxy_command,
+                    config_path=args.config,
+                    out=sys.stdout,
+                    output_json=args.json_output,
+                )
+            if args.control_action == "timeline":
+                return print_control_timeline_cli(
+                    home=args.home,
+                    config_path=args.config,
+                    limit=args.limit,
+                    out=sys.stdout,
+                    output_json=args.json_output,
+                )
+            raise ProxyCliError("control action must be status or timeline")
+        if args.command == "permission-doctor":
+            return print_permission_doctor_cli(
+                home=args.home,
+                client_id=args.client,
+                proxy_command=args.proxy_command,
+                config_path=args.config,
+                out=sys.stdout,
+                output_json=args.json_output,
+            )
         if args.command == "client-config":
-            if args.client_config_action != "print":
-                raise ProxyCliError("client-config action must be print")
-            print_client_configs(
-                clients=args.client or sorted(CLIENT_TARGETS),
-                server_name=args.server_name,
-                command=args.proxy_command,
+            if args.client_config_action == "print":
+                print_client_configs(
+                    clients=args.client or sorted(CLIENT_TARGETS),
+                    server_name=args.server_name,
+                    command=args.proxy_command,
+                    home=args.home,
+                    config_path=args.config,
+                    passphrase_file=args.passphrase_file,
+                    output_json=args.json_output,
+                )
+                return 0
+            if args.client_config_action == "packs":
+                return print_client_packs_cli(
+                    clients=args.client,
+                    output_json=args.json_output,
+                )
+            if args.client_config_action == "guidance":
+                return print_client_guidance_cli(
+                    clients=args.client,
+                    output_json=args.json_output,
+                )
+            raise ProxyCliError("client-config action must be print, packs, or guidance")
+        if args.command == "client-doctor":
+            return run_client_doctor_cli(
+                client_id=args.client,
                 home=args.home,
                 config_path=args.config,
                 passphrase_file=args.passphrase_file,
+                proxy_command=args.proxy_command,
+                list_only=args.list_only,
                 output_json=args.json_output,
             )
-            return 0
+        if args.command == "connect":
+            if args.status:
+                return run_connect_status_cli(
+                    client_id=args.client,
+                    home=args.home,
+                    config_path=args.config,
+                    passphrase_file=args.passphrase_file,
+                    proxy_command=args.proxy_command,
+                    server_name=args.server_name,
+                    project_root=args.project_root,
+                    output_json=args.json_output,
+            )
+            if not args.client:
+                # claim-check: allow "all" below is a CLI target literal, not a coverage claim.
+                raise ProxyCliError("client id required; example: connect cursor or connect all")
+            return run_connect_cli(
+                client_id=args.client,
+                home=args.home,
+                config_path=args.config,
+                passphrase_file=args.passphrase_file,
+                proxy_command=args.proxy_command,
+                server_name=args.server_name,
+                project_root=args.project_root,
+                write=args.write,
+                output_json=args.json_output,
+            )
+        if args.command == "disconnect":
+            return run_disconnect_cli(
+                client_id=args.client,
+                home=args.home,
+                config_path=args.config,
+                server_name=args.server_name,
+                project_root=args.project_root,
+                write=args.write,
+                output_json=args.json_output,
+            )
+        if args.command == "client-run":
+            return run_client_run_cli(
+                client_id=args.client,
+                home=args.home,
+                config_path=args.config,
+                passphrase_file=args.passphrase_file,
+                proxy_command=args.proxy_command,
+                launch=args.exec or args.launch,
+                prompt=args.prompt,
+                output_json=args.json_output,
+            )
         if args.command == "explain":
             if args.explain_action != "role":
                 raise ProxyCliError("explain action must be role")
@@ -2927,17 +4114,62 @@ def main(argv: list[str] | None = None) -> int:
                     output_json=args.json_output,
                 )
             raise ProxyCliError("wizard action must be print or validate")
-    except (ProxyCliError, ApprovalEvidenceError, EvidenceExportError, EvidenceVerificationError) as exc:
+        if args.command == "setup":
+            if args.setup_action == "run":
+                return run_setup_wizard_cli(
+                    home=args.home,
+                    inventory_path=args.inventory,
+                    mode=args.mode,
+                    overlays=args.overlays,
+                    client_id=args.client,
+                    server_name=args.server_name,
+                    proxy_command=args.proxy_command,
+                    agent_name=args.agent_name,
+                    trusted_signer_did=args.trusted_signer_did,
+                    output_json=args.json_output,
+                )
+            if args.setup_action == "status":
+                return print_setup_status_cli(
+                    home=args.home,
+                    client_id=args.client,
+                    proxy_command=args.proxy_command,
+                    config_path=args.config,
+                    output_json=args.json_output,
+                )
+            if args.setup_action == "restore":
+                return restore_setup_cli(
+                    home=args.home,
+                    target=args.target,
+                    client_id=args.client,
+                    output_json=args.json_output,
+                )
+            raise ProxyCliError("setup action must be run, status, or restore")
+    except (
+        ProxyCliError,
+        ApprovalEvidenceError,
+        EvidenceExportError,
+        EvidenceVerificationError,
+        ControlSurfaceError,
+        PermissionDoctorError,
+    ) as exc:
         if getattr(args, "json_output", False):
+            if isinstance(exc, (ControlSurfaceError, PermissionDoctorError)):
+                error_message = exc.public_message()
+            else:
+                error_message = str(exc)
             _print_json({
                 "ok": False,
-                "errors": [str(exc)],
+                "errors": [error_message],
                 "warnings": [],
                 "downstream": None,
                 "evidence_count": None,
             })
         else:
-            print(f"ERROR: {exc}", file=sys.stderr)
+            if isinstance(exc, (ControlSurfaceError, PermissionDoctorError)):
+                error_message = exc.public_message()
+            else:
+                error_message = str(exc)
+            print(f"ERROR: {error_message}", file=sys.stderr)
         return exc.exit_code if isinstance(exc, ProxyCliError) else 1
     raise AssertionError(f"unhandled command: {args.command}")
 

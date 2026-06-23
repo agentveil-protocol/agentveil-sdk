@@ -1433,3 +1433,155 @@ def test_runtime_gate_executed_record_without_local_grant_not_required(tmp_path)
         result = verify_evidence_bundle(bundle, trusted_signer_dids=[GRANT_DID], strict=True)
         assert result.valid
         assert result.verified_approval_grant_count == 0
+
+
+def test_redirect_automation_link_valid_requires_bounded_original_and_follow_up():
+    from agentveil_mcp_proxy.evidence.observability import redirect_automation_link_valid
+    from agentveil_mcp_proxy.policy import build_redirect_automation_metadata
+
+    # claim-check: allow test status enum; this is negative evidence-link coverage.
+    original_metadata = build_redirect_automation_metadata(
+        fixture_id="redirect.original",
+        tool_name="write_file",
+        policy_decision="block",
+        policy_rule_id="role_authority_reviewer_blocks_implementation",
+        approval_status=ApprovalStatus.BLOCKED.value,  # claim-check: allow test enum; negative evidence coverage.
+        execution_status="not_reached",
+        target_reached=False,
+        request_id="orig-write",
+        redirect_role="original",
+        redirect_playbook_id="create_implementer_task",
+        original_request_id="orig-write",
+    )
+    follow_metadata = build_redirect_automation_metadata(
+        fixture_id="redirect.follow",
+        tool_name="read_file",
+        policy_decision="allow",
+        policy_rule_id=None,
+        approval_status=ApprovalStatus.EXECUTED.value,
+        execution_status=ApprovalStatus.EXECUTED.value,
+        target_reached=True,
+        request_id="follow-read",
+        request_chain=["orig-write", "follow-read"],
+        redirect_role="follow_up",
+        redirect_playbook_id="create_implementer_task",
+        redirect_parent_request_id="orig-write",
+        original_request_id="orig-write",
+    )
+    original = PendingApproval(
+        **{
+            **asdict(_record("orig-write")),
+            "action_gate_metadata_jcs": json.dumps(original_metadata, separators=(",", ":"), sort_keys=True),
+            "status": ApprovalStatus.BLOCKED.value,  # claim-check: allow test enum; negative evidence coverage.
+        }
+    )
+    follow_up = PendingApproval(
+        **{
+            **asdict(_record("follow-read", status=ApprovalStatus.EXECUTED.value)),
+            "tool_name": "read_file",
+            "action_gate_metadata_jcs": json.dumps(follow_metadata, separators=(",", ":"), sort_keys=True),
+            "status": ApprovalStatus.EXECUTED.value,
+        }
+    )
+    assert redirect_automation_link_valid(original, follow_up) is True
+    broken = PendingApproval(
+        **{
+            **asdict(follow_up),
+            "request_id": "follow-broken",
+            "action_gate_metadata_jcs": json.dumps(
+                {**follow_metadata, "redirect_parent_request_id": "other-id"},
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+        }
+    )
+    assert redirect_automation_link_valid(original, broken) is False
+
+
+def test_redirect_original_record_valid_requires_original_role_and_playbook():
+    from agentveil_mcp_proxy.evidence.observability import redirect_original_record_valid
+    from agentveil_mcp_proxy.policy import (
+        build_controlled_path_metadata,
+        build_redirect_automation_metadata,
+    )
+
+    # claim-check: allow test status enum; this validates redirect parent bounds.
+    original_metadata = build_redirect_automation_metadata(
+        fixture_id="redirect.original",
+        tool_name="write_file",
+        policy_decision="block",
+        policy_rule_id="role_authority_reviewer_blocks_implementation",
+        approval_status=ApprovalStatus.BLOCKED.value,  # claim-check: allow test enum; redirect parent bounds.
+        execution_status="not_reached",
+        target_reached=False,
+        request_id="orig-write",
+        redirect_role="original",
+        redirect_playbook_id="create_implementer_task",
+        original_request_id="orig-write",
+    )
+    allow_metadata = build_controlled_path_metadata(
+        fixture_id="allow.read",
+        tool_name="read_file",
+        policy_decision="allow",
+        policy_rule_id="allow-read",
+        approval_status=ApprovalStatus.EXECUTED.value,
+        execution_status=ApprovalStatus.EXECUTED.value,
+        target_reached=True,
+        request_id="allow-baseline",
+    )
+    original = PendingApproval(
+        **{
+            **asdict(_record("orig-write")),
+            "action_gate_metadata_jcs": json.dumps(original_metadata, separators=(",", ":"), sort_keys=True),
+            "status": ApprovalStatus.BLOCKED.value,  # claim-check: allow test enum; redirect parent bounds.
+        }
+    )
+    allow_record = PendingApproval(
+        **{
+            **asdict(_record("allow-baseline", status=ApprovalStatus.EXECUTED.value)),
+            "tool_name": "read_file",
+            "action_gate_metadata_jcs": json.dumps(allow_metadata, separators=(",", ":"), sort_keys=True),
+            "status": ApprovalStatus.EXECUTED.value,
+        }
+    )
+    assert redirect_original_record_valid(
+        original,
+        redirect_playbook_id="create_implementer_task",
+    ) is True
+    assert redirect_original_record_valid(
+        original,
+        redirect_playbook_id="use_read_only_tool",
+    ) is False
+    assert redirect_original_record_valid(
+        allow_record,
+        redirect_playbook_id="create_implementer_task",
+    ) is False
+
+
+def test_control_surface_summarize_evidence_uses_redirect_observability_parsers():
+    from agentveil_mcp_proxy.control_surface import summarize_evidence
+    from agentveil_mcp_proxy.policy import build_redirect_automation_metadata
+
+    metadata = build_redirect_automation_metadata(
+        fixture_id="redirect.original",
+        tool_name="write_file",
+        policy_decision="block",
+        policy_rule_id="role_authority_reviewer_blocks_implementation",
+        approval_status=ApprovalStatus.BLOCKED.value,  # claim-check: allow status enum in control-surface parser test.
+        execution_status="not_reached",
+        target_reached=False,
+        request_id="orig-write",
+        redirect_role="original",
+        redirect_playbook_id="create_implementer_task",
+        original_request_id="orig-write",
+    )
+    record = PendingApproval(
+        **{
+            **asdict(_record("orig-write")),
+            "action_gate_metadata_jcs": json.dumps(metadata, separators=(",", ":"), sort_keys=True),
+            "status": ApprovalStatus.BLOCKED.value,  # claim-check: allow status enum in control-surface parser test.
+        }
+    )
+    summary = summarize_evidence([record])
+    assert summary["redirect_original_count"] == 1
+    assert summary["target_reached_false_count"] == 1

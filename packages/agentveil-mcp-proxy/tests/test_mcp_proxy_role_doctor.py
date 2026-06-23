@@ -98,11 +98,27 @@ def _privacy_clean(response_text: str) -> None:
     assert SECRET not in response_text
 
 
-def _assert_redirect_fields(data: dict) -> None:
+def _assert_redirect_fields(data: dict, *, call_id: str | None = None) -> None:
     assert isinstance(data.get("next_step"), str) and data["next_step"]
     assert isinstance(data.get("suggested_next_step_id"), str) and data["suggested_next_step_id"]
     assert isinstance(data.get("redirect_playbook_id"), str) and data["redirect_playbook_id"]
     assert data["suggested_next_step_id"] == data["redirect_playbook_id"]
+    original_request_id = data.get("original_request_id")
+    assert isinstance(original_request_id, str) and original_request_id
+    if call_id is not None and data.get("status") != "approval_required":
+        assert original_request_id == call_id
+    if data.get("status") == "approval_required":
+        assert original_request_id == data.get("record_id")
+    redirect_context = data.get("redirect_context")
+    assert isinstance(redirect_context, dict)
+    assert redirect_context["original_request_id"] == original_request_id
+    assert redirect_context["redirect_playbook_id"] == data["redirect_playbook_id"]
+    redirect_automation = data.get("redirect_automation")
+    assert isinstance(redirect_automation, dict)
+    assert redirect_automation["original_executed"] is False
+    assert redirect_automation["follow_up_required"] is (
+        data["redirect_playbook_id"] != "stop_and_classify_unknown_action"
+    )
 
 
 @pytest.mark.parametrize("preset_name", ROLE_PRESET_NAMES)
@@ -185,7 +201,7 @@ def test_reviewer_write_deny_is_human_readable_with_redirect(tmp_path, monkeypat
     assert data["reason"] == "role_authority_denied"
     assert "Review Agent cannot write files" in data["explanation"]
     assert "Review Agent cannot write files" in response["error"]["message"]
-    _assert_redirect_fields(data)
+    _assert_redirect_fields(data, call_id="role-doctor-call")
     assert data["redirect_playbook_id"] == "create_implementer_task"
     assert not fake_target_reached(outcome_path)
     _privacy_clean(response_text)
@@ -224,7 +240,7 @@ def test_readonly_mutation_deny_is_human_readable_with_redirect(tmp_path, monkey
     data = response["error"]["data"]
     assert data["reason"] == "role_authority_denied"
     assert "Read-only Agent cannot modify files" in data["explanation"]
-    _assert_redirect_fields(data)
+    _assert_redirect_fields(data, call_id="role-doctor-call")
     assert data["redirect_playbook_id"] == "use_read_only_tool"
     assert not fake_target_reached(outcome_path)
     _privacy_clean(response_text)
@@ -308,7 +324,7 @@ def test_unknown_high_risk_block_maps_to_stop_and_classify(tmp_path, monkeypatch
     response = _responses(response_text)[0]
     data = response["error"]["data"]
     assert "Unknown action denied" in data["explanation"]
-    _assert_redirect_fields(data)
+    _assert_redirect_fields(data, call_id="role-doctor-call")
     assert data["redirect_playbook_id"] == "stop_and_classify_unknown_action"
     assert not fake_target_reached(outcome_path)
     _privacy_clean(response_text)

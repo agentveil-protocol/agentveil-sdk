@@ -23,6 +23,7 @@ from agentveil_mcp_proxy.evidence.observability import (
     pending_approval_dict,
     terminal_state_for_record_status,
 )
+from agentveil_mcp_proxy.permission_doctor import blast_radius_lines
 
 
 MAX_POST_BODY_BYTES = 8192
@@ -45,6 +46,9 @@ COOKIE_NAME = "avp_approval_session"
 INTERNAL_REGISTER_TOKEN_HEADER = "X-AVP-Approval-Register-Token"
 APPROVAL_LOCAL_URL_WARNING = (
     "This local approval URL is a bearer-style session URL. Do not share it."
+)
+APPROVAL_DECISION_RECORDED_BODY = (
+    "Decision recorded. Retry the same request."
 )
 
 TERMINAL_ALREADY_DECIDED_APPROVE = "already_decided_approve"
@@ -576,7 +580,19 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, self.server_owner.pending_approvals_api_payload())
             return
         if route == "list":
-            self._send_html(HTTPStatus.OK, self._render_list())
+            prompts = self.server_owner.pending_prompts()
+            if len(prompts) == 1:
+                token = self.server_owner.session_token
+                location = f"/approval/{token}/pending/{prompts[0].request_id}"
+                self._send_redirect(
+                    location,
+                    extra_headers={"Set-Cookie": self._session_cookie_header()},
+                )
+                return
+            extra_headers = None
+            if prompts:
+                extra_headers = {"Set-Cookie": self._session_cookie_header()}
+            self._send_html(HTTPStatus.OK, self._render_list(), extra_headers=extra_headers)
             return
         if route != "pending" or request_id is None:
             self._send_text(HTTPStatus.NOT_FOUND, "not found")
@@ -636,7 +652,13 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
         except ApprovalServerError:
             self._send_html(HTTPStatus.FORBIDDEN, self._render_forbidden_session())
             return
-        self._send_html(HTTPStatus.OK, self._page("Approval recorded", "<p>Decision recorded.</p>"))
+        self._send_html(
+            HTTPStatus.OK,
+            self._page(
+                "Approval recorded",
+                f"<p>{escape(APPROVAL_DECISION_RECORDED_BODY)}</p>",
+            ),
+        )
 
     def _respond_pending_get(self, request_id: str) -> None:
         prompt = self.server_owner.prompt_for(request_id)
@@ -800,6 +822,7 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
                 self._render_dashboard_card(
                     self.server_owner.pending_row_dict(prompt),
                     detail_href=f"/approval/{token}/pending/{prompt.request_id}",
+                    csrf_token=prompt.csrf_token,
                 )
                 for prompt in prompts
             )
@@ -811,8 +834,22 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
             include_card_styles=bool(prompts),
         )
 
-    def _render_dashboard_card(self, row: dict[str, Any], *, detail_href: str) -> str:
+    def _render_dashboard_card(
+        self,
+        row: dict[str, Any],
+        *,
+        detail_href: str,
+        csrf_token: str,
+    ) -> str:
         risk = escape(row["risk_class"])
+        decision_form = (
+            f'<form method="post" action="{escape(detail_href)}">'
+            f'<input type="hidden" name="csrf_token" value="{escape(csrf_token)}">'
+            '<input type="hidden" name="approval_scope" value="exact">'
+            '<button type="submit" name="decision" value="approve">Approve</button>'
+            '<button type="submit" name="decision" value="deny">Deny</button>'
+            "</form>"
+        )
         return (
             '<article class="approval-card">'
             '<header class="approval-card-header">'
@@ -835,6 +872,7 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
             f'<p class="approval-card-actions">'
             f'<a class="approval-button" href="{escape(detail_href)}">Review &amp; decide</a>'
             "</p>"
+            f"{decision_form}"
             "</article>"
         )
 
@@ -896,9 +934,29 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
 """
         return self._page(title, body, page_kind="detail")
 
-    def _render_level2_metadata(self, metadata: Any) -> str:
+    def _render_blast_radius(self, metadata: Any) -> str:
         if not isinstance(metadata, dict):
             return ""
+        blast_radius = metadata.get("blast_radius")
+        if not isinstance(blast_radius, Mapping):
+            return ""
+        lines = blast_radius_lines(blast_radius)
+        if not lines:
+            return ""
+        rendered = "".join(
+            f"<div><dt>{escape(line.split(':', 1)[0])}</dt>"
+            f"<dd>{escape(line.split(':', 1)[1].strip())}</dd></div>"
+            for line in lines
+            if ":" in line
+        )
+        if not rendered:
+            return ""
+        return f"<dt>Blast radius</dt><dd><dl>{rendered}</dl></dd>"
+
+    def _render_level2_metadata(self, metadata: Any) -> str:
+        blast_radius_html = self._render_blast_radius(metadata)
+        if not isinstance(metadata, dict):
+            return blast_radius_html
         labels = (
             ("role", "Role"),
             ("authority", "Authority"),
@@ -922,8 +980,8 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
                 continue
             items.append(f"<dt>{escape(label)}</dt><dd>{escape(rendered)}</dd>")
         if not items:
-            return ""
-        return "".join(items)
+            return blast_radius_html
+        return blast_radius_html + "".join(items)
 
     def _security_notice_html(self) -> str:
         return (
@@ -1109,6 +1167,24 @@ details {{ margin: 8px 0 12px; }}
             f"<body>{notice}<h1>{escape(title)}</h1>{body}</body></html>"
         )
 
+    def _send_redirect(
+        self,
+        location: str,
+        *,
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
+        self.send_response(int(HTTPStatus.FOUND))
+        for key, value in SECURITY_HEADERS.items():
+            self.send_header(key, value)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        if extra_headers:
+            for key, value in extra_headers.items():
+                self.send_header(key, value)
+        self.end_headers()
+        self.close_connection = True
+
     def _send_html(
         self,
         status: HTTPStatus,
@@ -1152,6 +1228,7 @@ details {{ margin: 8px 0 12px; }}
 
 
 __all__ = [
+    "APPROVAL_DECISION_RECORDED_BODY",
     "APPROVAL_LOCAL_URL_WARNING",
     "INTERNAL_REGISTER_TOKEN_HEADER",
     "ApprovalPrompt",
