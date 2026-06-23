@@ -460,6 +460,10 @@ def test_concurrent_first_call_does_not_double_init_runtime_gate(tmp_path: Path)
         classifier=_classifier(_config(default_decision="ask_backend")),
         runtime_gate_factory=factory,
     )
+    # Subject is runtime-gate initialization under concurrent calls, not
+    # downstream schema discovery. Seed the cache so idle downstream is not
+    # probed for tools/list by each worker.
+    seed_tool_schemas(passthrough, [tool_entry("write_file")])
     try:
         passthrough.start()
         _run_threads(20, lambda index: passthrough.handle_client_line(_tool_call(f"call-{index}")))
