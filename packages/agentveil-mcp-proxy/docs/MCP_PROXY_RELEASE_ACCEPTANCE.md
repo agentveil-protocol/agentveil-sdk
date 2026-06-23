@@ -20,7 +20,7 @@ Use an already-built wheel:
 
 ```bash
 packages/agentveil-mcp-proxy/scripts/mcp_proxy_release_acceptance.py \
-  --wheel packages/agentveil-mcp-proxy/dist/agentveil_mcp_proxy-0.7.21-py3-none-any.whl
+  --wheel packages/agentveil-mcp-proxy/dist/agentveil_mcp_proxy-0.7.22-py3-none-any.whl
 ```
 
 Keep artifacts for debugging:

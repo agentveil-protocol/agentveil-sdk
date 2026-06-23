@@ -48,7 +48,7 @@ from mcp_proxy_acceptance_lib import (
 
 PRODUCT_ROUTE_PACKAGE_NAME = "agentveil-route-test-pkg"
 EXPECTED_TOOL_COUNT = 68
-EXPECTED_VERSION = "0.7.21"
+EXPECTED_VERSION = "0.7.22"
 RUN_NONINTERACTIVE_UI_ARGS = ["--approval-ui-mode", "none"]
 
 SAFE_READ_TOOLS = (
