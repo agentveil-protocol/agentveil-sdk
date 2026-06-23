@@ -293,6 +293,45 @@ def assert_installed_from_wheel(
     }
 
 
+def _extract_runnable_mcp_configs(payload: dict[str, Any]) -> list[tuple[str, list[str]]]:
+    """Return ``(command, args)`` pairs from legacy or client-matrix JSON shapes."""
+
+    configs: list[tuple[str, list[str]]] = []
+    legacy_command = payload.get("command")
+    legacy_args = payload.get("args")
+    if isinstance(legacy_command, str) and isinstance(legacy_args, list) and legacy_args:
+        if all(isinstance(item, str) for item in legacy_args):
+            configs.append((legacy_command, legacy_args))
+
+    clients = payload.get("clients")
+    if isinstance(clients, dict):
+        for client_payload in clients.values():
+            if not isinstance(client_payload, dict):
+                continue
+            for document_key in ("local_client_config", "document"):
+                document = client_payload.get(document_key)
+                if not isinstance(document, dict):
+                    continue
+                servers = document.get("mcpServers")
+                if not isinstance(servers, dict):
+                    continue
+                for entry in servers.values():
+                    if not isinstance(entry, dict):
+                        continue
+                    command = entry.get("command")
+                    args = entry.get("args")
+                    if isinstance(command, str) and isinstance(args, list) and args:
+                        if all(isinstance(item, str) for item in args):
+                            configs.append((command, args))
+    return configs
+
+
+def _json_text_contains_path(text: str, path: Path) -> bool:
+    path_text = str(path)
+    escaped_path_text = json.dumps(path_text)[1:-1]
+    return path_text in text or escaped_path_text in text
+
+
 def assert_client_config_print_payload(
     payload: dict[str, Any],
     *,
@@ -314,24 +353,51 @@ def assert_client_config_print_payload(
         raise AcceptanceError("client-config print must not include passphrase content")
     if privacy.get("includes_private_key") is not False:
         raise AcceptanceError("client-config print must not include private key material")
-    args = payload.get("args")
-    if not isinstance(args, list) or args[0] != "run":
-        raise AcceptanceError(f"client-config print args must start with run: {args}")
-    if "--home" not in args or str(home) not in args:
-        raise AcceptanceError("client-config print args must reference isolated --home")
-    if "--passphrase-file" not in args or str(passphrase_file) not in args:
-        raise AcceptanceError("client-config print args must reference passphrase file path")
-    if str(proxy_command) != payload.get("command"):
-        raise AcceptanceError("client-config print command must match installed proxy executable")
+
+    summary = payload.get("summary")
+    if isinstance(summary, dict):
+        summary_text = json.dumps(summary, sort_keys=True)
+        if _json_text_contains_path(summary_text, home):
+            raise AcceptanceError("client-config print summary must not include raw home path")
+        if _json_text_contains_path(summary_text, passphrase_file):
+            raise AcceptanceError("client-config print summary must not include raw passphrase file path")
+        summary_command = summary.get("command")
+        if isinstance(summary_command, str) and summary_command.strip():
+            if str(proxy_command) != summary_command and proxy_command.name != summary_command:
+                raise AcceptanceError("client-config print summary command must match installed proxy")
+
+    runnable_configs = _extract_runnable_mcp_configs(payload)
+    if not runnable_configs:
+        raise AcceptanceError("client-config print missing runnable MCP server config")
+
+    matching_configs = [
+        (command, args)
+        for command, args in runnable_configs
+        if args[0] == "run"
+        and str(proxy_command) == command
+        and "--home" in args
+        and str(home) in args
+        and "--passphrase-file" in args
+        and str(passphrase_file) in args
+    ]
+    if not matching_configs:
+        raise AcceptanceError(
+            "client-config print runnable config must invoke proxy run with isolated home and passphrase file",
+        )
+
     clients = payload.get("clients")
     if not isinstance(clients, dict):
         raise AcceptanceError("client-config print missing clients object")
     for client_id in ("cursor", "claude_desktop"):
         if client_id not in clients:
             raise AcceptanceError(f"client-config print missing client {client_id}")
-        document = clients[client_id].get("document")
+        client_payload = clients[client_id]
+        if not isinstance(client_payload, dict):
+            raise AcceptanceError(f"client-config print client payload invalid for {client_id}")
+        document = client_payload.get("local_client_config") or client_payload.get("document")
         if not isinstance(document, dict) or "mcpServers" not in document:
-            raise AcceptanceError(f"client-config print document invalid for {client_id}")
+            raise AcceptanceError(f"client-config print runnable document invalid for {client_id}")
+
     privacy_scan_text(
         "client_config_print",
         json.dumps(payload, sort_keys=True),
