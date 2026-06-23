@@ -175,6 +175,17 @@ from agentveil_mcp_proxy.role_presets import (
     resolve_role_preset,
     user_facing_setup_label,
 )
+from agentveil_mcp_proxy.cursor_hooks import CursorHookError, run_cursor_hook
+from agentveil_mcp_proxy.cursor_setup import (
+    CursorSetupError,
+    assert_cursor_setup_output_is_privacy_safe,
+    cursor_remove_result_to_dict,
+    cursor_setup_result_to_dict,
+    cursor_setup_status_to_dict,
+    derive_cursor_setup_status,
+    remove_cursor_hooks,
+    setup_cursor_hooks,
+)
 from agentveil_mcp_proxy.runtime_gate import RuntimeGateClient
 
 
@@ -1555,16 +1566,28 @@ def run_setup_wizard_cli(
 
 def print_setup_status_cli(
     *,
-    home: Path,
+    home: Path | None = None,
     client_id: str = "cursor",
     proxy_command: str | None = None,
     config_path: Path | None = None,
+    workspace: Path | None = None,
     out: TextIO | None = None,
     output_json: bool = False,
 ) -> int:
     """Print structured setup status derived from actual config files."""
 
     sink = out or sys.stdout
+    if home is None:
+        status = derive_cursor_setup_status(workspace=workspace)
+        payload = cursor_setup_status_to_dict(status)
+        assert_cursor_setup_output_is_privacy_safe(payload)
+        if output_json:
+            _print_json(payload, sink)
+        else:
+            for key, value in payload.items():
+                sink.write(f"{key}={value}\n")
+        return 0
+
     status = derive_setup_status(
         home=home,
         client_id=client_id,
@@ -1579,6 +1602,63 @@ def print_setup_status_cli(
         for key, value in payload.items():
             sink.write(f"{key}={value}\n")
     return 0
+
+
+def run_cursor_setup_cli(
+    *,
+    workspace: Path | None = None,
+    yes: bool = False,
+    out: TextIO | None = None,
+    output_json: bool = False,
+) -> int:
+    sink = out or sys.stdout
+    result = setup_cursor_hooks(
+        workspace=workspace,
+        yes=yes,
+        setup_argv0=sys.argv[0],
+    )
+    payload = cursor_setup_result_to_dict(result)
+    assert_cursor_setup_output_is_privacy_safe(payload)
+    if output_json:
+        _print_json(payload, sink)
+    else:
+        sink.write(f"{payload['message']}\n")
+        for error in payload["errors"]:
+            sink.write(f"ERROR: {error}\n")
+    return 0 if result.ok else 2
+
+
+def run_cursor_remove_cli(
+    *,
+    workspace: Path | None = None,
+    yes: bool = False,
+    out: TextIO | None = None,
+    output_json: bool = False,
+) -> int:
+    sink = out or sys.stdout
+    result = remove_cursor_hooks(workspace=workspace, yes=yes)
+    payload = cursor_remove_result_to_dict(result)
+    assert_cursor_setup_output_is_privacy_safe(payload)
+    if output_json:
+        _print_json(payload, sink)
+    else:
+        sink.write(f"{payload['message']}\n")
+        for error in payload["errors"]:
+            sink.write(f"ERROR: {error}\n")
+    return 0 if result.ok else 2
+
+
+def run_cursor_hook_cli(
+    *,
+    workspace: Path | None = None,
+    stdin_text: str | None = None,
+    out: TextIO | None = None,
+) -> int:
+    sink = out or sys.stdout
+    raw = stdin_text if stdin_text is not None else sys.stdin.read()
+    response, _evidence = run_cursor_hook(stdin_text=raw, workspace=workspace)
+    sink.write(json.dumps(response, sort_keys=True, separators=(",", ":")) + "\n")
+    return 0 if response.get("permission") != "error" else 2
 
 
 def print_control_status_cli(
@@ -3657,11 +3737,61 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_json_arg(setup_run)
 
+    setup_cursor = setup_subparsers.add_parser(
+        "cursor",
+        help="Install project-local Cursor hooks for the current workspace",
+    )
+    setup_cursor.add_argument(
+        "--workspace",
+        type=Path,
+        default=None,
+        help="Workspace root (default: current directory)",
+    )
+    setup_cursor.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm project-local Cursor hook installation",
+    )
+    _add_json_arg(setup_cursor)
+
+    setup_remove = setup_subparsers.add_parser(
+        "remove",
+        help="Remove setup-managed files for a supported target",
+    )
+    setup_remove.add_argument(
+        "target",
+        choices=["cursor"],
+        help="Setup target to remove",
+    )
+    setup_remove.add_argument(
+        "--workspace",
+        type=Path,
+        default=None,
+        help="Workspace root (default: current directory)",
+    )
+    setup_remove.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm removal of setup-managed Cursor hook files",
+    )
+    _add_json_arg(setup_remove)
+
     setup_status = setup_subparsers.add_parser(
         "status",
-        help="Report setup status from actual proxy and client config files",
+        help="Report setup status from actual proxy/client files or Cursor hooks",
     )
-    setup_status.add_argument("--home", type=Path, required=True, help="AVP home to inspect")
+    setup_status.add_argument(
+        "--home",
+        type=Path,
+        default=None,
+        help="AVP home to inspect for adaptive setup status",
+    )
+    setup_status.add_argument(
+        "--workspace",
+        type=Path,
+        default=None,
+        help="Workspace root for Cursor hook status when --home is omitted",
+    )
     setup_status.add_argument(
         "--client",
         default="cursor",
@@ -3701,6 +3831,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Desktop MCP client target to restore",
     )
     _add_json_arg(setup_restore)
+
+    hook = subparsers.add_parser(
+        "hook",
+        help="Run Cursor hook stdin handler for allow/deny decisions",
+    )
+    hook_subparsers = hook.add_subparsers(dest="hook_action", required=True)
+    hook_cursor = hook_subparsers.add_parser(
+        "cursor",
+        help="Handle one Cursor hook JSON payload from stdin",
+    )
+    hook_cursor.add_argument(
+        "--workspace",
+        type=Path,
+        default=None,
+        help="Workspace root for evidence output (default: current directory)",
+    )
 
     return parser
 
@@ -4114,7 +4260,25 @@ def main(argv: list[str] | None = None) -> int:
                     output_json=args.json_output,
                 )
             raise ProxyCliError("wizard action must be print or validate")
+        if args.command == "hook":
+            if args.hook_action == "cursor":
+                return run_cursor_hook_cli(workspace=args.workspace)
+            raise ProxyCliError("hook action must be cursor")
         if args.command == "setup":
+            if args.setup_action == "cursor":
+                return run_cursor_setup_cli(
+                    workspace=args.workspace,
+                    yes=args.yes,
+                    output_json=args.json_output,
+                )
+            if args.setup_action == "remove":
+                if args.target != "cursor":
+                    raise ProxyCliError("setup remove target must be cursor")
+                return run_cursor_remove_cli(
+                    workspace=args.workspace,
+                    yes=args.yes,
+                    output_json=args.json_output,
+                )
             if args.setup_action == "run":
                 return run_setup_wizard_cli(
                     home=args.home,
@@ -4134,6 +4298,7 @@ def main(argv: list[str] | None = None) -> int:
                     client_id=args.client,
                     proxy_command=args.proxy_command,
                     config_path=args.config,
+                    workspace=args.workspace,
                     output_json=args.json_output,
                 )
             if args.setup_action == "restore":
@@ -4143,7 +4308,7 @@ def main(argv: list[str] | None = None) -> int:
                     client_id=args.client,
                     output_json=args.json_output,
                 )
-            raise ProxyCliError("setup action must be run, status, or restore")
+            raise ProxyCliError("setup action must be cursor, remove, run, status, or restore")
     except (
         ProxyCliError,
         ApprovalEvidenceError,
@@ -4151,6 +4316,8 @@ def main(argv: list[str] | None = None) -> int:
         EvidenceVerificationError,
         ControlSurfaceError,
         PermissionDoctorError,
+        CursorSetupError,
+        CursorHookError,
     ) as exc:
         if getattr(args, "json_output", False):
             if isinstance(exc, (ControlSurfaceError, PermissionDoctorError)):
