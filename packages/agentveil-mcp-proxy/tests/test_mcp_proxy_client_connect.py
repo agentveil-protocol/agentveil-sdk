@@ -38,6 +38,54 @@ from agentveil_mcp_proxy.cli import init_proxy, main, quickstart_filesystem_down
 PASSPHRASE = "client-connect-test-passphrase"
 LOCAL_PATH_MARKERS = ("/Users/", "/private/", "/var/folders/")
 
+_REAL_CLIENT_DOCTOR_TESTS = {
+    "test_claude_code_connect_write_launch_proved",
+    "test_codex_connect_write_launch_proved",
+    "test_connect_status_not_connected_when_launch_probe_fails",
+    "test_connect_all_write_with_dummy_command_does_not_overclaim",
+}
+
+
+def _ok_client_doctor_report(client_id: str = "cursor") -> dict:
+    return {
+        "ok": True,
+        "client_id": client_id,
+        "diagnostic_status": "ok",
+        "proof_mode": "generated_config_proxy_path",
+        "provider_native_client_proof": False,
+        "checks": {
+            "generated_command_available": {"ok": True},
+            "config_generated": {"ok": True},
+            "config_routes_through_proxy": {"ok": True},
+            "downstream_configured": {"ok": True},
+            "generated_command_probe": {
+                "ok": True,
+                "proof_mode": "generated_config_proxy_path",
+            },
+            "tools_list_reachable": {"ok": True, "tool_count": 68},
+            "routed_read_action": {
+                "ok": True,
+                "tool": "list_workspace",
+                "target_reached": True,
+            },
+        },
+        "privacy_bounded": True,
+    }
+
+
+@pytest.fixture(autouse=True)
+def _fast_client_connect_doctor_probe(request, monkeypatch: pytest.MonkeyPatch) -> None:
+    if request.node.name in _REAL_CLIENT_DOCTOR_TESTS:
+        return
+
+    def _fake_report(*, client_id: str, **_kwargs):
+        return _ok_client_doctor_report(client_id)
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.client_connect.build_client_doctor_report",
+        _fake_report,
+    )
+
 
 @pytest.fixture
 def project_root(tmp_path: Path) -> Path:
