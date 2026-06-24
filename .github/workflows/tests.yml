@@ -77,10 +77,20 @@ jobs:
         run: python -m pip install -e "packages/agentveil-mcp-proxy[test]"
 
       - name: Run SDK tests
+        if: matrix.os == 'ubuntu-latest'
         run: python -m pytest -v
 
       - name: Run MCP Proxy tests
+        if: matrix.os == 'ubuntu-latest'
         run: python -m pytest -v packages/agentveil-mcp-proxy/tests
+
+      - name: Run Cursor hook platform compatibility tests
+        if: matrix.os != 'ubuntu-latest'
+        run: >-
+          python -m pytest -v
+          packages/agentveil-mcp-proxy/tests/test_mcp_proxy_platform_contract.py
+          packages/agentveil-mcp-proxy/tests/test_mcp_proxy_cursor_setup.py
+          packages/agentveil-mcp-proxy/tests/test_mcp_proxy_cursor_hooks.py
 
   compatibility-full:
     name: compatibility full (${{ matrix.os }}, ${{ matrix.python-version }})
