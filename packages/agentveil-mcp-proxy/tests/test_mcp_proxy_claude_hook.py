@@ -587,6 +587,48 @@ def test_native_bash_deny_redirect_does_not_leak_command() -> None:
     assert SENTINEL_COMMAND not in raw
 
 
+# ----- S3 corrective: controlled AgentVeil MCP route must pass through -------
+
+
+from agentveil_mcp_proxy.claude_hook import AGENTVEIL_CONTROLLED_MCP_SERVER
+
+
+@pytest.mark.parametrize(
+    "tool_name,tool_input",
+    [
+        (f"mcp__{AGENTVEIL_CONTROLLED_MCP_SERVER}__write_file", {"path": "/x", "content": "y"}),
+        (f"mcp__{AGENTVEIL_CONTROLLED_MCP_SERVER}__delete_file", {"path": "/x"}),
+        (f"mcp__{AGENTVEIL_CONTROLLED_MCP_SERVER}__move_file", {"src": "/a", "dst": "/b"}),
+        (f"mcp__{AGENTVEIL_CONTROLLED_MCP_SERVER}__list_workspace", {}),
+    ],
+)
+def test_controlled_mcp_route_passes_through(tool_name, tool_input) -> None:
+    """S3 blocker fix: the hook must NOT deny the AgentVeil controlled MCP
+    tools, or the redirect dead-ends. They self-govern at the proxy."""
+    engine = PolicyEngine(default_proxy_config_for_hook())
+    decision = decide(_payload(tool_name, tool_input), engine)
+    assert decision.hook_action == "allow", (
+        f"controlled route {tool_name} must pass through; got {decision.hook_action}"
+    )
+    assert decision.reason_code == "controlled_route_passthrough"
+    # No deny JSON emitted -> the call reaches the proxy.
+    assert format_hook_output(decision) is None
+
+
+def test_controlled_passthrough_does_not_weaken_other_mcp_servers() -> None:
+    """A non-AgentVeil MCP write tool is still denied (no blanket allow)."""
+    engine = PolicyEngine(default_proxy_config_for_hook())
+    decision = decide(_payload("mcp__other_server__write_note", {"content": "x"}), engine)
+    assert decision.hook_action == "deny"
+
+
+def test_controlled_passthrough_does_not_weaken_native_writes() -> None:
+    """Native Write/Bash mutations are still denied after the passthrough fix."""
+    engine = PolicyEngine(default_proxy_config_for_hook())
+    assert decide(_payload("Write", {"file_path": "/x", "content": "y"}), engine).hook_action == "deny"
+    assert decide(_payload("Bash", {"command": "echo y > /x"}), engine).hook_action == "deny"
+
+
 def test_mcp_deny_does_not_carry_native_redirect() -> None:
     """The native redirect is scoped to native tools, not MCP tool denies."""
     engine = PolicyEngine(default_proxy_config_for_hook())

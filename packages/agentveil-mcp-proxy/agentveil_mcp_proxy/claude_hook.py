@@ -48,6 +48,13 @@ from agentveil_mcp_proxy.policy import (
 CLAUDE_SERVER_LABEL = "claude_code"
 HOOK_EVENT_DEFAULT = "PreToolUse"
 
+# MCP server name written by `agentveil-mcp-proxy connect <client>`. Tool calls
+# routed to this server (``mcp__agentveil-mcp-proxy__*``) are the AgentVeil
+# controlled route: they already pass through the proxy's own approval boundary.
+# The PreToolUse hook must NOT double-block them — otherwise the redirect that
+# tells the agent to "use the controlled MCP tool" dead-ends on the hook itself.
+AGENTVEIL_CONTROLLED_MCP_SERVER = "agentveil-mcp-proxy"
+
 # Generic agent-facing redirect appended to NATIVE-tool deny reasons (S2
 # corrective). This is static instruction text only: no approval round-trip
 # (S3), no auto-transformation of Write into an MCP call, and no private
@@ -444,6 +451,20 @@ def decide(payload: Mapping[str, Any], engine: PolicyEngine) -> HookDecision:
     """Evaluate one PreToolUse payload and return the hook decision."""
     context = build_tool_call_context(payload)
     evaluation = engine.evaluate(context)
+
+    # Controlled-route pass-through: calls to the AgentVeil proxy's own MCP
+    # tools self-govern at the proxy's approval boundary. The hook allows them
+    # through (instead of denying write-shaped MCP tools on this controlled route) so the redirect
+    # to "use the controlled MCP tool" is reachable. The proxy, not the hook,
+    # then applies approval/redirect/evidence to these calls.
+    if context.server == AGENTVEIL_CONTROLLED_MCP_SERVER:
+        return HookDecision(
+            hook_action="allow",
+            reason_code="controlled_route_passthrough",
+            context=context,
+            evaluation=evaluation,
+        )
+
     if evaluation.decision in (PolicyDecision.ALLOW, PolicyDecision.OBSERVE):
         hook_action = "allow"
     elif evaluation.decision in _FAIL_CLOSED_DECISIONS:
@@ -638,6 +659,7 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "AGENTVEIL_CONTROLLED_MCP_SERVER",
     "CLAUDE_SERVER_LABEL",
     "HOOK_EVENT_DEFAULT",
     "NATIVE_REDIRECT_INSTRUCTION",
