@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import stat
@@ -22,6 +23,7 @@ CURSOR_SETUP_MANIFEST_NAME = ".agentveil-cursor-hooks.json"
 HOOKS_DIR_NAME = "hooks"
 HOOKS_JSON_NAME = "hooks.json"
 HOOK_SHIM_NAME = "agentveil-cursor-hook.sh"
+HOOK_SHIM_NAME_WINDOWS = "agentveil-cursor-hook.cmd"
 EVIDENCE_FILE_NAME = "agentveil-hook-evidence.jsonl"
 AGENTVEIL_HOOK_ID = "agentveil-cursor-hook-v1"
 AGENTVEIL_HOOK_EVENTS = ("preToolUse", "beforeShellExecution", "beforeMCPExecution")
@@ -88,16 +90,42 @@ def resolve_workspace_root(workspace: Path | None = None) -> Path:
     return root
 
 
+def resolved_hook_shim_name() -> str:
+    """Return the managed hook shim filename for the current platform."""
+
+    return HOOK_SHIM_NAME_WINDOWS if os.name == "nt" else HOOK_SHIM_NAME
+
+
+def normalize_cli_basename(cli_path: Path) -> str:
+    """Return a stable console-script basename across platforms."""
+
+    name = cli_path.name
+    if name.lower() == "__main__.py":
+        return "agentveil-mcp-proxy"
+    if cli_path.stem == "agentveil-mcp-proxy":
+        return "agentveil-mcp-proxy"
+    return name
+
+
+def _cli_path_is_usable(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    if os.name == "nt":
+        return True
+    return os.access(path, os.X_OK)
+
+
 def cursor_setup_paths(workspace: Path | None = None) -> CursorSetupPaths:
     root = resolve_workspace_root(workspace)
     cursor_dir = root / ".cursor"
     hooks_dir = cursor_dir / HOOKS_DIR_NAME
+    shim_name = resolved_hook_shim_name()
     return CursorSetupPaths(
         workspace=root,
         cursor_dir=cursor_dir,
         hooks_json=cursor_dir / HOOKS_JSON_NAME,
         hooks_dir=hooks_dir,
-        hook_shim=hooks_dir / HOOK_SHIM_NAME,
+        hook_shim=hooks_dir / shim_name,
         manifest_path=cursor_dir / CURSOR_SETUP_MANIFEST_NAME,
         evidence_path=cursor_dir / EVIDENCE_FILE_NAME,
     )
@@ -117,17 +145,21 @@ def _workspace_ref(workspace: Path) -> dict[str, str | None]:
 
 
 def _shim_relative_path() -> str:
-    return f".cursor/{HOOKS_DIR_NAME}/{HOOK_SHIM_NAME}"
+    return f".cursor/{HOOKS_DIR_NAME}/{resolved_hook_shim_name()}"
 
 
 def _managed_file_paths() -> tuple[str, ...]:
+    shim_name = resolved_hook_shim_name()
     return (
-        f".cursor/{HOOKS_DIR_NAME}/{HOOK_SHIM_NAME}",
+        f".cursor/{HOOKS_DIR_NAME}/{shim_name}",
         f".cursor/{CURSOR_SETUP_MANIFEST_NAME}",
     )
 
 
-def build_hook_shim_script(*, cli_path: Path) -> str:
+def build_hook_shim_script(*, cli_path: Path, platform_name: str | None = None) -> str:
+    if (platform_name or os.name) == "nt":
+        quoted = f'"{cli_path}"'
+        return f"@echo off\r\n{quoted} hook cursor %*\r\n"
     quoted = shlex.quote(str(cli_path))
     return f"""#!/usr/bin/env bash
 set -euo pipefail
@@ -144,7 +176,7 @@ def resolve_setup_cli_path(
 
     if setup_cli_path is not None:
         candidate = Path(setup_cli_path).expanduser().resolve()
-        if candidate.is_file() and os.access(candidate, os.X_OK):
+        if _cli_path_is_usable(candidate):
             return candidate
         raise CursorSetupError("setup CLI path is not an executable file")
 
@@ -152,13 +184,13 @@ def resolve_setup_cli_path(
         candidate = Path(setup_argv0).expanduser()
         if candidate.is_file():
             resolved = candidate.resolve()
-            if os.access(resolved, os.X_OK):
+            if _cli_path_is_usable(resolved):
                 return resolved
 
     which_path = shutil.which("agentveil-mcp-proxy")
     if which_path:
         resolved = Path(which_path).expanduser().resolve()
-        if resolved.is_file() and os.access(resolved, os.X_OK):
+        if _cli_path_is_usable(resolved):
             return resolved
 
     raise CursorSetupError(
@@ -170,11 +202,22 @@ def resolve_setup_cli_path(
 def _hook_cli_ref(cli_path: Path) -> dict[str, str | None]:
     from agentveil_mcp_proxy.client_config import bounded_path_ref
 
-    return bounded_path_ref(cli_path)
+    ref = bounded_path_ref(cli_path)
+    ref["basename"] = normalize_cli_basename(cli_path)
+    return ref
 
 
 def read_shim_cli_path(shim_path: Path) -> Path | None:
     if not shim_path.is_file():
+        return None
+    if shim_path.suffix.lower() == ".cmd":
+        for line in shim_path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.lower().startswith("@echo"):
+                continue
+            match = re.match(r'^"(?P<path>[^"]+)"\s+hook\s+cursor\b', stripped, flags=re.IGNORECASE)
+            if match:
+                return Path(match.group("path")).expanduser()
         return None
     for line in shim_path.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
@@ -187,11 +230,15 @@ def read_shim_cli_path(shim_path: Path) -> Path | None:
 
 def shim_cli_is_resolved(*, shim_path: Path, hook_cli_ref: Mapping[str, Any] | None = None) -> bool:
     cli_path = read_shim_cli_path(shim_path)
-    if cli_path is None or not cli_path.is_file() or not os.access(cli_path, os.X_OK):
+    if cli_path is None or not _cli_path_is_usable(cli_path):
         return False
     if hook_cli_ref is None:
         return True
-    return _hook_cli_ref(cli_path) == dict(hook_cli_ref)
+    current_ref = _hook_cli_ref(cli_path)
+    expected = dict(hook_cli_ref)
+    if current_ref.get("ref") != expected.get("ref"):
+        return False
+    return current_ref.get("basename") == expected.get("basename")
 
 
 def build_agentveil_hook_entries(*, shim_relative_path: str) -> dict[str, list[dict[str, Any]]]:
@@ -393,6 +440,8 @@ def hooks_document_is_empty(document: Mapping[str, Any]) -> bool:
 
 
 def _ensure_executable(path: Path) -> None:
+    if os.name == "nt":
+        return
     mode = path.stat().st_mode
     path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
@@ -736,10 +785,12 @@ __all__ = [
     "global_cursor_config_paths",
     "hooks_document_is_empty",
     "merge_agentveil_hooks",
+    "normalize_cli_basename",
     "read_shim_cli_path",
     "remove_cursor_hooks",
     "resolve_setup_cli_path",
     "resolve_workspace_root",
+    "resolved_hook_shim_name",
     "setup_cursor_hooks",
     "shim_cli_is_resolved",
     "unmerge_agentveil_hooks",

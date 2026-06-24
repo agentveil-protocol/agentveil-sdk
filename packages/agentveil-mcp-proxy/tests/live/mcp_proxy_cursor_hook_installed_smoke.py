@@ -17,7 +17,15 @@ ROOT = Path(__file__).resolve().parents[2]
 PACKAGE_ROOT = ROOT
 SDK_ROOT = PACKAGE_ROOT.parent.parent
 SECRET = "SECRET_CURSOR_HOOK_SMOKE"
-PRIVACY_MARKERS = ("/users/", "/private/", "/var/folders/", "/tmp/", SECRET.lower(), "library/caches/pip")
+PRIVACY_MARKERS = (
+    "/users/",
+    "\\users\\",
+    "/private/",
+    "/var/folders/",
+    "/tmp/",
+    SECRET.lower(),
+    "library/caches/pip",
+)
 
 
 def _clean_env(tmp_root: Path) -> dict[str, str]:
@@ -41,6 +49,10 @@ def _clean_env(tmp_root: Path) -> dict[str, str]:
     env["PIP_CACHE_DIR"] = str(pip_cache)
     env["XDG_CACHE_HOME"] = str(xdg_cache)
     return env
+
+
+def _resolved_hook_shim_name() -> str:
+    return "agentveil-cursor-hook.cmd" if sys.platform == "win32" else "agentveil-cursor-hook.sh"
 
 
 def _venv_python(venv: Path) -> Path:
@@ -192,10 +204,24 @@ def main() -> int:
             assert status_payload["installed"] is True
             assert status_payload["hook_cli_resolved"] is True
 
-            shim_path = workspace / ".cursor" / "hooks" / "agentveil-cursor-hook.sh"
+            shim_path = workspace / ".cursor" / "hooks" / _resolved_hook_shim_name()
+            if sys.platform == "win32":
+                shim_cmd = ["cmd", "/c", str(shim_path)]
+                shim_env = {
+                    "PATH": env.get("PATH", ""),
+                    "HOME": env["HOME"],
+                    "AGENTVEIL_CURSOR_WORKSPACE": str(workspace),
+                }
+            else:
+                shim_cmd = [str(shim_path)]
+                shim_env = {
+                    "PATH": "/usr/bin:/bin",
+                    "HOME": env["HOME"],
+                    "AGENTVEIL_CURSOR_WORKSPACE": str(workspace),
+                }
             shim_proc = _run(
-                [str(shim_path)],
-                env={"PATH": "/usr/bin:/bin", "HOME": env["HOME"], "AGENTVEIL_CURSOR_WORKSPACE": str(workspace)},
+                shim_cmd,
+                env=shim_env,
                 surfaces=surfaces,
                 cwd=str(workspace),
                 text_input=json.dumps({"tool_name": "Write", "tool_input": {"path": "x", "contents": "y"}}),
