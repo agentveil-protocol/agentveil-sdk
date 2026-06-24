@@ -537,6 +537,66 @@ def test_format_hook_output_deny_returns_claude_compatible_json() -> None:
     assert "risk_class=write" in reason
 
 
+# ----- S2 corrective: native deny carries an agent-facing redirect ----------
+
+
+from agentveil_mcp_proxy.claude_hook import NATIVE_REDIRECT_INSTRUCTION
+
+
+@pytest.mark.parametrize(
+    "tool_name,tool_input",
+    [
+        ("Write", {"file_path": "/tmp/x", "content": "y"}),
+        ("Edit", {"file_path": "/tmp/x", "old_string": "a", "new_string": "b"}),
+        ("MultiEdit", {"file_path": "/tmp/x", "edits": []}),
+        ("Bash", {"command": "echo y > /tmp/out"}),
+    ],
+)
+def test_native_mutation_deny_includes_redirect_instruction(tool_name, tool_input) -> None:
+    engine = PolicyEngine(default_proxy_config_for_hook())
+    decision = decide(_payload(tool_name, tool_input), engine)
+    assert decision.hook_action == "deny"
+    raw = format_hook_output(decision)
+    reason = json.loads(raw)["hookSpecificOutput"]["permissionDecisionReason"]
+    # Each required instruction element is present.
+    assert "Direct native tool use was blocked before mutation" in reason  # claim-check: allow literal hook-deny text asserted by this test.
+    assert "controlled MCP tool" in reason
+    assert "same path, content, and intent" in reason
+    assert "ask the user to approve" in reason and "retry the controlled tool call" in reason
+    assert NATIVE_REDIRECT_INSTRUCTION in reason
+
+
+def test_native_deny_redirect_does_not_leak_raw_input() -> None:
+    """Redirect text must not reintroduce a raw-value leak."""
+    engine = PolicyEngine(default_proxy_config_for_hook())
+    payload = _payload(
+        "Write",
+        {"file_path": SENTINEL_PATH, "content": SENTINEL_CONTENT},
+    )
+    decision = decide(payload, engine)
+    raw = format_hook_output(decision)
+    assert SENTINEL_CONTENT not in raw
+    assert SENTINEL_PATH not in raw
+
+
+def test_native_bash_deny_redirect_does_not_leak_command() -> None:
+    engine = PolicyEngine(default_proxy_config_for_hook())
+    payload = _payload("Bash", {"command": f"echo {SENTINEL_COMMAND} > /tmp/x"})
+    decision = decide(payload, engine)
+    raw = format_hook_output(decision)
+    assert SENTINEL_COMMAND not in raw
+
+
+def test_mcp_deny_does_not_carry_native_redirect() -> None:
+    """The native redirect is scoped to native tools, not MCP tool denies."""
+    engine = PolicyEngine(default_proxy_config_for_hook())
+    decision = decide(_payload("mcp__probe__write_note", {"content": "x"}), engine)
+    assert decision.hook_action == "deny"
+    reason = json.loads(format_hook_output(decision))["hookSpecificOutput"]["permissionDecisionReason"]
+    assert NATIVE_REDIRECT_INSTRUCTION not in reason
+    assert "target_reached=false" in reason  # base bounded reason still present
+
+
 def test_write_evidence_appends_jsonl_line(tmp_path: Path) -> None:
     engine = PolicyEngine(default_proxy_config_for_hook())
     payload = _payload("Write", {"file_path": "/tmp/x", "content": "y"})
@@ -594,6 +654,33 @@ def test_main_rejects_non_object_payload() -> None:
     rc = main(stdin=in_stream, stdout=out_stream)
     assert rc == 1
     assert out_stream.getvalue() == ""
+
+
+def test_main_evidence_path_arg_writes_evidence(tmp_path: Path) -> None:
+    """S2 wiring: the installed hook command passes --evidence-path."""
+    payload = _payload("Write", {"file_path": "/tmp/x", "content": "y"})
+    evidence = tmp_path / "agentveil" / "evidence.jsonl"
+    in_stream = io.StringIO(json.dumps(payload))
+    out_stream = io.StringIO()
+    rc = main(["--evidence-path", str(evidence)], stdin=in_stream, stdout=out_stream)
+    assert rc == 0
+    assert "permissionDecision" in out_stream.getvalue()
+    assert evidence.read_text(encoding="utf-8").strip() != ""
+
+
+def test_main_evidence_path_arg_overrides_env(tmp_path: Path, monkeypatch) -> None:
+    arg_path = tmp_path / "arg.jsonl"
+    env_path = tmp_path / "env.jsonl"
+    monkeypatch.setenv("AGENTVEIL_HOOK_EVIDENCE_PATH", str(env_path))
+    payload = _payload("Read", {"file_path": "/tmp/x"})
+    rc = main(
+        ["--evidence-path", str(arg_path)],
+        stdin=io.StringIO(json.dumps(payload)),
+        stdout=io.StringIO(),
+    )
+    assert rc == 0
+    assert arg_path.exists()
+    assert not env_path.exists()  # arg wins over env
 
 
 # ----- ASK_BACKEND deny fallback semantics (spec clarification #2) ----------

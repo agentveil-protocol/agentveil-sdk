@@ -48,6 +48,20 @@ from agentveil_mcp_proxy.policy import (
 CLAUDE_SERVER_LABEL = "claude_code"
 HOOK_EVENT_DEFAULT = "PreToolUse"
 
+# Generic agent-facing redirect appended to NATIVE-tool deny reasons (S2
+# corrective). This is static instruction text only: no approval round-trip
+# (S3), no auto-transformation of Write into an MCP call, and no private
+# playbook content. It tells the agent to re-route the same intent through a
+# controlled AgentVeil MCP tool when one is available.
+# claim-check: allow "blocked" is literal hook-deny user-facing text; tested in
+# tests/test_mcp_proxy_claude_hook.py native redirect assertions.
+NATIVE_REDIRECT_INSTRUCTION = (
+    "Direct native tool use was blocked before mutation. "  # claim-check: allow literal hook-deny text tested below.
+    "Use an AgentVeil controlled MCP tool for the same operation when available, "
+    "preserving the same path, content, and intent. "
+    "If approval is required, ask the user to approve and then retry the controlled tool call."
+)
+
 
 # Claude Code built-in tool names and their natural risk class. Bash is
 # special-cased at runtime because its input determines mutation vs read.
@@ -446,19 +460,28 @@ def decide(payload: Mapping[str, Any], engine: PolicyEngine) -> HookDecision:
 
 
 def format_hook_output(decision: HookDecision) -> str | None:
-    """Format Claude-compatible PreToolUse JSON, or ``None`` to allow silently."""
+    """Format Claude-compatible PreToolUse JSON, or ``None`` to allow silently.
+
+    For native Claude tools (Write/Edit/MultiEdit/NotebookEdit/Bash), the deny
+    reason carries a generic redirect instruction so the message is actionable
+    for the agent, not just "denied". MCP tool denies keep the bounded base
+    reason (the redirect-to-MCP instruction does not apply to an MCP call).
+    """
     if decision.hook_action == "allow":
         return None
+    reason = (
+        f"agentveil: denied {decision.context.tool} "
+        f"(risk_class={decision.evaluation.risk_class.value}, "
+        f"policy_decision={decision.evaluation.decision.value}, "
+        f"reason_code={decision.reason_code}); target_reached=false"
+    )
+    if decision.context.server == CLAUDE_SERVER_LABEL:
+        reason = f"{reason}. {NATIVE_REDIRECT_INSTRUCTION}"
     return json.dumps({
         "hookSpecificOutput": {
             "hookEventName": HOOK_EVENT_DEFAULT,
             "permissionDecision": "deny",
-            "permissionDecisionReason": (
-                f"agentveil: denied {decision.context.tool} "
-                f"(risk_class={decision.evaluation.risk_class.value}, "
-                f"policy_decision={decision.evaluation.decision.value}, "
-                f"reason_code={decision.reason_code}); target_reached=false"
-            ),
+            "permissionDecisionReason": reason,
         }
     })
 
@@ -572,14 +595,26 @@ def process_hook(
 
 
 def main(argv: list[str] | None = None, *, stdin: Any = None, stdout: Any = None) -> int:
-    """CLI entrypoint placeholder (S2 will wire it into the proxy CLI).
+    """Hook runtime entrypoint, invoked by Claude Code as the PreToolUse command.
 
     Reads a PreToolUse payload from stdin, processes it, writes the
     hookSpecificOutput JSON (or nothing for allow) to stdout, and returns 0.
-    Evidence path can be overridden via the ``AGENTVEIL_HOOK_EVIDENCE_PATH``
-    environment variable; otherwise no evidence is written.
+
+    Evidence path resolution order:
+    1. ``--evidence-path <path>`` argument (set by the installed hook command).
+    2. ``AGENTVEIL_HOOK_EVIDENCE_PATH`` environment variable.
+    3. None (no evidence written).
+
+    The ``--evidence-path`` argument is preferred because it is cross-platform
+    (no shell ``VAR=x cmd`` prefix needed) and is what S2's installer writes
+    into the project ``.claude/settings.json`` hook command.
     """
+    import argparse
     import os
+
+    parser = argparse.ArgumentParser(prog="agentveil-claude-hook", add_help=True)
+    parser.add_argument("--evidence-path", default=None)
+    args = parser.parse_args(argv if argv is not None else [])
 
     in_stream = stdin if stdin is not None else sys.stdin
     out_stream = stdout if stdout is not None else sys.stdout
@@ -591,15 +626,21 @@ def main(argv: list[str] | None = None, *, stdin: Any = None, stdout: Any = None
     if not isinstance(payload, Mapping):
         sys.stderr.write("claude_hook: PreToolUse payload must be a JSON object\n")
         return 1
-    evidence_env = os.environ.get("AGENTVEIL_HOOK_EVIDENCE_PATH")
-    evidence_path = Path(evidence_env) if evidence_env else None
+
+    evidence_arg = args.evidence_path or os.environ.get("AGENTVEIL_HOOK_EVIDENCE_PATH")
+    evidence_path = Path(evidence_arg) if evidence_arg else None
     process_hook(payload, evidence_path=evidence_path, out=out_stream)
     return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
 
 
 __all__ = [
     "CLAUDE_SERVER_LABEL",
     "HOOK_EVENT_DEFAULT",
+    "NATIVE_REDIRECT_INSTRUCTION",
     "HookDecision",
     "build_evidence_record",
     "build_tool_call_context",

@@ -1892,3 +1892,66 @@ def test_setup_cli_run_status_and_restore(tmp_path, capsys):
     assert "/private/" not in restore_text
     assert "/var/folders/" not in restore_text
     assert "/Users/" not in restore_text
+
+
+# ----- P10D.14 S2: Claude hook install/status/uninstall CLI dispatch --------
+
+
+def test_cli_install_claude_hook_preview_does_not_write(tmp_path, capsys):
+    assert main([
+        "install-claude-hook", "--project", "--project-dir", str(tmp_path),
+    ]) == 0
+    capsys.readouterr()
+    assert not (tmp_path / ".claude" / "settings.json").exists()
+
+
+def test_cli_install_status_uninstall_dispatch_roundtrip(tmp_path, capsys):
+    # install --yes --json
+    assert main([
+        "install-claude-hook", "--project", "--project-dir", str(tmp_path), "--yes", "--json",
+    ]) == 0
+    install_payload = json.loads(capsys.readouterr().out)
+    assert install_payload["ok"] is True
+    assert install_payload["applied"] is True
+    settings = tmp_path / ".claude" / "settings.json"
+    assert settings.exists()
+
+    # status --json -> advisory (installed, no firing evidence yet), bounded
+    assert main([
+        "status-claude-hook", "--project", "--project-dir", str(tmp_path), "--json",
+    ]) == 0
+    status_payload = json.loads(capsys.readouterr().out)
+    assert status_payload["status"] == "advisory"
+    assert status_payload["state"] == "installed"
+    assert status_payload["reload_required"] is True
+    status_text = json.dumps(status_payload)
+    assert str(tmp_path) not in status_text
+    assert "/Users/" not in status_text and "/private/" not in status_text
+
+    # uninstall --yes --json
+    assert main([
+        "uninstall-claude-hook", "--project", "--project-dir", str(tmp_path), "--yes", "--json",
+    ]) == 0
+    uninstall_payload = json.loads(capsys.readouterr().out)
+    assert uninstall_payload["ok"] is True
+    assert uninstall_payload["removed_entries"] == 1
+
+
+def test_cli_status_missing_is_unsafe(tmp_path, capsys):
+    assert main([
+        "status-claude-hook", "--project", "--project-dir", str(tmp_path), "--json",
+    ]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "unsafe"
+    assert payload["state"] == "missing"
+
+
+def test_cli_install_claude_hook_requires_project_flag(tmp_path):
+    # --project is required; omitting it is an argparse error (SystemExit).
+    with pytest.raises(SystemExit):
+        main(["install-claude-hook", "--project-dir", str(tmp_path), "--yes"])
+
+
+def test_cli_status_claude_hook_requires_project_flag(tmp_path):
+    with pytest.raises(SystemExit):
+        main(["status-claude-hook", "--project-dir", str(tmp_path), "--json"])

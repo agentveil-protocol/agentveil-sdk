@@ -3702,6 +3702,64 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_json_arg(setup_restore)
 
+    install_claude_hook = subparsers.add_parser(
+        "install-claude-hook",
+        help="Install the AgentVeil PreToolUse hook into a project's .claude/settings.json",
+    )
+    install_claude_hook.add_argument(
+        "--project",
+        action="store_true",
+        required=True,
+        help="Project scope (required; the only supported scope in this release)",
+    )
+    install_claude_hook.add_argument(
+        "--project-dir",
+        type=Path,
+        default=None,
+        help="Project directory to install into (default: current directory)",
+    )
+    install_claude_hook.add_argument(
+        "--yes",
+        action="store_true",
+        help="Proceed with the write; without it the command only previews",
+    )
+    _add_json_arg(install_claude_hook)
+
+    status_claude_hook = subparsers.add_parser(
+        "status-claude-hook",
+        help="Show AgentVeil Claude Code project hook status (bounded)",
+    )
+    status_claude_hook.add_argument(
+        "--project", action="store_true", required=True, help="Project scope (required)"
+    )
+    status_claude_hook.add_argument(
+        "--project-dir",
+        type=Path,
+        default=None,
+        help="Project directory to inspect (default: current directory)",
+    )
+    _add_json_arg(status_claude_hook)
+
+    uninstall_claude_hook = subparsers.add_parser(
+        "uninstall-claude-hook",
+        help="Remove the AgentVeil PreToolUse hook from a project's .claude/settings.json",
+    )
+    uninstall_claude_hook.add_argument(
+        "--project", action="store_true", required=True, help="Project scope (required)"
+    )
+    uninstall_claude_hook.add_argument(
+        "--project-dir",
+        type=Path,
+        default=None,
+        help="Project directory to uninstall from (default: current directory)",
+    )
+    uninstall_claude_hook.add_argument(
+        "--yes",
+        action="store_true",
+        help="Proceed with the removal; without it the command only previews",
+    )
+    _add_json_arg(uninstall_claude_hook)
+
     return parser
 
 
@@ -3731,6 +3789,129 @@ def _normalize_downstream_arg_values(argv: list[str]) -> list[str]:
         normalized.append(item)
         index += 1
     return normalized
+
+
+def run_install_claude_hook_cli(
+    *, project_dir: Path | None, assume_yes: bool, output_json: bool
+) -> int:
+    """Install/upsert the AgentVeil PreToolUse hook into a project."""
+    from agentveil_mcp_proxy import claude_hook_setup
+
+    target = Path(project_dir) if project_dir is not None else Path.cwd()
+    settings_path = claude_hook_setup.project_settings_path(target)
+    rel_settings = ".claude/settings.json"
+
+    if not assume_yes:
+        message = (
+            f"Would install the AgentVeil PreToolUse hook into {settings_path}. "
+            "Re-run with --yes to write it."
+        )
+        if output_json:
+            _print_json({
+                "ok": False,
+                "action": "install-claude-hook",
+                "applied": False,
+                "errors": ["confirmation required: pass --yes"],
+                "warnings": [message],
+                "settings_relpath": rel_settings,
+            })
+        else:
+            print(message)
+        return 0
+
+    try:
+        result = claude_hook_setup.install_hook(target)
+    except claude_hook_setup.HookSetupError as exc:
+        raise ProxyCliError(str(exc), exit_code=1) from exc
+
+    if output_json:
+        _print_operator_json({
+            "ok": True,
+            "action": "install-claude-hook",
+            "applied": True,
+            "scope": "project",
+            "settings_relpath": rel_settings,
+            "evidence_relpath": ".claude/agentveil/evidence.jsonl",
+            "created_settings": result.created_settings,
+            "replaced_existing_managed": result.replaced_existing_managed,
+            "reload_required": result.reload_required,
+            "matched_tool_classes": list(claude_hook_setup.MATCHED_TOOL_CLASSES),
+        })
+    else:
+        print(f"Installed AgentVeil PreToolUse hook: {settings_path}")
+        print(f"Evidence: {result.evidence_path}")
+        print("Restart Claude Code to load the hook.")
+    return 0
+
+
+def run_status_claude_hook_cli(*, project_dir: Path | None, output_json: bool) -> int:
+    """Print bounded project hook status."""
+    from agentveil_mcp_proxy import claude_hook_setup
+
+    target = Path(project_dir) if project_dir is not None else Path.cwd()
+    status = claude_hook_setup.status_hook(target)
+    bounded = status.to_bounded_dict()
+    if output_json:
+        _print_operator_json(bounded)
+    else:
+        print(f"status: {bounded['status']} ({bounded['state']})")
+        print(f"managed hook present: {bounded['managed_hook_present']}")
+        print(f"command points to module: {bounded['hook_command_points_to_module']}")
+        print(f"reload required: {bounded['reload_required']}")
+        for note in bounded["notes"]:
+            print(f"- {note}")
+    return 0
+
+
+def run_uninstall_claude_hook_cli(
+    *, project_dir: Path | None, assume_yes: bool, output_json: bool
+) -> int:
+    """Remove only AgentVeil-managed hook entries from a project."""
+    from agentveil_mcp_proxy import claude_hook_setup
+
+    target = Path(project_dir) if project_dir is not None else Path.cwd()
+    settings_path = claude_hook_setup.project_settings_path(target)
+
+    if not assume_yes:
+        message = (
+            f"Would remove the AgentVeil PreToolUse hook from {settings_path}. "
+            "Re-run with --yes to apply."
+        )
+        if output_json:
+            _print_json({
+                "ok": False,
+                "action": "uninstall-claude-hook",
+                "applied": False,
+                "errors": ["confirmation required: pass --yes"],
+                "warnings": [message],
+                "settings_relpath": ".claude/settings.json",
+            })
+        else:
+            print(message)
+        return 0
+
+    try:
+        result = claude_hook_setup.uninstall_hook(target)
+    except claude_hook_setup.HookSetupError as exc:
+        raise ProxyCliError(str(exc), exit_code=1) from exc
+
+    if output_json:
+        _print_operator_json({
+            "ok": True,
+            "action": "uninstall-claude-hook",
+            "applied": True,
+            "scope": "project",
+            "settings_existed": result.settings_existed,
+            "removed_entries": result.removed_entries,
+            "reload_required": result.reload_required,
+        })
+    else:
+        if result.removed_entries:
+            print(f"Removed {result.removed_entries} AgentVeil hook entry(ies): {settings_path}")
+            print("Restart Claude Code to drop the hook.")
+        else:
+            print("No AgentVeil-managed hook entry found; nothing to remove.")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -4144,6 +4325,23 @@ def main(argv: list[str] | None = None) -> int:
                     output_json=args.json_output,
                 )
             raise ProxyCliError("setup action must be run, status, or restore")
+        if args.command == "install-claude-hook":
+            return run_install_claude_hook_cli(
+                project_dir=args.project_dir,
+                assume_yes=args.yes,
+                output_json=args.json_output,
+            )
+        if args.command == "status-claude-hook":
+            return run_status_claude_hook_cli(
+                project_dir=args.project_dir,
+                output_json=args.json_output,
+            )
+        if args.command == "uninstall-claude-hook":
+            return run_uninstall_claude_hook_cli(
+                project_dir=args.project_dir,
+                assume_yes=args.yes,
+                output_json=args.json_output,
+            )
     except (
         ProxyCliError,
         ApprovalEvidenceError,
