@@ -21,6 +21,7 @@ from agentveil_mcp_proxy.cursor_hooks import (
     parse_cursor_hook_input,
     run_cursor_hook,
 )
+from conftest import privacy_home_markers
 
 
 @pytest.fixture
@@ -47,7 +48,9 @@ def test_risky_pre_tool_use_is_denied_before_mutation(workspace: Path) -> None:
     assert response["permission"] == "deny"
     assert "user_message" in response
     assert "agent_message" in response
-    assert "/users/" not in json.dumps(response).lower()
+    encoded = json.dumps(response).lower()
+    for marker in privacy_home_markers():
+        assert marker not in encoded
 
 
 def test_safe_marker_allows_write(workspace: Path) -> None:
@@ -121,7 +124,9 @@ def test_run_cursor_hook_writes_bounded_evidence(workspace: Path) -> None:
     assert row["decision"] == "deny"
     assert row["target_reached"] is False
     assert row["safe_first_step_id"] == "request_human_review"
-    assert "/users/" not in json.dumps(row).lower()
+    encoded = json.dumps(row).lower()
+    for marker in privacy_home_markers():
+        assert marker not in encoded
 
 
 def test_hook_cli_reads_stdin_and_returns_json(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:

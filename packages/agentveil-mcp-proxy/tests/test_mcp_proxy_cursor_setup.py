@@ -3,9 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -15,17 +12,21 @@ from agentveil_mcp_proxy.cursor_hooks import run_cursor_hook
 from agentveil_mcp_proxy.cursor_setup import (
     AGENTVEIL_HOOK_ID,
     build_hooks_document,
-    build_hook_shim_script,
     cursor_setup_paths,
     derive_cursor_setup_status,
     global_cursor_config_paths,
     merge_agentveil_hooks,
-    normalize_cli_basename,
     read_shim_cli_path,
     remove_cursor_hooks,
-    resolved_hook_shim_name,
     setup_cursor_hooks,
     unmerge_agentveil_hooks,
+)
+from conftest import (
+    assert_hook_shim_platform_contract,
+    hook_shim_relative_path,
+    is_windows_runtime,
+    privacy_home_markers,
+    run_hook_shim_subprocess,
 )
 
 
@@ -61,71 +62,13 @@ def _agentveil_entry_count(document: dict) -> int:
     return count
 
 
-@pytest.fixture
-def workspace(tmp_path: Path) -> Path:
-    workspace_root = tmp_path / "workspace"
-    workspace_root.mkdir()
-    return workspace_root
-
-
-def _shim_relative_path() -> str:
-    return f".cursor/hooks/{resolved_hook_shim_name()}"
-
-
-def _run_hook_shim(shim_path: Path, *, workspace: Path, payload: str) -> subprocess.CompletedProcess[str]:
-    env = {
-        "PATH": os.environ.get("PATH", ""),
-        "HOME": os.environ.get("HOME", "/tmp"),
-        "AGENTVEIL_CURSOR_WORKSPACE": str(workspace),
-    }
-    if sys.platform == "win32":
-        return subprocess.run(
-            ["cmd", "/c", str(shim_path)],
-            input=payload,
-            text=True,
-            capture_output=True,
-            check=False,
-            env=env,
-        )
-    return subprocess.run(
-        [str(shim_path)],
-        input=payload,
-        text=True,
-        capture_output=True,
-        check=False,
-        env={**env, "PATH": "/usr/bin:/bin"},
+def _setup(workspace: Path, proxy_cli_bin: Path, **kwargs):
+    return setup_cursor_hooks(
+        workspace=workspace,
+        yes=True,
+        setup_cli_path=proxy_cli_bin,
+        **kwargs,
     )
-
-
-@pytest.fixture
-def proxy_cli_bin(tmp_path: Path) -> Path:
-    venv_cli = Path("/private/tmp/agentveil-sdk/.test-venv/bin/agentveil-mcp-proxy")
-    if sys.platform != "win32" and venv_cli.is_file():
-        return venv_cli.resolve()
-
-    package_root = Path(__file__).resolve().parents[1]
-    repo_root = package_root.parent.parent
-    bindir = tmp_path / "bin"
-    bindir.mkdir()
-    if sys.platform == "win32":
-        cli = bindir / "agentveil-mcp-proxy.cmd"
-        cli.write_text(
-            "@echo off\r\n"
-            f'set "PYTHONPATH={repo_root};{package_root}"\r\n'
-            f'"{sys.executable}" -m agentveil_mcp_proxy.cli %*\r\n',
-            encoding="utf-8",
-        )
-    else:
-        cli = bindir / "agentveil-mcp-proxy"
-        cli.write_text(
-            "#!/bin/sh\n"
-            f"PYTHONPATH={json.dumps(str(repo_root))}:{json.dumps(str(package_root))} "
-            f"exec {json.dumps(sys.executable)} -m agentveil_mcp_proxy.cli "
-            '"$@"\n',
-            encoding="utf-8",
-        )
-        cli.chmod(0o755)
-    return cli.resolve()
 
 
 @pytest.fixture
@@ -141,17 +84,9 @@ def isolated_global_cursor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> t
     mcp_path.write_text('{"mcpServers": {}}\n', encoding="utf-8")
     settings_path.write_text('{"workbench.colorTheme": "Default Dark Modern"}\n', encoding="utf-8")
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.setenv("CURSOR_USER_DATA_DIR", str(user_data.parent.parent / "cursor-user-data"))
     return mcp_path, settings_path
-
-
-def _setup(workspace: Path, proxy_cli_bin: Path, **kwargs):
-    return setup_cursor_hooks(
-        workspace=workspace,
-        yes=True,
-        setup_cli_path=proxy_cli_bin,
-        **kwargs,
-    )
 
 
 def test_setup_cursor_requires_yes(workspace: Path, isolated_global_cursor) -> None:
@@ -176,17 +111,17 @@ def test_setup_writes_shim_with_absolute_cli_path(workspace: Path, proxy_cli_bin
     assert str(proxy_cli_bin) in paths.hook_shim.read_text(encoding="utf-8")
 
 
-def test_shim_works_with_empty_path(workspace: Path, proxy_cli_bin: Path) -> None:
+def test_shim_contract_and_optional_runtime_execution(workspace: Path, proxy_cli_bin: Path) -> None:
     _setup(workspace, proxy_cli_bin)
     paths = cursor_setup_paths(workspace)
-    if sys.platform == "win32":
-        assert paths.hook_shim.name == "agentveil-cursor-hook.cmd"
-        assert read_shim_cli_path(paths.hook_shim) == proxy_cli_bin
+    assert_hook_shim_platform_contract(paths.hook_shim)
+    assert read_shim_cli_path(paths.hook_shim) == proxy_cli_bin
+    if is_windows_runtime():
         assert f'"{proxy_cli_bin}" hook cursor %*' in paths.hook_shim.read_text(encoding="utf-8")
         return
 
     payload = json.dumps({"tool_name": "Write", "tool_input": {"path": "x", "contents": "y"}})
-    proc = _run_hook_shim(paths.hook_shim, workspace=workspace, payload=payload)
+    proc = run_hook_shim_subprocess(paths.hook_shim, workspace=workspace, payload=payload)
     assert proc.returncode == 0, proc.stderr
     body = json.loads(proc.stdout)
     assert body["permission"] == "deny"
@@ -204,7 +139,8 @@ def test_setup_and_status_output_do_not_leak_raw_cli_path(
     assert main(["setup", "cursor", "--yes", "--json"]) == 0
     setup_out = capsys.readouterr().out
     assert str(proxy_cli_bin) not in setup_out
-    assert "/users/" not in setup_out.lower()
+    for marker in privacy_home_markers():
+        assert marker not in setup_out.lower()
 
     assert main(["setup", "status", "--json"]) == 0
     status_payload = json.loads(capsys.readouterr().out)
@@ -226,8 +162,7 @@ def test_setup_cursor_creates_project_local_files_only(
     assert paths.hooks_json.is_file()
     assert paths.hook_shim.is_file()
     assert paths.manifest_path.is_file()
-    if os.name != "nt":
-        assert paths.hook_shim.stat().st_mode & 0o111
+    assert_hook_shim_platform_contract(paths.hook_shim)
 
     hooks_doc = json.loads(paths.hooks_json.read_text(encoding="utf-8"))
     assert hooks_doc["version"] == 1
@@ -378,7 +313,7 @@ def test_remove_cursor_requires_reload_message(workspace: Path, proxy_cli_bin: P
 
 
 def test_hooks_document_uses_expected_matchers() -> None:
-    doc = build_hooks_document(shim_relative_path=_shim_relative_path())
+    doc = build_hooks_document(shim_relative_path=hook_shim_relative_path())
     matcher = doc["hooks"]["preToolUse"][0]["matcher"]
     assert "Write" in matcher
     assert "Delete" in matcher
@@ -388,7 +323,7 @@ def test_hooks_document_uses_expected_matchers() -> None:
 
 def test_merge_and_unmerge_helpers_are_bounded() -> None:
     existing = _existing_user_hooks()
-    shim_relative = _shim_relative_path()
+    shim_relative = hook_shim_relative_path()
     merged, changed = merge_agentveil_hooks(
         existing,
         shim_relative_path=shim_relative,
@@ -410,25 +345,3 @@ def test_global_cursor_paths_are_outside_workspace(workspace: Path) -> None:
     mcp_path, settings_path = global_cursor_config_paths()
     assert workspace not in mcp_path.parents
     assert workspace not in settings_path.parents
-
-
-def test_normalize_cli_basename_maps_console_script_names() -> None:
-    assert normalize_cli_basename(Path("/tmp/agentveil-mcp-proxy.exe")) == "agentveil-mcp-proxy"
-    assert normalize_cli_basename(Path("/tmp/agentveil-mcp-proxy.cmd")) == "agentveil-mcp-proxy"
-    assert normalize_cli_basename(Path("/tmp/__main__.py")) == "agentveil-mcp-proxy"
-
-
-def test_read_shim_cli_path_parses_windows_cmd_shim(tmp_path: Path) -> None:
-    cli = tmp_path / "agentveil-mcp-proxy.exe"
-    cli.write_text("", encoding="utf-8")
-    shim = tmp_path / "agentveil-cursor-hook.cmd"
-    shim.write_text(f'@echo off\r\n"{cli}" hook cursor %*\r\n', encoding="utf-8")
-    assert read_shim_cli_path(shim) == cli
-
-
-def test_build_hook_shim_script_uses_cmd_on_windows(tmp_path: Path) -> None:
-    cli = tmp_path / "agentveil-mcp-proxy.exe"
-    cli.write_text("", encoding="utf-8")
-    script = build_hook_shim_script(cli_path=cli, platform_name="nt")
-    assert script.startswith("@echo off")
-    assert f'"{cli}" hook cursor %*' in script

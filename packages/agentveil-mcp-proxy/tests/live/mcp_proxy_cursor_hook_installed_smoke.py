@@ -13,19 +13,23 @@ import tempfile
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
+TESTS_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(TESTS_DIR))
+import conftest as platform_contract
+
 ROOT = Path(__file__).resolve().parents[2]
 PACKAGE_ROOT = ROOT
 SDK_ROOT = PACKAGE_ROOT.parent.parent
 SECRET = "SECRET_CURSOR_HOOK_SMOKE"
 PRIVACY_MARKERS = (
-    "/users/",
-    "\\users\\",
+    *platform_contract.privacy_home_markers(),
     "/private/",
     "/var/folders/",
     "/tmp/",
     SECRET.lower(),
     "library/caches/pip",
 )
+SUBPROCESS_TIMEOUT = platform_contract.HOOK_SUBPROCESS_TIMEOUT
 
 
 def _clean_env(tmp_root: Path) -> dict[str, str]:
@@ -45,22 +49,22 @@ def _clean_env(tmp_root: Path) -> dict[str, str]:
     xdg_cache = tmp_root / "xdg-cache"
     xdg_cache.mkdir(parents=True, exist_ok=True)
     env["HOME"] = str(home)
+    env["USERPROFILE"] = str(home)
     env["PIP_NO_CACHE_DIR"] = "1"
     env["PIP_CACHE_DIR"] = str(pip_cache)
     env["XDG_CACHE_HOME"] = str(xdg_cache)
     return env
 
 
-def _resolved_hook_shim_name() -> str:
-    return "agentveil-cursor-hook.cmd" if sys.platform == "win32" else "agentveil-cursor-hook.sh"
-
-
 def _venv_python(venv: Path) -> Path:
-    return venv / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+    scripts = platform_contract.venv_scripts_dirname()
+    name = "python.exe" if platform_contract.is_windows_runtime() else "python"
+    return venv / scripts / name
 
 
 def _installed_cli(venv: Path) -> Path:
-    return venv / ("Scripts/agentveil-mcp-proxy.exe" if sys.platform == "win32" else "bin/agentveil-mcp-proxy")
+    scripts = platform_contract.venv_scripts_dirname()
+    return venv / scripts / platform_contract.installed_cli_filename()
 
 
 def _record_output(surfaces: list[str], *chunks: str) -> None:
@@ -82,6 +86,7 @@ def _run(
     surfaces: list[str],
     cwd: str | None = None,
     text_input: str | None = None,
+    timeout: int = SUBPROCESS_TIMEOUT,
 ) -> subprocess.CompletedProcess[str]:
     proc = subprocess.run(
         cmd,
@@ -91,6 +96,7 @@ def _run(
         capture_output=True,
         check=False,
         env=env,
+        timeout=timeout,
     )
     _record_output(surfaces, proc.stdout, proc.stderr)
     return proc
@@ -104,21 +110,23 @@ def _build_installed_cli(tmp_root: Path, surfaces: list[str]) -> tuple[Path, Pat
         [sys.executable, "-m", "pip", "wheel", str(SDK_ROOT), "-w", str(wheelhouse), "-q"],
         [sys.executable, "-m", "pip", "wheel", str(PACKAGE_ROOT), "-w", str(wheelhouse), "--no-deps", "-q"],
     ):
-        proc = _run(cmd, env=env, surfaces=surfaces, cwd=str(tmp_root))
+        proc = _run(cmd, env=env, surfaces=surfaces, cwd=str(tmp_root), timeout=120)
         if proc.returncode != 0:
             raise RuntimeError(proc.stderr.strip() or proc.stdout.strip())
 
     venv = tmp_root / "venv"
-    create = _run([sys.executable, "-m", "venv", str(venv)], env=env, surfaces=surfaces, cwd=str(tmp_root))
+    create = _run([sys.executable, "-m", "venv", str(venv)], env=env, surfaces=surfaces, cwd=str(tmp_root), timeout=120)
     if create.returncode != 0:
         raise RuntimeError(create.stderr.strip() or create.stdout.strip())
 
-    pip = _venv_python(venv).parent / ("pip.exe" if sys.platform == "win32" else "pip")
+    pip_name = "pip.exe" if platform_contract.is_windows_runtime() else "pip"
+    pip = _venv_python(venv).parent / pip_name
     install = _run(
         [str(pip), "install", "--no-index", f"--find-links={wheelhouse}", "agentveil", "agentveil-mcp-proxy", "-q"],
         env=env,
         surfaces=surfaces,
         cwd=str(tmp_root),
+        timeout=120,
     )
     if install.returncode != 0:
         raise RuntimeError(install.stderr.strip() or install.stdout.strip())
@@ -127,6 +135,7 @@ def _build_installed_cli(tmp_root: Path, surfaces: list[str]) -> tuple[Path, Pat
         [str(_venv_python(venv)), "-c", "import agentveil_mcp_proxy.cli as c; print('ok')"],
         env=env,
         surfaces=surfaces,
+        timeout=SUBPROCESS_TIMEOUT,
     )
     if module_probe.returncode != 0:
         raise RuntimeError(module_probe.stderr.strip() or module_probe.stdout.strip())
@@ -204,43 +213,18 @@ def main() -> int:
             assert status_payload["installed"] is True
             assert status_payload["hook_cli_resolved"] is True
 
-            shim_path = workspace / ".cursor" / "hooks" / _resolved_hook_shim_name()
-            if sys.platform == "win32":
-                shim_cmd = ["cmd", "/c", str(shim_path)]
-                shim_env = {
-                    "PATH": env.get("PATH", ""),
-                    "HOME": env["HOME"],
-                    "AGENTVEIL_CURSOR_WORKSPACE": str(workspace),
-                }
-            else:
-                shim_cmd = [str(shim_path)]
-                shim_env = {
-                    "PATH": "/usr/bin:/bin",
-                    "HOME": env["HOME"],
-                    "AGENTVEIL_CURSOR_WORKSPACE": str(workspace),
-                }
-            shim_proc = _run(
-                shim_cmd,
-                env=shim_env,
-                surfaces=surfaces,
-                cwd=str(workspace),
-                text_input=json.dumps({"tool_name": "Write", "tool_input": {"path": "x", "contents": "y"}}),
+            shim_path = workspace / ".cursor" / "hooks" / platform_contract.expected_hook_shim_name()
+            platform_contract.assert_hook_shim_platform_contract(shim_path)
+            shim_proc = platform_contract.run_hook_shim_subprocess(
+                shim_path,
+                workspace=workspace,
+                payload=json.dumps({"tool_name": "Write", "tool_input": {"path": "x", "contents": "y"}}),
             )
+            _record_output(surfaces, shim_proc.stdout, shim_proc.stderr)
             assert shim_proc.returncode == 0, shim_proc.stderr
             shim_payload = json.loads(shim_proc.stdout)
             assert shim_payload["permission"] == "deny"
             assert "missing_cli" not in shim_payload.get("agent_message", "")
-
-            hook = _run(
-                [str(cli), "hook", "cursor", "--workspace", str(workspace)],
-                env=env,
-                surfaces=surfaces,
-                cwd=str(workspace),
-                text_input=json.dumps({"tool_name": "Write", "tool_input": {"path": "x", "contents": "y"}}),
-            )
-            assert hook.returncode == 0, hook.stderr
-            hook_payload = json.loads(hook.stdout)
-            assert hook_payload["permission"] == "deny"
 
             remove = _run(
                 [str(cli), "setup", "remove", "cursor", "--yes", "--json"],
