@@ -283,36 +283,14 @@ permissions (`0600` or `0400`) before starting the proxy.
 
 ### Policy Rule Override Semantics
 
-When you author a user policy rule with `intentional_override: true`, the local
-policy engine treats your override as an explicit decision to bypass built-in
-policy pack rules for the contexts that match your rule.
+User-authored policy rules can intentionally override built-in defaults for a
+matching context. Treat overrides as sensitive configuration: review them before
+use, keep them narrow, and prefer stricter rules when possible.
 
-Selection algorithm (`policy.py:_select_rule`):
-
-1. If any matching user rule has `intentional_override: true`:
-   - Built-in rules are ignored for this context.
-   - Among matching user rules, override and non-override, the highest-rank
-     decision wins. Stricter user-authored decisions are not silently bypassed.
-2. Otherwise, the highest-rank matching rule wins across user and built-in
-   rules.
-
-Operational implication:
-
-A single user rule with `intentional_override: true` matching a context where a
-built-in policy pack normally provides protection causes that built-in
-protection to be ignored. This is by design: operators use
-`intentional_override` to relax built-in defaults that conflict with their
-environment. It is still a security boundary footgun. There is no
-"intentional_override only narrows selection to this rule" mode; the override
-applies to the entire matching context.
-
-Example footgun:
-
-If you load the `filesystem` built-in pack, which blocks `delete_*`, `purge_*`,
-`wipe_*`, and similar tools through the `filesystem-delete` rule, and add a user
-rule matching `server: ["filesystem"]` with `intentional_override: true` and
-`decision: "allow"`, then all filesystem destructive actions become allowed
-regardless of the built-in rule's block intent.
+If an override is too broad, it can relax protection for actions that would
+otherwise require approval or be blocked. Validate policy changes with
+`agentveil-mcp-proxy doctor --full` and a local smoke run before relying on the
+configuration.
 
 Recommended pattern:
 

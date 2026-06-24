@@ -34,26 +34,17 @@ Run from a neutral cwd (for example `/tmp`) so `PYTHONPATH` does not shadow the 
 
 ## What It Verifies
 
-From an **installed wheel** in a clean virtualenv and an isolated `--home`:
+From an **installed wheel** in a clean virtualenv and an isolated `--home`, the
+gate verifies the public onboarding path:
 
-1. `init --quickstart-filesystem --json`
-2. `doctor --full --json`
-3. `smoke --json`
-4. `client-config print --json` (cursor + claude_desktop, dry-run, privacy-checked)
-5. Optional `register` + `doctor --check-backend` (unless `--skip-backend`)
-6. Persistent `run`: `initialize`, `tools/list`, allow `list_workspace`
-7. Risky `write_file` → `approval_required`, sandbox file **absent**
-8. Approval Center `GET …/api/approvals` when the wheel exposes it and a pending item exists
-9. HTTP approve + **one** successful retry; third identical call must **not** execute again
-10. Separate `run --approval-ui-mode none --headless --auto-deny` → deny path, deny probe file absent
-11. `events list --json` (approved, executed, denied)
-12. `export-evidence` + strict `verify --output json`
-13. Privacy scan on bundle, events, client-config JSON, runner output, and final report
+- init, doctor, smoke, and client config output;
+- MCP initialize/tools/list and one safe routed tool call;
+- one risky routed tool call requiring approval before target mutation;
+- approval, deny, evidence export, and verification surfaces;
+- privacy-bounded JSON, human output, and retained artifacts.
 
-Final stdout is one JSON object with metrics (`candidate_git_sha`, `wheel_sha256`,
-`installed_package_path`, `client_config_print_ok`, `approval_center_api`, etc.). The
-`approval_center_api` output is checked to omit the loopback bearer token and full
-`/approval/<token>/…` URL; it keeps redacted host/port/path metadata plus `pending_count`.
+Final stdout is one bounded JSON object with release metrics and a privacy scan
+summary.
 
 ## Stage Gate Rule
 

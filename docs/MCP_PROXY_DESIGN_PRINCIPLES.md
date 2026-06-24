@@ -53,10 +53,9 @@ an explicit rule, signed decision, or approval.
 
 The MCP Proxy applies this in several places:
 
-- Built-in policy packs block or require approval for higher-risk actions.
-- The `filesystem` pack blocks destructive tool patterns such as `delete_*`,
-  `purge_*`, `truncate_*`, `wipe_*`, `format_*`, `rm`, `rmdir_*`, `unlink_*`,
-  and `clean_*`.
+- Built-in policy defaults block or require approval for higher-risk actions.
+- Destructive filesystem-style operations are denied or routed to explicit
+  approval by default.
 - Runtime Gate fallback behavior blocks destructive, production, and financial
   risk classes when the backend cannot provide a trusted decision.
 - Approval timeout behavior defaults to deny; the timeout path does not become
@@ -190,8 +189,8 @@ The proxy keeps the first-use path familiar:
 - `agentveil-mcp-proxy doctor` validates local state.
 - `agentveil-mcp-proxy run` starts the stdio proxy used by MCP clients.
 
-Built-in policy packs (`default`, `github`, `filesystem`, and `shell`) let
-operators start from reviewable defaults before writing custom policy rules.
+Built-in policy defaults let operators start from reviewable behavior before
+writing custom policy rules.
 The browser approval surface uses conventional form semantics: review a
 privacy-filtered action, approve, deny, or let it expire. The operations guide
 documents the trade-offs between TTY passphrases, passphrase files, command-line

@@ -10,7 +10,7 @@
 [![License](https://img.shields.io/badge/License-MIT%20%2B%20BUSL-informational)](LICENSING.md)
 [![Glama MCP Directory](https://img.shields.io/badge/Glama-MCP%20Directory-blue)](https://glama.ai/mcp/servers/agentveil-protocol/avp-sdk)
 
-**AgentVeil MCP Proxy 0.7.22: routed action control for MCP tool calls.**
+**AgentVeil MCP Proxy 0.7.22: runtime action-control for agentic MCP deployments.**
 
 [Quick Start](#quick-start) · [Scope](#scope) · [Design Basis](#design-basis) · [Comparison](#comparison) · [Examples](examples/) · [Docs](docs/)
 
@@ -22,7 +22,7 @@ pip install agentveil-mcp-proxy
 
 **Proxy PyPI**: [agentveil-mcp-proxy](https://pypi.org/project/agentveil-mcp-proxy/) | **Website**: [agentveil.dev](https://agentveil.dev) | **Package source**: [`packages/agentveil-mcp-proxy/`](packages/agentveil-mcp-proxy/)
 
-> **MCP transport proxy:** AgentVeil MCP Proxy controls routed MCP tool calls through AgentVeil policy, approval / redirect / block / evidence paths, and bounded local evidence. The proxy controls only calls routed through it; actions outside the proxy are not classified or logged. It is a separately packaged source-available component under [`packages/agentveil-mcp-proxy/`](packages/agentveil-mcp-proxy/) and is not covered by the root MIT license. See [Licensing](LICENSING.md).
+> **MCP transport proxy:** AgentVeil MCP Proxy puts an AgentVeil control boundary in front of routed MCP tool calls: policy decisions, approval routing, redirect / block outcomes, and bounded local evidence. The proxy controls only calls routed through it; actions outside the proxy are not classified or logged. It is a separately packaged source-available component under [`packages/agentveil-mcp-proxy/`](packages/agentveil-mcp-proxy/) and is not covered by the root MIT license. See [Licensing](LICENSING.md).
 
 <p align="center">
   <img src="docs/routed-action-control.png" alt="AgentVeil routed action control flow" width="840">
@@ -59,6 +59,9 @@ at an AgentVeil boundary.
 The MCP Proxy design is summarized in
 [MCP Proxy Design Principles](docs/MCP_PROXY_DESIGN_PRINCIPLES.md).
 
+- Emerging AI-control patterns: separate runtime identity, least-privilege
+  action access, approval for sensitive operations, blocking or redirecting
+  unsafe calls, and bounded audit evidence.
 - Saltzer & Schroeder: the proxy maps classic security engineering principles
   to a bounded MCP mediation point.
 - Fail-safe defaults: missing policy, missing approval, or unavailable trusted

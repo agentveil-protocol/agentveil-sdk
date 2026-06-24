@@ -209,19 +209,9 @@ PYTHONPATH=.:packages/agentveil-mcp-proxy python3 \
 ## P10A.5 explain / redirect / role doctor
 
 P10A.5 makes P10A.4 role presets understandable and actionable. Deny and
-approval-required JSON-RPC errors include bounded `explanation` text plus redirect
-metadata:
-
-- `next_step`
-- `suggested_next_step_id`
-- `redirect_playbook_id`
-
-Examples:
-
-- reviewer write deny → `create_implementer_task`
-- readonly mutation deny → `use_read_only_tool`
-- approval-required risky action → `request_approval`
-- unknown high-risk block → `stop_and_classify_unknown_action`
+approval-required JSON-RPC errors include bounded explanation text plus redirect
+metadata identifiers. The identifiers are intentionally bounded; detailed
+workflow playbooks are not embedded in raw tool payloads.
 
 Redirect guidance does not call downstream targets, mutate config, auto-approve,
 or auto-execute.
@@ -237,15 +227,8 @@ agentveil-mcp-proxy explain role --home ~/.avp
 Output lists allowed, approval-required, and blocked action families per preset
 without raw prompts, secrets, stdout/stderr, or full payloads.
 
-Verification:
-
-```bash
-PYTHONPATH=.:packages/agentveil-mcp-proxy pytest \
-  packages/agentveil-mcp-proxy/tests/test_mcp_proxy_role_doctor.py -q
-
-PYTHONPATH=.:packages/agentveil-mcp-proxy python3 \
-  packages/agentveil-mcp-proxy/tests/live/mcp_proxy_role_doctor_smoke.py
-```
+Verification is covered by the role doctor tests and live smoke in the package
+test suite.
 
 ## P10A.6 one-command agent templates
 
@@ -271,15 +254,8 @@ Template behavior:
 - `build` → implementer preset reaches allowed quickstart read/list target; filesystem write goes to approval
 - `readonly` → readonly preset denies mutation before downstream target
 
-Verification:
-
-```bash
-PYTHONPATH=.:packages/agentveil-mcp-proxy pytest \
-  packages/agentveil-mcp-proxy/tests/test_mcp_proxy_agent_templates.py -q
-
-PYTHONPATH=.:packages/agentveil-mcp-proxy python3 \
-  packages/agentveil-mcp-proxy/tests/live/mcp_proxy_agent_templates_smoke.py
-```
+Verification is covered by the agent-template tests and live smoke in the
+package test suite.
 
 ## P10A.7 safe config wizard / all tools through proxy
 
@@ -310,15 +286,8 @@ Unsafe direct downstream configs (for example `npx @modelcontextprotocol/...` or
 `quickstart_filesystem.py` as the desktop client command) are detected and
 rejected with bounded guidance.
 
-Verification:
-
-```bash
-PYTHONPATH=.:packages/agentveil-mcp-proxy pytest \
-  packages/agentveil-mcp-proxy/tests/test_mcp_proxy_config_wizard.py -q
-
-PYTHONPATH=.:packages/agentveil-mcp-proxy python3 \
-  packages/agentveil-mcp-proxy/tests/live/mcp_proxy_config_wizard_smoke.py
-```
+Verification is covered by the config-wizard tests and live smoke in the
+package test suite.
 
 ## P10A.9 persistent Approval Center / any-client UX
 
