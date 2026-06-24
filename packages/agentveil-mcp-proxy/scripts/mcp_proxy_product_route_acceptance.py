@@ -1,30 +1,32 @@
 #!/usr/bin/env python3
-"""Full product-route acceptance for the installed AgentVeil MCP Proxy wheel.
+"""Public product-route smoke for the installed AgentVeil MCP Proxy wheel.
 
-Builds or consumes a candidate wheel, installs it into a clean virtualenv under an
-isolated AVP home, initializes the composite ``product_route`` profile, exercises
-safe reads, approval/deny/block flows over MCP stdio, and verifies evidence,
-timeline, and privacy boundaries. Emits a final bounded JSON report.
+This runner checks the public contract without publishing the full internal
+acceptance matrix: install the candidate wheel, initialize the product route,
+verify safe reads, one routed approval path, one denied path, one blocked path,
+bounded evidence, and privacy-clean output.
 """
 
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stderr, redirect_stdout
 from hashlib import sha256
+import io
 import json
 import os
 from pathlib import Path
 import secrets
-import shutil
-import subprocess
 import sys
 import tempfile
-import time
 from typing import Any
 from urllib.parse import urlencode
 from urllib.request import HTTPCookieProcessor, Request, build_opener
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys_path_inserted = False
+if __name__ == "__main__" or __package__ is None:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    sys_path_inserted = True
 
 from mcp_proxy_acceptance_lib import (
     AcceptanceError,
@@ -41,36 +43,18 @@ from mcp_proxy_acceptance_lib import (
     privacy_scan_events,
     privacy_scan_text,
     resolve_git_sha,
-    run,
     run_cli_json,
     scrub_install_env,
 )
 
-PRODUCT_ROUTE_PACKAGE_NAME = "agentveil-route-test-pkg"
 EXPECTED_TOOL_COUNT = 68
 EXPECTED_VERSION = "0.7.22"
 RUN_NONINTERACTIVE_UI_ARGS = ["--approval-ui-mode", "none"]
 
-SAFE_READ_TOOLS = (
-    "list_workspace",
-    "git_status",
-    "package_inspect_state",
-    "get_repository",
-    "ci_repo_target_snapshot",
-)
-
+SAFE_READ_TOOL = "list_workspace"
 APPROVE_WRITE_NAME = "product-route-approve.txt"
 DENY_WRITE_NAME = "product-route-deny.txt"
 WRITE_CONTENT = "product route acceptance write\n"
-GIT_STAGE_NAME = "product-route-stage.txt"
-
-GITHUB_RISKY_TOOLS: tuple[tuple[str, dict[str, Any], str, str], ...] = (
-    ("merge_pull_request", {"pull_number": 1}, "repo_admin_or_merge", "repo_change_review"),
-    ("deploy_release", {}, "deploy_release", "release_readiness_check"),
-    ("dispatch_workflow", {"workflow": "deploy.yml"}, "ci_workflow_mutation", "workflow_review"),
-    ("run_remote_command", {"command": "echo probe"}, "remote_command", "remote_command_review"),
-)
-
 PRIVACY_PATH_MARKERS = ("/Users/", "/private/", "/var/folders/")
 FAKE_SECRET_MARKERS = (
     "ghp_FAKE_NOT_A_REAL_GITHUB_TOKEN_00000000",
@@ -102,44 +86,10 @@ def deny_url(approval_url: str) -> None:
 
 
 def profile_layout(profile_root: Path) -> dict[str, Path]:
-    workspace = profile_root / "workspace"
     return {
         "profile_root": profile_root,
-        "workspace": workspace,
-        "package_venv": profile_root / "package" / "venv",
-        "github_state": profile_root / "github" / "state" / "state.json",
-        "git_outcome_log": profile_root / "logs" / "git-outcome.jsonl",
-        "package_outcome_log": profile_root / "logs" / "package-outcome.jsonl",
-        "github_outcome_log": profile_root / "logs" / "github-outcome.jsonl",
+        "workspace": profile_root / "workspace",
     }
-
-
-def git_staged_files(repo: Path) -> list[str]:
-    proc = subprocess.run(
-        ["git", "-C", str(repo), "diff", "--cached", "--name-only"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if proc.returncode != 0:
-        raise AcceptanceError(f"git diff --cached failed: {proc.stderr.strip()}")
-    return [line for line in proc.stdout.splitlines() if line.strip()]
-
-
-def package_installed(venv_dir: Path, package_name: str = PRODUCT_ROUTE_PACKAGE_NAME) -> bool:
-    python = venv_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    proc = subprocess.run(
-        [str(python), "-m", "pip", "show", package_name],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return proc.returncode == 0
-
-
-def github_merge_state(state_path: Path) -> bool:
-    state = json.loads(state_path.read_text(encoding="utf-8"))
-    return bool(state.get("pull_requests", {}).get("1", {}).get("merged"))
 
 
 def tool_result_text(response: dict[str, Any]) -> str:
@@ -158,8 +108,6 @@ def assert_approval_required(
     response: dict[str, Any],
     *,
     tool: str,
-    risk_family: str,
-    redirect_playbook: str,
     target_path: Path | None = None,
 ) -> dict[str, Any]:
     error = response.get("error")
@@ -170,18 +118,9 @@ def assert_approval_required(
         raise AcceptanceError(f"{tool}: approval_required data missing: {response}")
     if data.get("status") != "approval_required":
         raise AcceptanceError(f"{tool}: unexpected approval status: {data}")
-    if data.get("risk_family") != risk_family:
-        raise AcceptanceError(f"{tool}: expected risk_family={risk_family!r}, got {data.get('risk_family')!r}")
-    playbook_id = data.get("redirect_playbook_id")
-    if playbook_id != redirect_playbook:
-        raise AcceptanceError(
-            f"{tool}: expected redirect_playbook_id={redirect_playbook!r}, got {playbook_id!r}",
-        )
-    if not data.get("safe_first_step_id"):
-        raise AcceptanceError(f"{tool}: safe_first_step_id missing from approval data")
-    message = str(error.get("message", ""))
-    if "Safe first step:" not in message and "safe_first_step_id" not in data:
-        raise AcceptanceError(f"{tool}: safe first step guidance missing from approval surface")
+    for key in ("risk_family", "redirect_playbook_id", "safe_first_step_id"):
+        if not isinstance(data.get(key), str) or not data[key]:
+            raise AcceptanceError(f"{tool}: {key} missing from approval data")
     if target_path is not None and target_path.exists():
         raise AcceptanceError(f"{tool}: target reached before approval: {target_path.name}")
     if not data.get("record_id") or not data.get("approval_url"):
@@ -191,13 +130,7 @@ def assert_approval_required(
     return data
 
 
-def assert_blocked(
-    response: dict[str, Any],
-    *,
-    tool: str,
-    risk_family: str,
-    redirect_playbook: str,
-) -> dict[str, Any]:
+def assert_blocked(response: dict[str, Any], *, tool: str) -> dict[str, Any]:
     error = response.get("error")
     if not isinstance(error, dict):
         raise AcceptanceError(f"{tool}: expected JSON-RPC error: {response}")
@@ -206,12 +139,6 @@ def assert_blocked(
         raise AcceptanceError(f"{tool}: blocked data missing: {response}")
     if data.get("status") not in {"blocked", "policy_denied"}:
         raise AcceptanceError(f"{tool}: expected blocked status: {data}")
-    if data.get("risk_family") != risk_family:
-        raise AcceptanceError(f"{tool}: expected risk_family={risk_family!r}, got {data.get('risk_family')!r}")
-    if data.get("redirect_playbook_id") != redirect_playbook:
-        raise AcceptanceError(
-            f"{tool}: expected redirect_playbook_id={redirect_playbook!r}, got {data.get('redirect_playbook_id')!r}",
-        )
     if data.get("target_reached") is True:
         raise AcceptanceError(f"{tool}: blocked path reported target_reached=true")
     rendered = json.dumps(response, sort_keys=True)
@@ -238,17 +165,6 @@ def require_event(events: list[dict[str, Any]], tool: str, status: str) -> dict[
     if not matches:
         raise AcceptanceError(f"no evidence event for tool={tool!r} status={status!r}")
     return matches[-1]
-
-
-
-def event_redirect_fields(event: dict[str, Any]) -> tuple[str | None, str | None]:
-    risk_family = event.get("risk_family")
-    playbook = event.get("redirect_playbook_id")
-    controlled = event.get("controlled_path")
-    if isinstance(controlled, dict):
-        risk_family = risk_family or controlled.get("risk_family")
-        playbook = playbook or controlled.get("redirect_playbook_id")
-    return risk_family, playbook
 
 
 def run_product_route_acceptance(args: argparse.Namespace) -> dict[str, Any]:
@@ -332,8 +248,6 @@ def run_product_route_acceptance(args: argparse.Namespace) -> dict[str, Any]:
         workspace = layout["workspace"]
         approve_file = workspace / APPROVE_WRITE_NAME
         deny_file = workspace / DENY_WRITE_NAME
-        git_stage_file = workspace / GIT_STAGE_NAME
-        git_stage_file.write_text("stage me\n", encoding="utf-8")
 
         client = JsonRpcClient(
             [str(proxy), "run", *identity_args, *RUN_NONINTERACTIVE_UI_ARGS],
@@ -345,7 +259,7 @@ def run_product_route_acceptance(args: argparse.Namespace) -> dict[str, Any]:
                 client.call(
                     "initialize-1",
                     "initialize",
-                    {"clientInfo": {"name": "product-route-acceptance"}},
+                    {"clientInfo": {"name": "product-route-public-smoke"}},
                 ),
                 "initialize-1",
             )
@@ -360,14 +274,13 @@ def run_product_route_acceptance(args: argparse.Namespace) -> dict[str, Any]:
             if len(tool_names) != EXPECTED_TOOL_COUNT:
                 raise AcceptanceError(f"tools/list count mismatch: expected {EXPECTED_TOOL_COUNT}, got {len(tool_names)}")
 
-            for tool in SAFE_READ_TOOLS:
-                response = assert_tool_success(
-                    client.call(f"safe-{tool}", "tools/call", {"name": tool, "arguments": {}}),
-                    f"safe-{tool}",
-                )
-                rendered = tool_result_text(response)
-                if "redirect_playbook_id" in rendered or "risk_family" in rendered:
-                    raise AcceptanceError(f"{tool}: safe read leaked redirect metadata")
+            response = assert_tool_success(
+                client.call(f"safe-{SAFE_READ_TOOL}", "tools/call", {"name": SAFE_READ_TOOL, "arguments": {}}),
+                f"safe-{SAFE_READ_TOOL}",
+            )
+            rendered = tool_result_text(response)
+            if "redirect_playbook_id" in rendered or "risk_family" in rendered:
+                raise AcceptanceError(f"{SAFE_READ_TOOL}: safe read leaked redirect metadata")
             scenario_results["safe_read"] = True
 
             write_args = {
@@ -375,13 +288,7 @@ def run_product_route_acceptance(args: argparse.Namespace) -> dict[str, Any]:
                 "arguments": {"path": APPROVE_WRITE_NAME, "content": WRITE_CONTENT},
             }
             risky = client.call("write-pre-1", "tools/call", write_args)
-            assert_approval_required(
-                risky,
-                tool="write_file",
-                risk_family="file_write",
-                redirect_playbook="inspect_before_write",
-                target_path=approve_file,
-            )
+            assert_approval_required(risky, tool="write_file", target_path=approve_file)
             scenario_results["write_pre_approval"] = True
 
             approve_url(str(risky["error"]["data"]["approval_url"]))
@@ -399,13 +306,7 @@ def run_product_route_acceptance(args: argparse.Namespace) -> dict[str, Any]:
                 "arguments": {"path": DENY_WRITE_NAME, "content": "deny probe\n"},
             }
             deny_pending = client.call("write-deny-1", "tools/call", deny_args)
-            deny_data = assert_approval_required(
-                deny_pending,
-                tool="write_file",
-                risk_family="file_write",
-                redirect_playbook="inspect_before_write",
-                target_path=deny_file,
-            )
+            deny_data = assert_approval_required(deny_pending, tool="write_file", target_path=deny_file)
             deny_url(str(deny_data["approval_url"]))
             deny_retry = client.call("write-deny-2", "tools/call", deny_args)
             if deny_file.exists():
@@ -415,82 +316,16 @@ def run_product_route_acceptance(args: argparse.Namespace) -> dict[str, Any]:
                 raise AcceptanceError(f"denied write_file retry did not return an error: {deny_retry}")
             scenario_results["write_denied"] = True
 
-            git_before = git_staged_files(workspace)
-            git_args = {
-                "name": "git_add",
-                "arguments": {"files": [GIT_STAGE_NAME]},
-            }
-            git_pending = client.call("git-add-1", "tools/call", git_args)
-            assert_approval_required(
-                git_pending,
-                tool="git_add",
-                risk_family="git_mutation",
-                redirect_playbook="show_git_status_and_diff",
+            blocked = client.call(
+                "secret-1",
+                "tools/call",
+                {
+                    "name": "get_secret",
+                    "arguments": {"owner": "acme", "repo": "demo-repo", "secret_name": "DEPLOY_KEY"},
+                },
             )
-            if git_staged_files(workspace) != git_before:
-                raise AcceptanceError("git_add reached staging before approval")
-            approve_url(str(git_pending["error"]["data"]["approval_url"]))
-            git_retry = assert_tool_success(client.call("git-add-2", "tools/call", git_args), "git-add-2")
-            staged_after = git_staged_files(workspace)
-            if GIT_STAGE_NAME not in staged_after:
-                raise AcceptanceError("approved git_add did not stage target file")
-            if "target_reached" in tool_result_text(git_retry) and "true" not in tool_result_text(git_retry).lower():
-                raise AcceptanceError("approved git_add did not report target_reached=true")
-            scenario_results["git_add"] = True
-
-            if package_installed(layout["package_venv"]):
-                raise AcceptanceError("pip_install target package already installed before scenario")
-            pip_pending = client.call("pip-install-1", "tools/call", {"name": "pip_install", "arguments": {}})
-            assert_approval_required(
-                pip_pending,
-                tool="pip_install",
-                risk_family="package_mutation",
-                redirect_playbook="inspect_package_risk",
-            )
-            if package_installed(layout["package_venv"]):
-                raise AcceptanceError("pip_install reached target before approval")
-            approve_url(str(pip_pending["error"]["data"]["approval_url"]))
-            pip_retry = assert_tool_success(
-                client.call("pip-install-2", "tools/call", {"name": "pip_install", "arguments": {}}),
-                "pip-install-2",
-            )
-            if not package_installed(layout["package_venv"]):
-                raise AcceptanceError("approved pip_install did not install target package")
-            if "target_reached" in tool_result_text(pip_retry) and "true" not in tool_result_text(pip_retry).lower():
-                raise AcceptanceError("approved pip_install did not report target_reached=true")
-            scenario_results["pip_install"] = True
-
-            for tool in ("get_secret", "get_env_secret"):
-                secret_args = (
-                    {"owner": "acme", "repo": "demo-repo", "secret_name": "DEPLOY_KEY"}
-                    if tool == "get_secret"
-                    else {"secret_name": "DEPLOY_TOKEN"}
-                )
-                blocked = client.call(f"{tool}-1", "tools/call", {"name": tool, "arguments": secret_args})
-                assert_blocked(
-                    blocked,
-                    tool=tool,
-                    risk_family="secret_access",
-                    redirect_playbook="secret_posture_only",
-                )
+            assert_blocked(blocked, tool="get_secret")
             scenario_results["secret_block"] = True
-
-            merge_before = github_merge_state(layout["github_state"])
-            for tool, arguments, risk_family, redirect_playbook in GITHUB_RISKY_TOOLS:
-                risky_response = client.call(
-                    f"github-{tool}",
-                    "tools/call",
-                    {"name": tool, "arguments": dict(arguments)},
-                )
-                assert_approval_required(
-                    risky_response,
-                    tool=tool,
-                    risk_family=risk_family,
-                    redirect_playbook=redirect_playbook,
-                )
-            if github_merge_state(layout["github_state"]) != merge_before:
-                raise AcceptanceError("GitHub/CI-like risky tool reached target before approval")
-            scenario_results["github_ci_like"] = True
         finally:
             client.close()
 
@@ -527,22 +362,9 @@ def run_product_route_acceptance(args: argparse.Namespace) -> dict[str, Any]:
         if write_denied.get("target_reached") is True:
             raise AcceptanceError("denied write_file evidence reported target_reached=true")
 
-        for tool in ("get_secret", "get_env_secret"):
-            secret_event = require_event(events, tool, "blocked")
-            if secret_event.get("target_reached") is True:
-                raise AcceptanceError(f"{tool} blocked evidence reported target_reached=true")
-
-        for tool, _args, risk_family, redirect_playbook in GITHUB_RISKY_TOOLS:
-            event = require_event(events, tool, "pending")
-            observed_risk_family, observed_playbook = event_redirect_fields(event)
-            if observed_risk_family != risk_family:
-                raise AcceptanceError(f"{tool}: evidence missing risk_family={risk_family!r}")
-            if observed_playbook != redirect_playbook:
-                raise AcceptanceError(
-                    f"{tool}: evidence missing redirect_playbook_id={redirect_playbook!r}",
-                )
-            if event.get("target_reached") is True:
-                raise AcceptanceError(f"{tool} risky evidence reported target_reached=true before approval")
+        secret_event = require_event(events, "get_secret", "blocked")
+        if secret_event.get("target_reached") is True:
+            raise AcceptanceError("get_secret blocked evidence reported target_reached=true")
 
         privacy_scan_events(events_payload, secret_values=secret_values)
         runner_output = "".join(output_sink)
@@ -560,52 +382,44 @@ def run_product_route_acceptance(args: argparse.Namespace) -> dict[str, Any]:
         return {
             "ok": True,
             "candidate_git_sha": candidate_git_sha,
-            "wheel_sha256": wheel_sha256,
+            "wheel": {
+                "filename": wheel.name,
+                "sha256": wheel_sha256,
+            },
             "installed_package_version": install_info["version"],
             "doctor_tool_count": doctor_tool_count,
-            "doctor_smoke_ok": downstream.get("smoke_ok"),
             "scenarios": scenario_results,
-            "evidence_count": events_payload.get("evidence_count"),
-            "timeline_event_count": timeline_payload.get("event_count"),
-            "summary_record_count": summary_payload.get("record_count"),
+            "evidence_record_count": len(events),
             "privacy_scan": "clean",
-            "target_proof": {
-                "safe_read": scenario_results.get("safe_read") is True,
-                "write_pre_approval": scenario_results.get("write_pre_approval") is True,
-                "write_approved": scenario_results.get("write_approved") is True,
-                "write_denied": scenario_results.get("write_denied") is True,
-                "git_add": scenario_results.get("git_add") is True,
-                "pip_install": scenario_results.get("pip_install") is True,
-                "secret_block": scenario_results.get("secret_block") is True,
-                "github_ci_like": scenario_results.get("github_ci_like") is True,
-            },
         }
     finally:
         if not args.keep_tmp and args.work_dir is None:
+            import shutil
+
             shutil.rmtree(work_root, ignore_errors=True)
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--wheel", type=Path, default=None, help="Use an existing wheel instead of building one")
-    parser.add_argument("--work-dir", type=Path, default=None, help="Keep artifacts under this directory")
-    parser.add_argument("--keep-tmp", action="store_true", help="Do not delete the temporary work directory")
-    parser.add_argument("--python", default=sys.executable, help="Python executable used to build venvs")
-    parser.add_argument("--git-root", type=Path, default=None, help="Git repository root for candidate SHA resolution")
-    parser.add_argument("--git-sha", default=None, help="Override candidate git SHA in the report")
-    return parser
-
-
 def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--work-dir", type=Path, default=None, help="Keep all acceptance artifacts under this directory")
+    parser.add_argument("--wheel", type=Path, default=None, help="Candidate wheel to install instead of building one")
+    parser.add_argument("--python", default=sys.executable if sys_path_inserted else None, help="Python interpreter for build/install")
+    parser.add_argument("--git-root", type=Path, default=REPO_ROOT)
+    parser.add_argument("--git-sha", default=None)
+    parser.add_argument("--keep-tmp", action="store_true")
     args = parser.parse_args(argv)
+    if args.python is None:
+        args.python = sys.executable
+
+    captured_stdout = io.StringIO()
+    captured_stderr = io.StringIO()
     try:
-        report = run_product_route_acceptance(args)
+        with redirect_stdout(captured_stdout), redirect_stderr(captured_stderr):
+            report = run_product_route_acceptance(args)
     except AcceptanceError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        print(json.dumps({"ok": False, "error": str(exc)}, sort_keys=True), flush=True)
+        print(json.dumps({"ok": False, "error": str(exc)}, sort_keys=True))
         return 1
-    print(json.dumps(report, sort_keys=True), flush=True)
+    print(json.dumps(report, sort_keys=True))
     return 0
 
 

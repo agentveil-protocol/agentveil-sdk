@@ -38,26 +38,10 @@ sudo apt-get install -y python3.12-venv python3-pip
 
 ## What It Verifies
 
-The runner performs the customer path from the installed wheel, not from the
-source tree:
-
-1. Build a wheel, unless `--wheel` is supplied.
-2. Create a clean install virtualenv.
-3. Install the wheel into that virtualenv.
-4. Run `init --quickstart-filesystem --json`.
-5. Run `doctor --full --json`.
-6. Run `register --json`.
-7. Run `doctor --check-backend --json`.
-8. Start `agentveil-mcp-proxy run` as a stdio MCP server.
-9. Call `initialize` and `tools/list`.
-10. Call safe `list_workspace` and require success.
-11. Call risky `write_file` and require a fast `approval_required` response
-    containing `record_id` and `approval_url`.
-12. Open the approval URL and approve the request through the loopback UI.
-13. Retry the exact risky `write_file` call and require downstream execution.
-14. Run `events list --json`.
-15. Run `export-evidence`.
-16. Run `verify --output json`.
+The runner performs the public customer path from the installed wheel, not from
+the source tree. It checks install, setup, backend registration when enabled,
+MCP stdio startup, safe routed calls, one approval-required mutation, approval
+retry, evidence export, and verification.
 
 ## Release Rule
 
