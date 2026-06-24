@@ -25,8 +25,13 @@ agentveil-mcp-proxy hook cursor
 ## Installed Files
 
 Setup embeds the absolute path to the `agentveil-mcp-proxy` executable used
-during `setup cursor --yes` into `.cursor/hooks/agentveil-cursor-hook.sh`. The
-shim does not rely on Cursor GUI `PATH`. If the CLI moves or changes, rerun
+during `setup cursor --yes` into a platform-specific hook shim under
+`.cursor/hooks/`:
+
+- POSIX / macOS / Linux: `.cursor/hooks/agentveil-cursor-hook.sh`
+- Windows: `.cursor/hooks/agentveil-cursor-hook.cmd`
+
+The shim does not rely on Cursor GUI `PATH`. If the CLI moves or changes, rerun
 `agentveil-mcp-proxy setup cursor --yes`.
 
 `setup status --json` reports `hook_cli_resolved` and a bounded `hook_cli_ref`
@@ -35,7 +40,8 @@ shim does not rely on Cursor GUI `PATH`. If the CLI moves or changes, rerun
 Setup creates or merges:
 
 - `.cursor/hooks.json` (created when missing, otherwise merged additively)
-- `.cursor/hooks/agentveil-cursor-hook.sh`
+- `.cursor/hooks/agentveil-cursor-hook.sh` on POSIX / macOS / Linux, or
+  `.cursor/hooks/agentveil-cursor-hook.cmd` on Windows
 - `.cursor/.agentveil-cursor-hooks.json` (managed-file manifest)
 
 Existing unrelated Cursor hook entries in `hooks.json` are preserved. Setup is
