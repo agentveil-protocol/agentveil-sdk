@@ -85,6 +85,9 @@ def assert_hook_shim_platform_contract(shim_path: Path, *, platform_name: str | 
     if platform == PLATFORM_WINDOWS:
         assert shim_path.suffix.lower() == ".cmd"
         return
+    if is_windows_runtime():
+        assert shim_path.suffix.lower() == ".sh"
+        return
     assert shim_path.stat().st_mode & 0o111
 
 

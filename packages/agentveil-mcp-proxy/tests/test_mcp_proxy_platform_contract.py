@@ -94,7 +94,9 @@ def test_write_runnable_proxy_command_matches_platform_contract(tmp_path: Path) 
 
     posix_cli = write_runnable_proxy_command(tmp_path / "posix", platform_name=PLATFORM_POSIX)
     assert posix_cli.name == "agentveil-mcp-proxy"
-    assert posix_cli.stat().st_mode & 0o111
+    assert posix_cli.suffix == ""
+    if not is_windows_runtime():
+        assert posix_cli.stat().st_mode & 0o111
 
 
 def test_assert_hook_shim_platform_contract_posix(tmp_path: Path) -> None:
