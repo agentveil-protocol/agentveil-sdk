@@ -536,7 +536,9 @@ def test_cursor_open_command_prefers_cursor_cli_on_macos(tmp_path, monkeypatch):
 
     command = proxy_cli._cursor_open_command(tmp_path)
 
-    assert command == [cursor_cli, str(tmp_path)]
+    assert command is not None
+    assert Path(command[0]).as_posix() == cursor_cli
+    assert command[1] == str(tmp_path)
 
 
 def test_cli_setup_cursor_no_open_suppresses_cursor_open(tmp_path, monkeypatch, capsys):
