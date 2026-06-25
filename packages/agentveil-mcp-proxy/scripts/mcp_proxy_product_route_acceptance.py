@@ -48,7 +48,7 @@ from mcp_proxy_acceptance_lib import (
 )
 
 EXPECTED_TOOL_COUNT = 68
-EXPECTED_VERSION = "0.7.22"
+EXPECTED_VERSION = "0.7.23"
 RUN_NONINTERACTIVE_UI_ARGS = ["--approval-ui-mode", "none"]
 
 SAFE_READ_TOOL = "list_workspace"
