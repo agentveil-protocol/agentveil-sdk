@@ -19,6 +19,7 @@ import math
 import os
 from pathlib import Path
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -3670,7 +3671,17 @@ def build_parser() -> argparse.ArgumentParser:
     setup_cursor.add_argument(
         "--yes",
         action="store_true",
-        help="Apply the setup; without it the command only previews",
+        help="Apply setup non-interactively using --workspace or the current directory",
+    )
+    setup_cursor.add_argument(
+        "--choose-folder",
+        action="store_true",
+        help="Interactively choose the project folder to protect",
+    )
+    setup_cursor.add_argument(
+        "--no-open",
+        action="store_true",
+        help="Do not open Cursor after interactive setup",
     )
     setup_cursor.add_argument(
         "--passphrase-file",
@@ -3815,19 +3826,39 @@ def _prompt_cursor_setup_workspace(*, cwd: Path, input_fn) -> Path | None:
     return None
 
 
+def _open_cursor_workspace(workspace: Path) -> tuple[bool, str]:
+    """Open Cursor for *workspace* when supported; return (opened, message)."""
+    if sys.platform != "darwin":
+        return False, f"Open Cursor in this folder: {workspace}"
+    try:
+        completed = subprocess.run(
+            ["open", "-a", "Cursor", str(workspace)],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"Could not open Cursor automatically ({exc.__class__.__name__})."
+    if completed.returncode != 0:
+        return False, "Could not open Cursor automatically; open this project folder manually."
+    return True, "Cursor is opening this project folder."
+
+
 def _resolve_setup_cursor_target(
     *,
     workspace: Path | None,
     assume_yes: bool,
+    choose_folder: bool,
     output_json: bool,
     input_fn,
 ) -> tuple[Path | None, int | None]:
     """Resolve workspace for setup. Second value is early exit code when not None."""
     from agentveil_mcp_proxy import cursor_setup
 
-    if not assume_yes:
+    if choose_folder or not assume_yes:
         if output_json:
-            message = "confirmation required: pass --yes for non-interactive JSON setup"
+            message = "interactive folder selection is not available with --json"
             _print_json({
                 "ok": False,
                 "action": "setup-cursor",
@@ -3872,6 +3903,8 @@ def run_setup_cursor_cli(
     *,
     workspace: Path | None,
     assume_yes: bool,
+    choose_folder: bool,
+    open_after_setup: bool,
     passphrase_file: Path | None,
     force: bool,
     output_json: bool,
@@ -3883,6 +3916,7 @@ def run_setup_cursor_cli(
     target, early_exit = _resolve_setup_cursor_target(
         workspace=workspace,
         assume_yes=assume_yes,
+        choose_folder=choose_folder,
         output_json=output_json,
         input_fn=input_fn,
     )
@@ -3990,6 +4024,11 @@ def run_setup_cursor_cli(
         })
     else:
         print(cursor_setup.format_setup_success_message(target, status=status))
+        if open_after_setup and (choose_folder or not assume_yes):
+            opened, message = _open_cursor_workspace(target)
+            print(f"Cursor: {message}")
+            if not opened:
+                print(f"Open manually: {target}")
     return 0
 
 
@@ -4523,6 +4562,8 @@ def main(argv: list[str] | None = None) -> int:
                 return run_setup_cursor_cli(
                     workspace=args.workspace,
                     assume_yes=args.yes,
+                    choose_folder=args.choose_folder,
+                    open_after_setup=not args.no_open,
                     passphrase_file=args.passphrase_file,
                     force=args.force,
                     output_json=args.json_output,

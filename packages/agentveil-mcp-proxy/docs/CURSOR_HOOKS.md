@@ -10,12 +10,14 @@ agentveil-mcp-proxy setup cursor
 Interactive mode asks which project folder to protect (current folder, another path, or cancel). Non-interactive automation uses:
 
 ```bash
-agentveil-mcp-proxy setup cursor --yes
+agentveil-mcp-proxy setup cursor --choose-folder
+agentveil-mcp-proxy setup cursor --workspace ~/Desktop/my-app --yes
 ```
 
 Broad folders (home, Desktop, Downloads, `.worktrees` containers, and similar) are rejected with a clear message instead of silently installing.
 
-Then reload Cursor for the workspace and enable `agentveil-mcp-proxy` under **Settings → Tools & MCPs**.
+Setup opens Cursor for the selected workspace when supported. Then enable
+`agentveil-mcp-proxy` under **Settings → Tools & MCPs** if Cursor leaves it off.
 
 ## What setup writes
 

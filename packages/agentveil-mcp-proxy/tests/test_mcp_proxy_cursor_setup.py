@@ -450,6 +450,62 @@ def test_cli_setup_cursor_interactive_choose_other_folder(tmp_path, monkeypatch,
     assert "Tools & MCPs" in out
 
 
+def test_cli_setup_cursor_choose_folder_opens_cursor(tmp_path, monkeypatch, capsys):
+    project = tmp_path / "my-project"
+    project.mkdir()
+    monkeypatch.chdir(tmp_path)
+    _mock_successful_setup(monkeypatch, tmp_path)
+    opened: list[Path] = []
+    monkeypatch.setattr(
+        proxy_cli,
+        "_prompt_cursor_setup_workspace",
+        lambda *, cwd, input_fn: project,
+    )
+    monkeypatch.setattr(
+        proxy_cli,
+        "_open_cursor_workspace",
+        lambda workspace: (opened.append(workspace), (True, "Cursor is opening this project folder."))[1],
+    )
+
+    assert main(["setup", "cursor", "--choose-folder"]) == 0
+
+    assert opened == [project.resolve()]
+    out = capsys.readouterr().out
+    assert "Cursor is opening this project folder." in out
+
+
+def test_cli_setup_cursor_no_open_suppresses_cursor_open(tmp_path, monkeypatch, capsys):
+    project = tmp_path / "my-project"
+    project.mkdir()
+    monkeypatch.chdir(tmp_path)
+    _mock_successful_setup(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        proxy_cli,
+        "_prompt_cursor_setup_workspace",
+        lambda *, cwd, input_fn: project,
+    )
+
+    def fail_open(_workspace):
+        raise AssertionError("Cursor must not open with --no-open")
+
+    monkeypatch.setattr(proxy_cli, "_open_cursor_workspace", fail_open)
+
+    assert main(["setup", "cursor", "--choose-folder", "--no-open"]) == 0
+    assert "Cursor is opening" not in capsys.readouterr().out
+
+
+def test_cli_setup_cursor_yes_does_not_open_cursor(tmp_path, monkeypatch, capsys):
+    _mock_successful_setup(monkeypatch, tmp_path)
+
+    def fail_open(_workspace):
+        raise AssertionError("Cursor must not open in --yes mode")
+
+    monkeypatch.setattr(proxy_cli, "_open_cursor_workspace", fail_open)
+
+    assert main(["setup", "cursor", "--workspace", str(tmp_path), "--yes"]) == 0
+    assert "Cursor is opening" not in capsys.readouterr().out
+
+
 def test_home_folder_guard_blocks_home(tmp_path, monkeypatch, capsys):
     home = tmp_path / "home"
     home.mkdir()
