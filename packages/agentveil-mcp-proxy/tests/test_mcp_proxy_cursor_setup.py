@@ -529,6 +529,16 @@ def test_cli_setup_cursor_choose_folder_opens_cursor(tmp_path, monkeypatch, caps
     assert "Cursor is opening this project folder." in out
 
 
+def test_cursor_open_command_prefers_cursor_cli_on_macos(tmp_path, monkeypatch):
+    cursor_cli = "/Applications/Cursor.app/Contents/Resources/app/bin/cursor"
+    monkeypatch.setattr(proxy_cli.sys, "platform", "darwin")
+    monkeypatch.setattr(Path, "is_file", lambda self: str(self) == cursor_cli)
+
+    command = proxy_cli._cursor_open_command(tmp_path)
+
+    assert command == [cursor_cli, str(tmp_path)]
+
+
 def test_cli_setup_cursor_no_open_suppresses_cursor_open(tmp_path, monkeypatch, capsys):
     project = tmp_path / "my-project"
     project.mkdir()

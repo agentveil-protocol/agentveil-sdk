@@ -3880,13 +3880,24 @@ def _prompt_cursor_setup_workspace(*, cwd: Path, input_fn) -> Path | None:
     return None
 
 
+def _cursor_open_command(workspace: Path) -> list[str] | None:
+    """Return the preferred Cursor opener command for this platform."""
+    if sys.platform != "darwin":
+        return None
+    cursor_cli = Path("/Applications/Cursor.app/Contents/Resources/app/bin/cursor")
+    if cursor_cli.is_file():
+        return [str(cursor_cli), str(workspace)]
+    return ["open", "-a", "Cursor", str(workspace)]
+
+
 def _open_cursor_workspace(workspace: Path) -> tuple[bool, str]:
     """Open Cursor for *workspace* when supported; return (opened, message)."""
-    if sys.platform != "darwin":
+    command = _cursor_open_command(workspace)
+    if command is None:
         return False, f"Open Cursor in this folder: {workspace}"
     try:
         completed = subprocess.run(
-            ["open", "-a", "Cursor", str(workspace)],
+            command,
             text=True,
             capture_output=True,
             check=False,
