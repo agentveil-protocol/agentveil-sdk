@@ -467,3 +467,107 @@ def test_load_settings_non_object_raises(tmp_path: Path) -> None:
     p.write_text("[1,2,3]", encoding="utf-8")
     with pytest.raises(HookSetupError):
         load_settings(p)
+
+
+# ----- P10D.14 S5: one-command connector (.mcp.json route + status) ----------
+
+from agentveil_mcp_proxy.claude_hook_setup import (
+    AGENTVEIL_MCP_SERVER_NAME,
+    connector_status,
+    mcp_route_present,
+    project_mcp_config_path,
+    remove_mcp_route,
+)
+
+
+def _write_mcp(project: Path, data: dict) -> None:
+    p = project_mcp_config_path(project)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _seed_agentveil_mcp(project: Path, *, with_other: bool = False) -> None:
+    servers = {AGENTVEIL_MCP_SERVER_NAME: {"command": "agentveil-mcp-proxy", "args": ["run"]}}
+    if with_other:
+        servers["other-server"] = {"command": "other", "args": []}
+    _write_mcp(project, {"mcpServers": servers})
+
+
+def test_mcp_route_present_detects_agentveil_entry(tmp_path: Path) -> None:
+    assert mcp_route_present(tmp_path) is False
+    _seed_agentveil_mcp(tmp_path)
+    assert mcp_route_present(tmp_path) is True
+
+
+def test_remove_mcp_route_removes_only_agentveil(tmp_path: Path) -> None:
+    _seed_agentveil_mcp(tmp_path, with_other=True)
+    result = remove_mcp_route(tmp_path)
+    assert result.removed is True
+    data = json.loads(project_mcp_config_path(tmp_path).read_text(encoding="utf-8"))
+    assert AGENTVEIL_MCP_SERVER_NAME not in data["mcpServers"]
+    assert "other-server" in data["mcpServers"], "unrelated MCP server must survive"
+
+
+def test_remove_mcp_route_idempotent_and_cleans_empty(tmp_path: Path) -> None:
+    # no file
+    assert remove_mcp_route(tmp_path).removed is False
+    # only agentveil -> removed + mcpServers key cleaned
+    _seed_agentveil_mcp(tmp_path)
+    assert remove_mcp_route(tmp_path).removed is True
+    data = json.loads(project_mcp_config_path(tmp_path).read_text(encoding="utf-8"))
+    assert "mcpServers" not in data or data.get("mcpServers") == {}
+    # second remove is a no-op
+    assert remove_mcp_route(tmp_path).removed is False
+
+
+def test_remove_mcp_route_fail_closed_invalid_json(tmp_path: Path) -> None:
+    p = project_mcp_config_path(tmp_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    garbage = "{bad json"
+    p.write_text(garbage, encoding="utf-8")
+    with pytest.raises(HookSetupError):
+        remove_mcp_route(tmp_path)
+    assert p.read_text(encoding="utf-8") == garbage  # not rewritten
+
+
+def test_remove_mcp_route_preserves_unrelated_top_level(tmp_path: Path) -> None:
+    _write_mcp(tmp_path, {
+        "mcpServers": {AGENTVEIL_MCP_SERVER_NAME: {"command": "x"}},
+        "otherKey": {"keep": True},
+    })
+    remove_mcp_route(tmp_path)
+    data = json.loads(project_mcp_config_path(tmp_path).read_text(encoding="utf-8"))
+    assert data["otherKey"] == {"keep": True}
+
+
+def test_connector_status_missing_is_unsafe(tmp_path: Path) -> None:
+    st = connector_status(tmp_path, proxy_route_present=False)
+    assert st["status"] == "unsafe"
+    assert st["hook"] == "missing"
+    assert st["mcp_route"] == "missing"
+    assert st["proxy_route"] == "missing"
+    assert st["next_step"].startswith("run ")
+
+
+def test_connector_status_complete_is_advisory(tmp_path: Path) -> None:
+    install_hook(tmp_path)
+    _seed_agentveil_mcp(tmp_path)
+    st = connector_status(tmp_path, proxy_route_present=True)
+    assert st["status"] == "advisory"
+    assert st["hook"] == "installed"
+    assert st["mcp_route"] == "configured"
+    assert st["proxy_route"] == "configured"
+    assert st["restart_required"] is True
+
+
+def test_connector_status_bounded_no_absolute_paths(tmp_path: Path) -> None:
+    install_hook(tmp_path)
+    _seed_agentveil_mcp(tmp_path)
+    st = connector_status(tmp_path, proxy_route_present=True)
+    serialized = json.dumps(st)
+    assert str(tmp_path) not in serialized
+    assert "/Users/" not in serialized and "/private/" not in serialized
+    assert set(st.keys()) == {
+        "scope", "status", "hook", "mcp_route", "proxy_route",
+        "restart_required", "matched_tool_classes", "next_step",
+    }

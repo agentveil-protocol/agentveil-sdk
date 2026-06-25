@@ -3659,9 +3659,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     setup_status = setup_subparsers.add_parser(
         "status",
-        help="Report setup status from actual proxy and client config files",
+        help=(
+            "Without --home: project-local Claude connector status. "
+            "With --home: adaptive setup wizard status."
+        ),
     )
-    setup_status.add_argument("--home", type=Path, required=True, help="AVP home to inspect")
+    # --home is optional (option A): bare `setup status` reports the project
+    # connector status; `setup status --home <path>` keeps the adaptive wizard
+    # behavior, back-compatible with existing callers.
+    setup_status.add_argument("--home", type=Path, default=None, help="AVP home to inspect (wizard mode)")
+    setup_status.add_argument(
+        "--project-dir",
+        type=Path,
+        default=None,
+        help="Project directory for connector status (default: current directory)",
+    )
     setup_status.add_argument(
         "--client",
         default="cursor",
@@ -3701,6 +3713,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="Desktop MCP client target to restore",
     )
     _add_json_arg(setup_restore)
+
+    setup_claude_code = setup_subparsers.add_parser(
+        "claude-code",
+        help="One-command Claude Code connector setup (proxy route + MCP route + hook)",
+    )
+    setup_claude_code.add_argument(
+        "--project-dir", type=Path, default=None,
+        help="Project directory to set up (default: current directory)",
+    )
+    setup_claude_code.add_argument(
+        "--sandbox", type=Path, default=None,
+        help="Quickstart filesystem sandbox path (default: <project>/sandbox)",
+    )
+    setup_claude_code.add_argument(
+        "--yes", action="store_true",
+        help="Apply the setup; without it the command only previews",
+    )
+    setup_claude_code.add_argument(
+        "--passphrase-file", type=Path, default=None,
+        help="Encrypt the proxy identity with this passphrase file (default: plaintext quickstart)",
+    )
+    setup_claude_code.add_argument(
+        "--force", action="store_true",
+        help="Re-initialize the proxy route even if its config already exists",
+    )
+    _add_json_arg(setup_claude_code)
+
+    setup_remove = setup_subparsers.add_parser(
+        "remove",
+        help="Remove a one-command connector (AgentVeil-managed entries only)",
+    )
+    setup_remove.add_argument("target", choices=["claude-code"], help="Connector to remove")
+    setup_remove.add_argument(
+        "--project-dir", type=Path, default=None,
+        help="Project directory to remove from (default: current directory)",
+    )
+    setup_remove.add_argument(
+        "--yes", action="store_true",
+        help="Apply the removal; without it the command only previews",
+    )
+    _add_json_arg(setup_remove)
 
     install_claude_hook = subparsers.add_parser(
         "install-claude-hook",
@@ -3911,6 +3964,276 @@ def run_uninstall_claude_hook_cli(
             print("Restart Claude Code to drop the hook.")
         else:
             print("No AgentVeil-managed hook entry found; nothing to remove.")
+    return 0
+
+
+def _setup_claude_code_home(project_dir: Path) -> Path:
+    """Project-local proxy home for the one-command connector."""
+    return project_dir / ".avp"
+
+
+def _resolve_setup_proxy_command() -> str | None:
+    """Resolve the console script used by generated Claude setup config."""
+    import shutil
+
+    resolved = shutil.which("agentveil-mcp-proxy")
+    if resolved:
+        return resolved
+    invoked = Path(sys.argv[0])
+    if invoked.exists() and invoked.name == "agentveil-mcp-proxy":
+        return str(invoked.resolve())
+    return None
+
+
+def run_setup_claude_code_cli(
+    *,
+    project_dir: Path | None,
+    sandbox: Path | None,
+    assume_yes: bool,
+    passphrase_file: Path | None,
+    force: bool,
+    output_json: bool,
+) -> int:
+    """One-command Claude Code connector setup.
+
+    Orchestrates the existing primitives end-to-end: proxy quickstart route
+    (`init_proxy`), Claude MCP route (`connect claude_code`), and the
+    project-local hook (`install_hook`). It does not duplicate policy/approval
+    logic. It does not claim Claude Code has reloaded; it states restart is
+    required.
+    """
+    from agentveil_mcp_proxy import claude_hook_setup
+
+    target = (Path(project_dir) if project_dir is not None else Path.cwd()).resolve()
+    sandbox_path = Path(sandbox) if sandbox is not None else (target / "sandbox")
+    home = _setup_claude_code_home(target)
+    config_path = home / "mcp-proxy" / "config.json"
+
+    if not assume_yes:
+        message = (
+            f"Would set up the Claude Code connector in {target}: proxy quickstart "
+            f"route, project .mcp.json, and the project hook. Re-run with --yes."
+        )
+        if output_json:
+            _print_json({
+                "ok": False, "action": "setup-claude-code", "applied": False,
+                "errors": ["confirmation required: pass --yes"], "warnings": [message],
+            })
+        else:
+            print(message)
+        return 0
+
+    quiet = io.StringIO()
+    # 1. Proxy quickstart route (idempotent unless --force).
+    proxy_present = config_path.exists()
+    proxy_initialized = False
+    if force or not proxy_present:
+        downstream = quickstart_filesystem_downstream(sandbox_path)
+        try:
+            init_proxy(
+                home=home,
+                config_path=None,
+                downstream_config=downstream,
+                plaintext=(passphrase_file is None),
+                passphrase_file=passphrase_file,
+                force=force,
+                err=quiet,
+            )
+        except ProxyCliError:
+            raise
+        proxy_initialized = True
+
+    # 2. Claude Code MCP route (.mcp.json) — reuse the connect command. Resolve
+    # the installed console script explicitly (matches the supported manual
+    # `connect --proxy-command "$(which agentveil-mcp-proxy)"` path). The route
+    # is considered configured once .mcp.json carries the AgentVeil entry; a
+    # non-zero launch-proof is not fatal to setup if the route was written.
+    resolved_proxy_command = _resolve_setup_proxy_command()
+    run_connect_cli(
+        client_id="claude_code",
+        home=home,
+        project_root=target,
+        write=True,
+        proxy_command=resolved_proxy_command,
+        out=quiet,
+    )
+    if not claude_hook_setup.mcp_route_present(target):
+        raise ProxyCliError(
+            "could not write the Claude MCP route; ensure agentveil-mcp-proxy is "
+            "installed and on PATH",
+            exit_code=1,
+        )
+
+    # 3. Project-local hook.
+    try:
+        install_result = claude_hook_setup.install_hook(target)
+    except claude_hook_setup.HookSetupError as exc:
+        raise ProxyCliError(str(exc), exit_code=1) from exc
+
+    # 4. Approval Center: take ownership of lifecycle. Without a live center,
+    # controlled MCP write approvals would surface URLs that the user cannot
+    # open (ERR_CONNECTION_REFUSED). Setup must not claim ready in that case.
+    from agentveil_mcp_proxy import claude_center_lifecycle
+
+    proxy_cmd_for_center = resolved_proxy_command
+    if not proxy_cmd_for_center:
+        raise ProxyCliError(
+            "agentveil-mcp-proxy console script not on PATH; cannot start Approval Center",
+            exit_code=1,
+        )
+    center_result = claude_center_lifecycle.ensure_running(
+        home=home,
+        proxy_command=proxy_cmd_for_center,
+        passphrase_file=passphrase_file,
+    )
+    center_running = center_result.status.state == "running"
+
+    # 5. Bounded status summary.
+    status = claude_hook_setup.connector_status(target, proxy_route_present=config_path.exists())
+    sandbox_label = "sandbox" if sandbox is None else "custom"
+
+    if not center_running:
+        if output_json:
+            _print_json({
+                "ok": False,
+                "action": "setup-claude-code",
+                "applied": True,
+                "scope": "project",
+                "proxy_route_initialized": proxy_initialized,
+                "mcp_route_relpath": ".mcp.json",
+                "hook_relpath": ".claude/settings.json",
+                "sandbox_relpath": sandbox_label,
+                "identity_encrypted": passphrase_file is not None,
+                "approval_center": {"state": center_result.status.state, "reason": center_result.reason},
+                "errors": [
+                    "approval_center not running; controlled MCP writes would surface "
+                    "unreachable approval URLs. Setup is not ready/protected."
+                ],
+                "warnings": [],
+            })
+        else:
+            print("Claude Code connector partially set up:")
+            print(f"  proxy route: {'initialized' if proxy_initialized else 'already present'}")
+            print("  MCP route:   .mcp.json written")
+            print("  hook:        .claude/settings.json present")
+            print(f"  approval_center: {center_result.status.state} ({center_result.reason})")
+            print("ERROR: setup is NOT ready — Approval Center could not start.", file=sys.stderr)
+        return 1
+
+    if output_json:
+        _print_operator_json({
+            "ok": True,
+            "action": "setup-claude-code",
+            "applied": True,
+            "scope": "project",
+            "proxy_route_initialized": proxy_initialized,
+            "mcp_route_relpath": ".mcp.json",
+            "hook_relpath": ".claude/settings.json",
+            "sandbox_relpath": sandbox_label,
+            "identity_encrypted": passphrase_file is not None,
+            "approval_center": {
+                "state": center_result.status.state,
+                "started": center_result.started,
+                "reused": center_result.reused,
+                "restarted": center_result.restarted,
+            },
+            "reload_required": True,
+            "status": status,
+        })
+    else:
+        print("Claude Code connector set up for this project:")
+        print(f"  proxy route: {'initialized' if proxy_initialized else 'already present'}")
+        print("  MCP route:   .mcp.json written")
+        print(f"  hook:        .claude/settings.json ({'created' if install_result.created_settings else 'updated'})")
+        if passphrase_file is None:
+            print("  identity:    stored unencrypted (quickstart); use --passphrase-file to encrypt")
+        action = "reused" if center_result.reused else ("restarted" if center_result.restarted else "started")
+        print(f"  approval_center: running ({action})")
+        print(f"  status:      {status['status']}")
+        print("Restart Claude Code for this project, then run `agentveil-mcp-proxy setup status`.")
+    return 0
+
+
+def run_setup_connector_status_cli(*, project_dir: Path | None, output_json: bool) -> int:
+    """Project-local Claude connector status (bare `setup status`)."""
+    from agentveil_mcp_proxy import claude_center_lifecycle, claude_hook_setup
+
+    target = (Path(project_dir) if project_dir is not None else Path.cwd()).resolve()
+    home = _setup_claude_code_home(target)
+    config_path = home / "mcp-proxy" / "config.json"
+    status = claude_hook_setup.connector_status(target, proxy_route_present=config_path.exists())
+    center = claude_center_lifecycle.check_status(home)
+    status["approval_center"] = center.state
+    # Setup is not "ready" unless the center is running; downgrade product
+    # status accordingly so we never say protected with a dead approval path.
+    if center.state != "running" and status["status"] != "unsafe":
+        status["status"] = "unsafe" if status["mcp_route"] == "missing" else "advisory"
+    if output_json:
+        _print_operator_json(status)
+    else:
+        print(f"status: {status['status']}")
+        print(f"  hook:       {status['hook']}")
+        print(f"  mcp route:  {status['mcp_route']}")
+        print(f"  proxy route:{status['proxy_route']}")
+        print(f"  approval_center: {center.state}")
+        print(f"  restart required: {status['restart_required']}")
+        print(f"  next: {status['next_step']}")
+    return 0
+
+
+def run_setup_remove_claude_code_cli(
+    *, project_dir: Path | None, assume_yes: bool, output_json: bool
+) -> int:
+    """Remove the one-command Claude connector — AgentVeil-managed entries only."""
+    from agentveil_mcp_proxy import claude_hook_setup
+
+    target = (Path(project_dir) if project_dir is not None else Path.cwd()).resolve()
+
+    if not assume_yes:
+        message = (
+            f"Would remove AgentVeil-managed Claude hook and MCP route entries from "
+            f"{target} (unrelated settings and MCP servers preserved). Re-run with --yes."
+        )
+        if output_json:
+            _print_json({
+                "ok": False, "action": "setup-remove-claude-code", "applied": False,
+                "errors": ["confirmation required: pass --yes"], "warnings": [message],
+            })
+        else:
+            print(message)
+        return 0
+
+    from agentveil_mcp_proxy import claude_center_lifecycle
+
+    try:
+        hook_result = claude_hook_setup.uninstall_hook(target)
+        route_result = claude_hook_setup.remove_mcp_route(target)
+    except claude_hook_setup.HookSetupError as exc:
+        raise ProxyCliError(str(exc), exit_code=1) from exc
+
+    center_stop = claude_center_lifecycle.stop_if_managed(_setup_claude_code_home(target))
+    removed_any = (
+        hook_result.removed_entries > 0
+        or route_result.removed
+        or center_stop["stopped"]
+    )
+    if output_json:
+        _print_operator_json({
+            "ok": True,
+            "action": "setup-remove-claude-code",
+            "applied": True,
+            "scope": "project",
+            "hook_entries_removed": hook_result.removed_entries,
+            "mcp_route_removed": route_result.removed,
+            "approval_center_stopped": center_stop["stopped"],
+            "reload_required": removed_any,
+        })
+    else:
+        print(f"Removed: hook entries={hook_result.removed_entries}, mcp route={route_result.removed}, "
+              f"approval_center={'stopped' if center_stop['stopped'] else 'not running'}")
+        print("Unrelated Claude settings and MCP servers preserved.")
+        if removed_any:
+            print("Restart Claude Code for this project to drop the connector.")
     return 0
 
 
@@ -4310,6 +4633,13 @@ def main(argv: list[str] | None = None) -> int:
                     output_json=args.json_output,
                 )
             if args.setup_action == "status":
+                # Option A: bare `setup status` = project connector status;
+                # `setup status --home <path>` = existing adaptive wizard status.
+                if args.home is None:
+                    return run_setup_connector_status_cli(
+                        project_dir=args.project_dir,
+                        output_json=args.json_output,
+                    )
                 return print_setup_status_cli(
                     home=args.home,
                     client_id=args.client,
@@ -4324,7 +4654,26 @@ def main(argv: list[str] | None = None) -> int:
                     client_id=args.client,
                     output_json=args.json_output,
                 )
-            raise ProxyCliError("setup action must be run, status, or restore")
+            if args.setup_action == "claude-code":
+                return run_setup_claude_code_cli(
+                    project_dir=args.project_dir,
+                    sandbox=args.sandbox,
+                    assume_yes=args.yes,
+                    passphrase_file=args.passphrase_file,
+                    force=args.force,
+                    output_json=args.json_output,
+                )
+            if args.setup_action == "remove":
+                if args.target != "claude-code":
+                    raise ProxyCliError("setup remove target must be claude-code")
+                return run_setup_remove_claude_code_cli(
+                    project_dir=args.project_dir,
+                    assume_yes=args.yes,
+                    output_json=args.json_output,
+                )
+            raise ProxyCliError(
+                "setup action must be claude-code, status, remove, run, or restore"
+            )
         if args.command == "install-claude-hook":
             return run_install_claude_hook_cli(
                 project_dir=args.project_dir,

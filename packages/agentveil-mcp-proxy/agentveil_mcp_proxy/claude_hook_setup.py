@@ -439,20 +439,158 @@ def status_hook(project_dir: Path, *, evidence_path: Path | None = None) -> Stat
     return result
 
 
+# ----- project .mcp.json route (written by `connect claude_code`) ------------
+
+# mcpServers key that `connect claude_code` writes into the project .mcp.json.
+AGENTVEIL_MCP_SERVER_NAME = "agentveil-mcp-proxy"
+
+
+def project_mcp_config_path(project_dir: Path) -> Path:
+    return Path(project_dir) / ".mcp.json"
+
+
+def load_mcp_config(path: Path) -> dict[str, Any]:
+    """Load a project .mcp.json. Returns {} if absent. Refuses bad JSON."""
+    if not path.exists():
+        return {}
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise HookSetupError(f"cannot read {path}: {exc}") from exc
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HookSetupError(
+            f"existing {path} is not valid JSON; refusing to overwrite ({exc})"
+        ) from exc
+    if not isinstance(data, dict):
+        raise HookSetupError(f"existing {path} must be a JSON object")
+    return data
+
+
+def mcp_route_present(project_dir: Path) -> bool:
+    """True if the AgentVeil MCP route is configured in the project .mcp.json."""
+    try:
+        data = load_mcp_config(project_mcp_config_path(project_dir))
+    except HookSetupError:
+        return False
+    servers = data.get("mcpServers")
+    return isinstance(servers, dict) and AGENTVEIL_MCP_SERVER_NAME in servers
+
+
+@dataclass(frozen=True)
+class RemoveMcpRouteResult:
+    config_path: Path
+    removed: bool
+    config_existed: bool
+
+
+def remove_mcp_route(project_dir: Path) -> RemoveMcpRouteResult:
+    """Remove only the AgentVeil mcpServers entry from project .mcp.json.
+
+    Preserves unrelated MCP servers and unrelated keys. Idempotent. Invalid
+    JSON raises without rewriting.
+    """
+    path = project_mcp_config_path(project_dir)
+    if not path.exists():
+        return RemoveMcpRouteResult(config_path=path, removed=False, config_existed=False)
+
+    data = load_mcp_config(path)  # raises on invalid JSON
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict) or AGENTVEIL_MCP_SERVER_NAME not in servers:
+        return RemoveMcpRouteResult(config_path=path, removed=False, config_existed=True)
+
+    servers.pop(AGENTVEIL_MCP_SERVER_NAME, None)
+    if servers:
+        data["mcpServers"] = servers
+    else:
+        data.pop("mcpServers", None)
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    return RemoveMcpRouteResult(config_path=path, removed=True, config_existed=True)
+
+
+# ----- aggregated connector status ------------------------------------------
+
+
+def connector_status(
+    project_dir: Path,
+    *,
+    evidence_path: Path | None = None,
+    proxy_route_present: bool = False,
+) -> dict[str, Any]:
+    """Bounded one-command connector status.
+
+    Aggregates the project-local hook status, the .mcp.json route, and a
+    caller-supplied proxy-route flag into a single product-facing summary. No
+    absolute paths, prompts, secrets, or payloads.
+    """
+    hook = status_hook(project_dir, evidence_path=evidence_path)
+    route_present = mcp_route_present(project_dir)
+
+    if hook.state == "invalid-json":
+        hook_state = "stale"
+    elif not hook.managed_hook_present:
+        hook_state = "missing"
+    elif hook.state == "stale":
+        hook_state = "stale"
+    elif hook.status == "protected":
+        hook_state = "fired"
+    else:
+        hook_state = "installed"
+
+    configured = hook.managed_hook_present and route_present and proxy_route_present
+    if not configured or hook.state == "invalid-json":
+        status = "unsafe"
+    elif hook.status == "protected":
+        status = "protected"
+    else:
+        status = "advisory"
+
+    if not hook.managed_hook_present or not route_present or not proxy_route_present:
+        restart_required: bool | None = None  # setup incomplete; reload not the issue yet
+        next_step = "run `agentveil-mcp-proxy setup claude-code --yes`"
+    elif hook.status == "protected":
+        restart_required = False
+        next_step = "connector active; nothing to do"
+    else:
+        restart_required = True
+        next_step = "restart Claude Code, then run `agentveil-mcp-proxy setup status`"
+
+    return {
+        "scope": "project",
+        "status": status,
+        "hook": hook_state,
+        "mcp_route": "configured" if route_present else "missing",
+        "proxy_route": "configured" if proxy_route_present else "missing",
+        "restart_required": restart_required,
+        "matched_tool_classes": list(MATCHED_TOOL_CLASSES),
+        "next_step": next_step,
+    }
+
+
 __all__ = [
     "AGENTVEIL_HOOK_MARKER",
+    "AGENTVEIL_MCP_SERVER_NAME",
     "HOOK_MATCHER",
     "MATCHED_TOOL_CLASSES",
     "HookSetupError",
     "InstallResult",
+    "RemoveMcpRouteResult",
     "StatusResult",
     "UninstallResult",
     "build_hook_command",
     "build_managed_hook_entry",
+    "connector_status",
     "install_hook",
+    "load_mcp_config",
     "load_settings",
+    "mcp_route_present",
     "project_evidence_path",
+    "project_mcp_config_path",
     "project_settings_path",
+    "remove_mcp_route",
     "status_hook",
     "uninstall_hook",
 ]
