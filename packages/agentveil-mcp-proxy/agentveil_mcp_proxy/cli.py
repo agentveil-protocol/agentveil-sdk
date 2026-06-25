@@ -10,6 +10,7 @@ in-memory circuit breaker for sustained backend failures.
 from __future__ import annotations
 
 import argparse
+import contextlib
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 import getpass
@@ -19,6 +20,7 @@ import math
 import os
 from pathlib import Path
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -175,16 +177,9 @@ from agentveil_mcp_proxy.role_presets import (
     resolve_role_preset,
     user_facing_setup_label,
 )
-from agentveil_mcp_proxy.cursor_hooks import CursorHookError, run_cursor_hook
+from agentveil_mcp_proxy.cursor_hooks import main as run_cursor_hook_main
 from agentveil_mcp_proxy.cursor_setup import (
     CursorSetupError,
-    assert_cursor_setup_output_is_privacy_safe,
-    cursor_remove_result_to_dict,
-    cursor_setup_result_to_dict,
-    cursor_setup_status_to_dict,
-    derive_cursor_setup_status,
-    remove_cursor_hooks,
-    setup_cursor_hooks,
 )
 from agentveil_mcp_proxy.runtime_gate import RuntimeGateClient
 
@@ -1578,15 +1573,8 @@ def print_setup_status_cli(
 
     sink = out or sys.stdout
     if home is None:
-        status = derive_cursor_setup_status(workspace=workspace)
-        payload = cursor_setup_status_to_dict(status)
-        assert_cursor_setup_output_is_privacy_safe(payload)
-        if output_json:
-            _print_json(payload, sink)
-        else:
-            for key, value in payload.items():
-                sink.write(f"{key}={value}\n")
-        return 0
+        with contextlib.redirect_stdout(sink):
+            return run_setup_cursor_status_cli(workspace=workspace, output_json=output_json)
 
     status = derive_setup_status(
         home=home,
@@ -1612,20 +1600,28 @@ def run_cursor_setup_cli(
     output_json: bool = False,
 ) -> int:
     sink = out or sys.stdout
-    result = setup_cursor_hooks(
-        workspace=workspace,
-        yes=yes,
-        setup_argv0=sys.argv[0],
-    )
-    payload = cursor_setup_result_to_dict(result)
-    assert_cursor_setup_output_is_privacy_safe(payload)
-    if output_json:
-        _print_json(payload, sink)
-    else:
-        sink.write(f"{payload['message']}\n")
-        for error in payload["errors"]:
-            sink.write(f"ERROR: {error}\n")
-    return 0 if result.ok else 2
+    if not yes:
+        if output_json:
+            _print_json({
+                "ok": False,
+                "action": "setup-cursor",
+                "applied": False,
+                "errors": ["confirmation required: pass --yes"],
+                "warnings": ["Would set up the Cursor connector. Re-run with --yes."],
+            }, sink)
+        else:
+            sink.write("Would set up the Cursor connector. Re-run with --yes.\n")
+        return 0
+    with contextlib.redirect_stdout(sink):
+        return run_setup_cursor_cli(
+            workspace=workspace,
+            assume_yes=True,
+            choose_folder=False,
+            open_after_setup=False,
+            passphrase_file=None,
+            force=False,
+            output_json=output_json,
+        )
 
 
 def run_cursor_remove_cli(
@@ -1636,16 +1632,12 @@ def run_cursor_remove_cli(
     output_json: bool = False,
 ) -> int:
     sink = out or sys.stdout
-    result = remove_cursor_hooks(workspace=workspace, yes=yes)
-    payload = cursor_remove_result_to_dict(result)
-    assert_cursor_setup_output_is_privacy_safe(payload)
-    if output_json:
-        _print_json(payload, sink)
-    else:
-        sink.write(f"{payload['message']}\n")
-        for error in payload["errors"]:
-            sink.write(f"ERROR: {error}\n")
-    return 0 if result.ok else 2
+    with contextlib.redirect_stdout(sink):
+        return run_setup_remove_cursor_cli(
+            workspace=workspace,
+            assume_yes=yes,
+            output_json=output_json,
+        )
 
 
 def run_cursor_hook_cli(
@@ -1656,9 +1648,12 @@ def run_cursor_hook_cli(
 ) -> int:
     sink = out or sys.stdout
     raw = stdin_text if stdin_text is not None else sys.stdin.read()
-    response, _evidence = run_cursor_hook(stdin_text=raw, workspace=workspace)
-    sink.write(json.dumps(response, sort_keys=True, separators=(",", ":")) + "\n")
-    return 0 if response.get("permission") != "error" else 2
+    workspace_path = (workspace or Path.cwd()).resolve()
+    return run_cursor_hook_main(
+        ["--workspace", str(workspace_path)],
+        stdin=io.StringIO(raw),
+        stdout=sink,
+    )
 
 
 def print_control_status_cli(
@@ -3739,58 +3734,64 @@ def build_parser() -> argparse.ArgumentParser:
 
     setup_cursor = setup_subparsers.add_parser(
         "cursor",
-        help="Install project-local Cursor hooks for the current workspace",
+        help="One-command Cursor connector setup (hooks + MCP route + Approval Center)",
     )
     setup_cursor.add_argument(
         "--workspace",
         type=Path,
         default=None,
-        help="Workspace root (default: current directory)",
+        help="Workspace root to set up (default: current directory)",
     )
     setup_cursor.add_argument(
         "--yes",
         action="store_true",
-        help="Confirm project-local Cursor hook installation",
+        help="Apply setup non-interactively using --workspace or the current directory",
+    )
+    setup_cursor.add_argument(
+        "--choose-folder",
+        action="store_true",
+        help="Interactively choose the project folder to protect",
+    )
+    setup_cursor.add_argument(
+        "--no-open",
+        action="store_true",
+        help="Do not open Cursor after interactive setup",
+    )
+    setup_cursor.add_argument(
+        "--passphrase-file",
+        type=Path,
+        default=None,
+        help="Encrypt the proxy identity with this passphrase file (default: workspace .agentveil/passphrase)",
+    )
+    setup_cursor.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-initialize the proxy route even if its config already exists",
     )
     _add_json_arg(setup_cursor)
 
-    setup_remove = setup_subparsers.add_parser(
-        "remove",
-        help="Remove setup-managed files for a supported target",
-    )
-    setup_remove.add_argument(
-        "target",
-        choices=["cursor"],
-        help="Setup target to remove",
-    )
-    setup_remove.add_argument(
-        "--workspace",
-        type=Path,
-        default=None,
-        help="Workspace root (default: current directory)",
-    )
-    setup_remove.add_argument(
-        "--yes",
-        action="store_true",
-        help="Confirm removal of setup-managed Cursor hook files",
-    )
-    _add_json_arg(setup_remove)
-
     setup_status = setup_subparsers.add_parser(
         "status",
-        help="Report setup status from actual proxy/client files or Cursor hooks",
+        help=(
+            "Without --home: project-local connector status. "
+            "With --home: adaptive setup wizard status."
+        ),
     )
-    setup_status.add_argument(
-        "--home",
-        type=Path,
-        default=None,
-        help="AVP home to inspect for adaptive setup status",
-    )
+    # --home is optional (option A): bare `setup status` reports the project
+    # connector status; `setup status --home <path>` keeps the adaptive wizard
+    # behavior, back-compatible with existing callers.
+    setup_status.add_argument("--home", type=Path, default=None, help="AVP home to inspect (wizard mode)")
     setup_status.add_argument(
         "--workspace",
         type=Path,
         default=None,
-        help="Workspace root for Cursor hook status when --home is omitted",
+        help="Cursor workspace root for connector status (default: current directory)",
+    )
+    setup_status.add_argument(
+        "--project-dir",
+        type=Path,
+        default=None,
+        help="Claude Code project directory for connector status",
     )
     setup_status.add_argument(
         "--client",
@@ -3832,6 +3833,63 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_json_arg(setup_restore)
 
+    setup_claude_code = setup_subparsers.add_parser(
+        "claude-code",
+        help="One-command Claude Code connector setup (proxy route + MCP route + hook)",
+    )
+    setup_claude_code.add_argument(
+        "--project-dir", type=Path, default=None,
+        help="Project directory to set up (default: current directory)",
+    )
+    setup_claude_code.add_argument(
+        "--choose-folder", action="store_true",
+        help="Open the macOS folder picker to choose the project directory",
+    )
+    setup_claude_code.add_argument(
+        "--sandbox", type=Path, default=None,
+        help="Quickstart filesystem sandbox path (default: selected project directory)",
+    )
+    setup_claude_code.add_argument(
+        "--yes", action="store_true",
+        help="Apply the setup; without it the command only previews",
+    )
+    setup_claude_code.add_argument(
+        "--passphrase-file", type=Path, default=None,
+        help="Encrypt the proxy identity with this passphrase file (default: plaintext quickstart)",
+    )
+    setup_claude_code.add_argument(
+        "--force", action="store_true",
+        help="Re-initialize the proxy route even if its config already exists",
+    )
+    _add_json_arg(setup_claude_code)
+
+    setup_remove = setup_subparsers.add_parser(
+        "remove",
+        help="Remove a one-command connector (AgentVeil-managed entries only)",
+    )
+    setup_remove.add_argument(
+        "target",
+        choices=["cursor", "claude-code"],
+        help="Connector to remove",
+    )
+    setup_remove.add_argument(
+        "--workspace",
+        type=Path,
+        default=None,
+        help="Workspace root to remove from (default: current directory)",
+    )
+    setup_remove.add_argument(
+        "--project-dir",
+        type=Path,
+        default=None,
+        help="Project directory to remove from (default: current directory)",
+    )
+    setup_remove.add_argument(
+        "--yes", action="store_true",
+        help="Apply the removal; without it the command only previews",
+    )
+    _add_json_arg(setup_remove)
+
     hook = subparsers.add_parser(
         "hook",
         help="Run Cursor hook stdin handler for allow/deny decisions",
@@ -3848,7 +3906,465 @@ def build_parser() -> argparse.ArgumentParser:
         help="Workspace root for evidence output (default: current directory)",
     )
 
+    install_claude_hook = subparsers.add_parser(
+        "install-claude-hook",
+        help="Install the AgentVeil PreToolUse hook into a project's .claude/settings.json",
+    )
+    install_claude_hook.add_argument(
+        "--project",
+        action="store_true",
+        required=True,
+        help="Project scope (required; the only supported scope in this release)",
+    )
+    install_claude_hook.add_argument(
+        "--project-dir",
+        type=Path,
+        default=None,
+        help="Project directory to install into (default: current directory)",
+    )
+    install_claude_hook.add_argument(
+        "--yes",
+        action="store_true",
+        help="Proceed with the write; without it the command only previews",
+    )
+    _add_json_arg(install_claude_hook)
+
+    status_claude_hook = subparsers.add_parser(
+        "status-claude-hook",
+        help="Show AgentVeil Claude Code project hook status (bounded)",
+    )
+    status_claude_hook.add_argument(
+        "--project", action="store_true", required=True, help="Project scope (required)"
+    )
+    status_claude_hook.add_argument(
+        "--project-dir",
+        type=Path,
+        default=None,
+        help="Project directory to inspect (default: current directory)",
+    )
+    _add_json_arg(status_claude_hook)
+
+    uninstall_claude_hook = subparsers.add_parser(
+        "uninstall-claude-hook",
+        help="Remove the AgentVeil PreToolUse hook from a project's .claude/settings.json",
+    )
+    uninstall_claude_hook.add_argument(
+        "--project", action="store_true", required=True, help="Project scope (required)"
+    )
+    uninstall_claude_hook.add_argument(
+        "--project-dir",
+        type=Path,
+        default=None,
+        help="Project directory to uninstall from (default: current directory)",
+    )
+    uninstall_claude_hook.add_argument(
+        "--yes",
+        action="store_true",
+        help="Proceed with the removal; without it the command only previews",
+    )
+    _add_json_arg(uninstall_claude_hook)
+
     return parser
+
+
+def _setup_cursor_home(workspace: Path) -> Path:
+    from agentveil_mcp_proxy import cursor_setup
+
+    return cursor_setup.setup_home(workspace)
+
+
+def _resolve_setup_proxy_command() -> str | None:
+    """Resolve the console script used by generated setup config."""
+    import shutil
+
+    resolved = shutil.which("agentveil-mcp-proxy")
+    if resolved:
+        return resolved
+    invoked = Path(sys.argv[0])
+    if invoked.exists() and invoked.name == "agentveil-mcp-proxy":
+        return str(invoked.resolve())
+    return None
+
+
+def _choose_folder_with_system_picker(*, cwd: Path) -> Path | None:
+    """Open a native folder picker when supported."""
+    if sys.platform == "darwin":
+        script = "\n".join([
+            f"set defaultFolder to POSIX file {json.dumps(str(cwd))}",
+            (
+                'set chosenFolder to choose folder with prompt '
+                '"Choose the project folder to protect with AgentVeil" '
+                "default location defaultFolder"
+            ),
+            "POSIX path of chosenFolder",
+        ])
+        try:
+            completed = subprocess.run(
+                ["osascript", "-e", script],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        except OSError:
+            return None
+        if completed.returncode != 0:
+            return None
+        selected = completed.stdout.strip()
+        return Path(selected).expanduser() if selected else None
+    if sys.platform == "win32":
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+        except (ImportError, OSError):
+            return None
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        try:
+            selected = filedialog.askdirectory(
+                initialdir=str(cwd),
+                title="Choose the project folder to protect with AgentVeil",
+            )
+        finally:
+            root.destroy()
+        return Path(selected).expanduser() if selected else None
+    return None
+
+
+def _prompt_cursor_setup_workspace(*, cwd: Path, input_fn) -> Path | None:
+    """Interactive project picker; returns None when the user cancels."""
+    print("Which project do you want to protect?")
+    print(f"  1. Current folder: {cwd}")
+    print("  2. Choose another folder")
+    print("  3. Cancel")
+    try:
+        choice = input_fn("Choice [1]: ").strip()
+    except EOFError:
+        return None
+    if choice in ("", "1"):
+        return cwd
+    if choice == "2":
+        selected = _choose_folder_with_system_picker(cwd=cwd)
+        if selected is not None:
+            return selected
+        if sys.platform in {"darwin", "win32"}:
+            print("Folder selection cancelled.")
+            return None
+        try:
+            path_str = input_fn("Project folder path: ").strip()
+        except EOFError:
+            return None
+        if not path_str:
+            print("No path entered.")
+            return None
+        return Path(path_str).expanduser()
+    if choice == "3":
+        return None
+    print("Invalid choice.")
+    return None
+
+
+def _cursor_open_command(workspace: Path) -> list[str] | None:
+    """Return the preferred Cursor opener command for this platform."""
+    if sys.platform != "darwin":
+        return None
+    cursor_cli = Path("/Applications/Cursor.app/Contents/Resources/app/bin/cursor")
+    if cursor_cli.is_file():
+        return [str(cursor_cli), str(workspace)]
+    return ["open", "-a", "Cursor", str(workspace)]
+
+
+def _open_cursor_workspace(workspace: Path) -> tuple[bool, str]:
+    """Open Cursor for *workspace* when supported; return (opened, message)."""
+    command = _cursor_open_command(workspace)
+    if command is None:
+        return False, f"Open Cursor in this folder: {workspace}"
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"Could not open Cursor automatically ({exc.__class__.__name__})."
+    if completed.returncode != 0:
+        return False, "Could not open Cursor automatically; open this project folder manually."
+    return True, "Cursor is opening this project folder."
+
+
+def _resolve_setup_cursor_target(
+    *,
+    workspace: Path | None,
+    assume_yes: bool,
+    choose_folder: bool,
+    output_json: bool,
+    input_fn,
+) -> tuple[Path | None, int | None]:
+    """Resolve workspace for setup. Second value is early exit code when not None."""
+    from agentveil_mcp_proxy import cursor_setup
+
+    if choose_folder or not assume_yes:
+        if output_json:
+            message = "interactive folder selection is not available with --json"
+            _print_json({
+                "ok": False,
+                "action": "setup-cursor",
+                "applied": False,
+                "errors": [message],
+                "warnings": [],
+            })
+            return None, 0
+        selected = _prompt_cursor_setup_workspace(cwd=Path.cwd(), input_fn=input_fn)
+        if selected is None:
+            print("Setup cancelled.")
+            return None, 0
+        try:
+            target = selected.expanduser().resolve()
+        except OSError as exc:
+            raise ProxyCliError(
+                f"cannot resolve project folder: {exc.__class__.__name__}",
+                exit_code=1,
+            ) from exc
+        if cursor_setup.is_broad_workspace(target):
+            print(cursor_setup.BROAD_FOLDER_MESSAGE)
+            return None, 1
+        return target, None
+
+    target = (Path(workspace) if workspace is not None else Path.cwd()).resolve()
+    if cursor_setup.is_broad_workspace(target):
+        if output_json:
+            _print_json({
+                "ok": False,
+                "action": "setup-cursor",
+                "applied": False,
+                "errors": [cursor_setup.BROAD_FOLDER_MESSAGE.replace("\n", " ")],
+                "warnings": [],
+            })
+        else:
+            print(cursor_setup.BROAD_FOLDER_MESSAGE, file=sys.stderr)
+        return None, 1
+    return target, None
+
+
+def run_setup_cursor_cli(
+    *,
+    workspace: Path | None,
+    assume_yes: bool,
+    choose_folder: bool,
+    open_after_setup: bool,
+    passphrase_file: Path | None,
+    force: bool,
+    output_json: bool,
+    input_fn=input,
+) -> int:
+    """One-command Cursor connector setup."""
+    from agentveil_mcp_proxy import cursor_setup
+
+    target, early_exit = _resolve_setup_cursor_target(
+        workspace=workspace,
+        assume_yes=assume_yes,
+        choose_folder=choose_folder,
+        output_json=output_json,
+        input_fn=input_fn,
+    )
+    if early_exit is not None:
+        return early_exit
+    assert target is not None
+
+    home = _setup_cursor_home(target)
+    config_path = cursor_setup.proxy_config_path(home)
+    resolved_passphrase = passphrase_file or cursor_setup.passphrase_path(home)
+
+    quiet = io.StringIO()
+    proxy_initialized = False
+    try:
+        cursor_setup.prepare_proxy_home(target, force=force)
+        if force or not config_path.exists():
+            prof = cursor_setup.profile_root(home)
+            initialize_product_route_profile(prof)
+            downstream = build_product_route_downstream_config(prof)
+            init_proxy(
+                home=home,
+                config_path=None,
+                downstream_config=downstream,
+                policy_pack="product_route",
+                setup_profile=PRODUCT_ROUTE_SETUP_PROFILE,
+                plaintext=False,
+                passphrase_file=resolved_passphrase,
+                force=force,
+                err=quiet,
+            )
+            proxy_initialized = True
+    except ProxyCliError:
+        raise
+
+    proxy_cmd = _resolve_setup_proxy_command()
+    if not proxy_cmd:
+        raise ProxyCliError(
+            "agentveil-mcp-proxy console script not on PATH; install the package first",
+            exit_code=1,
+        )
+
+    try:
+        neutralize_result = cursor_setup.neutralize_competing_global_route(target)
+        cursor_setup.install_mcp_route(target, proxy_command=proxy_cmd, home=home)
+        hook_result = cursor_setup.install_hooks(target, home=home)
+    except cursor_setup.CursorSetupError as exc:
+        raise ProxyCliError(str(exc), exit_code=1) from exc
+
+    center_result = cursor_setup.ensure_approval_center_running(
+        home=home,
+        proxy_command=proxy_cmd,
+        passphrase_file=resolved_passphrase,
+    )
+    center_running = center_result.status.state == "running"
+    status = cursor_setup.connector_status(target, home=home)
+
+    if not center_running:
+        if output_json:
+            _print_json({
+                "ok": False,
+                "action": "setup-cursor",
+                "applied": True,
+                "scope": "project",
+                "proxy_route_initialized": proxy_initialized,
+                "hooks_relpath": ".cursor/hooks.json",
+                "mcp_route_relpath": ".cursor/mcp.json",
+                "approval_center": {
+                    "state": center_result.status.state,
+                    "reason": center_result.reason,
+                },
+                "errors": [
+                    "approval_center not running; controlled MCP writes would surface "
+                    "unreachable approval URLs. Setup is not ready/protected."
+                ],
+                "warnings": [],
+            })
+        else:
+            print("Cursor connector partially set up:")
+            print(f"  proxy route: {'initialized' if proxy_initialized else 'already present'}")
+            print("  MCP route:   .cursor/mcp.json written")
+            print("  hooks:       .cursor/hooks.json present")
+            print(f"  approval_center: {center_result.status.state} ({center_result.reason})")
+            print("ERROR: setup is NOT ready — Approval Center could not start.", file=sys.stderr)
+        return 1
+
+    if output_json:
+        _print_operator_json({
+            "ok": True,
+            "action": "setup-cursor",
+            "applied": True,
+            "scope": "project",
+            "proxy_route_initialized": proxy_initialized,
+            "hooks_relpath": ".cursor/hooks.json",
+            "mcp_route_relpath": ".cursor/mcp.json",
+            "approval_center": {
+                "state": center_result.status.state,
+                "started": center_result.started,
+                "reused": center_result.reused,
+                "restarted": center_result.restarted,
+            },
+            "reload_required": True,
+            "competing_global_route_neutralized": neutralize_result.changed,
+            "status": status,
+            "created_hooks": hook_result.created_hooks,
+        })
+    else:
+        print(cursor_setup.format_setup_success_message(target, status=status))
+        if open_after_setup and (choose_folder or not assume_yes):
+            opened, message = _open_cursor_workspace(target)
+            print(f"Cursor: {message}")
+            if not opened:
+                print(f"Open manually: {target}")
+    return 0
+
+
+def run_setup_cursor_status_cli(*, workspace: Path | None, output_json: bool) -> int:
+    """Project-local Cursor connector status (bare ``setup status``)."""
+    from agentveil_mcp_proxy import cursor_setup
+
+    target = (Path(workspace) if workspace is not None else Path.cwd()).resolve()
+    home = _setup_cursor_home(target)
+    status = cursor_setup.connector_status(target, home=home)
+    if status["approval_center"] != "running" and status["status"] != "unsafe":
+        status["status"] = "advisory"
+    if output_json:
+        _print_operator_json(status)
+    else:
+        print(f"status: {status['status']}")
+        print(f"  hook:            {status['hook']}")
+        print(f"  mcp route:       {status['mcp_route']}")
+        print(f"  user mcp route:  {status['user_mcp_route']}")
+        print(f"  proxy route:     {status['proxy_route']}")
+        print(f"  approval_center: {status['approval_center']}")
+        print(f"  global split:    {status['competing_global_route']}")
+        print(f"  mcp observed:    {status['mcp_route_observed']}")
+        print(f"  restart required:{status['restart_required']}")
+        print(f"  next: {status['next_step']}")
+    return 0
+
+
+def run_setup_remove_cursor_cli(
+    *,
+    workspace: Path | None,
+    assume_yes: bool,
+    output_json: bool,
+) -> int:
+    """Remove the one-command Cursor connector — AgentVeil-managed entries only."""
+    from agentveil_mcp_proxy import cursor_setup
+
+    target = (Path(workspace) if workspace is not None else Path.cwd()).resolve()
+
+    if not assume_yes:
+        message = (
+            f"Would remove AgentVeil-managed Cursor hook and MCP route entries from "
+            f"{target} (unrelated hooks and MCP servers preserved). Re-run with --yes."
+        )
+        if output_json:
+            _print_json({
+                "ok": False,
+                "action": "setup-remove-cursor",
+                "applied": False,
+                "errors": ["confirmation required: pass --yes"],
+                "warnings": [message],
+            })
+        else:
+            print(message)
+        return 0
+
+    try:
+        hooks_removed = cursor_setup.remove_hooks(target)
+        mcp_removed = cursor_setup.remove_mcp_route(target)
+    except cursor_setup.CursorSetupError as exc:
+        raise ProxyCliError(str(exc), exit_code=1) from exc
+
+    center_stop = cursor_setup.stop_managed_approval_center(_setup_cursor_home(target))
+    removed_any = hooks_removed > 0 or mcp_removed or center_stop["stopped"]
+    if output_json:
+        _print_operator_json({
+            "ok": True,
+            "action": "setup-remove-cursor",
+            "applied": True,
+            "scope": "project",
+            "hook_entries_removed": hooks_removed,
+            "mcp_route_removed": mcp_removed,
+            "approval_center_stopped": center_stop["stopped"],
+            "reload_required": removed_any,
+        })
+    else:
+        print(
+            f"Removed: hook entries={hooks_removed}, mcp route={mcp_removed}, "
+            f"approval_center={'stopped' if center_stop['stopped'] else 'not running'}"
+        )
+        print("Unrelated Cursor hooks and MCP servers preserved.")
+        if removed_any:
+            print("Reload Cursor for this workspace to drop the connector.")
+    return 0
 
 
 def _normalize_connect_argv(argv: list[str]) -> list[str]:
@@ -3877,6 +4393,452 @@ def _normalize_downstream_arg_values(argv: list[str]) -> list[str]:
         normalized.append(item)
         index += 1
     return normalized
+
+
+def run_install_claude_hook_cli(
+    *, project_dir: Path | None, assume_yes: bool, output_json: bool
+) -> int:
+    """Install/upsert the AgentVeil PreToolUse hook into a project."""
+    from agentveil_mcp_proxy import claude_hook_setup
+
+    target = Path(project_dir) if project_dir is not None else Path.cwd()
+    settings_path = claude_hook_setup.project_settings_path(target)
+    rel_settings = ".claude/settings.json"
+
+    if not assume_yes:
+        message = (
+            f"Would install the AgentVeil PreToolUse hook into {settings_path}. "
+            "Re-run with --yes to write it."
+        )
+        if output_json:
+            _print_json({
+                "ok": False,
+                "action": "install-claude-hook",
+                "applied": False,
+                "errors": ["confirmation required: pass --yes"],
+                "warnings": [message],
+                "settings_relpath": rel_settings,
+            })
+        else:
+            print(message)
+        return 0
+
+    try:
+        result = claude_hook_setup.install_hook(target)
+    except claude_hook_setup.HookSetupError as exc:
+        raise ProxyCliError(str(exc), exit_code=1) from exc
+
+    if output_json:
+        _print_operator_json({
+            "ok": True,
+            "action": "install-claude-hook",
+            "applied": True,
+            "scope": "project",
+            "settings_relpath": rel_settings,
+            "evidence_relpath": ".claude/agentveil/evidence.jsonl",
+            "created_settings": result.created_settings,
+            "replaced_existing_managed": result.replaced_existing_managed,
+            "reload_required": result.reload_required,
+            "matched_tool_classes": list(claude_hook_setup.MATCHED_TOOL_CLASSES),
+        })
+    else:
+        print(f"Installed AgentVeil PreToolUse hook: {settings_path}")
+        print(f"Evidence: {result.evidence_path}")
+        print("Restart Claude Code to load the hook.")
+    return 0
+
+
+def run_status_claude_hook_cli(*, project_dir: Path | None, output_json: bool) -> int:
+    """Print bounded project hook status."""
+    from agentveil_mcp_proxy import claude_hook_setup
+
+    target = Path(project_dir) if project_dir is not None else Path.cwd()
+    status = claude_hook_setup.status_hook(target)
+    bounded = status.to_bounded_dict()
+    if output_json:
+        _print_operator_json(bounded)
+    else:
+        print(f"status: {bounded['status']} ({bounded['state']})")
+        print(f"managed hook present: {bounded['managed_hook_present']}")
+        print(f"command points to module: {bounded['hook_command_points_to_module']}")
+        print(f"reload required: {bounded['reload_required']}")
+        for note in bounded["notes"]:
+            print(f"- {note}")
+    return 0
+
+
+def run_uninstall_claude_hook_cli(
+    *, project_dir: Path | None, assume_yes: bool, output_json: bool
+) -> int:
+    """Remove only AgentVeil-managed hook entries from a project."""
+    from agentveil_mcp_proxy import claude_hook_setup
+
+    target = Path(project_dir) if project_dir is not None else Path.cwd()
+    settings_path = claude_hook_setup.project_settings_path(target)
+
+    if not assume_yes:
+        message = (
+            f"Would remove the AgentVeil PreToolUse hook from {settings_path}. "
+            "Re-run with --yes to apply."
+        )
+        if output_json:
+            _print_json({
+                "ok": False,
+                "action": "uninstall-claude-hook",
+                "applied": False,
+                "errors": ["confirmation required: pass --yes"],
+                "warnings": [message],
+                "settings_relpath": ".claude/settings.json",
+            })
+        else:
+            print(message)
+        return 0
+
+    try:
+        result = claude_hook_setup.uninstall_hook(target)
+    except claude_hook_setup.HookSetupError as exc:
+        raise ProxyCliError(str(exc), exit_code=1) from exc
+
+    if output_json:
+        _print_operator_json({
+            "ok": True,
+            "action": "uninstall-claude-hook",
+            "applied": True,
+            "scope": "project",
+            "settings_existed": result.settings_existed,
+            "removed_entries": result.removed_entries,
+            "reload_required": result.reload_required,
+        })
+    else:
+        if result.removed_entries:
+            print(f"Removed {result.removed_entries} AgentVeil hook entry(ies): {settings_path}")
+            print("Restart Claude Code to drop the hook.")
+        else:
+            print("No AgentVeil-managed hook entry found; nothing to remove.")
+    return 0
+
+
+def _setup_claude_code_home(project_dir: Path) -> Path:
+    """Project-local proxy home for the one-command connector."""
+    return project_dir / ".avp"
+
+
+def _choose_setup_project_folder() -> Path:
+    """Open the native macOS folder picker and return the selected directory."""
+    if sys.platform != "darwin":
+        raise ProxyCliError("--choose-folder is currently supported on macOS only", exit_code=2)
+    import subprocess
+
+    script = (
+        'POSIX path of (choose folder with prompt '
+        '"Choose the project folder to protect with AgentVeil")'
+    )
+    try:
+        result = subprocess.run(  # noqa: S603 - fixed osascript invocation
+            ["osascript", "-e", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ProxyCliError(
+            f"could not open folder picker: {exc.__class__.__name__}",
+            exit_code=2,
+        ) from exc
+    if result.returncode != 0:
+        raise ProxyCliError("folder selection cancelled", exit_code=2)
+    selected = result.stdout.strip()
+    if not selected:
+        raise ProxyCliError("folder selection returned an empty path", exit_code=2)
+    return Path(selected)
+
+
+def _resolve_setup_proxy_command() -> str | None:
+    """Resolve the console script used by generated Claude setup config."""
+    import shutil
+
+    invoked = Path(sys.argv[0])
+    if invoked.exists() and invoked.name == "agentveil-mcp-proxy":
+        return str(invoked.resolve())
+    resolved = shutil.which("agentveil-mcp-proxy")
+    if resolved:
+        return resolved
+    return None
+
+
+def _configure_claude_setup_approval_ui(config_path: Path) -> None:
+    """Disable browser auto-open for Claude setup-managed approvals.
+
+    Claude Code already displays the exact pending approval URL in chat. Opening
+    the bare Approval Center dashboard from the proxy creates a confusing empty
+    browser tab during first-run setup and approval retries.
+    """
+    config_payload = _read_json(config_path, "proxy config")
+    approval = config_payload.get("approval")
+    if not isinstance(approval, dict):
+        approval = {}
+        config_payload["approval"] = approval
+    approval["ui_open_mode"] = ApprovalUiOpenMode.TERMINAL.value
+    _secure_write_json(config_path, config_payload, force=True)
+
+
+def run_setup_claude_code_cli(
+    *,
+    project_dir: Path | None,
+    choose_folder: bool,
+    sandbox: Path | None,
+    assume_yes: bool,
+    passphrase_file: Path | None,
+    force: bool,
+    output_json: bool,
+) -> int:
+    """One-command Claude Code connector setup.
+
+    Orchestrates the existing primitives end-to-end: proxy quickstart route
+    (`init_proxy`), Claude MCP route (`connect claude_code`), and the
+    project-local hook (`install_hook`). It does not duplicate policy/approval
+    logic. It does not claim Claude Code has reloaded; it states restart is
+    required.
+    """
+    from agentveil_mcp_proxy import claude_hook_setup
+
+    if choose_folder and project_dir is not None:
+        raise ProxyCliError("--choose-folder cannot be combined with --project-dir", exit_code=2)
+    selected_project = _choose_setup_project_folder() if choose_folder else project_dir
+    target = (Path(selected_project) if selected_project is not None else Path.cwd()).resolve()
+    sandbox_path = Path(sandbox).resolve() if sandbox is not None else target
+    home = _setup_claude_code_home(target)
+    config_path = home / "mcp-proxy" / "config.json"
+
+    if not assume_yes:
+        message = (
+            f"Would set up the Claude Code connector in {target}: proxy quickstart "
+            f"route, project .mcp.json, and the project hook. Re-run with --yes."
+        )
+        if output_json:
+            _print_json({
+                "ok": False, "action": "setup-claude-code", "applied": False,
+                "errors": ["confirmation required: pass --yes"], "warnings": [message],
+            })
+        else:
+            print(message)
+        return 0
+
+    quiet = io.StringIO()
+    # 1. Proxy quickstart route (idempotent unless --force).
+    proxy_present = config_path.exists()
+    proxy_initialized = False
+    if force or not proxy_present:
+        downstream = quickstart_filesystem_downstream(sandbox_path)
+        try:
+            init_proxy(
+                home=home,
+                config_path=None,
+                downstream_config=downstream,
+                plaintext=(passphrase_file is None),
+                passphrase_file=passphrase_file,
+                force=force,
+                err=quiet,
+            )
+        except ProxyCliError:
+            raise
+        proxy_initialized = True
+    if config_path.exists():
+        _configure_claude_setup_approval_ui(config_path)
+
+    # 2. Claude Code MCP route (.mcp.json) — reuse the connect command. Resolve
+    # the installed console script explicitly (matches the supported manual
+    # `connect --proxy-command "$(which agentveil-mcp-proxy)"` path). The route
+    # is considered configured once .mcp.json carries the AgentVeil entry; a
+    # non-zero launch-proof is not fatal to setup if the route was written.
+    resolved_proxy_command = _resolve_setup_proxy_command()
+    run_connect_cli(
+        client_id="claude_code",
+        home=home,
+        project_root=target,
+        write=True,
+        proxy_command=resolved_proxy_command,
+        out=quiet,
+    )
+    if not claude_hook_setup.mcp_route_present(target):
+        raise ProxyCliError(
+            "could not write the Claude MCP route; ensure agentveil-mcp-proxy is "
+            "installed and on PATH",
+            exit_code=1,
+        )
+
+    # 3. Project-local hook.
+    try:
+        install_result = claude_hook_setup.install_hook(target)
+    except claude_hook_setup.HookSetupError as exc:
+        raise ProxyCliError(str(exc), exit_code=1) from exc
+
+    # 4. Approval Center: take ownership of lifecycle. Without a live center,
+    # controlled MCP write approvals would surface URLs that the user cannot
+    # open (ERR_CONNECTION_REFUSED). Setup must not claim ready in that case.
+    from agentveil_mcp_proxy import claude_center_lifecycle
+
+    proxy_cmd_for_center = resolved_proxy_command
+    if not proxy_cmd_for_center:
+        raise ProxyCliError(
+            "agentveil-mcp-proxy console script not on PATH; cannot start Approval Center",
+            exit_code=1,
+        )
+    center_result = claude_center_lifecycle.ensure_running(
+        home=home,
+        proxy_command=proxy_cmd_for_center,
+        passphrase_file=passphrase_file,
+    )
+    center_running = center_result.status.state == "running"
+
+    # 5. Bounded status summary.
+    status = claude_hook_setup.connector_status(target, proxy_route_present=config_path.exists())
+    sandbox_label = "project" if sandbox is None else "custom"
+
+    if not center_running:
+        if output_json:
+            _print_json({
+                "ok": False,
+                "action": "setup-claude-code",
+                "applied": True,
+                "scope": "project",
+                "proxy_route_initialized": proxy_initialized,
+                "mcp_route_relpath": ".mcp.json",
+                "hook_relpath": ".claude/settings.json",
+                "sandbox_relpath": sandbox_label,
+                "identity_encrypted": passphrase_file is not None,
+                "approval_center": {"state": center_result.status.state, "reason": center_result.reason},
+                "errors": [
+                    "approval_center not running; controlled MCP writes would surface "
+                    "unreachable approval URLs. Setup is not ready/protected."
+                ],
+                "warnings": [],
+            })
+        else:
+            print("Claude Code connector partially set up:")
+            print(f"  proxy route: {'initialized' if proxy_initialized else 'already present'}")
+            print("  MCP route:   .mcp.json written")
+            print("  hook:        .claude/settings.json present")
+            print(f"  approval_center: {center_result.status.state} ({center_result.reason})")
+            print("ERROR: setup is NOT ready — Approval Center could not start.", file=sys.stderr)
+        return 1
+
+    if output_json:
+        _print_operator_json({
+            "ok": True,
+            "action": "setup-claude-code",
+            "applied": True,
+            "scope": "project",
+            "proxy_route_initialized": proxy_initialized,
+            "mcp_route_relpath": ".mcp.json",
+            "hook_relpath": ".claude/settings.json",
+            "sandbox_relpath": sandbox_label,
+            "identity_encrypted": passphrase_file is not None,
+            "approval_center": {
+                "state": center_result.status.state,
+                "started": center_result.started,
+                "reused": center_result.reused,
+                "restarted": center_result.restarted,
+            },
+            "reload_required": True,
+            "status": status,
+        })
+    else:
+        print("Claude Code connector set up for this project:")
+        print(f"  proxy route: {'initialized' if proxy_initialized else 'already present'}")
+        print("  MCP route:   .mcp.json written")
+        print(f"  hook:        .claude/settings.json ({'created' if install_result.created_settings else 'updated'})")
+        if passphrase_file is None:
+            print("  identity:    stored unencrypted (quickstart); use --passphrase-file to encrypt")
+        action = "reused" if center_result.reused else ("restarted" if center_result.restarted else "started")
+        print(f"  approval_center: running ({action})")
+        print(f"  status:      {status['status']}")
+        print("Restart Claude Code for this project, then run `agentveil-mcp-proxy setup status`.")
+    return 0
+
+
+def run_setup_connector_status_cli(*, project_dir: Path | None, output_json: bool) -> int:
+    """Project-local Claude connector status (bare `setup status`)."""
+    from agentveil_mcp_proxy import claude_center_lifecycle, claude_hook_setup
+
+    target = (Path(project_dir) if project_dir is not None else Path.cwd()).resolve()
+    home = _setup_claude_code_home(target)
+    config_path = home / "mcp-proxy" / "config.json"
+    status = claude_hook_setup.connector_status(target, proxy_route_present=config_path.exists())
+    center = claude_center_lifecycle.check_status(home)
+    status["approval_center"] = center.state
+    # Setup is not "ready" unless the center is running; downgrade product
+    # status accordingly so we never say protected with a dead approval path.
+    if center.state != "running" and status["status"] != "unsafe":
+        status["status"] = "unsafe" if status["mcp_route"] == "missing" else "advisory"
+    if output_json:
+        _print_operator_json(status)
+    else:
+        print(f"status: {status['status']}")
+        print(f"  hook:       {status['hook']}")
+        print(f"  mcp route:  {status['mcp_route']}")
+        print(f"  proxy route:{status['proxy_route']}")
+        print(f"  approval_center: {center.state}")
+        print(f"  restart required: {status['restart_required']}")
+        print(f"  next: {status['next_step']}")
+    return 0
+
+
+def run_setup_remove_claude_code_cli(
+    *, project_dir: Path | None, assume_yes: bool, output_json: bool
+) -> int:
+    """Remove the one-command Claude connector — AgentVeil-managed entries only."""
+    from agentveil_mcp_proxy import claude_hook_setup
+
+    target = (Path(project_dir) if project_dir is not None else Path.cwd()).resolve()
+
+    if not assume_yes:
+        message = (
+            f"Would remove AgentVeil-managed Claude hook and MCP route entries from "
+            f"{target} (unrelated settings and MCP servers preserved). Re-run with --yes."
+        )
+        if output_json:
+            _print_json({
+                "ok": False, "action": "setup-remove-claude-code", "applied": False,
+                "errors": ["confirmation required: pass --yes"], "warnings": [message],
+            })
+        else:
+            print(message)
+        return 0
+
+    from agentveil_mcp_proxy import claude_center_lifecycle
+
+    try:
+        hook_result = claude_hook_setup.uninstall_hook(target)
+        route_result = claude_hook_setup.remove_mcp_route(target)
+    except claude_hook_setup.HookSetupError as exc:
+        raise ProxyCliError(str(exc), exit_code=1) from exc
+
+    center_stop = claude_center_lifecycle.stop_if_managed(_setup_claude_code_home(target))
+    removed_any = (
+        hook_result.removed_entries > 0
+        or route_result.removed
+        or center_stop["stopped"]
+    )
+    if output_json:
+        _print_operator_json({
+            "ok": True,
+            "action": "setup-remove-claude-code",
+            "applied": True,
+            "scope": "project",
+            "hook_entries_removed": hook_result.removed_entries,
+            "mcp_route_removed": route_result.removed,
+            "approval_center_stopped": center_stop["stopped"],
+            "reload_required": removed_any,
+        })
+    else:
+        print(f"Removed: hook entries={hook_result.removed_entries}, mcp route={route_result.removed}, "
+              f"approval_center={'stopped' if center_stop['stopped'] else 'not running'}")
+        print("Unrelated Claude settings and MCP servers preserved.")
+        if removed_any:
+            print("Restart Claude Code for this project to drop the connector.")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -4266,19 +5228,29 @@ def main(argv: list[str] | None = None) -> int:
             raise ProxyCliError("hook action must be cursor")
         if args.command == "setup":
             if args.setup_action == "cursor":
-                return run_cursor_setup_cli(
+                return run_setup_cursor_cli(
                     workspace=args.workspace,
-                    yes=args.yes,
+                    assume_yes=args.yes,
+                    choose_folder=args.choose_folder,
+                    open_after_setup=not args.no_open,
+                    passphrase_file=args.passphrase_file,
+                    force=args.force,
                     output_json=args.json_output,
                 )
             if args.setup_action == "remove":
-                if args.target != "cursor":
-                    raise ProxyCliError("setup remove target must be cursor")
-                return run_cursor_remove_cli(
-                    workspace=args.workspace,
-                    yes=args.yes,
-                    output_json=args.json_output,
-                )
+                if args.target == "cursor":
+                    return run_setup_remove_cursor_cli(
+                        workspace=args.workspace,
+                        assume_yes=args.yes,
+                        output_json=args.json_output,
+                    )
+                if args.target == "claude-code":
+                    return run_setup_remove_claude_code_cli(
+                        project_dir=args.project_dir,
+                        assume_yes=args.yes,
+                        output_json=args.json_output,
+                    )
+                raise ProxyCliError("setup remove target must be cursor or claude-code")
             if args.setup_action == "run":
                 return run_setup_wizard_cli(
                     home=args.home,
@@ -4293,6 +5265,16 @@ def main(argv: list[str] | None = None) -> int:
                     output_json=args.json_output,
                 )
             if args.setup_action == "status":
+                if args.home is None:
+                    if args.project_dir is not None:
+                        return run_setup_connector_status_cli(
+                            project_dir=args.project_dir,
+                            output_json=args.json_output,
+                        )
+                    return run_setup_cursor_status_cli(
+                        workspace=args.workspace,
+                        output_json=args.json_output,
+                    )
                 return print_setup_status_cli(
                     home=args.home,
                     client_id=args.client,
@@ -4308,7 +5290,36 @@ def main(argv: list[str] | None = None) -> int:
                     client_id=args.client,
                     output_json=args.json_output,
                 )
-            raise ProxyCliError("setup action must be cursor, remove, run, status, or restore")
+            if args.setup_action == "claude-code":
+                return run_setup_claude_code_cli(
+                    project_dir=args.project_dir,
+                    choose_folder=args.choose_folder,
+                    sandbox=args.sandbox,
+                    assume_yes=args.yes,
+                    passphrase_file=args.passphrase_file,
+                    force=args.force,
+                    output_json=args.json_output,
+                )
+            raise ProxyCliError(
+                "setup action must be cursor, claude-code, status, remove, run, or restore"
+            )
+        if args.command == "install-claude-hook":
+            return run_install_claude_hook_cli(
+                project_dir=args.project_dir,
+                assume_yes=args.yes,
+                output_json=args.json_output,
+            )
+        if args.command == "status-claude-hook":
+            return run_status_claude_hook_cli(
+                project_dir=args.project_dir,
+                output_json=args.json_output,
+            )
+        if args.command == "uninstall-claude-hook":
+            return run_uninstall_claude_hook_cli(
+                project_dir=args.project_dir,
+                assume_yes=args.yes,
+                output_json=args.json_output,
+            )
     except (
         ProxyCliError,
         ApprovalEvidenceError,
@@ -4317,7 +5328,6 @@ def main(argv: list[str] | None = None) -> int:
         ControlSurfaceError,
         PermissionDoctorError,
         CursorSetupError,
-        CursorHookError,
     ) as exc:
         if getattr(args, "json_output", False):
             if isinstance(exc, (ControlSurfaceError, PermissionDoctorError)):

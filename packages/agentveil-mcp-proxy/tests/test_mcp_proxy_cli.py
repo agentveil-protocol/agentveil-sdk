@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import stat
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -1892,3 +1893,439 @@ def test_setup_cli_run_status_and_restore(tmp_path, capsys):
     assert "/private/" not in restore_text
     assert "/var/folders/" not in restore_text
     assert "/Users/" not in restore_text
+
+
+# ----- P10D.14 S2: Claude hook install/status/uninstall CLI dispatch --------
+
+
+def test_cli_install_claude_hook_preview_does_not_write(tmp_path, capsys):
+    assert main([
+        "install-claude-hook", "--project", "--project-dir", str(tmp_path),
+    ]) == 0
+    capsys.readouterr()
+    assert not (tmp_path / ".claude" / "settings.json").exists()
+
+
+def test_cli_install_status_uninstall_dispatch_roundtrip(tmp_path, capsys):
+    # install --yes --json
+    assert main([
+        "install-claude-hook", "--project", "--project-dir", str(tmp_path), "--yes", "--json",
+    ]) == 0
+    install_payload = json.loads(capsys.readouterr().out)
+    assert install_payload["ok"] is True
+    assert install_payload["applied"] is True
+    settings = tmp_path / ".claude" / "settings.json"
+    assert settings.exists()
+
+    # status --json -> advisory (installed, no firing evidence yet), bounded
+    assert main([
+        "status-claude-hook", "--project", "--project-dir", str(tmp_path), "--json",
+    ]) == 0
+    status_payload = json.loads(capsys.readouterr().out)
+    assert status_payload["status"] == "advisory"
+    assert status_payload["state"] == "installed"
+    assert status_payload["reload_required"] is True
+    status_text = json.dumps(status_payload)
+    assert str(tmp_path) not in status_text
+    assert "/Users/" not in status_text and "/private/" not in status_text
+
+    # uninstall --yes --json
+    assert main([
+        "uninstall-claude-hook", "--project", "--project-dir", str(tmp_path), "--yes", "--json",
+    ]) == 0
+    uninstall_payload = json.loads(capsys.readouterr().out)
+    assert uninstall_payload["ok"] is True
+    assert uninstall_payload["removed_entries"] == 1
+
+
+def test_cli_status_missing_is_unsafe(tmp_path, capsys):
+    assert main([
+        "status-claude-hook", "--project", "--project-dir", str(tmp_path), "--json",
+    ]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "unsafe"
+    assert payload["state"] == "missing"
+
+
+def test_cli_install_claude_hook_requires_project_flag(tmp_path):
+    # --project is required; omitting it is an argparse error (SystemExit).
+    with pytest.raises(SystemExit):
+        main(["install-claude-hook", "--project-dir", str(tmp_path), "--yes"])
+
+
+def test_cli_status_claude_hook_requires_project_flag(tmp_path):
+    with pytest.raises(SystemExit):
+        main(["status-claude-hook", "--project-dir", str(tmp_path), "--json"])
+
+
+# ----- P10D.14 S5: one-command Claude connector setup CLI --------------------
+
+
+def test_cli_setup_status_bare_is_connector(tmp_path, capsys):
+    assert main(["setup", "status", "--project-dir", str(tmp_path), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    # connector-shaped keys
+    assert payload["status"] == "unsafe"
+    assert payload["hook"] == "missing"
+    assert payload["mcp_route"] == "missing"
+    assert "next_step" in payload
+
+
+def test_cli_setup_status_home_routes_to_wizard(tmp_path, capsys):
+    # --home routes to the adaptive wizard, NOT the connector status.
+    home = tmp_path / "avp-home"
+    home.mkdir()
+    rc = main(["setup", "status", "--home", str(home), "--json"])
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    # wizard output must not carry the connector-only keys
+    assert "mcp_route" not in payload
+    assert "hook" not in payload or "next_step" not in payload
+
+
+def test_cli_setup_claude_code_preview_does_not_write(tmp_path, capsys):
+    assert main(["setup", "claude-code", "--project-dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    assert not (tmp_path / ".claude" / "settings.json").exists()
+    assert not (tmp_path / ".mcp.json").exists()
+
+
+def test_choose_setup_project_folder_macos(monkeypatch, tmp_path):
+    selected = tmp_path / "Selected Project"
+    selected.mkdir()
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=f"{selected}\n",
+            stderr="",
+        ),
+    )
+
+    assert proxy_cli._choose_setup_project_folder() == selected
+
+
+def test_cli_setup_claude_code_rejects_choose_folder_with_project_dir(tmp_path, capsys):
+    rc = main([
+        "setup", "claude-code",
+        "--choose-folder",
+        "--project-dir", str(tmp_path),
+        "--yes",
+    ])
+
+    assert rc == 2
+    assert "cannot be combined" in capsys.readouterr().err
+
+
+def test_cli_setup_remove_claude_code_apply(tmp_path, capsys):
+    from agentveil_mcp_proxy import claude_hook_setup
+    # seed an installed hook + an .mcp.json with agentveil + an unrelated server
+    claude_hook_setup.install_hook(tmp_path)
+    (tmp_path / ".mcp.json").write_text(json.dumps({
+        "mcpServers": {
+            "agentveil-mcp-proxy": {"command": "agentveil-mcp-proxy", "args": ["run"]},
+            "other-server": {"command": "other"},
+        }
+    }), encoding="utf-8")
+
+    assert main(["setup", "remove", "claude-code", "--project-dir", str(tmp_path), "--yes", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["hook_entries_removed"] == 1
+    assert payload["mcp_route_removed"] is True
+
+    settings = json.loads((tmp_path / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    pre = settings.get("hooks", {}).get("PreToolUse", [])
+    for entry in pre:
+        assert "agentveil_mcp_proxy.claude_hook" not in json.dumps(entry)
+    mcp = json.loads((tmp_path / ".mcp.json").read_text(encoding="utf-8"))
+    assert "agentveil-mcp-proxy" not in mcp.get("mcpServers", {})
+    assert "other-server" in mcp.get("mcpServers", {}), "unrelated MCP server must survive"
+
+
+def test_cli_setup_status_bounded_no_paths(tmp_path, capsys):
+    from agentveil_mcp_proxy import claude_hook_setup
+    claude_hook_setup.install_hook(tmp_path)
+    assert main(["setup", "status", "--project-dir", str(tmp_path), "--json"]) == 0
+    text = capsys.readouterr().out
+    assert str(tmp_path) not in text
+    assert "/Users/" not in text and "/private/" not in text
+
+
+def test_cli_setup_claude_code_starts_center_with_passphrase_without_url_leak(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from agentveil_mcp_proxy import claude_center_lifecycle
+
+    passphrase_file = tmp_path / "passphrase.txt"
+    passphrase_file.write_text(TEST_PASSPHRASE, encoding="utf-8")
+    seen: dict[str, object] = {}
+
+    def fake_init_proxy(**kwargs):
+        home = kwargs["home"]
+        (home / "mcp-proxy").mkdir(parents=True, exist_ok=True)
+        (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+        seen["init_plaintext"] = kwargs["plaintext"]
+        seen["init_passphrase_file"] = kwargs["passphrase_file"]
+        seen["downstream_root"] = kwargs["downstream_config"]["args"][-1]
+
+    def fake_connect(**kwargs):
+        project = kwargs["project_root"]
+        (project / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"agentveil-mcp-proxy": {"command": "agentveil-mcp-proxy"}}}),
+            encoding="utf-8",
+        )
+        return 0
+
+    def fake_ensure_running(**kwargs):
+        seen["center_passphrase_file"] = kwargs["passphrase_file"]
+        return SimpleNamespace(
+            status=SimpleNamespace(
+                state="running",
+                url="http://127.0.0.1:12345/approval/SECRET_TOKEN",
+            ),
+            started=True,
+            reused=False,
+            restarted=False,
+        )
+
+    monkeypatch.setattr(proxy_cli, "init_proxy", fake_init_proxy)
+    monkeypatch.setattr(proxy_cli, "run_connect_cli", fake_connect)
+    monkeypatch.setattr("shutil.which", lambda _name: "agentveil-mcp-proxy")
+    monkeypatch.setattr(claude_center_lifecycle, "ensure_running", fake_ensure_running)
+
+    rc = main([
+        "setup", "claude-code",
+        "--project-dir", str(tmp_path),
+        "--passphrase-file", str(passphrase_file),
+        "--yes",
+        "--json",
+    ])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["approval_center"]["state"] == "running"
+    assert "url" not in payload["approval_center"]
+    assert "SECRET_TOKEN" not in json.dumps(payload)
+    assert payload["identity_encrypted"] is True
+    assert seen["init_plaintext"] is False
+    assert seen["init_passphrase_file"] == passphrase_file
+    assert seen["center_passphrase_file"] == passphrase_file
+    assert seen["downstream_root"] == str(tmp_path.resolve())
+    config = json.loads((tmp_path / ".avp" / "mcp-proxy" / "config.json").read_text(encoding="utf-8"))
+    assert config["approval"]["ui_open_mode"] == "terminal"
+
+
+def test_cli_setup_claude_code_choose_folder_uses_selected_project(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from agentveil_mcp_proxy import claude_center_lifecycle
+
+    selected = tmp_path / "Selected Project"
+    selected.mkdir()
+    seen: dict[str, object] = {}
+
+    def fake_init_proxy(**kwargs):
+        home = kwargs["home"]
+        (home / "mcp-proxy").mkdir(parents=True, exist_ok=True)
+        (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+        seen["home"] = home
+        seen["downstream_root"] = kwargs["downstream_config"]["args"][-1]
+
+    def fake_connect(**kwargs):
+        project = kwargs["project_root"]
+        seen["project_root"] = project
+        (project / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"agentveil-mcp-proxy": {"command": "agentveil-mcp-proxy"}}}),
+            encoding="utf-8",
+        )
+        return 0
+
+    monkeypatch.setattr(proxy_cli, "_choose_setup_project_folder", lambda: selected)
+    monkeypatch.setattr(proxy_cli, "init_proxy", fake_init_proxy)
+    monkeypatch.setattr(proxy_cli, "run_connect_cli", fake_connect)
+    monkeypatch.setattr("shutil.which", lambda _name: "agentveil-mcp-proxy")
+    monkeypatch.setattr(
+        claude_center_lifecycle,
+        "ensure_running",
+        lambda **_kwargs: SimpleNamespace(
+            status=SimpleNamespace(state="running", url="http://127.0.0.1/approval/SECRET"),
+            started=True,
+            reused=False,
+            restarted=False,
+        ),
+    )
+
+    rc = main(["setup", "claude-code", "--choose-folder", "--yes", "--json"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert seen["project_root"] == selected.resolve()
+    assert seen["home"] == selected.resolve() / ".avp"
+    assert seen["downstream_root"] == str(selected.resolve())
+
+
+def test_cli_setup_claude_code_fails_when_center_not_running(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from agentveil_mcp_proxy import claude_center_lifecycle
+
+    def fake_init_proxy(**kwargs):
+        home = kwargs["home"]
+        (home / "mcp-proxy").mkdir(parents=True, exist_ok=True)
+        (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+
+    def fake_connect(**kwargs):
+        project = kwargs["project_root"]
+        (project / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"agentveil-mcp-proxy": {"command": "agentveil-mcp-proxy"}}}),
+            encoding="utf-8",
+        )
+        return 0
+
+    def fake_ensure_running(**_kwargs):
+        return SimpleNamespace(
+            status=SimpleNamespace(state="stale", url=None),
+            started=False,
+            reused=False,
+            restarted=False,
+            reason="approval-center did not become healthy",
+        )
+
+    monkeypatch.setattr(proxy_cli, "init_proxy", fake_init_proxy)
+    monkeypatch.setattr(proxy_cli, "run_connect_cli", fake_connect)
+    monkeypatch.setattr("shutil.which", lambda _name: "agentveil-mcp-proxy")
+    monkeypatch.setattr(claude_center_lifecycle, "ensure_running", fake_ensure_running)
+
+    rc = main(["setup", "claude-code", "--project-dir", str(tmp_path), "--yes", "--json"])
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["approval_center"]["state"] == "stale"
+    assert "not ready/protected" in payload["errors"][0]
+
+
+def test_claude_center_stop_does_not_kill_unhealthy_manifest(tmp_path, monkeypatch):
+    from agentveil_mcp_proxy import claude_center_lifecycle
+    from agentveil_mcp_proxy.approval.persistent import (
+        ApprovalCenterManifest,
+        save_manifest,
+        token_hash_for,
+    )
+
+    proxy_dir = tmp_path / ".avp" / "mcp-proxy"
+    token = "session-token"
+    save_manifest(
+        proxy_dir,
+        ApprovalCenterManifest(
+            schema_version=2,
+            host="127.0.0.1",
+            port=43210,
+            session_token=token,
+            token_hash=token_hash_for(token),
+            internal_register_token="internal",
+            pid=12345,
+            started_at=1,
+        ),
+    )
+    monkeypatch.setattr(claude_center_lifecycle, "is_process_alive", lambda _pid: True)
+    monkeypatch.setattr(claude_center_lifecycle, "_center_health", lambda _manifest: False)
+
+    def fail_kill(_pid, _signal):
+        raise AssertionError("must not kill an unhealthy/non-AgentVeil manifest pid")
+
+    monkeypatch.setattr(os, "kill", fail_kill)
+    result = claude_center_lifecycle.stop_if_managed(tmp_path / ".avp")
+    assert result["stopped"] is False
+    assert "not a healthy AgentVeil Approval Center" in result["reason"]
+
+
+def test_claude_center_health_uses_approval_center_page(tmp_path, monkeypatch):
+    from agentveil_mcp_proxy import claude_center_lifecycle
+    from agentveil_mcp_proxy.approval.persistent import (
+        ApprovalCenterManifest,
+        token_hash_for,
+    )
+
+    token = "session-token"
+    manifest = ApprovalCenterManifest(
+        schema_version=2,
+        host="127.0.0.1",
+        port=43210,
+        session_token=token,
+        token_hash=token_hash_for(token),
+        internal_register_token="internal",
+        pid=12345,
+        started_at=1,
+    )
+    seen_urls: list[str] = []
+
+    def fake_status(url: str, *, timeout: float) -> int:
+        del timeout
+        seen_urls.append(url)
+        return 200 if url == manifest.approval_center_url() else 403
+
+    monkeypatch.setattr(claude_center_lifecycle, "loopback_get_status", fake_status)
+
+    assert claude_center_lifecycle._center_health(manifest)
+    assert seen_urls == [manifest.approval_center_url()]
+
+
+def test_claude_center_status_uses_loopback_not_pid_probe(tmp_path, monkeypatch):
+    from agentveil_mcp_proxy import claude_center_lifecycle
+    from agentveil_mcp_proxy.approval.persistent import (
+        ApprovalCenterManifest,
+        save_manifest,
+        token_hash_for,
+    )
+
+    token = "session-token"
+    manifest = ApprovalCenterManifest(
+        schema_version=2,
+        host="127.0.0.1",
+        port=43210,
+        session_token=token,
+        token_hash=token_hash_for(token),
+        internal_register_token="internal",
+        pid=12345,
+        started_at=1,
+    )
+    save_manifest(tmp_path / ".avp" / "mcp-proxy", manifest)
+    monkeypatch.setattr(claude_center_lifecycle, "is_process_alive", lambda _pid: False)
+    monkeypatch.setattr(claude_center_lifecycle, "_center_health", lambda _manifest: True)
+
+    status = claude_center_lifecycle.check_status(tmp_path / ".avp")
+
+    assert status.state == "running"
+    assert status.port == 43210
+
+
+def test_setup_proxy_command_falls_back_to_invoked_console_script(tmp_path, monkeypatch):
+    script = tmp_path / "agentveil-mcp-proxy"
+    script.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+    monkeypatch.setattr(sys, "argv", [str(script), "setup", "claude-code"])
+
+    assert proxy_cli._resolve_setup_proxy_command() == str(script.resolve())
+
+
+def test_setup_proxy_command_prefers_invoked_script_over_path(tmp_path, monkeypatch):
+    invoked = tmp_path / "venv" / "bin" / "agentveil-mcp-proxy"
+    invoked.parent.mkdir(parents=True)
+    invoked.write_text("#!/bin/sh\n", encoding="utf-8")
+    global_script = tmp_path / "global" / "agentveil-mcp-proxy"
+    global_script.parent.mkdir()
+    global_script.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr("shutil.which", lambda _name: str(global_script))
+    monkeypatch.setattr(sys, "argv", [str(invoked), "setup", "claude-code"])
+
+    assert proxy_cli._resolve_setup_proxy_command() == str(invoked.resolve())

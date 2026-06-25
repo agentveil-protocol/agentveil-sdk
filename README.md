@@ -7,12 +7,15 @@
 [![PyPI](https://img.shields.io/pypi/v/agentveil-mcp-proxy)](https://pypi.org/project/agentveil-mcp-proxy/)
 [![Python](https://img.shields.io/pypi/pyversions/agentveil-mcp-proxy)](https://pypi.org/project/agentveil-mcp-proxy/)
 [![Tests](https://github.com/agentveil-protocol/agentveil-sdk/actions/workflows/tests.yml/badge.svg)](https://github.com/agentveil-protocol/agentveil-sdk/actions)
-[![License](https://img.shields.io/badge/License-MIT%20%2B%20BUSL-informational)](LICENSING.md)
+[![SDK License: MIT](https://img.shields.io/badge/SDK-MIT-informational)](LICENSING.md)
+[![Proxy License: BUSL-1.1](https://img.shields.io/badge/Proxy-BUSL--1.1-orange)](LICENSING.md)
 [![Glama MCP Directory](https://img.shields.io/badge/Glama-MCP%20Directory-blue)](https://glama.ai/mcp/servers/agentveil-protocol/avp-sdk)
 
-**AgentVeil MCP Proxy 0.7.22: runtime action-control for agentic MCP deployments.**
+**The risk isn't what AI says. It's what AI does.**
 
-[Quick Start](#quick-start) · [Scope](#scope) · [Design Basis](#design-basis) · [Comparison](#comparison) · [Examples](examples/) · [Docs](docs/)
+AgentVeil controls what AI agents can do across configured native agent actions and routed MCP tool calls: deny unsafe actions, redirect agents to controlled tools, require approval for risky writes, and record bounded evidence.
+
+[Quick Start](#quick-start) · [Connectors](#connectors-available-today) · [Evidence](#bounded-evidence) · [Scope](#scope) · [Design Basis](#design-basis) · [Docs](docs/)
 
 </div>
 
@@ -22,15 +25,59 @@ pip install agentveil-mcp-proxy
 
 **Proxy PyPI**: [agentveil-mcp-proxy](https://pypi.org/project/agentveil-mcp-proxy/) | **Website**: [agentveil.dev](https://agentveil.dev) | **Package source**: [`packages/agentveil-mcp-proxy/`](packages/agentveil-mcp-proxy/)
 
-> **MCP transport proxy:** AgentVeil MCP Proxy puts an AgentVeil control boundary in front of routed MCP tool calls: policy decisions, approval routing, redirect / block outcomes, and bounded local evidence. The proxy controls only calls routed through it; actions outside the proxy are not classified or logged. It is a separately packaged source-available component under [`packages/agentveil-mcp-proxy/`](packages/agentveil-mcp-proxy/) and is not covered by the root MIT license. See [Licensing](LICENSING.md).
+> **Agent action boundary:** AgentVeil helps put a control boundary between an AI agent and risky actions. Configured project connectors can deny supported native agent mutations and redirect the agent to controlled MCP tools. The Core MCP Proxy classifies routed MCP calls, handles approval / redirect / block outcomes, and records bounded local evidence.
+>
+> AgentVeil is not machine-wide control. Actions outside configured AgentVeil boundaries are not classified or logged.
 
 <p align="center">
   <img src="docs/routed-action-control.png" alt="AgentVeil routed action control flow" width="840">
 </p>
 
-> **Visual overview:** request → AgentVeil boundary → redirect / approval / block → bounded evidence. Enforcement applies only to actions routed through an AgentVeil boundary.
+> **Visual overview:** request → AgentVeil boundary → redirect / approval / block → bounded evidence.
 >
-> **Data handling:** AgentVeil does not train models on customer data or sell customer data. Runtime Gate is designed for bounded metadata and hashes; MCP Proxy keeps raw MCP arguments local by default. See [Data Handling](docs/DATA_HANDLING.md).
+> **Data handling:** AgentVeil is designed to keep raw MCP arguments local by default and to record bounded metadata and hashes for evidence. See [Data Handling](docs/DATA_HANDLING.md).
+
+## Quick Start
+
+Use AgentVeil with a supported project connector, or run the Core MCP Proxy directly.
+
+### Cursor project connector
+
+```bash
+pip install agentveil-mcp-proxy
+agentveil-mcp-proxy setup cursor --choose-folder
+```
+
+Choose the project folder you want to protect, then reopen / reload Cursor for that project.
+
+After setup, in the configured project:
+
+- supported native risky agent actions can be denied before execution;
+- the agent is guided toward the AgentVeil MCP route;
+- routed MCP writes can require approval;
+- AgentVeil records bounded local evidence for decisions and outcomes.
+
+Some Cursor versions may require enabling the managed `agentveil-mcp-proxy` MCP server once in **Tools & MCPs** after reload.
+
+### Claude Code project connector
+
+```bash
+pip install agentveil-mcp-proxy
+agentveil-mcp-proxy setup claude-code --choose-folder --yes
+```
+
+Choose the project folder you want to protect, then reopen / reload Claude Code for that project.
+
+After setup, in the configured project:
+
+- supported native Claude Code mutation tools are checked by a project-local hook;
+- risky native mutations are denied with a redirect to the controlled MCP route;
+- AgentVeil MCP writes go through the proxy approval path;
+- bounded evidence is written locally.
+
+### Core MCP Proxy path
+
+For lower-level MCP routing without an IDE connector:
 
 ```bash
 pip install agentveil-mcp-proxy
@@ -39,410 +86,258 @@ agentveil-mcp-proxy doctor --full
 agentveil-mcp-proxy run
 ```
 
+This starts the core route: MCP tool calls explicitly pointed at `agentveil-mcp-proxy`.
+
+### Verify your setup works
+
+After installing a project connector, ask your agent to do something risky in that project, for example:
+
+```text
+Create avp-test.txt with the text hello
+```
+
+AgentVeil should deny the native risky action, guide the agent toward the controlled MCP route, and require approval before the routed write executes.
+
+Check recent bounded evidence:
+
+```bash
+agentveil-mcp-proxy events list --limit 1
+```
+
+## Connectors Available Today
+
+AgentVeil is built around action-control boundaries. Cursor and Claude Code are the first supported project connectors.
+
+| Connector | Mechanism | What it adds | Status |
+|---|---|---|---|
+| Cursor project connector | Project-local hooks + MCP route | Native mutation deny/redirect, routed MCP approval/evidence | Available |
+| Claude Code project connector | Project-local `PreToolUse` hook + MCP route | Native mutation deny/redirect, routed MCP approval/evidence | Available |
+| Core MCP Proxy | MCP transport boundary | Routed MCP policy, approval, redirect / block outcomes, bounded evidence | Available |
+
+Future connectors can follow the same model: configure a boundary, route risky actions through controlled tools, and record evidence.
+
+## Compatibility
+
+Current connector checks have been run with:
+
+| Surface | Checked version |
+|---|---|
+| Cursor | 3.6.31 |
+| Claude Code | 2.1.126 |
+| Python package metadata | Python 3.10-3.13 |
+
+Other versions may work, but are not listed here until verified.
+
+## What AgentVeil Controls
+
+AgentVeil has two public control surfaces:
+
+1. **Project connectors**
+   - configured per project/workspace;
+   - install managed local hooks and MCP route config;
+   - deny supported native risky agent mutation tools;
+   - redirect the agent toward AgentVeil MCP tools;
+   - use MCP Proxy approval and evidence for routed tool calls.
+
+2. **Core MCP Proxy**
+   - wraps downstream MCP servers;
+   - classifies routed MCP tool calls;
+   - returns allow / approval_required / redirect / block;
+   - records bounded local evidence.
+
+## What AgentVeil Does Not Control
+
+AgentVeil does **not** claim machine-wide control.
+
+It does not control:
+
+- your whole machine;
+- every Cursor / Claude / Codex chat globally;
+- direct human terminal commands outside configured AgentVeil paths;
+- IDE actions outside supported agent tool surfaces;
+- MCP servers not routed through AgentVeil;
+- disabled, removed, or bypassed hooks;
+- unsupported client modes that skip hooks.
+
+Actions outside configured AgentVeil boundaries are not classified or logged.
+
+## Bounded Evidence
+
+AgentVeil records bounded local evidence for controlled actions, so teams can review what an agent requested, what policy decided, whether approval was required, and whether the action executed.
+
+Example evidence shape:
+
+```json
+{
+  "tool": "write_file",
+  "decision": "approval_required",
+  "approval": "approved",
+  "target_reached": true,
+  "payload_hash": "sha256:...",
+  "timestamp": "2026-06-25T..."
+}
+```
+
+Evidence is designed for audit and incident review:
+
+- what the agent requested;
+- what policy decided;
+- whether approval was required;
+- whether the action executed;
+- hashes and bounded metadata instead of raw prompts or full payloads by default.
+
+This is useful for AI-agent governance, compliance review, and debugging unsafe automation.
+
+## Handling False Positives
+
+AgentVeil is designed to fail closed for risky actions. If a supported agent action is blocked unexpectedly, inspect local decision evidence before changing the setup.
+
+Start with:
+
+```bash
+agentveil-mcp-proxy events list --limit 10
+agentveil-mcp-proxy setup status --json
+```
+
+For routed MCP actions, approval and policy behavior are documented in:
+
+- [Approval Routing](docs/APPROVAL_ROUTING.md)
+- [MCP Proxy Operations](docs/MCP_PROXY_OPERATIONS.md)
+
+If a connector is not right for a project, remove only the managed AgentVeil entries for that project instead of editing Cursor / Claude config by hand.
+
+Preview managed removal:
+
+```bash
+agentveil-mcp-proxy setup remove cursor
+agentveil-mcp-proxy setup remove claude-code
+```
+
+Apply removal after review:
+
+```bash
+agentveil-mcp-proxy setup remove cursor --yes
+agentveil-mcp-proxy setup remove claude-code --yes
+```
+
 ## Scope
 
-AgentVeil MCP Proxy controls routed MCP tool calls that are explicitly pointed
-at an AgentVeil boundary.
+Available today:
 
-- Available today: MCP Proxy for routed MCP tool calls.
-- Supported routed outcomes: approval / redirect / block / evidence.
-- Preview/design-partner boundary patterns: credential custody, egress boundary,
-  and API gate.
-- Not host-wide: AgentVeil does not monitor or control your whole machine.
-- Not a lock for Cursor, Codex, or Claude.
-- MCP Proxy does not control IDE-native edits, direct shell commands, direct
-  git/pip calls, or actions that bypass the proxy.
-- Actions outside the proxy are not classified or logged.
+- MCP Proxy for routed MCP tool calls;
+- project-local Cursor connector;
+- project-local Claude Code connector;
+- approval / redirect / block / evidence outcomes for routed actions;
+- bounded local evidence export.
+
+Available as SDK / protocol primitives:
+
+- capability-token primitives;
+- local identity helpers;
+- delegation receipts;
+- proof packet helpers.
+
+Preview / design-partner product flows:
+
+- session-token flows for reducing repeated approvals;
+- richer policy packs;
+- credential custody;
+- egress boundary;
+- hosted approval and team governance.
+
+Not included in the public connector:
+
+- machine-wide shell interception;
+- global Cursor / Claude / Codex lock;
+- automatic control of unrelated chats;
+- private enterprise policy packs;
+- hosted auth, licensing, telemetry, or enterprise custody logic.
+
+## Example Risk Patterns
+
+AgentVeil is useful when an agent crosses from reading context into changing state.
+
+| Workflow | Low-risk actions | Higher-risk actions AgentVeil can gate |
+|---|---|---|
+| Code / PR workflow | read files, inspect git history, list workspace | edit files, run mutation commands, change repo state |
+| Content workflow | read drafts, inspect metadata | publish, send, update CMS-like content |
+| Data workflow | read query results, inspect schemas | mutate records, export sensitive data, run destructive operations |
+| Package / build workflow | inspect dependencies, read lockfiles | install packages, run scripts, change build output |
+
+### Agentic media / broadcast workflows
+
+Agentic media and broadcast workflows often start with read access to files, assets, CMS entries, Git history, or SQL query results, then cross into higher-risk writes and sends: publishing updates, changing a repository, mutating a database, or sending final content.
+
+This is one example of the broader risk pattern:
+
+```text
+agent reads metadata        -> allow / observe
+agent edits file or record  -> approval required
+agent publishes or sends    -> approval / redirect
+agent tries unsafe mutation -> block
+agent action completes      -> bounded evidence
+```
+
+AgentVeil does not ship native broadcast, CMS, or SQL integrations in this package. The example describes the risk pattern for agentic workflows.
+
+## Why This Exists
+
+AI agents increasingly hold direct access to files, repositories, package managers, credentials, and workflow tools.
+
+The risk is no longer only what an AI says. The risk is what an AI can do.
+
+AgentVeil focuses on action control:
+
+1. **Deny unsafe native agent actions** in configured project connectors.
+2. **Redirect risky work** toward controlled MCP tools.
+3. **Require approval** for routed writes and mutations.
+4. **Record bounded evidence** for audit, review, and compliance.
+
+AgentVeil does not solve the general access-control safety problem. It narrows the problem to configured projects, routed MCP calls, supported agent tool paths, and explicit policy decisions.
 
 ## Design Basis
 
 The MCP Proxy design is summarized in
 [MCP Proxy Design Principles](docs/MCP_PROXY_DESIGN_PRINCIPLES.md).
 
-- Emerging AI-control patterns: separate runtime identity, least-privilege
-  action access, approval for sensitive operations, blocking or redirecting
-  unsafe calls, and bounded audit evidence.
-- Saltzer & Schroeder: the proxy maps classic security engineering principles
-  to a bounded MCP mediation point.
-- Fail-safe defaults: missing policy, missing approval, or unavailable trusted
-  decisions move toward denial or explicit review.
-- Complete mediation on routed calls: each protected downstream MCP call goes
-  through the same classify, decide, evidence, and forward-or-deny path.
-- Least privilege: approvals are scoped to concrete action context instead of
-  broad standing permission.
-- Separation of privilege: local proxy identity, control grants, and backend
-  signing authority are separate roles.
-- Bounded evidence: receipts, payload hashes, and local evidence chains bind
-  decisions to the routed action subset.
-- HRU limitation: AgentVeil treats general access-control safety as out of
-  scope and narrows its claims to routed calls and an explicit policy
-  vocabulary.
+- Fail-safe defaults: missing policy, missing approval, or unavailable trusted decisions move toward denial or explicit review.
+- Complete mediation on routed calls: each protected downstream MCP call goes through the same classify, decide, evidence, and forward-or-deny path.
+- Least privilege: approvals are scoped to concrete action context instead of broad standing permission.
+- Separation of privilege: local proxy identity, control grants, and backend signing authority are separate roles.
+- Bounded evidence: receipts, payload hashes, and local evidence chains bind decisions to the routed action subset.
 
-## Example: agentic media / broadcast workflows
-
-Agentic media and broadcast workflows often start with read access to files,
-assets, CMS entries, Git history, or SQL query results, then cross into
-higher-risk writes and sends: publishing updates, changing a repository,
-mutating a database, or sending final content. That crossing is the risk
-pattern for the proxy. Routed MCP tool calls can require approval and bounded
-evidence before the downstream write, send, or mutation proceeds. Direct paths
-outside the proxy remain outside AgentVeil classification and logging.
-
-## Quick Start
-
-### Route one local MCP path
-
-```bash
-pip install agentveil-mcp-proxy
-agentveil-mcp-proxy init --quickstart-filesystem ./sandbox
-agentveil-mcp-proxy doctor --full
-agentveil-mcp-proxy run
-```
-
-This starts with the public AgentVeil route available today: MCP tool calls that
-are explicitly pointed at `agentveil-mcp-proxy`. See the
-[MCP Proxy README](packages/agentveil-mcp-proxy/README.md) for client
-configuration and local evidence export.
-
----
-
-## Why This Exists
-
-AI agents increasingly hold direct access to production credentials, deploy
-workflows, and developer infrastructure. The current AgentVeil MCP Proxy product
-path focuses on routed action control for MCP tool calls:
-
-1. **Routed MCP mediation** — place an AgentVeil boundary in front of downstream MCP tools
-2. **Approval / redirect / block decisions** — classify routed risky calls before forwarding
-3. **Bounded evidence** — keep local evidence for routed decisions and downstream calls
-
-AgentVeil does not claim to solve the general access-control safety problem.
-For routed MCP calls, it narrows the problem to an explicit action vocabulary
-and policy subset: each mediated decision is bound to explicit risk, resource,
-environment, and payload evidence.
-
-See [Security Context](docs/SECURITY_CONTEXT.md) for background on agent action-control risk.
-
----
+For deeper security framing, including Saltzer & Schroeder and HRU-aware limits, see [MCP Proxy Design Principles](docs/MCP_PROXY_DESIGN_PRINCIPLES.md).
 
 ## Comparison
 
-|  | Without AgentVeil | With AgentVeil |
+| Category | Main focus | Where AgentVeil differs |
 |---|---|---|
-| **MCP boundary** | Client calls downstream tools directly | Client routes selected MCP tools through `agentveil-mcp-proxy` |
-| **Risky tool execution** | Tool call proceeds without the proxy decision path | Routed MCP call is classified before forwarding -> allow / approval_required / redirect / block |
-| **Approval on critical steps** | Rubber-stamped or skipped | Approval is bound to exact action/resource/env context |
-| **Audit evidence** | "Agent triggered X" in app logs | Local evidence records bind the routed call, decision, hashes, and timestamp |
+| Prompt/content guardrails | Detect unsafe text | AgentVeil controls actions and tool calls, not only prompts |
+| LLM API gateways | Route model traffic | AgentVeil mediates agent tool execution and evidence |
+| Direct MCP servers | Expose tools to agents | AgentVeil adds policy, approval, redirect, and evidence between agent and tool |
+| Secret managers | Store credentials | AgentVeil controls when risky agent actions may execute |
+| Generic audit logs | Record app events | AgentVeil binds evidence to specific agent action requests and decisions |
 
----
+## Reporting Issues And Security Findings
+
+For bugs and integration problems, use the repository issue tracker. For security-sensitive findings, follow the repository [Security Policy](SECURITY.md).
+
+Security-sensitive reports should not include secrets, raw credentials, private keys, or full customer data in public issues.
+
+## Licensing
+
+The root SDK is MIT-licensed.
+
+`agentveil-mcp-proxy` is a separately packaged source-available component under BUSL-1.1. See [Licensing](LICENSING.md) before using it in commercial or competing hosted services.
 
 ## Python SDK and advanced protocol primitives
 
-Advanced Python SDK package: agentveil
+Advanced Python SDK package: `agentveil`.
 
-The public SDK also includes protocol primitives that can support custom
-integrations: local `did:key` identity, delegation receipts, credential
-helpers, reputation credential access, receipt helpers, and optional
-framework adapter modules under `agentveil.tools.*` when their framework
-dependencies are installed.
+The public SDK also includes protocol primitives that can support custom integrations: local `did:key` identity, delegation receipts, credential helpers, reputation credential access, receipt helpers, and optional framework adapter modules under `agentveil.tools.*` when their framework dependencies are installed.
 
-These primitives are not the main product path in this README. For direct use,
-start with [Agent Network (Advanced)](docs/ADVANCED_AGENT_NETWORK.md),
-[DelegationReceipt Guide](docs/DELEGATION_RECEIPT.md), and
-[Proof Packet Guide](docs/PROOF_PACKET.md).
+These primitives are not the main product path in this README. For direct use, start with:
 
-### Capability Tokens
-
-AVP approvals are capability tokens, not flat permissions. A Runtime Gate
-decision or approval grant is signed by the AVP backend, scoped to concrete
-action context (`client_risk_class`, `client_policy_context_hash`, and
-`payload_hash`), time-bounded by grant expiry, replay-resistant at the proxy
-boundary, and attenuatable through narrower follow-on grants such as
-`similar_5m`. Downstream tools receive only the authority needed for the
-approved action, not broad standing permission.
-
----
-
-### Decision Inputs (advisory)
-
-These advisory APIs feed the Runtime Gate's risk assessment. They inform
-action gating decisions but do not grant execution authority on their own.
-For direct reputation and agent-network usage, see
-[Agent Network (Advanced)](docs/ADVANCED_AGENT_NETWORK.md).
-
-For advisory selection and existing integrations, the SDK also includes:
-
-- `can_trust(...)` — advisory score, tier, risk, and explanation before delegation
-- `@avp_tracked(...)` — decorator for auto-registering and attesting local work
-- Framework tools such as `AVPReputationTool`, `avp_should_delegate(...)`, and `avp_tool_definitions()`
-
-```python
-from agentveil import AVPAgent, avp_tracked
-
-agent = AVPAgent.load("https://agentveil.dev", "my-agent")
-decision = agent.can_trust("did:key:z6Mk...", min_tier="trusted")
-print(decision["allowed"], decision["reason"])
-
-@avp_tracked("https://agentveil.dev", name="reviewer", to_did="did:key:z6Mk...")
-def review_code(pr_url: str) -> str:
-    return analysis
-```
-
----
-
-### Features
-
-**Action control surface**
-
-- **Pre-runtime Checks** — inspect agent identity, status, delegation evidence, and risk signals before runtime
-- **Runtime Gate** — evaluate routed risky actions and return allow / approval required / block
-- **Receipt records** — keep evidence for gate decisions, approvals, and routed actions
-- **W3C VC v2.0 Credentials** — export offline-verifiable credentials with `eddsa-jcs-2022` Data Integrity proofs
-- **Webhook Alerts** — score-change notifications to any HTTP endpoint ([setup guide](docs/WEBHOOKS.md))
-- **Framework Integrations** — SDK tools for CrewAI, LangGraph, AutoGen, OpenAI, Claude MCP, Paperclip, and more
-
-**Supporting signals (advisory)**
-
-- **Reputation Signals** — peer attestations, confidence scoring, and advisory trust checks
-- **Agent Discovery** — publish capability cards and find agents by skill and reputation
-- **Dispute & Review Support** — attach evidence and review contested attestations
-
----
-
-### Integrations
-
-| Stack | Install | Integration surface |
-|-------|---------|---------------------|
-| **Any Python** | `pip install agentveil` | `AVPAgent`, `integration_preflight()`, `controlled_action()`, `build_proof_packet()` |
-| **CrewAI** | `pip install agentveil crewai` | `AVPReputationTool`, `AVPDelegationTool`, `AVPAttestationTool` |
-| **LangGraph** | `pip install agentveil langgraph` | `ToolNode([avp_check_reputation, avp_should_delegate, avp_log_interaction])` |
-| **AutoGen** | `pip install agentveil autogen-core` | `avp_reputation_tools()` |
-| **OpenAI** | `pip install agentveil openai` | `avp_tool_definitions()` + `handle_avp_tool_call(...)` from `agentveil.tools.openai` |
-| **MCP clients** | `pip install 'agentveil[mcp]'` | `agentveil-mcp` toolbox for explicit Runtime Gate evaluation, approvals, receipts, reputation, identity lookup, and audit. It does not intercept or gate other MCP tools. ([docs](agentveil_mcp/README.md)) |
-| **MCP transport proxy** | `pip install agentveil-mcp-proxy` | `agentveil-mcp-proxy` gates downstream MCP calls routed through the proxy with approval routing and bounded local evidence for MCP clients ([docs](packages/agentveil-mcp-proxy/README.md)) |
-| **Gemini** | `pip install agentveil google-generativeai` | Function-calling example: [`examples/gemini_example.py`](examples/gemini_example.py) |
-| **PydanticAI** | `pip install agentveil pydantic-ai` | Tool example: [`examples/pydantic_ai_example.py`](examples/pydantic_ai_example.py) |
-| **Paperclip** | `pip install agentveil` | `avp_should_delegate(...)`, `avp_evaluate_team(...)`, `avp_plugin_tools()` |
-| **AWS Bedrock** | `pip install agentveil boto3` | Converse API example: [`examples/aws_bedrock.py`](examples/aws_bedrock.py) |
-| **Microsoft AGT / AgentMesh** | `pip install agentmesh-avp` | External/community adapter path for Agent Governance Toolkit / AgentMesh |
-
-Full integration guides: [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md)
-
----
-
-### Batch Attestations
-
-Attestations from peer agents build reputation history that feeds future
-Runtime Gate decisions.
-
-Submit up to 50 attestations in a single request. Each is validated independently — partial success is possible.
-
-```python
-results = agent.attest_batch([
-    {"to_did": "did:key:z6MkAgent1...", "outcome": "positive", "weight": 0.9, "context": "code_review"},
-    {
-        "to_did": "did:key:z6MkAgent2...",
-        "outcome": "negative",
-        "weight": 0.7,
-        "context": "failed_security_review",
-        "evidence_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-    },
-    {"to_did": "did:key:z6MkAgent3...", "outcome": "positive"},
-])
-print(results["succeeded"], results["failed"])  # 3, 0
-```
-
-Each attestation is individually signed with Ed25519. Optional fields: `context`, `evidence_hash`, `is_private`, `interaction_id`.
-Negative attestations require both `context` and a 64-character lowercase hex
-`evidence_hash`.
-
----
-
-### Security
-
-- Ed25519 signature authentication with nonce anti-replay
-- W3C `did:key` identity with Ed25519 keys for portable agent identity
-- Input validation for signed SDK/API requests
-- Agent status checks for active, suspended, revoked, or migrated identities
-- Audit trail — SHA-256 hash-chained events with optional IPFS anchoring for published proof artifacts
-
----
-
-### Documentation
-
-| Doc | Description |
-|-----|-------------|
-| [API Reference](docs/API.md) | Full SDK method reference with examples |
-| [Data Handling](docs/DATA_HANDLING.md) | Local tools, hosted proof ledger, customer evidence stores, hosted content surfaces, and privacy guardrails |
-| [Customer Integration](docs/CUSTOMER_INTEGRATION.md) | Controlled-action flow, secrets, errors, and compliance evidence |
-| [Mode A Quickstart](docs/MODE_A_QUICKSTART.md) | Project owner path — scan, policy, evaluate, evidence |
-| [Error Handling](docs/ERRORS.md) | Exception hierarchy, recovery patterns, HTTP status mapping |
-| [Proof Packet Guide](docs/PROOF_PACKET.md) | Build, save, verify signed action evidence offline |
-| [Live Developer Adoption Smoke](docs/LIVE_DEVELOPER_ADOPTION_SMOKE.md) | Production validation for Runtime Gate, approval, proof packets, typed errors |
-| [Approval Routing](docs/APPROVAL_ROUTING.md) | Resolve approval_required outcomes, grant/deny patterns, resume execution |
-| [Registration & Verification](docs/REGISTRATION.md) | Agent registration lifecycle, states, error cases, passphrase security |
-| [DelegationReceipt Guide](docs/DELEGATION_RECEIPT.md) | Issuance, verification, common patterns, error handling |
-| [Integrations](docs/INTEGRATIONS.md) | Framework-specific setup guides |
-| [Webhook Alerts](docs/WEBHOOKS.md) | Push notification setup |
-| [Protocol Spec](docs/PROTOCOL.md) | AgentVeil wire format and authentication |
-| [Security Model](docs/SECURITY_MODEL.md) | Mode 1 SDK developer flow, Mode 2/3 gateway enforcement roadmap |
-| [MCP Proxy Operations](docs/MCP_PROXY_OPERATIONS.md) | Downstream lifecycle behavior and response timeout configuration |
-| [MCP Proxy Design Principles](docs/MCP_PROXY_DESIGN_PRINCIPLES.md) | Saltzer-Schroeder mapping, HRU-aware framing, and capability-token discipline |
-| [Security Context](docs/SECURITY_CONTEXT.md) | Why agent trust matters — CVEs and market data |
-| [Agent Network (Advanced)](docs/ADVANCED_AGENT_NETWORK.md) | Reputation, attestations, agent identity — internal mechanisms |
-| [Changelog](CHANGELOG.md) | Version history |
-
----
-
-### Examples
-
-| Example | Description |
-|---------|-------------|
-| [`first_controlled_action.py`](examples/first_controlled_action.py) | **Action control demo** — preflight → Runtime Gate → approval routing → signed receipt |
-| [`approval_flow.py`](examples/approval_flow.py) | **Approval pattern** — controlled_action → approval_required → grant → execute_after_approval |
-| [`handle_errors.py`](examples/handle_errors.py) | **Error patterns** — typed exception handling for retry, re-auth, validation, network |
-| [`proof_packet_export.py`](examples/proof_packet_export.py) | **Proof packet export** — build, save, reload, verify offline (mock mode) |
-| [`registration/`](examples/registration/) | **Registration patterns** — first-time setup, verification state, encrypted reload |
-| [`delegation/`](examples/delegation/) | **DelegationReceipt patterns** — issue, verify offline, persist/reload, multi-scope |
-| [`proof_pack/`](examples/proof_pack/) | **Offline audit verification** — local-backend demo: signed events → hash chain → independent offline verification (no SDK or AVP API needed). Local backend required. |
-| [`standalone_demo.py`](examples/standalone_demo.py) | **Agent network primitives** — registration, peer attestations, scoring (mock mode, no server). Advanced internal surface. For action control, see [Mode A Quickstart](docs/MODE_A_QUICKSTART.md). |
-| [`quickstart.py`](examples/quickstart.py) | Register, publish card, check reputation |
-| [`two_agents.py`](examples/two_agents.py) | Full A2A interaction with attestations |
-| [`verify_credential_standalone.py`](examples/verify_credential_standalone.py) | Offline credential verification (no SDK needed) |
-
-Framework examples: [CrewAI](examples/crewai_example.py) · [LangGraph](examples/langgraph_example.py) · [AutoGen](examples/autogen_example.py) · [OpenAI](examples/openai_example.py) · [Claude MCP](examples/claude_mcp_example.py) · [Paperclip](examples/paperclip_example.py)
-
----
-
-### Audit chain and proof packets
-
-**Audit chain walkthrough:** [`examples/proof_pack/`](examples/proof_pack/) —
-local-backend demo for offline audit-trail integrity checks. Flow: signed
-events -> hash chain -> offline verify (stdlib only, no SDK dependency).
-
-**Controlled-action proof packets:** Runtime Gate flows can export signed proof
-packets with `agent.build_proof_packet(...)`; see
-[Customer Integration](docs/CUSTOMER_INTEGRATION.md).
-
-### Run SDK-only protocol primitives locally
-
-```python
-from datetime import timedelta
-from agentveil import AVPAgent
-
-owner = AVPAgent.create(mock=True, name="workflow-owner")
-agent = AVPAgent.create(mock=True, name="demo-agent")
-agent.register(display_name="Test Agent")
-
-delegation = owner.issue_delegation_receipt(
-    agent_did=agent.did,
-    allowed_categories=["deploy"],
-    valid_for=timedelta(minutes=15),
-)
-verification = agent.verify_delegation_receipt(delegation)
-
-print("delegation valid:", verification["valid"])
-print("scope:", verification["scope"][0]["value"])
-```
-
-For hosted Runtime Gate, approvals, and receipt records, see
-[Customer Integration](docs/CUSTOMER_INTEGRATION.md).
-
-### Integrated application shape
-
-```python
-from agentveil import AVPAgent
-
-agent = AVPAgent.load("https://agentveil.dev", "my-agent")
-
-report = agent.integration_preflight()
-if not report.ready:
-    raise RuntimeError(report.next_action)
-
-outcome = agent.controlled_action(
-    action="deploy.release",
-    resource="service:critical-workflow",
-    environment="production",
-    delegation_receipt=delegation_receipt,  # issued by the workflow owner
-)
-
-if outcome.status == "approval_required":
-    wait_for_principal_approval(outcome.approval["approval_id"])
-elif outcome.status == "executed":
-    store(outcome.receipt_jcs)
-elif outcome.status == "blocked":
-    raise RuntimeError(outcome.reason)
-```
-
-### Verify advanced credentials offline
-
-```bash
-# Get a W3C Verifiable Credential (VC v2.0)
-curl https://agentveil.dev/v1/reputation/{agent_did}/credential?format=w3c
-```
-
-The response is a verifiable credential. This is an advanced protocol
-primitive; check it with a VC library or your own Ed25519 implementation when
-you use the identity/reputation layer directly.
-
-```python
-# Or verify with the SDK:
-cred = agent.get_reputation_credential(format="w3c")
-assert AVPAgent.verify_w3c_credential(cred)  # offline, no API call
-```
-
-Microsoft AGT / AgentMesh support is presented as an external/community adapter
-path, not as an endorsement claim. Research background remains available in
-[Security Context](docs/SECURITY_CONTEXT.md).
-
----
-
-### Mode A Quickstart
-
-Project owners can use AgentVeil as a routed action-control path for agents,
-tools, workflows, MCP servers, and CI jobs inside one project.
-
-1. Check the agent project with Lurkr before deployment:
-
-   ```bash
-   pip install lurkr
-   lurkr scan --path ./your-agent-project
-   ```
-
-2. Define local policy:
-
-   ```bash
-   agentveil policy init                # (planned for v0.8 / Phase 3)
-   ```
-
-3. Evaluate actions before execution:
-
-   ```python
-   from agentveil import evaluate_action  # (planned for v0.8 / Phase 3)
-   ```
-
-4. Produce signed evidence today with `controlled_action(...)`,
-   DelegationReceipts, approval routing, and Proof Packets.
-
-See [Mode A Quickstart](docs/MODE_A_QUICKSTART.md) for the full Project Owner
-path and planned capability markers.
-
----
-
-## Community
-
-- ⭐ **[Star this repo](https://github.com/agentveil-protocol/agentveil-sdk/stargazers)** — helps others discover AgentVeil
-- 🐛 **[Open an issue](https://github.com/agentveil-protocol/agentveil-sdk/issues)** — bugs, questions, feature requests
-- 📖 **[Customer Integration guide](docs/CUSTOMER_INTEGRATION.md)** — production setup
-
----
-
-## License
-
-This is a multi-license repository.
-
-The public `agentveil` SDK package and explicit `agentveil-mcp` toolbox are MIT
-licensed under [LICENSE](LICENSE). The separately packaged MCP transport proxy
-under [`packages/agentveil-mcp-proxy/`](packages/agentveil-mcp-proxy/) is
-source-available under the Business Source License 1.1, not MIT. See
-[LICENSING.md](LICENSING.md) for the package boundary.
+- [Agent Network (Advanced)](docs/ADVANCED_AGENT_NETWORK.md)
+- [DelegationReceipt Guide](docs/DELEGATION_RECEIPT.md)
+- [Proof Packet Guide](docs/PROOF_PACKET.md)

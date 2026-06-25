@@ -227,12 +227,10 @@ def test_canonical_readme_marks_mcp_server_as_deprecated():
     assert "mcp_server" in text, "README must reference old mcp_server path to migrate from"
 
 
-def test_top_readme_uses_extras_install_form():
+def test_top_readme_uses_current_proxy_install_form():
     text = TOP_README.read_text(encoding="utf-8")
-    # The Claude/Hermes rows should use the `'agentveil[mcp]'` extras form,
-    # not the bare `pip install agentveil mcp` two-package form.
-    assert "pip install 'agentveil[mcp]'" in text, (
-        "top-level README should advertise the [mcp] extras install form"
+    assert "pip install agentveil-mcp-proxy" in text, (
+        "top-level README should advertise the current MCP proxy package install form"
     )
     # Guard against regression to the old two-package form in the integrations table rows
     # that mention MCP.

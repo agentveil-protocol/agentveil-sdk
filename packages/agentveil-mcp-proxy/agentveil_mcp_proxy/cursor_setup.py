@@ -1,797 +1,1023 @@
-"""Project-local Cursor hook setup, status, and removal for configured workspaces."""
+"""Project-local Cursor one-command setup (hooks, MCP route, Approval Center).
+
+Public SDK surface for ``agentveil-mcp-proxy setup cursor --yes``. Writes merge-
+preserving entries into ``.cursor/hooks.json`` and ``.cursor/mcp.json``,
+initializes workspace-scoped ``.agentveil`` proxy home, owns the generic local
+Approval Center lifecycle, and reports bounded ``Protected`` / ``Advisory`` /
+``Unsafe`` status.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 import os
-from pathlib import Path
-import re
+import secrets
 import shlex
-import shutil
+import signal
 import stat
-from typing import Any, Mapping
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
-from agentveil_mcp_proxy.client_connect import (
-    resolve_cursor_global_mcp_json_path,
-    resolve_cursor_user_data_dir,
+from agentveil_mcp_proxy.approval.persistent import (
+    ApprovalCenterManifest,
+    is_process_alive,
+    load_manifest,
+    loopback_get_status,
+    manifest_path,
 )
-from agentveil_mcp_proxy.config_wizard import assert_setup_output_is_privacy_safe
+from agentveil_mcp_proxy.client_connect import resolve_cursor_global_mcp_json_path
+from agentveil_mcp_proxy.cursor_hooks import AGENTVEIL_MCP_SERVER_KEY
+from agentveil_mcp_proxy.cursor_user_mcp import (
+    detect_unmanaged_user_mcp_route,
+    install_user_mcp_route,
+    remove_user_mcp_route,
+    user_mcp_route_is_managed,
+    user_mcp_route_present,
+)
+from agentveil_mcp_proxy.product_route import (
+    PRODUCT_ROUTE_DOWNSTREAM_NAME,
+    build_product_route_downstream_config,
+    initialize_product_route_profile,
+)
 
-CURSOR_SETUP_MANIFEST_VERSION = 2
-CURSOR_SETUP_MANIFEST_NAME = ".agentveil-cursor-hooks.json"
-HOOKS_DIR_NAME = "hooks"
-HOOKS_JSON_NAME = "hooks.json"
-HOOK_SHIM_NAME = "agentveil-cursor-hook.sh"
-HOOK_SHIM_NAME_WINDOWS = "agentveil-cursor-hook.cmd"
-EVIDENCE_FILE_NAME = "agentveil-hook-evidence.jsonl"
-AGENTVEIL_HOOK_ID = "agentveil-cursor-hook-v1"
+AGENTVEIL_HOOK_MARKER = "agentveil_mcp_proxy.cursor_hooks"
 AGENTVEIL_HOOK_EVENTS = ("preToolUse", "beforeShellExecution", "beforeMCPExecution")
-RELOAD_MESSAGE = (
-    "Reload or restart Cursor (Developer -> Reload Window) so hook changes take effect."
+MATCHED_TOOL_CLASSES = ("Write", "Edit", "StrReplace", "ApplyPatch", "Delete", "Shell", "mcp__*")
+MCP_ROUTE_ENV_KEYS = (
+    "DOWNSTREAM_NAME",
+    "AVP_HOME",
+    "MCP_CONTENT_ROOT",
+    "AVP_CURSOR_WORKSPACE",
+    "PRODUCT_ROUTE_PROFILE_ROOT",
 )
+USER_MCP_BACKUP_DIRNAME = "cursor-setup/user-mcp-backups"
+USER_MCP_BACKUP_PREFIX = "user-mcp.json"
+
+BROAD_FOLDER_MESSAGE = (
+    "This looks like a broad folder, not a project workspace.\n"
+    "Choose a project folder instead."
+)
+SETUP_ADVISORY_NEXT_STEP = (
+    "installed; waiting for Cursor reload / MCP confirmation"
+)
+_BROAD_CONTAINER_DIRNAMES = frozenset({".worktrees", "worktrees"})
+_PROJECT_MARKERS = (
+    ".git",
+    "pyproject.toml",
+    "package.json",
+    "Cargo.toml",
+    "go.mod",
+    "pnpm-workspace.yaml",
+    "composer.json",
+)
+
+_START_TIMEOUT_SECONDS = 12.0
+_POLL_INTERVAL_SECONDS = 0.2
+_HEALTH_TIMEOUT_SECONDS = 1.5
 
 
 class CursorSetupError(RuntimeError):
-    """Raised when Cursor hook setup inputs or state are invalid."""
+    """Raised when install/uninstall cannot proceed safely."""
 
 
-@dataclass(frozen=True)
-class CursorSetupPaths:
-    workspace: Path
-    cursor_dir: Path
-    hooks_json: Path
-    hooks_dir: Path
-    hook_shim: Path
-    manifest_path: Path
-    evidence_path: Path
+class BroadWorkspaceError(CursorSetupError):
+    """Raised when the selected workspace is too broad for project setup."""
 
 
-@dataclass(frozen=True)
-class CursorSetupResult:
-    ok: bool
-    action: str
-    workspace_ref: dict[str, str | None]
-    managed_files: tuple[str, ...]
-    reload_required: bool
-    message: str
-    hook_cli_resolved: bool = False
-    hook_cli_ref: dict[str, str | None] | None = None
-    errors: tuple[str, ...] = ()
+def has_project_markers(path: Path) -> bool:
+    """True when *path* looks like a project root rather than a container folder."""
+    for marker in _PROJECT_MARKERS:
+        if (path / marker).exists():
+            return True
+    return False
 
 
-@dataclass(frozen=True)
-class CursorSetupStatus:
-    installed: bool
-    stale: bool
-    workspace_ref: dict[str, str | None]
-    hook_state: str
-    boundary: str
-    managed_files: tuple[str, ...]
-    reload_required: bool
-    message: str
-    hook_cli_resolved: bool = False
-    hook_cli_ref: dict[str, str | None] | None = None
-
-
-@dataclass(frozen=True)
-class CursorRemoveResult:
-    ok: bool
-    removed_files: tuple[str, ...]
-    reload_required: bool
-    message: str
-    errors: tuple[str, ...] = ()
-
-
-def resolve_workspace_root(workspace: Path | None = None) -> Path:
-    root = (workspace or Path.cwd()).expanduser().resolve()
-    if not root.is_dir():
-        raise CursorSetupError("workspace must be an existing directory")
-    return root
-
-
-def resolved_hook_shim_name() -> str:
-    """Return the managed hook shim filename for the current platform."""
-
-    return HOOK_SHIM_NAME_WINDOWS if os.name == "nt" else HOOK_SHIM_NAME
-
-
-def normalize_cli_basename(cli_path: Path) -> str:
-    """Return a stable console-script basename across platforms."""
-
-    name = cli_path.name
-    if name.lower() == "__main__.py":
-        return "agentveil-mcp-proxy"
-    if cli_path.stem == "agentveil-mcp-proxy":
-        return "agentveil-mcp-proxy"
-    return name
-
-
-def _cli_path_is_usable(path: Path) -> bool:
-    if not path.is_file():
-        return False
-    if os.name == "nt":
+def is_broad_workspace(path: Path) -> bool:
+    """True for home/desktop/downloads/root and obvious non-project containers."""
+    resolved = path.expanduser().resolve()
+    home = Path.home().resolve()
+    if resolved in {home, Path("/")}:
         return True
-    return os.access(path, os.X_OK)
-
-
-def cursor_setup_paths(workspace: Path | None = None) -> CursorSetupPaths:
-    root = resolve_workspace_root(workspace)
-    cursor_dir = root / ".cursor"
-    hooks_dir = cursor_dir / HOOKS_DIR_NAME
-    shim_name = resolved_hook_shim_name()
-    return CursorSetupPaths(
-        workspace=root,
-        cursor_dir=cursor_dir,
-        hooks_json=cursor_dir / HOOKS_JSON_NAME,
-        hooks_dir=hooks_dir,
-        hook_shim=hooks_dir / shim_name,
-        manifest_path=cursor_dir / CURSOR_SETUP_MANIFEST_NAME,
-        evidence_path=cursor_dir / EVIDENCE_FILE_NAME,
-    )
-
-
-def global_cursor_config_paths() -> tuple[Path, Path]:
-    return (
-        resolve_cursor_global_mcp_json_path(),
-        resolve_cursor_user_data_dir() / "User" / "settings.json",
-    )
-
-
-def _workspace_ref(workspace: Path) -> dict[str, str | None]:
-    from agentveil_mcp_proxy.client_config import bounded_path_ref
-
-    return bounded_path_ref(workspace)
-
-
-def _shim_relative_path() -> str:
-    return f".cursor/{HOOKS_DIR_NAME}/{resolved_hook_shim_name()}"
-
-
-def _managed_file_paths() -> tuple[str, ...]:
-    shim_name = resolved_hook_shim_name()
-    return (
-        f".cursor/{HOOKS_DIR_NAME}/{shim_name}",
-        f".cursor/{CURSOR_SETUP_MANIFEST_NAME}",
-    )
-
-
-def build_hook_shim_script(*, cli_path: Path, platform_name: str | None = None) -> str:
-    if (platform_name or os.name) == "nt":
-        quoted = f'"{cli_path}"'
-        return f"@echo off\r\n{quoted} hook cursor %*\r\n"
-    quoted = shlex.quote(str(cli_path))
-    return f"""#!/usr/bin/env bash
-set -euo pipefail
-exec {quoted} hook cursor
-"""
-
-
-def resolve_setup_cli_path(
-    *,
-    setup_cli_path: Path | str | None = None,
-    setup_argv0: str | None = None,
-) -> Path:
-    """Resolve the executable used to embed into the Cursor hook shim."""
-
-    if setup_cli_path is not None:
-        candidate = Path(setup_cli_path).expanduser().resolve()
-        if _cli_path_is_usable(candidate):
-            return candidate
-        raise CursorSetupError("setup CLI path is not an executable file")
-
-    if setup_argv0:
-        candidate = Path(setup_argv0).expanduser()
-        if candidate.is_file():
-            resolved = candidate.resolve()
-            if _cli_path_is_usable(resolved):
-                return resolved
-
-    which_path = shutil.which("agentveil-mcp-proxy")
-    if which_path:
-        resolved = Path(which_path).expanduser().resolve()
-        if _cli_path_is_usable(resolved):
-            return resolved
-
-    raise CursorSetupError(
-        "Could not resolve agentveil-mcp-proxy for Cursor hook setup. "
-        "Install the package or rerun setup from the intended console script."
-    )
-
-
-def _hook_cli_ref(cli_path: Path) -> dict[str, str | None]:
-    from agentveil_mcp_proxy.client_config import bounded_path_ref
-
-    ref = bounded_path_ref(cli_path)
-    ref["basename"] = normalize_cli_basename(cli_path)
-    return ref
-
-
-def read_shim_cli_path(shim_path: Path) -> Path | None:
-    if not shim_path.is_file():
-        return None
-    if shim_path.suffix.lower() == ".cmd":
-        for line in shim_path.read_text(encoding="utf-8").splitlines():
-            stripped = line.strip()
-            if not stripped or stripped.lower().startswith("@echo"):
-                continue
-            match = re.match(r'^"(?P<path>[^"]+)"\s+hook\s+cursor\b', stripped, flags=re.IGNORECASE)
-            if match:
-                return Path(match.group("path")).expanduser()
-        return None
-    for line in shim_path.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if stripped.startswith("exec "):
-            parts = shlex.split(stripped)
-            if len(parts) >= 2:
-                return Path(parts[1]).expanduser()
-    return None
-
-
-def shim_cli_is_resolved(*, shim_path: Path, hook_cli_ref: Mapping[str, Any] | None = None) -> bool:
-    cli_path = read_shim_cli_path(shim_path)
-    if cli_path is None or not _cli_path_is_usable(cli_path):
-        return False
-    if hook_cli_ref is None:
+    if resolved in {home / "Desktop", home / "Downloads"}:
         return True
-    current_ref = _hook_cli_ref(cli_path)
-    expected = dict(hook_cli_ref)
-    if current_ref.get("ref") != expected.get("ref"):
+    if resolved.parent == Path("/Users") and resolved.name == home.name:
+        return True
+    if has_project_markers(resolved):
         return False
-    return current_ref.get("basename") == expected.get("basename")
+    if resolved.name in _BROAD_CONTAINER_DIRNAMES:
+        return True
+    return False
 
 
-def build_agentveil_hook_entries(*, shim_relative_path: str) -> dict[str, list[dict[str, Any]]]:
-    return {
-        "preToolUse": [
-            {
-                "command": shim_relative_path,
-                "matcher": "Shell|Write|Delete|StrReplace|ApplyPatch|Edit",
-                "failClosed": True,
-                "agentveilHookId": AGENTVEIL_HOOK_ID,
-            }
-        ],
-        "beforeShellExecution": [
-            {
-                "command": shim_relative_path,
-                "failClosed": True,
-                "agentveilHookId": AGENTVEIL_HOOK_ID,
-            }
-        ],
-        "beforeMCPExecution": [
-            {
-                "command": shim_relative_path,
-                "failClosed": True,
-                "agentveilHookId": AGENTVEIL_HOOK_ID,
-            }
-        ],
-    }
+def format_setup_success_message(workspace: Path, *, status: dict[str, Any]) -> str:
+    """User-facing success summary with honest next steps (no false protected claim)."""
+    lines = [
+        "AgentVeil is installed for:",
+        f"  {workspace.resolve()}",
+        "",
+        "Next:",
+        "1. Reopen Cursor in this folder.",
+        "2. Open Settings -> Tools & MCPs.",
+        "3. Confirm agentveil-mcp-proxy is enabled.",
+        "4. Try: Create avp-test.txt with the text hello.",
+    ]
+    if status.get("status") == "protected" and status.get("mcp_route_observed"):
+        lines.extend(["", "MCP route activity was observed in bounded evidence."])
+    else:
+        lines.extend([
+            "",
+            "Setup files are in place; Cursor must reload and enable the MCP server "
+            "before writes are routed through AgentVeil.",
+        ])
+    return "\n".join(lines)
 
 
-def build_hooks_document(*, shim_relative_path: str) -> dict[str, Any]:
-    entries = build_agentveil_hook_entries(shim_relative_path=shim_relative_path)
-    return {
-        "version": 1,
-        "hooks": entries,
-    }
+def setup_home(workspace: Path) -> Path:
+    return Path(workspace).resolve() / ".agentveil"
 
 
-def build_setup_manifest(
+def project_cursor_dir(workspace: Path) -> Path:
+    return Path(workspace).resolve() / ".cursor"
+
+
+def hooks_config_path(workspace: Path) -> Path:
+    return project_cursor_dir(workspace) / "hooks.json"
+
+
+def mcp_config_path(workspace: Path) -> Path:
+    return project_cursor_dir(workspace) / "mcp.json"
+
+
+def project_evidence_path(workspace: Path) -> Path:
+    return project_cursor_dir(workspace) / "agentveil" / "evidence.jsonl"
+
+
+def passphrase_path(home: Path) -> Path:
+    return Path(home) / "passphrase"
+
+
+def profile_root(home: Path) -> Path:
+    return Path(home) / "product-profile"
+
+
+def proxy_config_path(home: Path) -> Path:
+    return Path(home) / "mcp-proxy" / "config.json"
+
+
+def _proxy_dir(home: Path) -> Path:
+    return Path(home) / "mcp-proxy"
+
+
+def load_json_object(path: Path, *, label: str | None = None) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise CursorSetupError(f"cannot read {label or path.name}: {exc.__class__.__name__}") from exc
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise CursorSetupError(
+            f"existing {label or path.name} is not valid JSON; refusing to overwrite"
+        ) from exc
+    if not isinstance(data, dict):
+        raise CursorSetupError(f"existing {label or path.name} must be a JSON object")
+    return data
+
+
+def _write_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def build_hook_command(
     *,
-    managed_files: tuple[str, ...],
-    hooks_json_origin: str,
-    hook_cli_ref: dict[str, str | None],
+    python: str,
+    workspace: Path,
+    home: Path,
+    evidence_path: Path,
+    hook_event: str,
+) -> str:
+    return (
+        f"{shlex.quote(python)} -m {AGENTVEIL_HOOK_MARKER} "
+        f"--workspace {shlex.quote(str(workspace))} "
+        f"--home {shlex.quote(str(home))} "
+        f"--evidence-path {shlex.quote(str(evidence_path))} "
+        f"--hook-event {shlex.quote(hook_event)}"
+    )
+
+
+def build_managed_hook_entry(
+    *,
+    python: str,
+    workspace: Path,
+    home: Path,
+    evidence_path: Path,
+    hook_event: str,
 ) -> dict[str, Any]:
     return {
-        "version": CURSOR_SETUP_MANIFEST_VERSION,
-        "agentveil_hook_id": AGENTVEIL_HOOK_ID,
-        "hooks_json_origin": hooks_json_origin,
-        "managed_events": list(AGENTVEIL_HOOK_EVENTS),
-        "managed_files": list(managed_files),
-        "evidence_file": f".cursor/{EVIDENCE_FILE_NAME}",
-        "hook_cli_ref": dict(hook_cli_ref),
+        "command": build_hook_command(
+            python=python,
+            workspace=workspace,
+            home=home,
+            evidence_path=evidence_path,
+            hook_event=hook_event,
+        ),
+        "failClosed": True,
     }
 
 
-def _load_manifest(paths: CursorSetupPaths) -> dict[str, Any] | None:
-    if not paths.manifest_path.is_file():
-        return None
+def is_managed_hook_command(command: str) -> bool:
+    """True only for hooks installed by this module (exact module marker)."""
+    return AGENTVEIL_HOOK_MARKER in str(command)
+
+
+def _is_agentveil_hook_command(command: str) -> bool:
+    return is_managed_hook_command(command)
+
+
+def _ensure_passphrase(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_file():
+        return
+    path.write_text(secrets.token_urlsafe(32) + "\n", encoding="utf-8")
     try:
-        payload = json.loads(paths.manifest_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise CursorSetupError("Cursor hook manifest is invalid JSON") from exc
-    if not isinstance(payload, dict):
-        raise CursorSetupError("Cursor hook manifest must be a JSON object")
-    return payload
+        path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        pass
 
 
-def _manifest_hooks_json_origin(manifest: Mapping[str, Any]) -> str:
-    origin = manifest.get("hooks_json_origin")
-    if origin in {"created", "merged"}:
-        return str(origin)
-    return "created"
+def _ensure_workspace_sandbox(profile: Path, workspace: Path, *, force: bool = False) -> None:
+    from agentveil_mcp_proxy.product_route_local_fixtures import PRODUCT_ROUTE_WORKSPACE_DIRNAME
+
+    profile.mkdir(parents=True, exist_ok=True)
+    sandbox = profile / PRODUCT_ROUTE_WORKSPACE_DIRNAME
+    workspace = workspace.resolve()
+    if sandbox.is_symlink():
+        if sandbox.resolve() != workspace:
+            sandbox.unlink()
+            sandbox.symlink_to(workspace, target_is_directory=True)
+        return
+    if sandbox.exists():
+        if sandbox.resolve() == workspace:
+            return
+        if force and sandbox.is_dir() and not any(sandbox.iterdir()):
+            sandbox.rmdir()
+        elif force:
+            import shutil
+
+            if sandbox.is_dir():
+                shutil.rmtree(sandbox)
+            else:
+                sandbox.unlink()
+        else:
+            raise CursorSetupError("product profile sandbox conflicts with workspace")
+    sandbox.symlink_to(workspace, target_is_directory=True)
 
 
-def _manifest_hook_id(manifest: Mapping[str, Any]) -> str:
-    hook_id = manifest.get("agentveil_hook_id")
-    return str(hook_id) if isinstance(hook_id, str) and hook_id else AGENTVEIL_HOOK_ID
-
-
-def _load_hooks_document(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        return {"version": 1, "hooks": {}}
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise CursorSetupError("Cursor hooks.json is invalid JSON") from exc
-    if not isinstance(payload, dict):
-        raise CursorSetupError("Cursor hooks.json must be a JSON object")
-    hooks = payload.get("hooks")
-    if hooks is None:
-        payload = {**payload, "hooks": {}}
-    elif not isinstance(hooks, dict):
-        raise CursorSetupError("Cursor hooks.json hooks field must be an object")
-    if "version" not in payload:
-        payload = {**payload, "version": 1}
-    return payload
-
-
-def _is_agentveil_hook_entry(entry: Any, *, hook_id: str, shim_relative_path: str) -> bool:
-    if not isinstance(entry, dict):
-        return False
-    if entry.get("agentveilHookId") == hook_id:
-        return True
-    return entry.get("command") == shim_relative_path
-
-
-def _count_agentveil_entries(
-    document: Mapping[str, Any],
+def build_mcp_server_entry(
     *,
-    hook_id: str,
-    shim_relative_path: str,
-) -> int:
-    hooks = document.get("hooks") or {}
-    count = 0
+    proxy_command: str,
+    home: Path,
+    config_path: Path,
+    passphrase_file: Path,
+    profile: Path,
+    workspace: Path,
+) -> dict[str, Any]:
+    """Build a project MCP entry aligned with the working private product route."""
+    resolved_home = Path(home).expanduser().resolve()
+    resolved_workspace = Path(workspace).expanduser().resolve()
+    resolved_profile = Path(profile).expanduser().resolve()
+    executable = str(Path(proxy_command).expanduser().resolve())
+    return {
+        "type": "stdio",
+        "command": executable,
+        "args": [
+            "run",
+            "--home", str(resolved_home),
+            "--config", str(Path(config_path).expanduser().resolve()),
+            "--passphrase-file", str(Path(passphrase_file).expanduser().resolve()),
+        ],
+        "env": {
+            "DOWNSTREAM_NAME": PRODUCT_ROUTE_DOWNSTREAM_NAME,
+            "AVP_HOME": str(resolved_home),
+            "MCP_CONTENT_ROOT": str(resolved_workspace),
+            "AVP_CURSOR_WORKSPACE": str(resolved_workspace),
+            "PRODUCT_ROUTE_PROFILE_ROOT": str(resolved_profile),
+        },
+    }
+
+
+def _entry_mentions_agentveil(entry: dict[str, Any]) -> bool:
+    return "agentveil" in json.dumps(entry).lower()
+
+
+def _agentveil_mcp_server_keys(servers: dict[str, Any]) -> tuple[str, ...]:
+    keys: list[str] = []
+    for key, entry in servers.items():
+        if not isinstance(entry, dict):
+            continue
+        if key == AGENTVEIL_MCP_SERVER_KEY or _entry_mentions_agentveil(entry):
+            keys.append(str(key))
+    return tuple(sorted(keys))
+
+
+def user_mcp_backup_dir(workspace: Path) -> Path:
+    return setup_home(workspace) / USER_MCP_BACKUP_DIRNAME
+
+
+def _backup_timestamp() -> str:
+    from datetime import datetime, timezone
+
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+        .replace(":", "-")
+    )
+
+
+@dataclass(frozen=True)
+class NeutralizeGlobalRouteResult:
+    changed: bool
+    removed_server_keys: tuple[str, ...] = ()
+    backup_basename: str | None = None
+    reload_required: bool = False
+
+
+def neutralize_competing_global_route(workspace: Path) -> NeutralizeGlobalRouteResult:
+    """Backup and remove user/global AgentVeil MCP entries that split the route."""
+    user_config_path = resolve_cursor_global_mcp_json_path()
+    if not user_config_path.is_file():
+        return NeutralizeGlobalRouteResult(changed=False)
+
+    payload = load_json_object(user_config_path, label="~/.cursor/mcp.json")
+    servers = payload.get("mcpServers")
+    if not isinstance(servers, dict):
+        raise CursorSetupError("existing ~/.cursor/mcp.json mcpServers must be an object")
+
+    agentveil_keys = _agentveil_mcp_server_keys(servers)
+    if not agentveil_keys:
+        return NeutralizeGlobalRouteResult(changed=False)
+
+    backup_dir = user_mcp_backup_dir(workspace)
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup_path = backup_dir / f"{USER_MCP_BACKUP_PREFIX}.{_backup_timestamp()}.backup"
+    backup_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    try:
+        backup_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        pass
+
+    merged_servers = {
+        key: value for key, value in servers.items() if str(key) not in agentveil_keys
+    }
+    other_top_level = {key: value for key, value in payload.items() if key != "mcpServers"}
+    if not merged_servers and not other_top_level:
+        user_config_path.unlink()
+    else:
+        updated = dict(other_top_level)
+        if merged_servers:
+            updated["mcpServers"] = merged_servers
+        user_config_path.write_text(json.dumps(updated, indent=2) + "\n", encoding="utf-8")
+
+    return NeutralizeGlobalRouteResult(
+        changed=True,
+        removed_server_keys=agentveil_keys,
+        backup_basename=backup_path.name,
+        reload_required=True,
+    )
+
+
+def load_project_mcp_server_entry(workspace: Path) -> dict[str, Any] | None:
+    try:
+        payload = load_json_object(mcp_config_path(workspace), label=".cursor/mcp.json")
+    except CursorSetupError:
+        return None
+    servers = payload.get("mcpServers")
+    if not isinstance(servers, dict):
+        return None
+    entry = servers.get(AGENTVEIL_MCP_SERVER_KEY)
+    return entry if isinstance(entry, dict) else None
+
+
+def mcp_route_entry_has_private_parity(entry: dict[str, Any]) -> bool:
+    env = entry.get("env")
+    if not isinstance(env, dict):
+        return False
+    if set(env.keys()) != set(MCP_ROUTE_ENV_KEYS):
+        return False
+    command = str(entry.get("command") or "").strip()
+    if not command:
+        return False
+    return Path(command).is_absolute()
+
+
+@dataclass(frozen=True)
+class InstallHooksResult:
+    hooks_path: Path
+    evidence_path: Path
+    created_hooks: bool
+    replaced_existing_managed: bool
+    reload_required: bool = True
+
+
+@dataclass(frozen=True)
+class InstallMcpResult:
+    config_path: Path
+    created_config: bool
+    replaced_existing_managed: bool
+
+
+@dataclass(frozen=True)
+class UninstallResult:
+    hooks_removed: int
+    mcp_removed: bool
+    reload_required: bool
+
+
+@dataclass
+class StatusResult:
+    scope: str = "project"
+    status: str = "unsafe"
+    state: str = "missing"
+    hooks_present: bool = False
+    managed_hooks_present: bool = False
+    mcp_route_present: bool = False
+    proxy_home_initialized: bool = False
+    proxy_doctor_ok: bool = False
+    approval_center: str = "down"
+    competing_global_route: bool = False
+    reload_required: bool = False
+    matched_tool_classes: tuple[str, ...] = field(default_factory=lambda: MATCHED_TOOL_CLASSES)
+    notes: tuple[str, ...] = ()
+
+
+def _merge_hooks(workspace: Path, *, python: str, home: Path, evidence_path: Path) -> tuple[bool, bool]:
+    path = hooks_config_path(workspace)
+    created = not path.exists()
+    payload = load_json_object(path, label=".cursor/hooks.json")
+    hooks = payload.get("hooks")
+    if not isinstance(hooks, dict):
+        hooks = {}
+
+    replaced = False
+    merged_hooks: dict[str, Any] = dict(hooks)
+    changed = False
+    workspace = workspace.resolve()
+
+    for event in AGENTVEIL_HOOK_EVENTS:
+        existing = merged_hooks.get(event)
+        if existing is None:
+            merged_hooks[event] = [
+                build_managed_hook_entry(
+                    python=python,
+                    workspace=workspace,
+                    home=home,
+                    evidence_path=evidence_path,
+                    hook_event=event,
+                )
+            ]
+            changed = True
+            continue
+        if not isinstance(existing, list):
+            raise CursorSetupError(".cursor/hooks.json hooks entries must be arrays")
+        kept = [
+            item for item in existing
+            if not (isinstance(item, dict) and _is_agentveil_hook_command(str(item.get("command") or "")))
+        ]
+        if len(kept) != len(existing):
+            replaced = True
+        desired = [
+            *kept,
+            build_managed_hook_entry(
+                python=python,
+                workspace=workspace,
+                home=home,
+                evidence_path=evidence_path,
+                hook_event=event,
+            ),
+        ]
+        if desired != existing:
+            changed = True
+        merged_hooks[event] = desired
+
+    if not changed and not created:
+        return created, replaced
+
+    payload["hooks"] = merged_hooks
+    payload.setdefault("version", 1)
+    _write_json(path, payload)
+    return created, replaced
+
+
+def install_hooks(
+    workspace: Path,
+    *,
+    python: str | None = None,
+    home: Path | None = None,
+    evidence_path: Path | None = None,
+) -> InstallHooksResult:
+    workspace = workspace.resolve()
+    resolved_home = home or setup_home(workspace)
+    resolved_python = python or sys.executable
+    resolved_evidence = evidence_path or project_evidence_path(workspace)
+    created, replaced = _merge_hooks(
+        workspace,
+        python=resolved_python,
+        home=resolved_home,
+        evidence_path=resolved_evidence,
+    )
+    return InstallHooksResult(
+        hooks_path=hooks_config_path(workspace),
+        evidence_path=resolved_evidence,
+        created_hooks=created,
+        replaced_existing_managed=replaced,
+    )
+
+
+def install_mcp_route(
+    workspace: Path,
+    *,
+    proxy_command: str,
+    home: Path | None = None,
+) -> InstallMcpResult:
+    workspace = workspace.resolve()
+    resolved_home = home or setup_home(workspace)
+    path = mcp_config_path(workspace)
+    created = not path.exists()
+    payload = load_json_object(path, label=".cursor/mcp.json")
+    servers = payload.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = {}
+    _ensure_passphrase(passphrase_path(resolved_home))
+    prof = profile_root(resolved_home)
+    entry = build_mcp_server_entry(
+        proxy_command=proxy_command,
+        home=resolved_home,
+        config_path=proxy_config_path(resolved_home),
+        passphrase_file=passphrase_path(resolved_home),
+        profile=prof,
+        workspace=workspace,
+    )
+    previous = servers.get(AGENTVEIL_MCP_SERVER_KEY)
+    servers[AGENTVEIL_MCP_SERVER_KEY] = entry
+    payload["mcpServers"] = servers
+    _write_json(path, payload)
+    install_user_mcp_route(workspace, python=sys.executable, proxy_command=proxy_command)
+    return InstallMcpResult(
+        config_path=path,
+        created_config=created,
+        replaced_existing_managed=previous != entry,
+    )
+
+
+def remove_hooks(workspace: Path) -> int:
+    path = hooks_config_path(workspace)
+    if not path.is_file():
+        return 0
+    payload = load_json_object(path, label=".cursor/hooks.json")
+    hooks = payload.get("hooks")
     if not isinstance(hooks, dict):
         return 0
-    for event in AGENTVEIL_HOOK_EVENTS:
-        entries = hooks.get(event) or []
-        if not isinstance(entries, list):
-            continue
-        for entry in entries:
-            if _is_agentveil_hook_entry(entry, hook_id=hook_id, shim_relative_path=shim_relative_path):
-                count += 1
-    return count
-
-
-def merge_agentveil_hooks(
-    document: Mapping[str, Any],
-    *,
-    shim_relative_path: str,
-) -> tuple[dict[str, Any], bool]:
-    merged: dict[str, Any] = dict(document)
-    existing_hooks = document.get("hooks") or {}
-    if not isinstance(existing_hooks, dict):
-        raise CursorSetupError("Cursor hooks.json hooks field must be an object")
-
-    agentveil_entries = build_agentveil_hook_entries(shim_relative_path=shim_relative_path)
-    changed = False
-    merged_hooks: dict[str, list[Any]] = {}
-
-    for event, existing_entries in existing_hooks.items():
-        if isinstance(existing_entries, list):
-            merged_hooks[event] = list(existing_entries)
-
-    for event, new_entries in agentveil_entries.items():
-        current = list(merged_hooks.get(event) or [])
-        for entry in new_entries:
-            if any(
-                _is_agentveil_hook_entry(item, hook_id=AGENTVEIL_HOOK_ID, shim_relative_path=shim_relative_path)
-                for item in current
-            ):
-                continue
-            current.append(dict(entry))
-            changed = True
-        merged_hooks[event] = current
-
-    merged["hooks"] = merged_hooks
-    return merged, changed
-
-
-def unmerge_agentveil_hooks(
-    document: Mapping[str, Any],
-    *,
-    hook_id: str,
-    shim_relative_path: str,
-) -> tuple[dict[str, Any], bool]:
-    existing_hooks = document.get("hooks") or {}
-    if not isinstance(existing_hooks, dict):
-        return dict(document), False
-
-    changed = False
-    merged_hooks: dict[str, list[Any]] = {}
-    for event, entries in existing_hooks.items():
-        if not isinstance(entries, list):
-            merged_hooks[event] = entries
+    merged_hooks: dict[str, Any] = {}
+    removed = 0
+    for event, commands in hooks.items():
+        if not isinstance(commands, list):
+            merged_hooks[event] = commands
             continue
         kept = [
-            entry
-            for entry in entries
-            if not _is_agentveil_hook_entry(entry, hook_id=hook_id, shim_relative_path=shim_relative_path)
+            item for item in commands
+            if not (isinstance(item, dict) and _is_agentveil_hook_command(str(item.get("command") or "")))
         ]
-        if len(kept) != len(entries):
-            changed = True
+        removed += len(commands) - len(kept)
         if kept:
             merged_hooks[event] = kept
+    if removed == 0:
+        return 0
+    other = {key: value for key, value in payload.items() if key != "hooks"}
+    if not merged_hooks and not other:
+        path.unlink()
+        return removed
+    payload = dict(other)
+    payload["hooks"] = merged_hooks
+    payload.setdefault("version", 1)
+    _write_json(path, payload)
+    return removed
 
-    merged = dict(document)
-    merged["hooks"] = merged_hooks
-    return merged, changed
+
+def remove_mcp_route(workspace: Path) -> bool:
+    project_removed = False
+    path = mcp_config_path(workspace)
+    if path.is_file():
+        payload = load_json_object(path, label=".cursor/mcp.json")
+        servers = payload.get("mcpServers")
+        if isinstance(servers, dict) and AGENTVEIL_MCP_SERVER_KEY in servers:
+            servers.pop(AGENTVEIL_MCP_SERVER_KEY, None)
+            other = {key: value for key, value in payload.items() if key != "mcpServers"}
+            if not servers and not other:
+                path.unlink()
+            else:
+                payload = dict(other)
+                payload["mcpServers"] = servers
+                _write_json(path, payload)
+            project_removed = True
+    user_removed = remove_user_mcp_route().removed
+    return project_removed or user_removed
 
 
-def hooks_document_is_empty(document: Mapping[str, Any]) -> bool:
-    hooks = document.get("hooks") or {}
-    if not isinstance(hooks, dict) or not hooks:
+def mcp_route_present(workspace: Path) -> bool:
+    try:
+        payload = load_json_object(mcp_config_path(workspace), label=".cursor/mcp.json")
+    except CursorSetupError:
+        return False
+    servers = payload.get("mcpServers")
+    return isinstance(servers, dict) and AGENTVEIL_MCP_SERVER_KEY in servers
+
+
+def detect_competing_global_route() -> bool:
+    if detect_unmanaged_user_mcp_route():
         return True
-    for entries in hooks.values():
-        if isinstance(entries, list) and entries:
-            return False
-    return True
+    path = resolve_cursor_global_mcp_json_path()
+    if not path.is_file():
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    servers = payload.get("mcpServers") if isinstance(payload, dict) else None
+    if not isinstance(servers, dict):
+        return False
+    for key, entry in servers.items():
+        if key == AGENTVEIL_MCP_SERVER_KEY:
+            return True
+        if isinstance(entry, dict) and "agentveil" in json.dumps(entry).lower():
+            return True
+    return False
 
 
-def _ensure_executable(path: Path) -> None:
-    if os.name == "nt":
-        return
-    mode = path.stat().st_mode
-    path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+def _center_health(manifest: ApprovalCenterManifest) -> bool:
+    url = f"{manifest.approval_center_url()}/api/approvals"
+    try:
+        return loopback_get_status(url, timeout=_HEALTH_TIMEOUT_SECONDS) == 200
+    except (OSError, TimeoutError, ValueError):
+        return False
 
 
-def _write_text_atomic(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+@dataclass(frozen=True)
+class CenterStatus:
+    state: str
+    pid: int | None
+    port: int | None
 
 
-def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
-    _write_text_atomic(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+def check_approval_center_status(home: Path) -> CenterStatus:
+    manifest = load_manifest(_proxy_dir(home))
+    if manifest is None:
+        return CenterStatus(state="down", pid=None, port=None)
+    alive = is_process_alive(manifest.pid)
+    healthy = _center_health(manifest) if alive else False
+    if alive and healthy:
+        return CenterStatus(state="running", pid=manifest.pid, port=manifest.port)
+    return CenterStatus(state="stale", pid=manifest.pid, port=manifest.port)
 
 
-def setup_cursor_hooks(
+@dataclass(frozen=True)
+class EnsureCenterResult:
+    status: CenterStatus
+    started: bool
+    reused: bool
+    restarted: bool
+    reason: str
+
+
+def _spawn_approval_center(
     *,
-    workspace: Path | None = None,
-    yes: bool = False,
-    setup_cli_path: Path | str | None = None,
-    setup_argv0: str | None = None,
-) -> CursorSetupResult:
-    paths = cursor_setup_paths(workspace)
-    managed = _managed_file_paths()
-    if not yes:
-        return CursorSetupResult(
-            ok=False,
-            action="setup_cursor",
-            workspace_ref=_workspace_ref(paths.workspace),
-            managed_files=managed,
-            reload_required=True,
-            message="Pass --yes to install project-local Cursor hooks.",
-            errors=("confirmation_required",),
+    proxy_command: str,
+    home: Path,
+    passphrase_file: Path | None = None,
+) -> subprocess.Popen[bytes]:
+    config = proxy_config_path(home)
+    kwargs: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if os.name == "posix":
+        kwargs["start_new_session"] = True
+    args = [
+        proxy_command,
+        "approval-center",
+        "serve",
+        "--home", str(home),
+        "--config", str(config),
+        "--port", "0",
+    ]
+    if passphrase_file is not None:
+        args.extend(["--passphrase-file", str(passphrase_file)])
+    return subprocess.Popen(args, **kwargs)  # noqa: S603
+
+
+def _wait_for_center(home: Path, *, deadline: float) -> CenterStatus:
+    last = CenterStatus(state="down", pid=None, port=None)
+    while time.monotonic() < deadline:
+        last = check_approval_center_status(home)
+        if last.state == "running":
+            return last
+        time.sleep(_POLL_INTERVAL_SECONDS)
+    return last
+
+
+def ensure_approval_center_running(
+    *,
+    home: Path,
+    proxy_command: str,
+    passphrase_file: Path | None = None,
+) -> EnsureCenterResult:
+    initial = check_approval_center_status(home)
+    if initial.state == "running":
+        return EnsureCenterResult(
+            status=initial, started=False, reused=True, restarted=False,
+            reason="center already running and healthy",
         )
+    restarted = initial.state == "stale"
+    try:
+        _spawn_approval_center(
+            proxy_command=proxy_command,
+            home=home,
+            passphrase_file=passphrase_file,
+        )
+    except (OSError, ValueError) as exc:
+        return EnsureCenterResult(
+            status=initial, started=False, reused=False, restarted=False,
+            reason=f"could not spawn approval-center: {exc.__class__.__name__}",
+        )
+    final = _wait_for_center(home, deadline=time.monotonic() + _START_TIMEOUT_SECONDS)
+    if final.state == "running":
+        return EnsureCenterResult(
+            status=final, started=True, reused=False, restarted=restarted,
+            reason="center restarted" if restarted else "center started",
+        )
+    return EnsureCenterResult(
+        status=final, started=False, reused=False, restarted=False,
+        reason="approval-center did not become healthy within the start timeout",
+    )
+
+
+def stop_managed_approval_center(home: Path) -> dict[str, Any]:
+    proxy_dir = _proxy_dir(home)
+    manifest = load_manifest(proxy_dir)
+    if manifest is None or manifest.pid is None:
+        return {"stopped": False, "reason": "no managed approval-center manifest"}
+
+    if not is_process_alive(manifest.pid):
+        try:
+            manifest_path(proxy_dir).unlink(missing_ok=True)
+        except OSError:
+            pass
+        return {"stopped": False, "reason": "managed pid not alive; manifest cleared"}
+
+    if not _center_health(manifest):
+        return {
+            "stopped": False,
+            "reason": "manifest pid is not a healthy AgentVeil Approval Center; not stopped",
+        }
 
     try:
-        resolved_cli = resolve_setup_cli_path(
-            setup_cli_path=setup_cli_path,
-            setup_argv0=setup_argv0,
-        )
-    except CursorSetupError as exc:
-        return CursorSetupResult(
-            ok=False,
-            action="setup_cursor",
-            workspace_ref=_workspace_ref(paths.workspace),
-            managed_files=managed,
-            reload_required=True,
-            message=str(exc),
-            hook_cli_resolved=False,
-            errors=("hook_cli_unresolved",),
-        )
+        os.kill(manifest.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return {"stopped": False, "reason": "managed pid already exited"}
+    except PermissionError:
+        return {"stopped": False, "reason": "no permission to stop managed pid"}
 
-    cli_ref = _hook_cli_ref(resolved_cli)
-    shim_relative = _shim_relative_path()
-    hooks_existed = paths.hooks_json.is_file()
-    existing_document = _load_hooks_document(paths.hooks_json)
-    merged_document, hooks_changed = merge_agentveil_hooks(
-        existing_document,
-        shim_relative_path=shim_relative,
+    for _ in range(20):
+        if not is_process_alive(manifest.pid):
+            break
+        time.sleep(0.1)
+    try:
+        manifest_path(proxy_dir).unlink(missing_ok=True)
+    except OSError:
+        pass
+    return {"stopped": True, "reason": "managed approval-center stopped"}
+
+
+def _hook_observation_state(workspace: Path, hooks_path: Path) -> tuple[bool, bool]:
+    evidence = project_evidence_path(workspace)
+    if not evidence.is_file() or not hooks_path.is_file():
+        return False, False
+    try:
+        if evidence.stat().st_size <= 0 or evidence.stat().st_mtime <= hooks_path.stat().st_mtime:
+            return False, False
+    except OSError:
+        return False, False
+
+    hook_observed = False
+    mcp_route_observed = False
+    try:
+        lines = evidence.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False, False
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        hook_observed = True
+        tool_name = str(row.get("tool_name") or "")
+        hook_event = str(row.get("hook_event") or "")
+        server = str(row.get("server") or "")
+        if (
+            server == AGENTVEIL_MCP_SERVER_KEY
+            or tool_name.startswith("MCP:")
+            or hook_event == "beforeMCPExecution"
+        ):
+            mcp_route_observed = True
+    return hook_observed, mcp_route_observed
+
+
+def prepare_proxy_home(workspace: Path, *, force: bool = False) -> Path:
+    workspace = workspace.resolve()
+    home = setup_home(workspace)
+    home.mkdir(parents=True, exist_ok=True)
+    _ensure_workspace_sandbox(profile_root(home), workspace, force=force)
+    _ensure_passphrase(passphrase_path(home))
+    return home
+
+
+def connector_status(workspace: Path, *, home: Path | None = None) -> dict[str, Any]:
+    workspace = workspace.resolve()
+    resolved_home = home or setup_home(workspace)
+    hooks_path = hooks_config_path(workspace)
+    hooks_present = hooks_path.is_file()
+    managed = False
+    hook_state = "missing"
+    if hooks_present:
+        try:
+            payload = load_json_object(hooks_path, label=".cursor/hooks.json")
+            hooks = payload.get("hooks")
+            if isinstance(hooks, dict):
+                for event in AGENTVEIL_HOOK_EVENTS:
+                    commands = hooks.get(event)
+                    if isinstance(commands, list) and any(
+                        isinstance(item, dict)
+                        and AGENTVEIL_HOOK_MARKER in str(item.get("command") or "")
+                        for item in commands
+                    ):
+                        managed = True
+                        break
+            hook_state = "installed" if managed else "stale"
+        except CursorSetupError:
+            hook_state = "stale"
+
+    route_present = mcp_route_present(workspace)
+    route_entry = load_project_mcp_server_entry(workspace) if route_present else None
+    route_parity_ok = (
+        route_entry is not None and mcp_route_entry_has_private_parity(route_entry)
+    )
+    mcp_state = "configured" if route_present and route_parity_ok else (
+        "partial" if route_present else "missing"
+    )
+    config_exists = proxy_config_path(resolved_home).is_file()
+    proxy_state = "configured" if config_exists else "missing"
+    center = check_approval_center_status(resolved_home)
+    competing = detect_competing_global_route()
+    user_mcp_present = user_mcp_route_present()
+    user_mcp_managed = user_mcp_route_is_managed()
+    user_mcp_state = (
+        "configured" if user_mcp_present and user_mcp_managed else
+        ("partial" if user_mcp_present else "missing")
     )
 
-    paths.hooks_dir.mkdir(parents=True, exist_ok=True)
-    _write_text_atomic(paths.hook_shim, build_hook_shim_script(cli_path=resolved_cli))
-    _ensure_executable(paths.hook_shim)
+    hook_observed = False
+    mcp_route_observed = False
+    if managed:
+        hook_observed, mcp_route_observed = _hook_observation_state(workspace, hooks_path)
 
-    if hooks_changed or not paths.hooks_json.is_file():
-        _write_json_atomic(paths.hooks_json, merged_document)
-
-    origin = "merged" if hooks_existed else "created"
-    _write_json_atomic(
-        paths.manifest_path,
-        build_setup_manifest(
-            managed_files=managed,
-            hooks_json_origin=origin,
-            hook_cli_ref=cli_ref,
-        ),
+    ready = (
+        managed
+        and route_present
+        and route_parity_ok
+        and config_exists
+        and center.state == "running"
+        and user_mcp_managed
+        and not competing
     )
-
-    if hooks_existed and not hooks_changed:
-        message = f"AgentVeil Cursor hooks already present in existing hooks.json. {RELOAD_MESSAGE}"
-    elif hooks_existed:
-        message = f"Merged AgentVeil Cursor hooks into existing hooks.json. {RELOAD_MESSAGE}"
+    if not managed or not route_present or not config_exists or not route_parity_ok:
+        status = "unsafe"
+    elif center.state != "running" or competing or not user_mcp_managed:
+        status = "advisory"
+    elif mcp_route_observed and user_mcp_managed:
+        status = "protected"
     else:
-        message = f"Installed project-local Cursor hooks. {RELOAD_MESSAGE}"
+        status = "advisory"
 
-    return CursorSetupResult(
-        ok=True,
-        action="setup_cursor",
-        workspace_ref=_workspace_ref(paths.workspace),
-        managed_files=managed,
-        reload_required=True,
-        message=message,
-        hook_cli_resolved=True,
-        hook_cli_ref=cli_ref,
-    )
-
-
-def derive_cursor_setup_status(*, workspace: Path | None = None) -> CursorSetupStatus:
-    paths = cursor_setup_paths(workspace)
-    manifest = _load_manifest(paths)
-    managed = _managed_file_paths()
-    boundary = (
-        "Project-local Cursor hooks only. Does not configure host-wide Cursor control "
-        "or actions outside this workspace."
-    )
-
-    if manifest is None:
-        return CursorSetupStatus(
-            installed=False,
-            stale=False,
-            workspace_ref=_workspace_ref(paths.workspace),
-            hook_state="not_installed",
-            boundary=boundary,
-            managed_files=(),
-            reload_required=False,
-            message="Cursor hooks are not installed for this workspace.",
-            hook_cli_resolved=False,
+    if not managed or not route_present or not config_exists or not route_parity_ok:
+        restart_required: bool | None = None
+        next_step = "run `agentveil-mcp-proxy setup cursor --yes`"
+    elif center.state != "running":
+        restart_required = None
+        next_step = "Approval Center is not running; rerun setup cursor --yes"
+    elif competing:
+        restart_required = True
+        next_step = (
+            "Competing unmanaged user/global AgentVeil MCP route detected; "
+            "rerun setup cursor --yes to replace it with the managed wrapper, then reload Cursor"
         )
-
-    shim_relative = _shim_relative_path()
-    hook_id = _manifest_hook_id(manifest)
-    manifest_cli_ref = manifest.get("hook_cli_ref")
-    hook_cli_ref = dict(manifest_cli_ref) if isinstance(manifest_cli_ref, dict) else None
-    missing_files = [rel for rel in managed if not (paths.workspace / rel).is_file()]
-    if missing_files:
-        return CursorSetupStatus(
-            installed=False,
-            stale=True,
-            workspace_ref=_workspace_ref(paths.workspace),
-            hook_state="stale",
-            boundary=boundary,
-            managed_files=tuple(rel for rel in managed if (paths.workspace / rel).is_file()),
-            reload_required=True,
-            message=(
-                "Cursor hook setup is stale or incomplete. "
-                f"Re-run setup cursor --yes or remove and reinstall. {RELOAD_MESSAGE}"
-            ),
-            hook_cli_resolved=False,
-            hook_cli_ref=hook_cli_ref,
+    elif not user_mcp_managed:
+        restart_required = True
+        next_step = (
+            "User/Home MCP route is missing or not managed; "
+            "rerun setup cursor --yes, then reload Cursor"
         )
+    elif not route_parity_ok:
+        restart_required = True
+        next_step = "Project MCP route is stale; rerun setup cursor --yes, then reload Cursor"
+    elif status == "protected":
+        restart_required = False
+        next_step = "connector active; nothing to do"
+    elif ready:
+        restart_required = True
+        next_step = SETUP_ADVISORY_NEXT_STEP
+    else:
+        restart_required = True
+        next_step = SETUP_ADVISORY_NEXT_STEP
 
-    if not paths.hooks_json.is_file():
-        return CursorSetupStatus(
-            installed=False,
-            stale=True,
-            workspace_ref=_workspace_ref(paths.workspace),
-            hook_state="stale",
-            boundary=boundary,
-            managed_files=managed,
-            reload_required=True,
-            message=f"Cursor hooks.json is missing. {RELOAD_MESSAGE}",
-            hook_cli_resolved=False,
-            hook_cli_ref=hook_cli_ref,
-        )
-
-    document = _load_hooks_document(paths.hooks_json)
-    installed_count = _count_agentveil_entries(
-        document,
-        hook_id=hook_id,
-        shim_relative_path=shim_relative,
-    )
-    hook_cli_resolved = shim_cli_is_resolved(
-        shim_path=paths.hook_shim,
-        hook_cli_ref=hook_cli_ref,
-    )
-    if installed_count < len(AGENTVEIL_HOOK_EVENTS):
-        return CursorSetupStatus(
-            installed=False,
-            stale=True,
-            workspace_ref=_workspace_ref(paths.workspace),
-            hook_state="stale",
-            boundary=boundary,
-            managed_files=managed,
-            reload_required=True,
-            message=f"AgentVeil hook entries are missing from hooks.json. {RELOAD_MESSAGE}",
-            hook_cli_resolved=hook_cli_resolved,
-            hook_cli_ref=hook_cli_ref,
-        )
-
-    if not hook_cli_resolved:
-        return CursorSetupStatus(
-            installed=False,
-            stale=True,
-            workspace_ref=_workspace_ref(paths.workspace),
-            hook_state="stale",
-            boundary=boundary,
-            managed_files=managed,
-            reload_required=True,
-            message=(
-                "AgentVeil hook CLI path is missing or changed. "
-                f"Re-run setup cursor --yes. {RELOAD_MESSAGE}"
-            ),
-            hook_cli_resolved=False,
-            hook_cli_ref=hook_cli_ref,
-        )
-
-    return CursorSetupStatus(
-        installed=True,
-        stale=False,
-        workspace_ref=_workspace_ref(paths.workspace),
-        hook_state="installed",
-        boundary=boundary,
-        managed_files=managed,
-        reload_required=True,
-        message=f"Cursor hooks are installed for this workspace. {RELOAD_MESSAGE}",
-        hook_cli_resolved=True,
-        hook_cli_ref=hook_cli_ref,
-    )
-
-
-def remove_cursor_hooks(*, workspace: Path | None = None, yes: bool = False) -> CursorRemoveResult:
-    paths = cursor_setup_paths(workspace)
-    if not yes:
-        return CursorRemoveResult(
-            ok=False,
-            removed_files=(),
-            reload_required=True,
-            message="Pass --yes to remove project-local Cursor hooks.",
-            errors=("confirmation_required",),
-        )
-
-    manifest = _load_manifest(paths)
-    if manifest is None:
-        return CursorRemoveResult(
-            ok=True,
-            removed_files=(),
-            reload_required=True,
-            message=f"No AgentVeil Cursor hook setup found. {RELOAD_MESSAGE}",
-        )
-
-    removed: list[str] = []
-    shim_relative = _shim_relative_path()
-    hook_id = _manifest_hook_id(manifest)
-    origin = _manifest_hooks_json_origin(manifest)
-
-    if paths.hooks_json.is_file():
-        document = _load_hooks_document(paths.hooks_json)
-        updated, changed = unmerge_agentveil_hooks(
-            document,
-            hook_id=hook_id,
-            shim_relative_path=shim_relative,
-        )
-        if changed:
-            if origin == "created" and hooks_document_is_empty(updated):
-                paths.hooks_json.unlink()
-                removed.append(str(paths.hooks_json.relative_to(paths.workspace)))
-            else:
-                _write_json_atomic(paths.hooks_json, updated)
-
-    if paths.hook_shim.is_file():
-        rel = str(paths.hook_shim.relative_to(paths.workspace))
-        paths.hook_shim.unlink()
-        removed.append(rel)
-
-    if paths.manifest_path.is_file():
-        rel = str(paths.manifest_path.relative_to(paths.workspace))
-        paths.manifest_path.unlink()
-        removed.append(rel)
-
-    if paths.hooks_dir.is_dir() and not any(paths.hooks_dir.iterdir()):
-        paths.hooks_dir.rmdir()
-
-    return CursorRemoveResult(
-        ok=True,
-        removed_files=tuple(removed),
-        reload_required=True,
-        message=(
-            "Removed AgentVeil Cursor hook entries from this workspace. "
-            f"{RELOAD_MESSAGE}"
-        ),
-    )
-
-
-def cursor_setup_result_to_dict(result: CursorSetupResult) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "ok": result.ok,
-        "action": result.action,
-        "workspace_ref": dict(result.workspace_ref),
-        "managed_files": list(result.managed_files),
-        "reload_required": result.reload_required,
-        "message": result.message,
-        "boundary": (
-            "Project-local Cursor hooks only. Does not configure host-wide Cursor control."
-        ),
-        "hook_cli_resolved": result.hook_cli_resolved,
-        "errors": list(result.errors),
-    }
-    if result.hook_cli_ref is not None:
-        payload["hook_cli_ref"] = dict(result.hook_cli_ref)
-    return payload
-
-
-def cursor_setup_status_to_dict(status: CursorSetupStatus) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "installed": status.installed,
-        "stale": status.stale,
-        "workspace_ref": dict(status.workspace_ref),
-        "hook_state": status.hook_state,
-        "boundary": status.boundary,
-        "managed_files": list(status.managed_files),
-        "reload_required": status.reload_required,
-        "message": status.message,
-        "hook_cli_resolved": status.hook_cli_resolved,
-    }
-    if status.hook_cli_ref is not None:
-        payload["hook_cli_ref"] = dict(status.hook_cli_ref)
-    return payload
-
-
-def cursor_remove_result_to_dict(result: CursorRemoveResult) -> dict[str, Any]:
     return {
-        "ok": result.ok,
-        "removed_files": list(result.removed_files),
-        "reload_required": result.reload_required,
-        "message": result.message,
-        "errors": list(result.errors),
+        "scope": "project",
+        "status": status,
+        "hook": hook_state,
+        "mcp_route": mcp_state,
+        "mcp_route_parity_ok": route_parity_ok,
+        "user_mcp_route": user_mcp_state,
+        "user_mcp_route_managed": user_mcp_managed,
+        "proxy_route": proxy_state,
+        "proxy_home": "initialized" if config_exists else "missing",
+        "proxy_doctor_ok": config_exists,
+        "approval_center": center.state,
+        "competing_global_route": competing,
+        "hook_observed": hook_observed,
+        "mcp_route_observed": mcp_route_observed,
+        "restart_required": restart_required,
+        "matched_tool_classes": list(MATCHED_TOOL_CLASSES),
+        "next_step": next_step,
     }
-
-
-def assert_cursor_setup_output_is_privacy_safe(payload: Mapping[str, Any]) -> None:
-    assert_setup_output_is_privacy_safe(payload)
 
 
 __all__ = [
-    "AGENTVEIL_HOOK_ID",
-    "CURSOR_SETUP_MANIFEST_NAME",
-    "CursorRemoveResult",
+    "AGENTVEIL_HOOK_MARKER",
+    "AGENTVEIL_HOOK_EVENTS",
+    "AGENTVEIL_MCP_SERVER_KEY",
+    "BROAD_FOLDER_MESSAGE",
+    "MATCHED_TOOL_CLASSES",
+    "MCP_ROUTE_ENV_KEYS",
+    "SETUP_ADVISORY_NEXT_STEP",
+    "BroadWorkspaceError",
+    "CenterStatus",
     "CursorSetupError",
-    "CursorSetupPaths",
-    "CursorSetupResult",
-    "CursorSetupStatus",
-    "RELOAD_MESSAGE",
-    "assert_cursor_setup_output_is_privacy_safe",
-    "build_agentveil_hook_entries",
-    "build_hook_shim_script",
-    "build_hooks_document",
-    "build_setup_manifest",
-    "cursor_remove_result_to_dict",
-    "cursor_setup_paths",
-    "cursor_setup_result_to_dict",
-    "cursor_setup_status_to_dict",
-    "derive_cursor_setup_status",
-    "global_cursor_config_paths",
-    "hooks_document_is_empty",
-    "merge_agentveil_hooks",
-    "normalize_cli_basename",
-    "read_shim_cli_path",
-    "remove_cursor_hooks",
-    "resolve_setup_cli_path",
-    "resolve_workspace_root",
-    "resolved_hook_shim_name",
-    "setup_cursor_hooks",
-    "shim_cli_is_resolved",
-    "unmerge_agentveil_hooks",
+    "EnsureCenterResult",
+    "InstallHooksResult",
+    "InstallMcpResult",
+    "NeutralizeGlobalRouteResult",
+    "StatusResult",
+    "UninstallResult",
+    "build_hook_command",
+    "build_managed_hook_entry",
+    "build_mcp_server_entry",
+    "format_setup_success_message",
+    "has_project_markers",
+    "is_broad_workspace",
+    "check_approval_center_status",
+    "connector_status",
+    "detect_competing_global_route",
+    "ensure_approval_center_running",
+    "hooks_config_path",
+    "install_hooks",
+    "install_mcp_route",
+    "is_managed_hook_command",
+    "load_json_object",
+    "load_project_mcp_server_entry",
+    "mcp_config_path",
+    "mcp_route_entry_has_private_parity",
+    "mcp_route_present",
+    "neutralize_competing_global_route",
+    "prepare_proxy_home",
+    "project_evidence_path",
+    "remove_hooks",
+    "remove_mcp_route",
+    "setup_home",
+    "stop_managed_approval_center",
+    "user_mcp_backup_dir",
 ]
