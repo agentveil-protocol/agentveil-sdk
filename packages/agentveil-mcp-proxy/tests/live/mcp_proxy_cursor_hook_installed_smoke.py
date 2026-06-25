@@ -32,6 +32,7 @@ def _run(cmd: list[str], *, cwd: Path, env: dict[str, str]) -> subprocess.Comple
 def main() -> int:
     env = clean_env()
     with tempfile.TemporaryDirectory(prefix="avp-cursor-installed-smoke-") as tmp:
+        env["CURSOR_USER_DATA_DIR"] = str(Path(tmp) / "cursor-user-data")
         install_root = Path(tmp) / "install"
         cli, python = build_installed_runtime(install_root)
 
