@@ -336,7 +336,13 @@ def user_mcp_backup_dir(workspace: Path) -> Path:
 def _backup_timestamp() -> str:
     from datetime import datetime, timezone
 
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+        .replace(":", "-")
+    )
 
 
 @dataclass(frozen=True)

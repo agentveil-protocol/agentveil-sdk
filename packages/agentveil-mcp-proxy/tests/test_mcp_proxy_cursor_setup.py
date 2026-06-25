@@ -532,7 +532,7 @@ def test_cli_setup_cursor_choose_folder_opens_cursor(tmp_path, monkeypatch, caps
 def test_cursor_open_command_prefers_cursor_cli_on_macos(tmp_path, monkeypatch):
     cursor_cli = "/Applications/Cursor.app/Contents/Resources/app/bin/cursor"
     monkeypatch.setattr(proxy_cli.sys, "platform", "darwin")
-    monkeypatch.setattr(Path, "is_file", lambda self: str(self) == cursor_cli)
+    monkeypatch.setattr(Path, "is_file", lambda self: self.as_posix() == cursor_cli)
 
     command = proxy_cli._cursor_open_command(tmp_path)
 
