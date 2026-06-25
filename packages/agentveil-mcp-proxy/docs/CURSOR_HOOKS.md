@@ -7,7 +7,10 @@ pip install agentveil-mcp-proxy
 agentveil-mcp-proxy setup cursor
 ```
 
-Interactive mode asks which project folder to protect (current folder, another path, or cancel). Non-interactive automation uses:
+Interactive mode asks which project folder to protect. On macOS and Windows,
+the `--choose-folder` path opens the system folder picker for another folder.
+Other environments fall back to entering a folder path. Non-interactive
+automation uses:
 
 ```bash
 agentveil-mcp-proxy setup cursor --choose-folder

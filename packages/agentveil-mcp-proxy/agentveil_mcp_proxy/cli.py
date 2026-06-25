@@ -3799,6 +3799,54 @@ def _resolve_setup_proxy_command() -> str | None:
     return None
 
 
+def _choose_folder_with_system_picker(*, cwd: Path) -> Path | None:
+    """Open a native folder picker when supported."""
+    if sys.platform == "darwin":
+        script = "\n".join([
+            f"set defaultFolder to POSIX file {json.dumps(str(cwd))}",
+            (
+                'set chosenFolder to choose folder with prompt '
+                '"Choose the project folder to protect with AgentVeil" '
+                "default location defaultFolder"
+            ),
+            "POSIX path of chosenFolder",
+        ])
+        try:
+            completed = subprocess.run(
+                ["osascript", "-e", script],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        except OSError:
+            return None
+        if completed.returncode != 0:
+            return None
+        selected = completed.stdout.strip()
+        return Path(selected).expanduser() if selected else None
+    if sys.platform == "win32":
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+        except (ImportError, OSError):
+            return None
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        try:
+            selected = filedialog.askdirectory(
+                initialdir=str(cwd),
+                title="Choose the project folder to protect with AgentVeil",
+            )
+        finally:
+            root.destroy()
+        return Path(selected).expanduser() if selected else None
+    return None
+
+
 def _prompt_cursor_setup_workspace(*, cwd: Path, input_fn) -> Path | None:
     """Interactive project picker; returns None when the user cancels."""
     print("Which project do you want to protect?")
@@ -3812,6 +3860,12 @@ def _prompt_cursor_setup_workspace(*, cwd: Path, input_fn) -> Path | None:
     if choice in ("", "1"):
         return cwd
     if choice == "2":
+        selected = _choose_folder_with_system_picker(cwd=cwd)
+        if selected is not None:
+            return selected
+        if sys.platform in {"darwin", "win32"}:
+            print("Folder selection cancelled.")
+            return None
         try:
             path_str = input_fn("Project folder path: ").strip()
         except EOFError:

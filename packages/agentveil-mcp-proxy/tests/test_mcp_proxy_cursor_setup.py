@@ -450,6 +450,61 @@ def test_cli_setup_cursor_interactive_choose_other_folder(tmp_path, monkeypatch,
     assert "Tools & MCPs" in out
 
 
+def test_prompt_cursor_setup_workspace_uses_native_picker_on_macos(tmp_path, monkeypatch):
+    project = tmp_path / "chosen-project"
+    project.mkdir()
+    monkeypatch.setattr(proxy_cli.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        proxy_cli,
+        "_choose_folder_with_system_picker",
+        lambda *, cwd: project,
+    )
+
+    result = proxy_cli._prompt_cursor_setup_workspace(
+        cwd=tmp_path,
+        input_fn=lambda _prompt: "2",
+    )
+
+    assert result == project
+
+
+def test_prompt_cursor_setup_workspace_uses_native_picker_on_windows(tmp_path, monkeypatch):
+    project = tmp_path / "chosen-project"
+    project.mkdir()
+    monkeypatch.setattr(proxy_cli.sys, "platform", "win32")
+    monkeypatch.setattr(
+        proxy_cli,
+        "_choose_folder_with_system_picker",
+        lambda *, cwd: project,
+    )
+
+    result = proxy_cli._prompt_cursor_setup_workspace(
+        cwd=tmp_path,
+        input_fn=lambda _prompt: "2",
+    )
+
+    assert result == project
+
+
+def test_prompt_cursor_setup_workspace_non_native_path_fallback(tmp_path, monkeypatch):
+    project = tmp_path / "typed-project"
+    project.mkdir()
+    answers = iter(["2", str(project)])
+    monkeypatch.setattr(proxy_cli.sys, "platform", "linux")
+    monkeypatch.setattr(
+        proxy_cli,
+        "_choose_folder_with_system_picker",
+        lambda *, cwd: None,
+    )
+
+    result = proxy_cli._prompt_cursor_setup_workspace(
+        cwd=tmp_path,
+        input_fn=lambda _prompt: next(answers),
+    )
+
+    assert result == project
+
+
 def test_cli_setup_cursor_choose_folder_opens_cursor(tmp_path, monkeypatch, capsys):
     project = tmp_path / "my-project"
     project.mkdir()
