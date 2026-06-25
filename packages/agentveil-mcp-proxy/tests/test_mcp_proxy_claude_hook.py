@@ -450,7 +450,7 @@ def test_spec6_input_ref_contains_only_hash_and_keys() -> None:
 # ----- corrective: cwd must not appear raw in evidence ---------------------
 
 
-SENTINEL_CWD = "/Users/olegboiko/SENTINEL_SECRET_WORKSPACE_zlj9k"
+SENTINEL_CWD = "/tmp/agentveil/SENTINEL_SECRET_WORKSPACE_zlj9k"
 
 
 def test_corrective_evidence_does_not_contain_raw_cwd() -> None:
@@ -476,9 +476,9 @@ def test_corrective_evidence_does_not_contain_raw_cwd() -> None:
 def test_corrective_cwd_digest_is_deterministic_for_same_path() -> None:
     """Audit need: same workspace -> same digest, so sessions can be grouped
     without leaking the path."""
-    payload_a = _payload("Read", {"file_path": "/tmp/x"}, cwd="/Users/x/proj")
-    payload_b = _payload("Read", {"file_path": "/tmp/y"}, cwd="/Users/x/proj")
-    payload_c = _payload("Read", {"file_path": "/tmp/z"}, cwd="/Users/x/other")
+    payload_a = _payload("Read", {"file_path": "/tmp/x"}, cwd="/tmp/agentveil/proj")
+    payload_b = _payload("Read", {"file_path": "/tmp/y"}, cwd="/tmp/agentveil/proj")
+    payload_c = _payload("Read", {"file_path": "/tmp/z"}, cwd="/tmp/agentveil/other")
     engine = PolicyEngine(default_proxy_config_for_hook())
     rec_a = build_evidence_record(payload_a, decide(payload_a, engine))
     rec_b = build_evidence_record(payload_b, decide(payload_b, engine))

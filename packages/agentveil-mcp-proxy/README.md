@@ -23,13 +23,6 @@ Use credential custody, egress boundaries, or API gates when an action must be
 controlled below the agent process. Those boundary patterns are preview and
 design-partner work, not general public release paths in this package.
 
-## Claude Code connector
-
-For the project-local Claude Code connector — the hook that denies native
-mutations with a redirect, the routed MCP approval/evidence path, setup path,
-and its limits — see
-[Claude Code Connector — Scope and Quickstart](docs/CLAUDE_CODE_SCOPE.md).
-
 ## Install
 
 ```bash
