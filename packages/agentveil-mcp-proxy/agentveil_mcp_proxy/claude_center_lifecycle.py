@@ -54,9 +54,14 @@ def _proxy_dir(home: Path) -> Path:
 
 
 def _center_health(manifest: ApprovalCenterManifest) -> bool:
-    url = f"{manifest.approval_center_url()}/api/approvals"
     try:
-        return loopback_get_status(url, timeout=_HEALTH_TIMEOUT_SECONDS) == 200
+        return (
+            loopback_get_status(
+                manifest.approval_center_url(),
+                timeout=_HEALTH_TIMEOUT_SECONDS,
+            )
+            == 200
+        )
     except (OSError, TimeoutError, ValueError):
         return False
 
@@ -82,9 +87,8 @@ def check_status(home: Path) -> CenterStatus:
     manifest = load_manifest(_proxy_dir(home))
     if manifest is None:
         return CenterStatus(state="down", pid=None, port=None, url=None)
-    alive = is_process_alive(manifest.pid)
-    healthy = _center_health(manifest) if alive else False
-    if alive and healthy:
+    healthy = _center_health(manifest)
+    if healthy:
         return CenterStatus(
             state="running",
             pid=manifest.pid,
@@ -216,20 +220,19 @@ def stop_if_managed(home: Path) -> dict[str, Any]:
     if manifest is None or manifest.pid is None:
         return {"stopped": False, "reason": "no managed approval-center manifest"}
 
-    if not is_process_alive(manifest.pid):
-        # Process is already gone but the manifest lingered. Remove it so a
-        # later setup does not see a stale running-looking record.
+    if not _center_health(manifest):
+        if is_process_alive(manifest.pid):
+            return {
+                "stopped": False,
+                "reason": "manifest pid is not a healthy AgentVeil Approval Center; not stopped",
+            }
+        # The center is not reachable and the manifest PID is not alive. Remove
+        # it so a later setup does not see a stale running-looking record.
         try:
             manifest_path(proxy_dir).unlink(missing_ok=True)
         except OSError:
             pass
         return {"stopped": False, "reason": "managed pid not alive; manifest cleared"}
-
-    if not _center_health(manifest):
-        return {
-            "stopped": False,
-            "reason": "manifest pid is not a healthy AgentVeil Approval Center; not stopped",
-        }
 
     try:
         os.kill(manifest.pid, signal.SIGTERM)

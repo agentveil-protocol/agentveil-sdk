@@ -1,12 +1,12 @@
 # Claude Code Connector — Scope and Quickstart
 
 The AgentVeil MCP Proxy can be installed as a project-local connector for
-Claude Code. The connector routes selected Claude Code actions through an
-AgentVeil control boundary: native mutations are denied with a redirect, and
-the AgentVeil controlled MCP route owns approval and bounded evidence.
+Claude Code. The connector makes Claude ask before changing files in the
+configured project: direct native mutations are denied before they run, Claude
+can retry through the AgentVeil-managed write path, and the MCP Proxy owns
+approval plus bounded evidence.
 
-This document describes only the public connector path. It does not describe
-policy-pack internals, guided remediation, or product methodology.
+This document describes only the public connector path and its limits.
 
 ## What the connector controls
 
@@ -14,7 +14,7 @@ policy-pack internals, guided remediation, or product methodology.
   `./.claude/settings.json`.
 - Native Claude Code mutation tools (`Write`, `Edit`, `MultiEdit`,
   `NotebookEdit`, mutating `Bash`) are denied **before** the mutation, with a
-  generic redirect to the AgentVeil controlled MCP route.
+  short instruction for Claude to retry the same change through AgentVeil.
 - MCP tool calls routed to the `agentveil-mcp-proxy` server pass through the
   hook and are governed by the MCP Proxy itself (classification, approval,
   evidence).
@@ -29,12 +29,19 @@ The intended product setup is one project command after package install:
 
 ```bash
 pip install agentveil-mcp-proxy
+agentveil-mcp-proxy setup claude-code --choose-folder --yes
+```
+
+The folder picker selects the project to protect without typing a path. Terminal
+users can also run the setup from inside the project folder:
+
+```bash
 agentveil-mcp-proxy setup claude-code --yes
 ```
 
-That one-command setup is the target public UX. Until that command lands, the
-same connector can be configured with the lower-level primitives below. Do not
-treat the lower-level sequence as the final product setup shape.
+That one-command setup is the target public UX. The same connector can still be
+configured with the lower-level primitives below for diagnostics. Do not treat
+the lower-level sequence as the final product setup shape.
 
 ## Current lower-level setup
 
@@ -69,19 +76,23 @@ removal.
 ## Expected flow
 
 1. The agent attempts a native mutation (for example `Write`). The project hook
-   denies it before the mutation and returns a generic redirect telling the
-   agent to use the AgentVeil controlled MCP route for the same intent.
-2. The agent calls the controlled MCP write tool
+   denies it before the mutation and tells Claude to retry the same change
+   through AgentVeil.
+2. The agent calls the AgentVeil MCP write tool
    (`mcp__agentveil-mcp-proxy__*`). The hook passes that call through; the MCP
    Proxy classifies it and requires approval for a write.
 3. An approval is surfaced through the MCP Proxy approval path. The target file
    is not written before approval.
-4. After approval, a retry of the same controlled MCP call writes the file into
-   the configured quickstart sandbox, and the MCP Proxy records bounded
-   evidence for the routed decision.
+4. After approval, a retry of the same controlled MCP call writes the file under
+   the configured project root or explicit sandbox, and the MCP Proxy records
+   bounded evidence for the routed decision.
 
-The MCP Proxy — not the hook — owns approval and evidence for routed MCP calls.
-The hook's role is to deny native mutations and redirect to that route.
+The MCP Proxy owns approval and evidence for AgentVeil-managed writes. The
+hook's role is to stop direct native mutations before they bypass that approval
+step.
+Claude setup does not auto-open a browser tab for the bare Approval Center
+dashboard; Claude Code shows the exact pending approval URL when an action
+requires approval.
 
 ## Status meaning (connector-local only)
 
@@ -111,11 +122,12 @@ The connector is deliberately narrow. It does **not** claim host-wide control.
 - **Out-of-band actions are outside control.** Manual edits in an IDE, external
   terminals, and direct filesystem changes are not Claude Code tool calls and
   are not controlled.
-- **Only configured/routed calls are controlled.** Native mutation tools are
-  denied; the controlled MCP route is governed by the proxy. Calls that are not
-  routed through the connector are not classified or logged by it.
-- **Quickstart writes stay under the sandbox root.** The
-  `--quickstart-filesystem ./sandbox` downstream writes within the configured
+- **Only configured AgentVeil calls are controlled.** Native mutation tools are
+  denied; AgentVeil-managed MCP calls are governed by the proxy. Calls that are
+  not routed through the connector are not classified or logged by it.
+- **Controlled writes stay under the configured root.** The one-command Claude
+  setup uses the current project folder by default. The lower-level
+  `--quickstart-filesystem ./sandbox` primitive writes within the configured
   sandbox path.
 - **Claude Code may prompt first.** Claude Code can show its own MCP tool
   permission prompt before the AgentVeil approval step.
@@ -126,9 +138,9 @@ The connector is deliberately narrow. It does **not** claim host-wide control.
 
 ## Not in this connector
 
-This connector is the minimal public path. It does not include guided
-remediation logic, policy-pack content, acceptance methodology, or any
-host-wide, all-terminal, or hosted-custody capability. <!-- claim-check: allow negative boundary; this disclaims host-wide/all-terminal/hosted claims, it does not assert them. -->
+This connector is the minimal public path. It does not include advanced team
+policy packages, hosted custody, or any host-wide/all-terminal capability.
+<!-- claim-check: allow negative boundary; this disclaims host-wide/all-terminal/hosted claims, it does not assert them. -->
 
 See [MCP Proxy Operations](../../../docs/MCP_PROXY_OPERATIONS.md) for downstream
 lifecycle and [Data Handling](../../../docs/DATA_HANDLING.md) for the evidence

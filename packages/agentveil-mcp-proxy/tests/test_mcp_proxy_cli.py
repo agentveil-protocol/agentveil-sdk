@@ -1990,6 +1990,35 @@ def test_cli_setup_claude_code_preview_does_not_write(tmp_path, capsys):
     assert not (tmp_path / ".mcp.json").exists()
 
 
+def test_choose_setup_project_folder_macos(monkeypatch, tmp_path):
+    selected = tmp_path / "Selected Project"
+    selected.mkdir()
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=f"{selected}\n",
+            stderr="",
+        ),
+    )
+
+    assert proxy_cli._choose_setup_project_folder() == selected
+
+
+def test_cli_setup_claude_code_rejects_choose_folder_with_project_dir(tmp_path, capsys):
+    rc = main([
+        "setup", "claude-code",
+        "--choose-folder",
+        "--project-dir", str(tmp_path),
+        "--yes",
+    ])
+
+    assert rc == 2
+    assert "cannot be combined" in capsys.readouterr().err
+
+
 def test_cli_setup_remove_claude_code_apply(tmp_path, capsys):
     from agentveil_mcp_proxy import claude_hook_setup
     # seed an installed hook + an .mcp.json with agentveil + an unrelated server
@@ -2042,6 +2071,7 @@ def test_cli_setup_claude_code_starts_center_with_passphrase_without_url_leak(
         (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
         seen["init_plaintext"] = kwargs["plaintext"]
         seen["init_passphrase_file"] = kwargs["passphrase_file"]
+        seen["downstream_root"] = kwargs["downstream_config"]["args"][-1]
 
     def fake_connect(**kwargs):
         project = kwargs["project_root"]
@@ -2085,6 +2115,61 @@ def test_cli_setup_claude_code_starts_center_with_passphrase_without_url_leak(
     assert seen["init_plaintext"] is False
     assert seen["init_passphrase_file"] == passphrase_file
     assert seen["center_passphrase_file"] == passphrase_file
+    assert seen["downstream_root"] == str(tmp_path.resolve())
+    config = json.loads((tmp_path / ".avp" / "mcp-proxy" / "config.json").read_text(encoding="utf-8"))
+    assert config["approval"]["ui_open_mode"] == "terminal"
+
+
+def test_cli_setup_claude_code_choose_folder_uses_selected_project(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from agentveil_mcp_proxy import claude_center_lifecycle
+
+    selected = tmp_path / "Selected Project"
+    selected.mkdir()
+    seen: dict[str, object] = {}
+
+    def fake_init_proxy(**kwargs):
+        home = kwargs["home"]
+        (home / "mcp-proxy").mkdir(parents=True, exist_ok=True)
+        (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+        seen["home"] = home
+        seen["downstream_root"] = kwargs["downstream_config"]["args"][-1]
+
+    def fake_connect(**kwargs):
+        project = kwargs["project_root"]
+        seen["project_root"] = project
+        (project / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"agentveil-mcp-proxy": {"command": "agentveil-mcp-proxy"}}}),
+            encoding="utf-8",
+        )
+        return 0
+
+    monkeypatch.setattr(proxy_cli, "_choose_setup_project_folder", lambda: selected)
+    monkeypatch.setattr(proxy_cli, "init_proxy", fake_init_proxy)
+    monkeypatch.setattr(proxy_cli, "run_connect_cli", fake_connect)
+    monkeypatch.setattr("shutil.which", lambda _name: "agentveil-mcp-proxy")
+    monkeypatch.setattr(
+        claude_center_lifecycle,
+        "ensure_running",
+        lambda **_kwargs: SimpleNamespace(
+            status=SimpleNamespace(state="running", url="http://127.0.0.1/approval/SECRET"),
+            started=True,
+            reused=False,
+            restarted=False,
+        ),
+    )
+
+    rc = main(["setup", "claude-code", "--choose-folder", "--yes", "--json"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert seen["project_root"] == selected.resolve()
+    assert seen["home"] == selected.resolve() / ".avp"
+    assert seen["downstream_root"] == str(selected.resolve())
 
 
 def test_cli_setup_claude_code_fails_when_center_not_running(
@@ -2164,6 +2249,66 @@ def test_claude_center_stop_does_not_kill_unhealthy_manifest(tmp_path, monkeypat
     assert "not a healthy AgentVeil Approval Center" in result["reason"]
 
 
+def test_claude_center_health_uses_approval_center_page(tmp_path, monkeypatch):
+    from agentveil_mcp_proxy import claude_center_lifecycle
+    from agentveil_mcp_proxy.approval.persistent import (
+        ApprovalCenterManifest,
+        token_hash_for,
+    )
+
+    token = "session-token"
+    manifest = ApprovalCenterManifest(
+        schema_version=2,
+        host="127.0.0.1",
+        port=43210,
+        session_token=token,
+        token_hash=token_hash_for(token),
+        internal_register_token="internal",
+        pid=12345,
+        started_at=1,
+    )
+    seen_urls: list[str] = []
+
+    def fake_status(url: str, *, timeout: float) -> int:
+        del timeout
+        seen_urls.append(url)
+        return 200 if url == manifest.approval_center_url() else 403
+
+    monkeypatch.setattr(claude_center_lifecycle, "loopback_get_status", fake_status)
+
+    assert claude_center_lifecycle._center_health(manifest)
+    assert seen_urls == [manifest.approval_center_url()]
+
+
+def test_claude_center_status_uses_loopback_not_pid_probe(tmp_path, monkeypatch):
+    from agentveil_mcp_proxy import claude_center_lifecycle
+    from agentveil_mcp_proxy.approval.persistent import (
+        ApprovalCenterManifest,
+        save_manifest,
+        token_hash_for,
+    )
+
+    token = "session-token"
+    manifest = ApprovalCenterManifest(
+        schema_version=2,
+        host="127.0.0.1",
+        port=43210,
+        session_token=token,
+        token_hash=token_hash_for(token),
+        internal_register_token="internal",
+        pid=12345,
+        started_at=1,
+    )
+    save_manifest(tmp_path / ".avp" / "mcp-proxy", manifest)
+    monkeypatch.setattr(claude_center_lifecycle, "is_process_alive", lambda _pid: False)
+    monkeypatch.setattr(claude_center_lifecycle, "_center_health", lambda _manifest: True)
+
+    status = claude_center_lifecycle.check_status(tmp_path / ".avp")
+
+    assert status.state == "running"
+    assert status.port == 43210
+
+
 def test_setup_proxy_command_falls_back_to_invoked_console_script(tmp_path, monkeypatch):
     script = tmp_path / "agentveil-mcp-proxy"
     script.write_text("#!/bin/sh\n", encoding="utf-8")
@@ -2171,3 +2316,16 @@ def test_setup_proxy_command_falls_back_to_invoked_console_script(tmp_path, monk
     monkeypatch.setattr(sys, "argv", [str(script), "setup", "claude-code"])
 
     assert proxy_cli._resolve_setup_proxy_command() == str(script.resolve())
+
+
+def test_setup_proxy_command_prefers_invoked_script_over_path(tmp_path, monkeypatch):
+    invoked = tmp_path / "venv" / "bin" / "agentveil-mcp-proxy"
+    invoked.parent.mkdir(parents=True)
+    invoked.write_text("#!/bin/sh\n", encoding="utf-8")
+    global_script = tmp_path / "global" / "agentveil-mcp-proxy"
+    global_script.parent.mkdir()
+    global_script.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr("shutil.which", lambda _name: str(global_script))
+    monkeypatch.setattr(sys, "argv", [str(invoked), "setup", "claude-code"])
+
+    assert proxy_cli._resolve_setup_proxy_command() == str(invoked.resolve())

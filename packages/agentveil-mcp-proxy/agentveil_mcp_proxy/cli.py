@@ -3723,8 +3723,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Project directory to set up (default: current directory)",
     )
     setup_claude_code.add_argument(
+        "--choose-folder", action="store_true",
+        help="Open the macOS folder picker to choose the project directory",
+    )
+    setup_claude_code.add_argument(
         "--sandbox", type=Path, default=None,
-        help="Quickstart filesystem sandbox path (default: <project>/sandbox)",
+        help="Quickstart filesystem sandbox path (default: selected project directory)",
     )
     setup_claude_code.add_argument(
         "--yes", action="store_true",
@@ -3972,22 +3976,70 @@ def _setup_claude_code_home(project_dir: Path) -> Path:
     return project_dir / ".avp"
 
 
+def _choose_setup_project_folder() -> Path:
+    """Open the native macOS folder picker and return the selected directory."""
+    if sys.platform != "darwin":
+        raise ProxyCliError("--choose-folder is currently supported on macOS only", exit_code=2)
+    import subprocess
+
+    script = (
+        'POSIX path of (choose folder with prompt '
+        '"Choose the project folder to protect with AgentVeil")'
+    )
+    try:
+        result = subprocess.run(  # noqa: S603 - fixed osascript invocation
+            ["osascript", "-e", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ProxyCliError(
+            f"could not open folder picker: {exc.__class__.__name__}",
+            exit_code=2,
+        ) from exc
+    if result.returncode != 0:
+        raise ProxyCliError("folder selection cancelled", exit_code=2)
+    selected = result.stdout.strip()
+    if not selected:
+        raise ProxyCliError("folder selection returned an empty path", exit_code=2)
+    return Path(selected)
+
+
 def _resolve_setup_proxy_command() -> str | None:
     """Resolve the console script used by generated Claude setup config."""
     import shutil
 
-    resolved = shutil.which("agentveil-mcp-proxy")
-    if resolved:
-        return resolved
     invoked = Path(sys.argv[0])
     if invoked.exists() and invoked.name == "agentveil-mcp-proxy":
         return str(invoked.resolve())
+    resolved = shutil.which("agentveil-mcp-proxy")
+    if resolved:
+        return resolved
     return None
+
+
+def _configure_claude_setup_approval_ui(config_path: Path) -> None:
+    """Disable browser auto-open for Claude setup-managed approvals.
+
+    Claude Code already displays the exact pending approval URL in chat. Opening
+    the bare Approval Center dashboard from the proxy creates a confusing empty
+    browser tab during first-run setup and approval retries.
+    """
+    config_payload = _read_json(config_path, "proxy config")
+    approval = config_payload.get("approval")
+    if not isinstance(approval, dict):
+        approval = {}
+        config_payload["approval"] = approval
+    approval["ui_open_mode"] = ApprovalUiOpenMode.TERMINAL.value
+    _secure_write_json(config_path, config_payload, force=True)
 
 
 def run_setup_claude_code_cli(
     *,
     project_dir: Path | None,
+    choose_folder: bool,
     sandbox: Path | None,
     assume_yes: bool,
     passphrase_file: Path | None,
@@ -4004,8 +4056,11 @@ def run_setup_claude_code_cli(
     """
     from agentveil_mcp_proxy import claude_hook_setup
 
-    target = (Path(project_dir) if project_dir is not None else Path.cwd()).resolve()
-    sandbox_path = Path(sandbox) if sandbox is not None else (target / "sandbox")
+    if choose_folder and project_dir is not None:
+        raise ProxyCliError("--choose-folder cannot be combined with --project-dir", exit_code=2)
+    selected_project = _choose_setup_project_folder() if choose_folder else project_dir
+    target = (Path(selected_project) if selected_project is not None else Path.cwd()).resolve()
+    sandbox_path = Path(sandbox).resolve() if sandbox is not None else target
     home = _setup_claude_code_home(target)
     config_path = home / "mcp-proxy" / "config.json"
 
@@ -4042,6 +4097,8 @@ def run_setup_claude_code_cli(
         except ProxyCliError:
             raise
         proxy_initialized = True
+    if config_path.exists():
+        _configure_claude_setup_approval_ui(config_path)
 
     # 2. Claude Code MCP route (.mcp.json) — reuse the connect command. Resolve
     # the installed console script explicitly (matches the supported manual
@@ -4090,7 +4147,7 @@ def run_setup_claude_code_cli(
 
     # 5. Bounded status summary.
     status = claude_hook_setup.connector_status(target, proxy_route_present=config_path.exists())
-    sandbox_label = "sandbox" if sandbox is None else "custom"
+    sandbox_label = "project" if sandbox is None else "custom"
 
     if not center_running:
         if output_json:
@@ -4657,6 +4714,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.setup_action == "claude-code":
                 return run_setup_claude_code_cli(
                     project_dir=args.project_dir,
+                    choose_folder=args.choose_folder,
                     sandbox=args.sandbox,
                     assume_yes=args.yes,
                     passphrase_file=args.passphrase_file,
