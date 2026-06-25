@@ -3565,3 +3565,62 @@ def test_invalid_approval_token_returns_403_html_without_leaking_pending():
         _assert_stale_html_privacy_safe(response.text, session_token=server.session_token)
     finally:
         server.stop()
+
+
+# ----- P10D.14 S3 follow-up: G4 approve->retry payload-drift diagnosis -------
+#
+# Root cause of the live G4 failure: a controlled write_file retry through a
+# *separate* Claude session produced the same path but different content bytes
+# (e.g. a trailing newline), so payload_hash drifted while resource_hash stayed
+# identical. exact-scope approval is payload-bound, so it correctly did NOT  # claim-check: allow approval binding property asserted by tests below.
+# cover the changed-content retry. similar_5m is resource-bound and
+# payload-AGNOSTIC (store.find_active_similar_grant has no payload_hash filter),
+# so enabling it for filesystem writes would approve *changed content* to the
+# same path for 5 minutes — which the slice explicitly forbids. These tests pin
+# that security property so the "broad similar" fix cannot be introduced by
+# accident.
+
+
+def test_g4_changed_content_changes_payload_but_not_resource() -> None:
+    from agentveil_mcp_proxy.classification import (
+        extract_resource,
+        sha256_jcs,
+        sha256_text,
+    )
+
+    args_a = {"path": "config.py", "content": "FEATURE_X=true"}
+    args_b = {"path": "config.py", "content": "FEATURE_X=true\n"}  # trailing-newline drift
+
+    # Same path -> identical resource label and resource_hash.
+    assert extract_resource(args_a) == extract_resource(args_b)
+    assert sha256_text(extract_resource(args_a)) == sha256_text(extract_resource(args_b))
+
+    # Different content -> different payload_hash. This is why an exact-scope
+    # approval of args_a does NOT cover an args_b retry (security-correct).
+    assert sha256_jcs(args_a) != sha256_jcs(args_b)
+
+
+def test_g4_identical_retry_keeps_same_payload_hash() -> None:
+    """Exact retry stability: a byte-identical retry hashes the same, so an
+    exact grant would be reused (the in-session interactive retry path)."""
+    from agentveil_mcp_proxy.classification import sha256_jcs
+
+    args = {"path": "config.py", "content": "FEATURE_X=true"}
+    assert sha256_jcs(args) == sha256_jcs(dict(args))
+
+
+def test_g4_similar_grant_matching_is_payload_agnostic_by_design() -> None:
+    """Guard: find_active_similar_grant does not constrain payload_hash, so
+    enabling similar_5m for filesystem writes would cover changed content.
+    This documents WHY similar_5m is rejected for the controlled write route."""
+    import inspect
+
+    from agentveil_mcp_proxy.evidence.store import ApprovalEvidenceStore
+
+    src = inspect.getsource(ApprovalEvidenceStore.find_active_similar_grant)
+    # The SQL match binds resource_hash but must not bind payload_hash.
+    assert "resource_hash" in src
+    assert "payload_hash" not in src, (
+        "similar grant matching now references payload_hash; re-verify the G4 "
+        "scope analysis before enabling similar_5m for filesystem writes"
+    )

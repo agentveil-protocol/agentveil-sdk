@@ -171,6 +171,47 @@ def test_manifest_health_check_uses_direct_loopback_socket(tmp_path, monkeypatch
         store.close()
 
 
+def test_manifest_health_check_uses_approval_center_page(tmp_path, monkeypatch):
+    store, server, _manager, proxy_dir = _start_persistent_center(tmp_path)
+    try:
+        manifest = load_manifest(proxy_dir)
+        assert manifest is not None
+        seen_urls: list[str] = []
+
+        def fake_status(url: str, *, timeout: float) -> int:
+            del timeout
+            seen_urls.append(url)
+            return 200 if url == manifest.approval_center_url() else 403
+
+        monkeypatch.setattr(persistent_module, "loopback_get_status", fake_status)
+
+        assert manifest_is_reachable(manifest)
+        assert seen_urls == [manifest.approval_center_url()]
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_manifest_reachability_uses_loopback_not_pid_probe(tmp_path, monkeypatch):
+    store, server, _manager, proxy_dir = _start_persistent_center(tmp_path)
+    try:
+        manifest = load_manifest(proxy_dir)
+        assert manifest is not None
+        monkeypatch.setattr(persistent_module, "is_process_alive", lambda _pid: False)
+        monkeypatch.setattr(
+            persistent_module,
+            "loopback_get_status",
+            lambda url, *, timeout: (
+                200 if url == manifest.approval_center_url() else 403
+            ),
+        )
+
+        assert manifest_is_reachable(manifest)
+    finally:
+        server.stop()
+        store.close()
+
+
 def test_public_session_token_cannot_register_prompts(tmp_path):
     store, server, _manager, proxy_dir = _start_persistent_center(tmp_path)
     manifest = load_manifest(proxy_dir)

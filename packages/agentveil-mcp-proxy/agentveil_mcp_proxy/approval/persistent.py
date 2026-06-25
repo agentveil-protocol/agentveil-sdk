@@ -145,9 +145,14 @@ def _windows_process_alive(pid: int) -> bool:
 
 
 def _health_check(manifest: ApprovalCenterManifest) -> bool:
-    url = f"{manifest.approval_center_url()}/api/approvals"
     try:
-        return loopback_get_status(url, timeout=HEALTH_TIMEOUT_SECONDS) == 200
+        return (
+            loopback_get_status(
+                manifest.approval_center_url(),
+                timeout=HEALTH_TIMEOUT_SECONDS,
+            )
+            == 200
+        )
     except (OSError, TimeoutError, ValueError):
         return False
 
@@ -265,8 +270,6 @@ def _parse_http_response(response: bytes) -> tuple[int, bytes]:
 
 
 def manifest_is_reachable(manifest: ApprovalCenterManifest) -> bool:
-    if not is_process_alive(manifest.pid):
-        return False
     return _health_check(manifest)
 
 
