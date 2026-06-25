@@ -3657,11 +3657,53 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_json_arg(setup_run)
 
+    setup_cursor = setup_subparsers.add_parser(
+        "cursor",
+        help="One-command Cursor connector setup (hooks + MCP route + Approval Center)",
+    )
+    setup_cursor.add_argument(
+        "--workspace",
+        type=Path,
+        default=None,
+        help="Workspace root to set up (default: current directory)",
+    )
+    setup_cursor.add_argument(
+        "--yes",
+        action="store_true",
+        help="Apply the setup; without it the command only previews",
+    )
+    setup_cursor.add_argument(
+        "--passphrase-file",
+        type=Path,
+        default=None,
+        help="Encrypt the proxy identity with this passphrase file (default: workspace .agentveil/passphrase)",
+    )
+    setup_cursor.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-initialize the proxy route even if its config already exists",
+    )
+    _add_json_arg(setup_cursor)
+
     setup_status = setup_subparsers.add_parser(
         "status",
-        help="Report setup status from actual proxy and client config files",
+        help=(
+            "Without --home: project-local Cursor connector status. "
+            "With --home: adaptive setup wizard status."
+        ),
     )
-    setup_status.add_argument("--home", type=Path, required=True, help="AVP home to inspect")
+    setup_status.add_argument(
+        "--home",
+        type=Path,
+        default=None,
+        help="AVP home to inspect (wizard mode)",
+    )
+    setup_status.add_argument(
+        "--workspace",
+        type=Path,
+        default=None,
+        help="Workspace root for connector status (default: current directory)",
+    )
     setup_status.add_argument(
         "--client",
         default="cursor",
@@ -3702,7 +3744,336 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_json_arg(setup_restore)
 
+    setup_remove = setup_subparsers.add_parser(
+        "remove",
+        help="Remove a one-command connector (AgentVeil-managed entries only)",
+    )
+    setup_remove.add_argument(
+        "target",
+        choices=["cursor"],
+        help="Connector to remove",
+    )
+    setup_remove.add_argument(
+        "--workspace",
+        type=Path,
+        default=None,
+        help="Workspace root to remove from (default: current directory)",
+    )
+    setup_remove.add_argument(
+        "--yes",
+        action="store_true",
+        help="Apply the removal; without it the command only previews",
+    )
+    _add_json_arg(setup_remove)
+
     return parser
+
+
+def _setup_cursor_home(workspace: Path) -> Path:
+    from agentveil_mcp_proxy import cursor_setup
+
+    return cursor_setup.setup_home(workspace)
+
+
+def _resolve_setup_proxy_command() -> str | None:
+    """Resolve the console script used by generated setup config."""
+    import shutil
+
+    resolved = shutil.which("agentveil-mcp-proxy")
+    if resolved:
+        return resolved
+    invoked = Path(sys.argv[0])
+    if invoked.exists() and invoked.name == "agentveil-mcp-proxy":
+        return str(invoked.resolve())
+    return None
+
+
+def _prompt_cursor_setup_workspace(*, cwd: Path, input_fn) -> Path | None:
+    """Interactive project picker; returns None when the user cancels."""
+    print("Which project do you want to protect?")
+    print(f"  1. Current folder: {cwd}")
+    print("  2. Choose another folder")
+    print("  3. Cancel")
+    try:
+        choice = input_fn("Choice [1]: ").strip()
+    except EOFError:
+        return None
+    if choice in ("", "1"):
+        return cwd
+    if choice == "2":
+        try:
+            path_str = input_fn("Project folder path: ").strip()
+        except EOFError:
+            return None
+        if not path_str:
+            print("No path entered.")
+            return None
+        return Path(path_str).expanduser()
+    if choice == "3":
+        return None
+    print("Invalid choice.")
+    return None
+
+
+def _resolve_setup_cursor_target(
+    *,
+    workspace: Path | None,
+    assume_yes: bool,
+    output_json: bool,
+    input_fn,
+) -> tuple[Path | None, int | None]:
+    """Resolve workspace for setup. Second value is early exit code when not None."""
+    from agentveil_mcp_proxy import cursor_setup
+
+    if not assume_yes:
+        if output_json:
+            message = "confirmation required: pass --yes for non-interactive JSON setup"
+            _print_json({
+                "ok": False,
+                "action": "setup-cursor",
+                "applied": False,
+                "errors": [message],
+                "warnings": [],
+            })
+            return None, 0
+        selected = _prompt_cursor_setup_workspace(cwd=Path.cwd(), input_fn=input_fn)
+        if selected is None:
+            print("Setup cancelled.")
+            return None, 0
+        try:
+            target = selected.expanduser().resolve()
+        except OSError as exc:
+            raise ProxyCliError(
+                f"cannot resolve project folder: {exc.__class__.__name__}",
+                exit_code=1,
+            ) from exc
+        if cursor_setup.is_broad_workspace(target):
+            print(cursor_setup.BROAD_FOLDER_MESSAGE)
+            return None, 1
+        return target, None
+
+    target = (Path(workspace) if workspace is not None else Path.cwd()).resolve()
+    if cursor_setup.is_broad_workspace(target):
+        if output_json:
+            _print_json({
+                "ok": False,
+                "action": "setup-cursor",
+                "applied": False,
+                "errors": [cursor_setup.BROAD_FOLDER_MESSAGE.replace("\n", " ")],
+                "warnings": [],
+            })
+        else:
+            print(cursor_setup.BROAD_FOLDER_MESSAGE, file=sys.stderr)
+        return None, 1
+    return target, None
+
+
+def run_setup_cursor_cli(
+    *,
+    workspace: Path | None,
+    assume_yes: bool,
+    passphrase_file: Path | None,
+    force: bool,
+    output_json: bool,
+    input_fn=input,
+) -> int:
+    """One-command Cursor connector setup."""
+    from agentveil_mcp_proxy import cursor_setup
+
+    target, early_exit = _resolve_setup_cursor_target(
+        workspace=workspace,
+        assume_yes=assume_yes,
+        output_json=output_json,
+        input_fn=input_fn,
+    )
+    if early_exit is not None:
+        return early_exit
+    assert target is not None
+
+    home = _setup_cursor_home(target)
+    config_path = cursor_setup.proxy_config_path(home)
+    resolved_passphrase = passphrase_file or cursor_setup.passphrase_path(home)
+
+    quiet = io.StringIO()
+    proxy_initialized = False
+    try:
+        cursor_setup.prepare_proxy_home(target, force=force)
+        if force or not config_path.exists():
+            prof = cursor_setup.profile_root(home)
+            initialize_product_route_profile(prof)
+            downstream = build_product_route_downstream_config(prof)
+            init_proxy(
+                home=home,
+                config_path=None,
+                downstream_config=downstream,
+                policy_pack="product_route",
+                setup_profile=PRODUCT_ROUTE_SETUP_PROFILE,
+                plaintext=False,
+                passphrase_file=resolved_passphrase,
+                force=force,
+                err=quiet,
+            )
+            proxy_initialized = True
+    except ProxyCliError:
+        raise
+
+    proxy_cmd = _resolve_setup_proxy_command()
+    if not proxy_cmd:
+        raise ProxyCliError(
+            "agentveil-mcp-proxy console script not on PATH; install the package first",
+            exit_code=1,
+        )
+
+    try:
+        neutralize_result = cursor_setup.neutralize_competing_global_route(target)
+        cursor_setup.install_mcp_route(target, proxy_command=proxy_cmd, home=home)
+        hook_result = cursor_setup.install_hooks(target, home=home)
+    except cursor_setup.CursorSetupError as exc:
+        raise ProxyCliError(str(exc), exit_code=1) from exc
+
+    center_result = cursor_setup.ensure_approval_center_running(
+        home=home,
+        proxy_command=proxy_cmd,
+        passphrase_file=resolved_passphrase,
+    )
+    center_running = center_result.status.state == "running"
+    status = cursor_setup.connector_status(target, home=home)
+
+    if not center_running:
+        if output_json:
+            _print_json({
+                "ok": False,
+                "action": "setup-cursor",
+                "applied": True,
+                "scope": "project",
+                "proxy_route_initialized": proxy_initialized,
+                "hooks_relpath": ".cursor/hooks.json",
+                "mcp_route_relpath": ".cursor/mcp.json",
+                "approval_center": {
+                    "state": center_result.status.state,
+                    "reason": center_result.reason,
+                },
+                "errors": [
+                    "approval_center not running; controlled MCP writes would surface "
+                    "unreachable approval URLs. Setup is not ready/protected."
+                ],
+                "warnings": [],
+            })
+        else:
+            print("Cursor connector partially set up:")
+            print(f"  proxy route: {'initialized' if proxy_initialized else 'already present'}")
+            print("  MCP route:   .cursor/mcp.json written")
+            print("  hooks:       .cursor/hooks.json present")
+            print(f"  approval_center: {center_result.status.state} ({center_result.reason})")
+            print("ERROR: setup is NOT ready — Approval Center could not start.", file=sys.stderr)
+        return 1
+
+    if output_json:
+        _print_operator_json({
+            "ok": True,
+            "action": "setup-cursor",
+            "applied": True,
+            "scope": "project",
+            "proxy_route_initialized": proxy_initialized,
+            "hooks_relpath": ".cursor/hooks.json",
+            "mcp_route_relpath": ".cursor/mcp.json",
+            "approval_center": {
+                "state": center_result.status.state,
+                "started": center_result.started,
+                "reused": center_result.reused,
+                "restarted": center_result.restarted,
+            },
+            "reload_required": True,
+            "competing_global_route_neutralized": neutralize_result.changed,
+            "status": status,
+            "created_hooks": hook_result.created_hooks,
+        })
+    else:
+        print(cursor_setup.format_setup_success_message(target, status=status))
+    return 0
+
+
+def run_setup_cursor_status_cli(*, workspace: Path | None, output_json: bool) -> int:
+    """Project-local Cursor connector status (bare ``setup status``)."""
+    from agentveil_mcp_proxy import cursor_setup
+
+    target = (Path(workspace) if workspace is not None else Path.cwd()).resolve()
+    home = _setup_cursor_home(target)
+    status = cursor_setup.connector_status(target, home=home)
+    if status["approval_center"] != "running" and status["status"] != "unsafe":
+        status["status"] = "advisory"
+    if output_json:
+        _print_operator_json(status)
+    else:
+        print(f"status: {status['status']}")
+        print(f"  hook:            {status['hook']}")
+        print(f"  mcp route:       {status['mcp_route']}")
+        print(f"  user mcp route:  {status['user_mcp_route']}")
+        print(f"  proxy route:     {status['proxy_route']}")
+        print(f"  approval_center: {status['approval_center']}")
+        print(f"  global split:    {status['competing_global_route']}")
+        print(f"  mcp observed:    {status['mcp_route_observed']}")
+        print(f"  restart required:{status['restart_required']}")
+        print(f"  next: {status['next_step']}")
+    return 0
+
+
+def run_setup_remove_cursor_cli(
+    *,
+    workspace: Path | None,
+    assume_yes: bool,
+    output_json: bool,
+) -> int:
+    """Remove the one-command Cursor connector — AgentVeil-managed entries only."""
+    from agentveil_mcp_proxy import cursor_setup
+
+    target = (Path(workspace) if workspace is not None else Path.cwd()).resolve()
+
+    if not assume_yes:
+        message = (
+            f"Would remove AgentVeil-managed Cursor hook and MCP route entries from "
+            f"{target} (unrelated hooks and MCP servers preserved). Re-run with --yes."
+        )
+        if output_json:
+            _print_json({
+                "ok": False,
+                "action": "setup-remove-cursor",
+                "applied": False,
+                "errors": ["confirmation required: pass --yes"],
+                "warnings": [message],
+            })
+        else:
+            print(message)
+        return 0
+
+    try:
+        hooks_removed = cursor_setup.remove_hooks(target)
+        mcp_removed = cursor_setup.remove_mcp_route(target)
+    except cursor_setup.CursorSetupError as exc:
+        raise ProxyCliError(str(exc), exit_code=1) from exc
+
+    center_stop = cursor_setup.stop_managed_approval_center(_setup_cursor_home(target))
+    removed_any = hooks_removed > 0 or mcp_removed or center_stop["stopped"]
+    if output_json:
+        _print_operator_json({
+            "ok": True,
+            "action": "setup-remove-cursor",
+            "applied": True,
+            "scope": "project",
+            "hook_entries_removed": hooks_removed,
+            "mcp_route_removed": mcp_removed,
+            "approval_center_stopped": center_stop["stopped"],
+            "reload_required": removed_any,
+        })
+    else:
+        print(
+            f"Removed: hook entries={hooks_removed}, mcp route={mcp_removed}, "
+            f"approval_center={'stopped' if center_stop['stopped'] else 'not running'}"
+        )
+        print("Unrelated Cursor hooks and MCP servers preserved.")
+        if removed_any:
+            print("Reload Cursor for this workspace to drop the connector.")
+    return 0
 
 
 def _normalize_connect_argv(argv: list[str]) -> list[str]:
@@ -4129,6 +4500,11 @@ def main(argv: list[str] | None = None) -> int:
                     output_json=args.json_output,
                 )
             if args.setup_action == "status":
+                if args.home is None:
+                    return run_setup_cursor_status_cli(
+                        workspace=args.workspace,
+                        output_json=args.json_output,
+                    )
                 return print_setup_status_cli(
                     home=args.home,
                     client_id=args.client,
@@ -4143,7 +4519,25 @@ def main(argv: list[str] | None = None) -> int:
                     client_id=args.client,
                     output_json=args.json_output,
                 )
-            raise ProxyCliError("setup action must be run, status, or restore")
+            if args.setup_action == "cursor":
+                return run_setup_cursor_cli(
+                    workspace=args.workspace,
+                    assume_yes=args.yes,
+                    passphrase_file=args.passphrase_file,
+                    force=args.force,
+                    output_json=args.json_output,
+                )
+            if args.setup_action == "remove":
+                if args.target != "cursor":
+                    raise ProxyCliError("setup remove target must be cursor")
+                return run_setup_remove_cursor_cli(
+                    workspace=args.workspace,
+                    assume_yes=args.yes,
+                    output_json=args.json_output,
+                )
+            raise ProxyCliError(
+                "setup action must be cursor, status, remove, run, or restore"
+            )
     except (
         ProxyCliError,
         ApprovalEvidenceError,
