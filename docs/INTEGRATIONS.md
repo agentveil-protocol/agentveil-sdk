@@ -1,6 +1,18 @@
-# Framework Integrations
+# Framework SDK Examples
 
-AVP works with any Python code. These integrations provide native tool adapters for popular agent frameworks.
+AVP works with any Python code. The examples in this document show how popular
+agent frameworks can call AgentVeil SDK tools explicitly.
+
+These examples are not the same as AgentVeil project connectors. A project
+connector, such as the Cursor or Claude Code connector in `agentveil-mcp-proxy`,
+installs a configured action-control boundary with hooks, routed MCP approval,
+redirects, and bounded evidence. The framework examples below add AgentVeil
+tools to an agent workflow; they do not automatically intercept framework-side
+actions or claim project-control coverage by themselves.
+
+Use these examples when you want an agent to call AgentVeil primitives directly.
+Use a project connector or routed MCP proxy when you need AgentVeil to control
+configured side-effect paths.
 
 ## CrewAI
 

@@ -74,7 +74,13 @@ def review_code(pr_url: str) -> str:
 
 ---
 
-### Integrations
+### SDK Integrations And Examples
+
+These integrations expose AgentVeil SDK primitives to Python frameworks and
+model APIs. They are explicit tool/example integrations, not automatic Safe
+Mode project connectors. For configured action-control boundaries with hooks,
+routed MCP approval, redirect outcomes, and bounded local evidence, use the
+supported project connectors or the MCP transport proxy.
 
 | Stack | Install | Integration surface |
 |-------|---------|---------------------|
