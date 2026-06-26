@@ -36,6 +36,13 @@ from agentveil_mcp_proxy.product_route_local_fixtures import (
 PRODUCT_ROUTE_POLICY_ID: Final = "product_route"
 PRODUCT_ROUTE_DOWNSTREAM_NAME: Final = "product"
 
+SANDBOX_READ_ONLY_MCP_TOOLS: Final[frozenset[str]] = frozenset({
+    "list_workspace",
+    "read_file",
+    "get_file_info",
+    "instruction_surface_status",
+})
+
 PRODUCT_ROUTE_ACCEPTED_PACKS: Final[tuple[str, ...]] = (
     "filesystem",
     "git",
@@ -45,6 +52,8 @@ PRODUCT_ROUTE_ACCEPTED_PACKS: Final[tuple[str, ...]] = (
 
 FILESYSTEM_PRODUCT_TOOLS: Final[tuple[str, ...]] = (
     "list_workspace",
+    "read_file",
+    "get_file_info",
     "instruction_surface_status",
     "write_file",
     "delete_file",

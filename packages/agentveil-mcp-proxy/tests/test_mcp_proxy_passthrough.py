@@ -20,6 +20,7 @@ import webbrowser
 import agentveil_mcp_proxy.passthrough as passthrough_module
 import agentveil_mcp_proxy.cli as proxy_cli
 from agentveil_mcp_proxy.cli import ProxyCliError, init_proxy, run_proxy
+from agentveil_mcp_proxy.classification import ToolCallClassifier
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore
 from agentveil_mcp_proxy.evidence.observability import parse_controlled_path_metadata
 from agentveil_mcp_proxy.evidence.summary import evidence_summary_record
@@ -3940,3 +3941,94 @@ def test_redirect_follow_up_rejects_mismatched_redirect_playbook(tmp_path, monke
     follow_response = _responses(follow_out.getvalue())[0]
     assert follow_response["error"]["data"]["reason"] == "invalid_redirect_context"
     assert _redirect_metadata_for_request(home, "follow-playbook-mismatch") is None
+
+
+def test_read_file_allow_policy_reaches_downstream_without_approval(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    _set_downstream(init.config_path, _normal_downstream(tmp_path), log_path=log_path)
+    _set_allow_policy(init.config_path, server="fake-downstream", tool="read_file")
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("local allow must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+
+    client_out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line({
+            "jsonrpc": "2.0",
+            "id": "read-1",
+            "method": "tools/call",
+            "params": {"name": "read_file", "arguments": {"path": "a.txt"}},
+        })),
+        out=client_out,
+        approval_ui_mode="none",
+    ) == 0
+    response = _responses(client_out.getvalue())[0]
+    assert "error" not in response
+    assert log_path.read_text(encoding="utf-8").splitlines()[-1] == "tools/call"
+
+
+def test_differentiated_user_messages_for_approval_block_and_redirect() -> None:
+    from agentveil_mcp_proxy.passthrough import (
+        APPROVAL_REQUIRED_USER_MESSAGE,
+        HARD_BLOCK_USER_MESSAGE,
+        _approval_required_error,
+        _blocked_error,
+    )
+
+    classification = ToolCallClassifier(
+        ProxyConfig.from_dict({
+            "proxy_config_schema_version": 1,
+            "avp": {
+                "base_url": "https://agentveil.dev",
+                "agent_name": "proxy",
+                "trusted_signer_dids": ["did:example:test"],
+            },
+            "role_authority": {"mode": "enforce", "role": "reviewer", "authority": "review"},
+            "policy": {
+                "id": "test",
+                "policy_schema_version": 1,
+                "default_decision": "approval",
+                "default_risk_class": "write",
+                "rules": [{
+                    "id": "write-approval",
+                    "source": "user",
+                    "decision": "approval",
+                    "match": {"server": ["github"], "tool": ["create_issue"]},
+                }],
+            },
+        }),
+        server_name="github",
+    ).classify(tool="create_issue", arguments={"owner": "acme", "repo": "demo"})
+
+    approval = _approval_required_error(
+        "req-1",
+        reason="local_approval_required",
+        classification=classification,
+    )
+    block = _blocked_error(
+        "req-2",
+        HARD_BLOCK_USER_MESSAGE,
+        reason="local_policy_block",
+        classification=classification,
+        enrich_guidance=True,
+    )
+    redirect = _blocked_error(
+        "req-3",
+        # claim-check: allow "blocked" as a legacy test fixture message.
+        "blocked",
+        reason="role_authority_denied",
+        classification=classification,
+        enrich_guidance=True,
+    )
+
+    assert approval["error"]["message"] == APPROVAL_REQUIRED_USER_MESSAGE
+    assert block["error"]["message"] == HARD_BLOCK_USER_MESSAGE
+    assert redirect["error"]["message"] != approval["error"]["message"]
+    assert redirect["error"]["message"] != block["error"]["message"]
+    assert "Review Agent cannot write" in redirect["error"]["message"]

@@ -37,10 +37,15 @@ from agentveil_mcp_proxy.cli import (
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore, PendingApproval
 from agentveil_mcp_proxy.identity import encrypted_identity_payload, load_agent_from_identity
 from agentveil_mcp_proxy.policy import ProxyConfig
+from agentveil_mcp_proxy.quickstart_filesystem import _tools as quickstart_filesystem_tools
 
 
 TEST_PASSPHRASE = "correct horse battery staple"
 WRONG_PASSPHRASE = "wrong horse battery staple"
+
+
+def _quickstart_filesystem_tool_count() -> int:
+    return len(quickstart_filesystem_tools())
 
 
 def _mode(path: Path) -> int:
@@ -1227,7 +1232,11 @@ def test_doctor_full_smokes_downstream(tmp_path):
 
     assert code == 0
     assert "OK: downstream filesystem configured" in out.getvalue()
-    assert "OK: downstream filesystem answered initialize/tools/list (9 tools)" in out.getvalue()
+    tool_count = _quickstart_filesystem_tool_count()
+    assert (
+        f"OK: downstream filesystem answered initialize/tools/list ({tool_count} tools)"
+        in out.getvalue()
+    )
 
 
 def test_doctor_json_reports_downstream_and_evidence_count(tmp_path):
@@ -1251,7 +1260,7 @@ def test_doctor_json_reports_downstream_and_evidence_count(tmp_path):
     assert payload["ok"] is True
     assert payload["errors"] == []
     assert payload["downstream"]["name"] == "filesystem"
-    assert payload["downstream"]["tool_count"] == 9
+    assert payload["downstream"]["tool_count"] == _quickstart_filesystem_tool_count()
     assert payload["evidence_count"] == 1
 
 
@@ -1288,7 +1297,7 @@ def test_smoke_proxy_smokes_downstream(tmp_path):
     result = smoke_proxy(home=home, out=out)
 
     assert result.downstream_name == "filesystem"
-    assert result.tool_count == 9
+    assert result.tool_count == _quickstart_filesystem_tool_count()
     assert "OK: downstream filesystem answered initialize/tools/list" in out.getvalue()
 
 
@@ -1306,11 +1315,11 @@ def test_smoke_json_reports_machine_readable_result(tmp_path):
     result = smoke_proxy(home=home, output_json=True, out=out)
 
     payload = json.loads(out.getvalue())
-    assert result.tool_count == 9
+    assert result.tool_count == _quickstart_filesystem_tool_count()
     assert payload["ok"] is True
     assert payload["errors"] == []
     assert payload["downstream"]["name"] == "filesystem"
-    assert payload["downstream"]["tool_count"] == 9
+    assert payload["downstream"]["tool_count"] == _quickstart_filesystem_tool_count()
     assert payload["evidence_count"] == 0
 
 
@@ -2071,6 +2080,7 @@ def test_cli_setup_claude_code_starts_center_with_passphrase_without_url_leak(
         (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
         seen["init_plaintext"] = kwargs["plaintext"]
         seen["init_passphrase_file"] = kwargs["passphrase_file"]
+        seen["policy_pack"] = kwargs.get("policy_pack")
         seen["downstream_root"] = kwargs["downstream_config"]["args"][-1]
 
     def fake_connect(**kwargs):
@@ -2113,6 +2123,7 @@ def test_cli_setup_claude_code_starts_center_with_passphrase_without_url_leak(
     assert "SECRET_TOKEN" not in json.dumps(payload)
     assert payload["identity_encrypted"] is True
     assert seen["init_plaintext"] is False
+    assert seen["policy_pack"] == "filesystem"
     assert seen["init_passphrase_file"] == passphrase_file
     assert seen["center_passphrase_file"] == passphrase_file
     assert seen["downstream_root"] == str(tmp_path.resolve())

@@ -4,10 +4,114 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 import json
+from pathlib import Path
 from typing import Any
 
 from agentveil_mcp_proxy.authority_boundary import parse_authority_from_metadata
 from agentveil_mcp_proxy.evidence.store import ApprovalStatus, PendingApproval
+
+_BOUNDED_RESOURCE_KEY_PREFIXES = frozenset({
+    "path",
+    "paths",
+    "source",
+    "destination",
+    "file",
+    "filename",
+    "uri",
+    "url",
+    "resource",
+})
+
+
+def risk_class_plain_label(risk_class: str) -> str:
+    """Return a plain-language risk label for Approval Center UI."""
+
+    labels = {
+        "read": "Read-only",
+        "write": "Write action",
+        "destructive": "Destructive action",
+        # claim-check: allow "production" as an internal risk_class enum key, not a support claim.
+        "production": "Release/deploy action",
+        "financial": "Financial action",
+        "unknown": "Unknown risk",
+    }
+    return labels.get(risk_class, risk_class.replace("_", " ").title())
+
+
+def human_approval_summary(
+    *,
+    tool_name: str,
+    resource_display: str | None,
+) -> str:
+    """Return a short user-facing summary of what the agent wants to do."""
+
+    target = resource_display if resource_display not in (None, "", "none") else "this workspace"
+    return f"The agent wants to run {tool_name} on {target}."
+
+
+def bounded_approval_resource_display(resource_plain: str | None) -> str | None:
+    """Return a bounded basename/path label for Approval Center default view."""
+
+    if not resource_plain:
+        return None
+    prefix, _, remainder = resource_plain.partition(":")
+    if prefix not in _BOUNDED_RESOURCE_KEY_PREFIXES or not remainder:
+        return None
+    normalized = remainder.replace("\\", "/").strip()
+    if not normalized or normalized in {".", ".."}:
+        return None
+    basename = Path(normalized).name
+    if basename:
+        return basename[:120]
+    return normalized[:120]
+
+
+def approval_resource_display(
+    *,
+    resource_plain: str | None,
+    resource_hashed: str | None,
+) -> str | None:
+    """Return the default Approval Center target label."""
+
+    bounded = bounded_approval_resource_display(resource_plain)
+    if bounded is not None:
+        return bounded
+    return resource_hashed
+
+
+def approval_display_risk_class(
+    *,
+    risk_class: str,
+    tool_name: str,
+    action_plain: str,
+    resource_plain: str | None,
+) -> str:
+    """Return the risk class label shown on Approval Center default pages."""
+
+    if risk_class != "unknown":
+        return risk_class
+    from agentveil_mcp_proxy.classification import infer_risk_class
+
+    return infer_risk_class(
+        action_plain,
+        tool=tool_name,
+        resource=resource_plain,
+        arguments={},
+    ).value
+
+
+def human_approval_reason_label(reason: str) -> str:
+    """Return a plain-language reason label for one pending approval."""
+
+    if reason == "local_approval_required":
+        return "Needs your approval before it can run"
+    if reason == "role_authority_denied":
+        return "Not allowed for the current agent role"
+    if reason.startswith("package_manager"):
+        return "Package manager action needs approval"
+    if "instruction" in reason:
+        return "Instruction or repo surface risk detected"
+    return "Needs review before it can run"
 
 
 def pending_approval_dict(

@@ -1598,8 +1598,8 @@ def test_pending_list_shows_correlation_fields_for_multiple_clients():
         server.register(second)
         text = httpx.get(server.approval_center_url()).text
         assert "approval-card" in text
-        assert "github.create_issue" in text
-        assert "write" in text
+        assert "create_issue" in text
+        assert "Write action" in text or "write" in text
         assert "cursor:session-1" in text
         assert "claude:session-2" in text
     finally:
@@ -1612,7 +1612,7 @@ def test_browser_tab_title_includes_client_id_and_session_short_id():
     try:
         url = server.register(_prompt_not_expired())
         text = httpx.get(url).text
-        assert "<title>Approval pending: cursor:session-1 session session-" in text
+        assert "<title>Review: create_issue</title>" in text
     finally:
         server.stop()
 
@@ -3046,16 +3046,12 @@ def test_dashboard_pending_cards_render_sanitized_fields(tmp_path):
         assert outcome.status == ApprovalStatus.PENDING.value
         text = _dashboard_list_html(server)
         assert "approval-card" in text
-        assert "fake-downstream" in text
+        assert "The agent wants to run" in text
         assert "run_terminal_cmd" in text
-        assert "local_approval_required" in text
-        assert "approval-risk-write" in text or "approval-risk" in text
+        assert "Needs your approval" in text
+        assert "Write action" in text or "approval-risk-write" in text
         assert "Review &amp; decide" in text
-        assert "approval-request-id" in text
-        assert str(outcome.request_id) in text
-        assert "approval-wrap" in text
-        assert "Created" in text
-        assert "Expires" in text
+        assert "payload_hash" not in text
     finally:
         server.stop()
         store.close()
@@ -3083,7 +3079,17 @@ def test_dashboard_and_detail_render_level2_metadata_without_raw_payload(tmp_pat
         prompt = server.pending_prompts()[0]
         dashboard = _dashboard_list_html(server)
         detail = httpx.get(server.approval_url(prompt.request_id)).text
+        assert "Technical details" in detail
+        assert "Payload hash" in detail
         for text in (dashboard, detail):
+            assert "The agent wants to run" in text
+            assert "Needs your approval" in text or "Needs review" in text
+            _assert_t1_privacy_safe_text(text)
+            assert SECRET not in text
+            assert "ghp_private" not in text
+            assert "source_code" not in text
+            assert "session-1234567890" not in text
+        for text in (detail,):
             assert "Role" in text
             assert "implementer" in text
             assert "Authority" in text
@@ -3100,11 +3106,6 @@ def test_dashboard_and_detail_render_level2_metadata_without_raw_payload(tmp_pat
             assert "false" in text
             assert "Redirect" in text
             assert "request_approval" in text
-            _assert_t1_privacy_safe_text(text)
-            assert SECRET not in text
-            assert "ghp_private" not in text
-            assert "source_code" not in text
-            assert "session-1234567890" not in text
     finally:
         server.stop()
         store.close()
@@ -3131,7 +3132,9 @@ def test_dashboard_excludes_raw_secrets_and_long_plaintext(tmp_path):
         )
         text = _dashboard_list_html(server)
         _assert_t1_privacy_safe_text(text)
-        assert "sha256:" in text
+        prompt = server.pending_prompts()[0]
+        detail = httpx.get(server.approval_url(prompt.request_id)).text
+        assert "sha256:" in detail
     finally:
         server.stop()
         store.close()
@@ -3352,7 +3355,7 @@ def test_api_approvals_json_excludes_raw_secrets_and_html_still_works(tmp_path):
 
         prompt = server.pending_prompts()[0]
         detail_html = httpx.get(server.approval_url(prompt.request_id)).text
-        assert "Approval pending" in detail_html
+        assert "Review:" in detail_html
         _assert_t1_privacy_safe_text(detail_html)
     finally:
         server.stop()
@@ -3527,6 +3530,25 @@ def test_get_unknown_request_id_returns_html_no_longer_pending():
         server.stop()
 
 
+def test_expired_pending_removed_from_default_dashboard_list(monkeypatch):
+    server = ApprovalServer()
+    server.start()
+    try:
+        prompt = replace(
+            _prompt("req-expired-dashboard"),
+            created_at=100,
+            expires_at=150,
+        )
+        server.register(prompt)
+        monkeypatch.setattr(approval_server_module.time, "time", lambda: 200.0)
+        assert not server.pending_prompts()
+        text = httpx.get(server.approval_center_url()).text
+        assert "No pending approvals" in text
+        assert server.terminal_snapshot_for(prompt.request_id) is not None
+    finally:
+        server.stop()
+
+
 def test_get_expired_prompt_before_unregister_shows_expired_html(monkeypatch):
     server = ApprovalServer()
     server.start()
@@ -3545,7 +3567,8 @@ def test_get_expired_prompt_before_unregister_shows_expired_html(monkeypatch):
             headline="Approval expired",
             session_token=server.session_token,
         )
-        assert server.pending_prompts(), "prompt remains until manager unregisters"
+        assert not server.pending_prompts()
+        assert server.terminal_snapshot_for(prompt.request_id) is not None
     finally:
         server.stop()
 
@@ -3565,6 +3588,51 @@ def test_invalid_approval_token_returns_403_html_without_leaking_pending():
         _assert_stale_html_privacy_safe(response.text, session_token=server.session_token)
     finally:
         server.stop()
+
+
+# ----- P0.1 installed-path approval UX: human-readable write_file detail -----
+
+
+def test_write_file_approval_detail_shows_bounded_target_and_write_risk(tmp_path):
+    from agentveil_mcp_proxy.cli import init_proxy, quickstart_filesystem_downstream
+
+    home = tmp_path / "home"
+    sandbox = tmp_path / "sandbox"
+    init_proxy(
+        home=home,
+        agent_name="proxy",
+        plaintext=True,
+        policy_pack="filesystem",
+        downstream_config=quickstart_filesystem_downstream(sandbox),
+    )
+    config = ProxyConfig.from_dict(
+        json.loads((home / "mcp-proxy" / "config.json").read_text(encoding="utf-8")),
+    )
+    manager, store, server, _cli = _manager(
+        home,
+        config=config,
+        wait_for_decision=False,
+    )
+    try:
+        classification = ToolCallClassifier(config, server_name="filesystem").classify(
+            tool="write_file",
+            arguments={"path": "approval-ui-smoke.txt", "content": "probe"},
+        )
+        outcome = manager.request_approval(classification, reason="local_approval_required")
+        assert outcome.status == ApprovalStatus.PENDING.value
+        prompt = server.pending_prompts()[0]
+        detail = httpx.get(server.approval_url(prompt.request_id)).text
+        assert "write_file" in detail
+        assert "approval-ui-smoke.txt" in detail
+        assert "Write action" in detail
+        assert "Unknown risk" not in detail
+        assert "Approve</button>" in detail
+        assert "Deny</button>" in detail
+        main_view, _, _ = detail.partition("<details class=\"approval-technical-details\">")
+        assert "sha256:" not in main_view
+    finally:
+        server.stop()
+        store.close()
 
 
 # ----- P10D.14 S3 follow-up: G4 approve->retry payload-drift diagnosis -------

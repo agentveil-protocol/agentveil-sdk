@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import io
 import json
+import os
+import webbrowser
+from pathlib import Path
 
 import pytest
 
-from agentveil_mcp_proxy.cli import init_proxy, load_proxy_config, main, proxy_paths
+import agentveil_mcp_proxy.cli as proxy_cli
+from agentveil_mcp_proxy.cli import init_proxy, load_proxy_config, main, proxy_paths, run_proxy
 from agentveil_mcp_proxy.policy import PolicyDecision
 from agentveil_mcp_proxy.product_route import (
     FILESYSTEM_PRODUCT_TOOLS,
@@ -20,6 +25,8 @@ from agentveil_mcp_proxy.product_route import (
     PRODUCT_ROUTE_TOOL_CATALOG,
     PRODUCT_ROUTE_TOOL_PACK,
     PRODUCT_ROUTE_WORKSPACE_DIRNAME,
+    SANDBOX_READ_ONLY_MCP_TOOLS,
+    _pack_policy_expectation,
     build_product_route_downstream_config,
     build_product_route_policy,
     build_product_route_policy_expectations,
@@ -38,6 +45,8 @@ from mcp_fake_downstream import (
 
 QUICKSTART_FILESYSTEM_TOOL_NAMES: tuple[str, ...] = (
     "list_workspace",
+    "read_file",
+    "get_file_info",
     "instruction_surface_status",
     "write_file",
     "delete_file",
@@ -78,7 +87,7 @@ def test_product_route_catalog_matches_existing_pack_constants() -> None:
 
 def test_product_route_catalog_is_complete_and_deduplicated() -> None:
     assert len(PRODUCT_ROUTE_TOOL_CATALOG) == len(set(PRODUCT_ROUTE_TOOL_CATALOG))
-    assert len(PRODUCT_ROUTE_TOOL_CATALOG) == 68
+    assert len(PRODUCT_ROUTE_TOOL_CATALOG) == 70
     assert PRODUCT_ROUTE_TOOL_CATALOG.count("instruction_surface_status") == 1
     assert product_route_tool_pack("instruction_surface_status") == "filesystem"
 
@@ -101,6 +110,8 @@ def test_product_route_expectations_cover_full_catalog() -> None:
     ("tool", "pack", "decision", "source_rule_suffix"),
     [
         ("list_workspace", "filesystem", PolicyDecision.ALLOW, "filesystem-read"),
+        ("read_file", "filesystem", PolicyDecision.ALLOW, "filesystem-read"),
+        ("get_file_info", "filesystem", PolicyDecision.ALLOW, "filesystem-read"),
         ("list_issues", "github", PolicyDecision.ALLOW, "github-read"),
         ("list_files", "github", PolicyDecision.ALLOW, "github-read"),
         ("instruction_surface_status", "filesystem", PolicyDecision.ALLOW, "filesystem-read"),
@@ -212,6 +223,16 @@ def test_unknown_tool_is_not_in_catalog() -> None:
         evaluate_product_route_tool("definitely_missing_tool")
 
 
+@pytest.mark.parametrize("tool", sorted(SANDBOX_READ_ONLY_MCP_TOOLS))
+def test_sandbox_read_only_tools_allow_on_filesystem_pack(tool: str) -> None:
+    from agentveil_mcp_proxy.classification import infer_risk_class
+
+    assert infer_risk_class(f"filesystem.{tool}", tool=tool, resource=None, arguments={}).value == "read"
+    expectation = _pack_policy_expectation(pack="filesystem", tool=tool)
+    assert expectation.decision == PolicyDecision.ALLOW
+    assert expectation.source_pack_rule_id == "filesystem-read"
+
+
 def test_product_route_pack_schemas_default_profile_paths_without_requirements() -> None:
     entries = {entry["name"]: entry for entry in build_product_route_tool_entries()}
     for name in GIT_PRODUCT_TOOLS:
@@ -226,3 +247,178 @@ def test_product_route_pack_schemas_default_profile_paths_without_requirements()
         schema = entries[name]["inputSchema"]
         assert "owner" not in schema.get("required", [])
         assert "repo" not in schema.get("required", [])
+
+
+@pytest.fixture(autouse=True)
+def _suppress_browser_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(webbrowser, "open", lambda *_args, **_kwargs: False)
+
+
+def _json_line(message: dict) -> str:
+    return json.dumps(message, separators=(",", ":")) + "\n"
+
+
+def _responses(text: str) -> list[dict]:
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+def _tool_call(tool: str, arguments: dict, *, call_id: str = "call-1") -> str:
+    return _json_line({
+        "jsonrpc": "2.0",
+        "id": call_id,
+        "method": "tools/call",
+        "params": {"name": tool, "arguments": arguments},
+    })
+
+
+def _tools_list_request(*, call_id: str = "list-1") -> str:
+    return _json_line({
+        "jsonrpc": "2.0",
+        "id": call_id,
+        "method": "tools/list",
+        "params": {},
+    })
+
+
+def _workspace_pythonpath() -> str:
+    proxy_root = Path(__file__).resolve().parents[1]
+    repo_root = proxy_root.parents[1]
+    return os.pathsep.join((str(repo_root), str(proxy_root)))
+
+
+def _init_product_route_proxy(home, profile_root):
+    initialize_product_route_profile(profile_root)
+    downstream = build_product_route_downstream_config(profile_root)
+    env = dict(downstream.get("env", {}))
+    pythonpath = _workspace_pythonpath()
+    if env.get("PYTHONPATH"):
+        pythonpath = f"{pythonpath}{os.pathsep}{env['PYTHONPATH']}"
+    env["PYTHONPATH"] = pythonpath
+    downstream["env"] = env
+    return init_proxy(
+        home=home,
+        agent_name="proxy",
+        plaintext=True,
+        policy_pack="product_route",
+        setup_profile=PRODUCT_ROUTE_SETUP_PROFILE,
+        downstream_config=downstream,
+    )
+
+
+def _block_avp_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("product route proxy must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+
+
+def test_product_route_tools_list_includes_read_only_filesystem_tools(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "home"
+    profile_root = tmp_path / "profile"
+    _init_product_route_proxy(home, profile_root)
+    _block_avp_agent(monkeypatch)
+
+    out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_tools_list_request()),
+        out=out,
+        approval_ui_mode="none",
+    ) == 0
+
+    tools = _responses(out.getvalue())[0]["result"]["tools"]
+    tool_names = [entry["name"] for entry in tools]
+    assert tool_names == list(PRODUCT_ROUTE_TOOL_CATALOG)
+    assert "read_file" in tool_names
+    assert "get_file_info" in tool_names
+
+
+def test_product_route_read_file_succeeds_without_approval(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    profile_root = tmp_path / "profile"
+    _init_product_route_proxy(home, profile_root)
+    probe = profile_root / PRODUCT_ROUTE_WORKSPACE_DIRNAME / "probe.txt"
+    probe.write_text("read-me\n", encoding="utf-8")
+    _block_avp_agent(monkeypatch)
+
+    out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_tool_call("read_file", {"path": "probe.txt"}, call_id="read-1")),
+        out=out,
+        approval_ui_mode="none",
+    ) == 0
+
+    response = _responses(out.getvalue())[0]
+    assert "error" not in response
+    assert response["result"]["content"][0]["text"] == "read-me\n"
+
+
+def test_product_route_get_file_info_succeeds_without_approval(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    profile_root = tmp_path / "profile"
+    _init_product_route_proxy(home, profile_root)
+    probe = profile_root / PRODUCT_ROUTE_WORKSPACE_DIRNAME / "probe.txt"
+    probe.write_text("meta\n", encoding="utf-8")
+    _block_avp_agent(monkeypatch)
+
+    out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_tool_call("get_file_info", {"path": "probe.txt"}, call_id="info-1")),
+        out=out,
+        approval_ui_mode="none",
+    ) == 0
+
+    response = _responses(out.getvalue())[0]
+    assert "error" not in response
+    payload = json.loads(response["result"]["content"][0]["text"])
+    assert payload["path"] == "probe.txt"
+    assert payload["size_bytes"] == len("meta\n")
+
+
+@pytest.mark.parametrize("bad_path", ["../outside.txt", "/etc/passwd", "nested/../../outside.txt"])
+def test_product_route_read_file_blocks_path_traversal(
+    tmp_path,
+    monkeypatch,
+    bad_path: str,
+) -> None:
+    home = tmp_path / "home"
+    profile_root = tmp_path / "profile"
+    _init_product_route_proxy(home, profile_root)
+    _block_avp_agent(monkeypatch)
+
+    out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_tool_call("read_file", {"path": bad_path}, call_id="traversal-1")),
+        out=out,
+        approval_ui_mode="none",
+    ) == 0
+
+    response = _responses(out.getvalue())[0]
+    assert "error" in response
+    assert response["error"]["code"] in {-32010, -32602}
+
+
+def test_product_route_unknown_tool_call_fails_closed(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    profile_root = tmp_path / "profile"
+    _init_product_route_proxy(home, profile_root)
+    _block_avp_agent(monkeypatch)
+
+    out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_tool_call("definitely_missing_tool", {}, call_id="unknown-1")),
+        out=out,
+        approval_ui_mode="none",
+    ) == 0
+
+    response = _responses(out.getvalue())[0]
+    # claim-check: allow "blocked" as the expected fail-closed JSON-RPC status for unknown tools.
+    assert response["error"]["data"] == {"status": "blocked", "reason": "unknown_tool"}

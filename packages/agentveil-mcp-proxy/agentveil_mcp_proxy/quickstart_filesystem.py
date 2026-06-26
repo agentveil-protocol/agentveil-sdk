@@ -131,6 +131,30 @@ def _tools() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "read_file",
+            "description": "Read a UTF-8 text file under the quickstart sandbox root.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "get_file_info",
+            "description": "Return bounded metadata for one file under the quickstart sandbox root.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "instruction_surface_status",
             "description": (
                 "Return bounded metadata when repo instruction files are present."
@@ -296,6 +320,42 @@ def _handle_tools_call(root: Path, request_id: Any, params: Mapping[str, Any]) -
             if item.is_file()
         ]
         return _response(request_id, {"content": [{"type": "text", "text": "\n".join(files)}]})
+    if name == "read_file":
+        path = arguments.get("path")
+        if not isinstance(path, str) or not path:
+            return _error(request_id, -32602, "path must be a non-empty string")
+        try:
+            target = _safe_child(root, path)
+        except ValueError as exc:
+            return _error(request_id, -32602, str(exc))
+        if not target.is_file():
+            return _error(request_id, -32602, "file not found")
+        return _response(
+            request_id,
+            {"content": [{"type": "text", "text": target.read_text(encoding="utf-8")}]},
+        )
+    if name == "get_file_info":
+        path = arguments.get("path")
+        if not isinstance(path, str) or not path:
+            return _error(request_id, -32602, "path must be a non-empty string")
+        try:
+            target = _safe_child(root, path)
+        except ValueError as exc:
+            return _error(request_id, -32602, str(exc))
+        if not target.exists():
+            return _error(request_id, -32602, "file not found")
+        if not target.is_file():
+            return _error(request_id, -32602, "path is not a file")
+        stat = target.stat()
+        info = {
+            "path": target.relative_to(root).as_posix(),
+            "size_bytes": stat.st_size,
+            "size_bucket": _size_bucket(stat.st_size),
+        }
+        return _response(
+            request_id,
+            {"content": [{"type": "text", "text": json.dumps(info, separators=(",", ":"))}]},
+        )
     if name == "instruction_surface_status":
         summary = _summarize_instruction_surface_risk(_scan_instruction_surfaces(root))
         return _response(

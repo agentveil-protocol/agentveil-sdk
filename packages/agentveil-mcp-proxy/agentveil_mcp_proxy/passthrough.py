@@ -45,6 +45,7 @@ from agentveil_mcp_proxy.classification import (
     ClassifiedToolCall,
     ToolCallClassifier,
     infer_action_family,
+    infer_risk_class,
     sha256_jcs,
 )
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceError, ApprovalStatus
@@ -69,6 +70,8 @@ from agentveil_mcp_proxy.role_doctor import (
     UNSUPPORTED_REDIRECT_PLAYBOOK,
     RedirectContext,
     blocked_error_message,
+    build_approval_guidance,
+    build_deny_guidance,
     enrich_error_data,
     parse_redirect_context,
     redirect_playbook_id_for_classification,
@@ -91,9 +94,11 @@ from agentveil_mcp_proxy.redirect_playbooks import (
     redirect_playbook_id_for_risk_family,
     uses_risk_family_redirects,
 )
+from agentveil_mcp_proxy.product_route import SANDBOX_READ_ONLY_MCP_TOOLS
 from agentveil_mcp_proxy.policy import (
     PolicyDecision,
     ProxyConfig,
+    RiskClass,
     ToolSurfaceMode,
     _ACTION_GATE_ESCALATION_EXTRA_TOOL,
     _ACTION_GATE_ESCALATION_SURFACE_DRIFT,
@@ -134,6 +139,35 @@ APPROVAL_REQUIRED_INSTRUCTIONS = (
     "Approval required. Open approval_url, approve or deny, then retry the same request."
 )
 APPROVAL_REQUIRED_RETRY_SUFFIX = "approve or deny, then retry the same request."
+
+APPROVAL_REQUIRED_USER_MESSAGE = (
+    "Approval required: open the approval page, approve or deny, then retry this request."
+)
+HARD_BLOCK_USER_MESSAGE = (
+    # claim-check: allow "Blocked" as a user-facing policy outcome label for denied local actions.
+    "Blocked: this action is not allowed by local policy and cannot be approved."
+)
+_HARD_BLOCK_REASONS = frozenset({
+    "local_policy_block",
+    "filesystem_delete",
+    "secret_path_blocked",
+    "tool_schema_unavailable",
+    "unknown_tool_not_advertised",
+    "runtime_gate_not_configured",
+    "runtime_gate_evidence_unavailable",
+    "approval_evidence_unavailable",
+})
+_REDIRECT_USE_READ_ONLY_TOOL = "use_read_only_tool"
+_REDIRECT_CREATE_IMPLEMENTER_TASK = "create_implementer_task"
+_REDIRECT_STOP_AND_CLASSIFY = "stop_and_classify_unknown_action"
+
+
+def approval_required_user_message(*, approval_url: str | None = None) -> str:
+    """Return the default user-facing approval-required message."""
+
+    if approval_url:
+        return actionable_approval_required_message(approval_url)
+    return APPROVAL_REQUIRED_USER_MESSAGE
 
 
 def actionable_approval_required_message(approval_url: str) -> str:
@@ -672,6 +706,37 @@ def _redirect_playbook_id_for_classification(
     )
 
 
+def _passthrough_blocked_error_message(
+    classification: ClassifiedToolCall | None,
+    *,
+    reason: str,
+    default_message: str,
+) -> str:
+    """Return a differentiated user-facing block message for proxy policy outcomes."""
+
+    if classification is None:
+        return default_message
+    if reason == "role_authority_denied" or classification.risk_class is RiskClass.UNKNOWN:
+        return build_deny_guidance(classification, reason=reason).message
+    if reason in _HARD_BLOCK_REASONS:
+        return HARD_BLOCK_USER_MESSAGE
+    guidance = build_deny_guidance(classification, reason=reason)
+    if reason.startswith("redirect") or guidance.redirect.redirect_playbook_id in {
+        _REDIRECT_USE_READ_ONLY_TOOL,
+        _REDIRECT_CREATE_IMPLEMENTER_TASK,
+        _REDIRECT_STOP_AND_CLASSIFY,
+    }:
+        return guidance.message
+    # claim-check: allow "blocked" as the legacy JSON-RPC policy outcome string under test.
+    if default_message == "blocked by local MCP policy":
+        return HARD_BLOCK_USER_MESSAGE
+    return blocked_error_message(
+        classification,
+        reason=reason,
+        default_message=default_message,
+    )
+
+
 def _blocked_redirect_message(
     classification: ClassifiedToolCall | None,
     *,
@@ -685,7 +750,7 @@ def _blocked_redirect_message(
             reason=reason,
         )
         return message_visible_blocked_redirect(guidance)
-    return blocked_error_message(
+    return _passthrough_blocked_error_message(
         classification,
         reason=reason,
         default_message=default_message,
@@ -786,13 +851,16 @@ def _approval_required_error(
     request_id: Any,
     *,
     reason: str,
-    message: str = "approval required",
+    message: str | None = None,
     decision: RuntimeGateDecision | None = None,
     approval_outcome: ApprovalOutcome | None = None,
     classification: ClassifiedToolCall | None = None,
     enrich_guidance: bool = False,
 ) -> dict[str, Any]:
     data: dict[str, Any] = {"status": "approval_required", "reason": reason}
+    resolved_message = message
+    if resolved_message in (None, "approval required"):
+        resolved_message = APPROVAL_REQUIRED_USER_MESSAGE
     if decision is not None:
         data["decision"] = decision.decision
         if decision.audit_id is not None:
@@ -805,7 +873,7 @@ def _approval_required_error(
         if approval_outcome.approval_url is not None:
             data["approval_url"] = approval_outcome.approval_url
             data["instructions"] = APPROVAL_REQUIRED_INSTRUCTIONS
-            message = actionable_approval_required_message(approval_outcome.approval_url)
+            resolved_message = actionable_approval_required_message(approval_outcome.approval_url)
     if enrich_guidance:
         redirect_original_id = (
             approval_outcome.request_id
@@ -818,12 +886,17 @@ def _approval_required_error(
             outcome="approval",
             original_request_id=redirect_original_id,
         )
-        message = _approval_redirect_message(
+        resolved_message = _approval_redirect_message(
             classification,
             data,
-            default_message=message,
+            default_message=resolved_message or APPROVAL_REQUIRED_USER_MESSAGE,
         )
-    return jsonrpc_error(request_id, JSONRPC_APPROVAL_REQUIRED, message, data=data)
+    return jsonrpc_error(
+        request_id,
+        JSONRPC_APPROVAL_REQUIRED,
+        resolved_message or APPROVAL_REQUIRED_USER_MESSAGE,
+        data=data,
+    )
 
 
 def _coalesce_approval_outcome(
@@ -2157,8 +2230,7 @@ class McpPassthrough:
             return self._apply_policy_risk_surface_metadata(
                 _blocked_error(
                     request_id,
-                    # claim-check: allow literal JSON-RPC deny message covered by policy/passthrough tests.
-                    "blocked by local MCP policy",
+                    HARD_BLOCK_USER_MESSAGE,
                     reason=block_reason,
                     classification=classification,
                     enrich_guidance=True,
@@ -2477,11 +2549,35 @@ class McpPassthrough:
             data={"status": "blocked", "reason": "unsupported_runtime_decision"},
         ), None
 
+    def _read_only_sandbox_tool_allowed_when_gate_unavailable(
+        self,
+        classification: ClassifiedToolCall,
+    ) -> bool:
+        tool = classification.tool or ""
+        if tool not in SANDBOX_READ_ONLY_MCP_TOOLS:
+            return False
+        server = classification.server or ""
+        if server not in {"filesystem", "product"} and "filesystem" not in server:
+            return False
+        if classification.policy_evaluation.decision in {
+            PolicyDecision.ALLOW,
+            PolicyDecision.OBSERVE,
+        }:
+            return True
+        return infer_risk_class(
+            classification.action_plain,
+            tool=tool,
+            resource=classification.resource_plain,
+            arguments={},
+        ) is RiskClass.READ
+
     def _fallback_error_response(
         self,
         classification: ClassifiedToolCall,
         request_id: Any,
     ) -> tuple[dict[str, Any] | None, ApprovalOutcome | None]:
+        if self._read_only_sandbox_tool_allowed_when_gate_unavailable(classification):
+            return None, None
         config = self.config
         fallback = (
             config.fallback.for_risk(classification.risk_class)
@@ -2510,12 +2606,18 @@ class McpPassthrough:
         request_id: Any,
         *,
         reason: str,
-        message: str = "approval required",
+        message: str | None = None,
         runtime_decision: RuntimeGateDecision | None = None,
         in_flight_approval: ApprovalOutcome | None = None,
         coalesce_in_flight: bool = False,
         enrich_guidance: bool = False,
     ) -> tuple[dict[str, Any] | None, ApprovalOutcome | None]:
+        if message is None:
+            message = (
+                build_approval_guidance(classification, reason=reason).message
+                if classification is not None
+                else APPROVAL_REQUIRED_USER_MESSAGE
+            )
         if not enrich_guidance and uses_risk_family_redirects(classification):
             enrich_guidance = True
 

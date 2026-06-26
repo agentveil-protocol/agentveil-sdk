@@ -1423,7 +1423,13 @@ def builtin_policy_pack(name: str) -> PolicyConfig:
                 "risk_class": "read",
                 "match": {
                     "server": ["filesystem", "fs", "*filesystem*"],
-                    "tool": ["read_*", "list_*", "stat_*", "instruction_surface_*"],
+                    "tool": [
+                        "read_*",
+                        "list_*",
+                        "stat_*",
+                        "get_file_info",
+                        "instruction_surface_*",
+                    ],
                 },
             },
             {

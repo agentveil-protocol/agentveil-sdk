@@ -29,6 +29,7 @@ from agentveil_mcp_proxy.evidence import (
     verify_evidence_bundle,
 )
 from agentveil_mcp_proxy.passthrough import (
+    APPROVAL_REQUIRED_USER_MESSAGE,
     DownstreamConfig,
     JSONRPC_APPROVAL_REQUIRED,
     JSONRPC_POLICY_BLOCKED,
@@ -791,7 +792,9 @@ def test_waiting_does_not_forward_and_returns_approval_required_shape(tmp_path):
 
     response = _responses(client_out.getvalue())[0]
     assert response["error"]["code"] == JSONRPC_APPROVAL_REQUIRED
-    assert response["error"]["message"] == "approval required"
+    assert response["error"]["message"] == APPROVAL_REQUIRED_USER_MESSAGE
+    assert response["error"]["data"]["status"] == "approval_required"
+    assert response["error"]["data"]["reason"] == "runtime_gate_waiting_for_human_approval"
     assert response["error"]["data"] == {
         "status": "approval_required",
         "reason": "runtime_gate_waiting_for_human_approval",
