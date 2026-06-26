@@ -42,6 +42,18 @@ def _tool_call(request_id: str, tool: str = "write_file") -> str:
     })
 
 
+def _hard_block_data(reason: str, *, reason_code: str | None = None) -> dict[str, Any]:
+    return {
+        # claim-check: allow "blocked" is the JSON-RPC error status vocabulary asserted by this test helper.
+        "status": "blocked",
+        "reason": reason,
+        "reason_code": reason_code or reason,
+        "approval_possible": False,
+        "retry_after_approval": False,
+        "next_step": "This action cannot be approved. Adjust the tool call or local policy.",
+    }
+
+
 def _config(
     *,
     default_decision: str,
@@ -324,7 +336,7 @@ def test_classifier_exception_on_tool_call_fails_closed_without_forwarding() -> 
     assert len(responses) == 1
     error = responses[0]["error"]
     assert error["code"] == JSONRPC_POLICY_BLOCKED
-    assert error["data"] == {"status": "blocked", "reason": "classifier_error"}  # claim-check: allow "blocked" is the literal expected payload value
+    assert error["data"] == _hard_block_data("classifier_error")  # claim-check: allow "blocked" is the literal expected payload value
     assert passthrough.classifier_errors == 1
     # claim-check: allow "never" describes the asserted sanitization; checked below
     # Sanitized: raw tool arguments never appear in the error response.
@@ -518,7 +530,10 @@ def test_ask_backend_without_gate_factory_fails_closed() -> None:
     assert len(responses) == 1
     error = responses[0]["error"]
     assert error["code"] == JSONRPC_POLICY_BLOCKED
-    assert error["data"] == {"status": "blocked", "reason": "runtime_gate_not_configured"}
+    assert error["data"] == _hard_block_data(
+        "runtime_gate_not_configured",
+        reason_code="runtime_gate_unavailable",
+    )
     # claim-check: allow "blocked"/"never" describe the asserted sanitized error payload
     # Sanitized: raw tool arguments never appear in the blocked response.
     assert "call-1.txt" not in json.dumps(responses[0])
