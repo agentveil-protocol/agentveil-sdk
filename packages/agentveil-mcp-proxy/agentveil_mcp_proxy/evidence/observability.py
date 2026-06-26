@@ -2,12 +2,412 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 import json
+from pathlib import Path
 from typing import Any
 
 from agentveil_mcp_proxy.authority_boundary import parse_authority_from_metadata
 from agentveil_mcp_proxy.evidence.store import ApprovalStatus, PendingApproval
+
+_BOUNDED_RESOURCE_KEY_PREFIXES = frozenset({
+    "path",
+    "paths",
+    "source",
+    "destination",
+    "file",
+    "filename",
+    "uri",
+    "url",
+    "resource",
+})
+
+
+def risk_class_plain_label(risk_class: str) -> str:
+    """Return a plain-language risk label for Approval Center UI."""
+
+    labels = {
+        "read": "Read-only",
+        "write": "Write action",
+        "destructive": "Destructive action",
+        # claim-check: allow "production" as an internal risk_class enum key, not a support claim.
+        "production": "Release/deploy action",
+        "financial": "Financial action",
+        "unknown": "Unknown risk",
+    }
+    return labels.get(risk_class, risk_class.replace("_", " ").title())
+
+
+def human_approval_summary(
+    *,
+    tool_name: str,
+    resource_display: str | None,
+) -> str:
+    """Return a short user-facing summary of what the agent wants to do."""
+
+    target = resource_display if resource_display not in (None, "", "none") else "this workspace"
+    return f"The agent wants to run {tool_name} on {target}."
+
+
+def bounded_approval_resource_display(resource_plain: str | None) -> str | None:
+    """Return a bounded basename/path label for Approval Center default view."""
+
+    if not resource_plain:
+        return None
+    prefix, _, remainder = resource_plain.partition(":")
+    if prefix not in _BOUNDED_RESOURCE_KEY_PREFIXES or not remainder:
+        return None
+    normalized = remainder.replace("\\", "/").strip()
+    if not normalized or normalized in {".", ".."}:
+        return None
+    basename = Path(normalized).name
+    if basename:
+        return basename[:120]
+    return normalized[:120]
+
+
+def approval_resource_display(
+    *,
+    resource_plain: str | None,
+    resource_hashed: str | None,
+) -> str | None:
+    """Return the default Approval Center target label."""
+
+    bounded = bounded_approval_resource_display(resource_plain)
+    if bounded is not None:
+        return bounded
+    return resource_hashed
+
+
+def approval_display_risk_class(
+    *,
+    risk_class: str,
+    tool_name: str,
+    action_plain: str,
+    resource_plain: str | None,
+) -> str:
+    """Return the risk class label shown on Approval Center default pages."""
+
+    if risk_class != "unknown":
+        return risk_class
+    from agentveil_mcp_proxy.classification import infer_risk_class
+
+    return infer_risk_class(
+        action_plain,
+        tool=tool_name,
+        resource=resource_plain,
+        arguments={},
+    ).value
+
+
+def human_approval_reason_label(reason: str) -> str:
+    """Return a plain-language reason label for one pending approval."""
+
+    if reason == "local_approval_required":
+        return "Needs your approval before it can run"
+    if reason == "role_authority_denied":
+        return "Not allowed for the current agent role"
+    if reason.startswith("package_manager"):
+        return "Package manager action needs approval"
+    if "instruction" in reason:
+        return "Instruction or repo surface risk detected"
+    return "Needs review before it can run"
+
+
+def policy_decision_plain_label(decision: str) -> str:
+    """Return a plain-language policy decision label for approval proof."""
+
+    # claim-check: allow bounded UI decision labels; behavior is covered by
+    # approval proof/detail tests and does not claim host-wide protection.
+    labels = {
+        "approval": "Approval required",
+        "allow": "Allowed",
+        "block": "Stopped by policy",
+        "deny": "Denied",
+    }
+    return labels.get(decision, decision.replace("_", " ").title())
+
+
+def approval_access_plain_label(*, reason: str, policy_decision: str) -> str:
+    """Return whether approval is possible or policy stopped the action."""
+
+    if reason == "role_authority_denied" or policy_decision in {"block", "deny"}:
+        return "Stopped by policy"
+    if policy_decision == "approval":
+        return "Approval required"
+    return policy_decision_plain_label(policy_decision)
+
+
+_FILESYSTEM_TOOL_NAMES = frozenset({
+    "list_workspace",
+    "instruction_surface_status",
+    "write_file",
+    "read_file",
+    "get_file_info",
+    "delete_file",
+    "rmdir_tree",
+    "move_file",
+    "copy_file",
+    "chmod_file",
+    "create_symlink",
+})
+
+
+def _is_filesystem_operation(preview: Mapping[str, Any]) -> bool:
+    """Return True when blast-radius preview describes a filesystem tool action."""
+
+    tool = str(preview.get("tool", "")).lower()
+    server = str(preview.get("server", "")).lower()
+    if "filesystem" in server:
+        return True
+    if tool in _FILESYSTEM_TOOL_NAMES:
+        return True
+    return tool.startswith(("read_", "get_", "list_", "fetch_", "write_", "delete_", "remove_"))
+
+
+def blast_radius_has_unassessed_dimensions(preview: Mapping[str, Any]) -> bool:
+    """Return True when blast-radius preview includes unknown dimensions."""
+
+    caps = preview.get("capabilities")
+    if isinstance(caps, Mapping) and any(value == "unknown" for value in caps.values()):
+        return True
+    credential = preview.get("credential_posture")
+    return credential == "unknown"
+
+
+def assessed_blast_radius_lines(preview: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return blast-radius lines for dimensions that were actually assessed."""
+
+    from agentveil_mcp_proxy.permission_doctor import blast_radius_lines
+
+    return tuple(
+        line
+        for line in blast_radius_lines(preview)
+        if not line.endswith(": unknown")
+        and not line.startswith("Why approval required:")
+    )
+
+
+def blast_radius_unassessed_note(preview: Mapping[str, Any]) -> str | None:
+    """Return a compact note when some blast-radius dimensions were not assessed."""
+
+    if not blast_radius_has_unassessed_dimensions(preview):
+        return None
+    if _is_filesystem_operation(preview):
+        return "Not applicable to this filesystem operation."
+    return "Not evaluated by this policy mode."
+
+
+def approval_proof_detail_rows(
+    *,
+    tool_name: str,
+    resource_display: str | None,
+    risk_class: str,
+    reason: str,
+    payload_hash: str,
+    policy_rule_id: str,
+    request_id: str,
+    created_at: int,
+    expires_at: int,
+    action_gate_metadata: dict[str, Any] | None,
+) -> tuple[tuple[str, str], ...]:
+    """Return compact human proof rows for Approval Center detail pages."""
+
+    metadata = action_gate_metadata if isinstance(action_gate_metadata, dict) else {}
+    policy_decision = str(metadata.get("policy_decision", "approval"))
+    rows: list[tuple[str, str]] = [
+        ("Decision", approval_access_plain_label(reason=reason, policy_decision=policy_decision)),
+        ("Why approval is required", human_approval_reason_label(reason)),
+        ("Tool", tool_name),
+        ("Target", resource_display or "none"),
+        ("Risk", risk_class_plain_label(risk_class)),
+        ("Policy rule", policy_rule_id),
+    ]
+    action_family = metadata.get("action_family")
+    if isinstance(action_family, str) and action_family:
+        rows.append(("Action family", action_family))
+    for key, label in (
+        ("approval_status", "Approval status"),
+        ("execution_status", "Execution status"),
+        ("target_reached", "Target reached"),
+    ):
+        value = metadata.get(key)
+        if isinstance(value, bool):
+            rows.append((label, "true" if value else "false"))
+        elif isinstance(value, str) and value:
+            rows.append((label, value))
+    rows.extend([
+        ("Request id", request_id),
+        ("Payload hash", payload_hash),
+        ("Created", str(created_at)),
+        ("Expires", str(expires_at)),
+    ])
+    blast_radius = metadata.get("blast_radius")
+    if isinstance(blast_radius, Mapping):
+        for line in assessed_blast_radius_lines(blast_radius):
+            if ":" not in line:
+                continue
+            label, value = line.split(":", 1)
+            rows.append((label.strip(), value.strip()))
+        note = blast_radius_unassessed_note(blast_radius)
+        if note is not None:
+            rows.append(("Scope note", note))
+    return tuple(rows)
+
+
+def approval_raw_evidence_rows(
+    *,
+    client_id: str,
+    session_id_prefix: str,
+    action_display: str,
+    action_gate_metadata: dict[str, Any] | None,
+) -> tuple[tuple[str, str], ...]:
+    """Return bounded raw/debug rows for Approval Center advanced evidence."""
+
+    metadata = action_gate_metadata if isinstance(action_gate_metadata, dict) else {}
+    rows: list[tuple[str, str]] = [
+        ("Client", client_id),
+        ("Session prefix", session_id_prefix),
+        ("Action", action_display),
+    ]
+    for key, label in (
+        ("role", "Role"),
+        ("authority", "Authority"),
+        ("policy_decision", "Policy decision"),
+        ("redirect_playbook_id", "Redirect"),
+    ):
+        value = metadata.get(key)
+        if isinstance(value, str) and value:
+            rows.append((label, value))
+    blast_radius = metadata.get("blast_radius")
+    if isinstance(blast_radius, Mapping):
+        from agentveil_mcp_proxy.permission_doctor import blast_radius_lines
+
+        for line in blast_radius_lines(blast_radius):
+            if ":" not in line:
+                continue
+            label, value = line.split(":", 1)
+            rows.append((f"Blast radius: {label.strip()}", value.strip()))
+    return tuple(rows)
+
+
+_PATH_OUTSIDE_SANDBOX_USER_MESSAGE = (
+    "Path is outside the configured sandbox. "
+    "Use a relative path under the project workspace."
+)
+_DEFAULT_HARD_DENY_NEXT_STEP = (
+    "This action cannot be approved. Adjust the tool call or local policy."
+)
+_APPROVAL_REQUIRED_NEXT_STEP = (
+    "Open approval_url, approve or deny, then retry the same MCP tool call."
+)
+_TOOL_NOT_AVAILABLE_NEXT_STEP = (
+    "Configure or enable the MCP route that advertises this tool."
+)
+_DEFAULT_SANDBOX_PATH_HINT = (
+    "Use a relative path under the configured sandbox, for example notes/example.txt."
+)
+
+
+def mcp_error_reason_code(reason: str) -> str:
+    """Return a bounded public reason_code for MCP proxy errors."""
+
+    mapping = {
+        "local_approval_required": "approval_required",
+        "path_outside_workspace": "path_outside_sandbox",
+        "unknown_tool_not_advertised": "tool_not_available",
+        "tool_schema_unavailable": "tool_not_available",
+        "runtime_gate_not_configured": "runtime_gate_unavailable",
+        "runtime_gate_evidence_unavailable": "runtime_gate_unavailable",
+        "approval_evidence_unavailable": "approval_unavailable",
+    }
+    return mapping.get(reason, reason)
+
+
+def _leaf_tool_name(tool_name: str | None) -> str | None:
+    if not tool_name:
+        return None
+    leaf = tool_name.rsplit(".", 1)[-1].strip()
+    return leaf or None
+
+
+def enrich_mcp_error_contract(
+    data: dict[str, Any],
+    *,
+    tool_name: str | None = None,
+) -> dict[str, Any]:
+    """Attach minimal structured MCP error contract fields to JSON-RPC error data."""
+
+    status = str(data.get("status", ""))
+    reason = str(data.get("reason", ""))
+    reason_code = mcp_error_reason_code(reason)
+    data["reason_code"] = reason_code
+
+    if status == "approval_required":
+        data["approval_possible"] = True
+        data["retry_after_approval"] = True
+        if "next_step" not in data:
+            data["next_step"] = _APPROVAL_REQUIRED_NEXT_STEP
+        leaf = _leaf_tool_name(tool_name)
+        if leaf is not None:
+            data.setdefault("suggested_tool", leaf)
+        return data
+
+    data["approval_possible"] = False
+    data["retry_after_approval"] = False
+
+    if reason == "path_outside_workspace":
+        data["next_step"] = (
+            "Choose a relative path under the configured sandbox or project workspace."
+        )
+        data["safe_path_hint"] = _DEFAULT_SANDBOX_PATH_HINT
+        leaf = _leaf_tool_name(tool_name)
+        if leaf is not None:
+            data.setdefault("suggested_tool", leaf)
+        return data
+
+    if reason in {"unknown_tool_not_advertised", "tool_schema_unavailable"}:
+        data["next_step"] = _TOOL_NOT_AVAILABLE_NEXT_STEP
+        return data
+
+    if "next_step" not in data:
+        data["next_step"] = _DEFAULT_HARD_DENY_NEXT_STEP
+    return data
+
+
+def mcp_error_user_message(data: Mapping[str, Any]) -> str:
+    """Return a differentiated user-facing MCP error message."""
+
+    status = str(data.get("status", ""))
+    reason = str(data.get("reason", ""))
+    if status == "approval_required":
+        return (
+            "Approval required: open the approval page, approve or deny, "
+            "then retry this request."
+        )
+    if status == "policy_denied" and reason == "path_outside_workspace":
+        return _PATH_OUTSIDE_SANDBOX_USER_MESSAGE
+    if status == "blocked":  # claim-check: allow bounded JSON-RPC status vocabulary; negative tests assert no downstream execution.
+        if reason == "role_authority_denied":
+            return str(data.get("explanation") or _DEFAULT_HARD_DENY_NEXT_STEP)
+        if reason in {
+            "local_policy_block",
+            "filesystem_delete",
+            "secret_path_blocked",
+            "unknown_tool_not_advertised",
+            "runtime_gate_not_configured",
+            "runtime_gate_evidence_unavailable",
+            "approval_evidence_unavailable",
+        }:
+            return (
+                "Stopped by policy: this action is not allowed by local policy "
+                "and cannot be approved."
+            )
+    if status == "policy_denied":
+        return _PATH_OUTSIDE_SANDBOX_USER_MESSAGE if reason == "path_outside_workspace" else (
+            "Denied by MCP proxy policy."
+        )
+    return "Denied by MCP proxy policy."
 
 
 def pending_approval_dict(

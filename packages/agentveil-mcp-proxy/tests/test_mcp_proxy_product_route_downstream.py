@@ -71,7 +71,7 @@ def test_tools_list_exact_catalog_in_process(runtime: ProductRouteRuntime) -> No
     assert response is not None
     tools = response["result"]["tools"]
     assert [entry["name"] for entry in tools] == list(PRODUCT_ROUTE_TOOL_CATALOG)
-    assert len(tools) == 68
+    assert len(tools) == len(PRODUCT_ROUTE_TOOL_CATALOG)
 
 
 def test_tools_list_stable_schema_fingerprint() -> None:
@@ -267,6 +267,78 @@ def test_write_file_path_traversal_is_blocked(runtime: ProductRouteRuntime) -> N
                 "name": "write_file",
                 "arguments": {"path": "../outside.txt", "content": "escape"},
             },
+        },
+    )
+    assert response is not None
+    assert "error" in response
+    assert "path escapes" in response["error"]["message"]
+    assert outside.read_text(encoding="utf-8") == "outside\n"
+
+
+def test_read_file_reads_sandbox_file(runtime: ProductRouteRuntime) -> None:
+    probe = runtime.profile.filesystem_sandbox / "read_probe.txt"
+    probe.write_text("read-me\n", encoding="utf-8")
+
+    response = handle_message(
+        runtime,
+        {
+            "jsonrpc": "2.0",
+            "id": "read-probe",
+            "method": "tools/call",
+            "params": {"name": "read_file", "arguments": {"path": "read_probe.txt"}},
+        },
+    )
+    assert response is not None
+    assert "error" not in response, response
+    assert response["result"]["content"][0]["text"] == "read-me\n"
+
+
+def test_get_file_info_returns_bounded_metadata(runtime: ProductRouteRuntime) -> None:
+    probe = runtime.profile.filesystem_sandbox / "info_probe.txt"
+    content = "meta\n"
+    probe.write_text(content, encoding="utf-8")
+
+    response = handle_message(
+        runtime,
+        {
+            "jsonrpc": "2.0",
+            "id": "info-probe",
+            "method": "tools/call",
+            "params": {"name": "get_file_info", "arguments": {"path": "info_probe.txt"}},
+        },
+    )
+    assert response is not None
+    assert "error" not in response, response
+    payload = json.loads(response["result"]["content"][0]["text"])
+    assert payload["path"] == "info_probe.txt"
+    assert payload["size_bytes"] == len(content.encode("utf-8"))
+    assert payload["size_bucket"] in {"tiny", "small", "medium", "large"}
+
+
+@pytest.mark.parametrize(
+    ("tool", "bad_path"),
+    [
+        ("read_file", "../outside.txt"),
+        ("read_file", "/etc/passwd"),
+        ("get_file_info", "../outside.txt"),
+        ("get_file_info", "nested/../../outside.txt"),
+    ],
+)
+def test_read_tools_path_traversal_is_blocked(
+    runtime: ProductRouteRuntime,
+    tool: str,
+    bad_path: str,
+) -> None:
+    outside = runtime.profile.root / "outside.txt"
+    outside.write_text("outside\n", encoding="utf-8")
+
+    response = handle_message(
+        runtime,
+        {
+            "jsonrpc": "2.0",
+            "id": f"{tool}-traversal",
+            "method": "tools/call",
+            "params": {"name": tool, "arguments": {"path": bad_path}},
         },
     )
     assert response is not None

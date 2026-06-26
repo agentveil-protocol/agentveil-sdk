@@ -106,6 +106,12 @@ _GIT_TOOL_RISK_CLASSES: Mapping[str, RiskClass] = {
     "git_push": RiskClass.PRODUCTION,
     "instruction_surface_status": RiskClass.READ,
 }
+_FILESYSTEM_READ_TOOL_RISK_CLASSES: Mapping[str, RiskClass] = {
+    "list_workspace": RiskClass.READ,
+    "read_file": RiskClass.READ,
+    "get_file_info": RiskClass.READ,
+    "instruction_surface_status": RiskClass.READ,
+}
 
 # Python package-manager MCP tool surface. Ecosystem scope: pip only.
 # GitHub MCP-style tool catalog for routed GitHub pack behavior. Tool names
@@ -428,6 +434,10 @@ def infer_risk_class(
     arguments: Mapping[str, Any] | None = None,
 ) -> RiskClass:
     """Best-effort local risk inference before policy rules are applied."""
+
+    filesystem_read_risk = _FILESYSTEM_READ_TOOL_RISK_CLASSES.get(tool)
+    if filesystem_read_risk is not None:
+        return filesystem_read_risk
 
     git_risk = _GIT_TOOL_RISK_CLASSES.get(tool)
     if git_risk is not None:

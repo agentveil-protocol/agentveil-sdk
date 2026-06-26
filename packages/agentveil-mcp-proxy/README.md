@@ -1,7 +1,9 @@
 # agentveil-mcp-proxy
 
 `agentveil-mcp-proxy` is the public AgentVeil package for project connector
-setup and routed MCP action control.
+setup and routed MCP action control. AgentVeil is an independent control layer:
+it works alongside agent runtimes and controls actions that are configured to
+pass through AgentVeil.
 
 It includes two public surfaces:
 
@@ -11,7 +13,7 @@ It includes two public surfaces:
    the AgentVeil MCP route.
 2. **Core MCP Proxy**, which wraps a downstream MCP server and applies
    AgentVeil policy to calls that pass through the proxy: allow,
-   approval-required, redirect, or block, with bounded local evidence.
+   approval-required, redirect, or policy-stop, with bounded local evidence.
 
 This package is source-available under the Business Source License 1.1. See
 [`LICENSE`](LICENSE).
@@ -36,6 +38,19 @@ calls.
 Use credential custody, egress boundaries, or API gates when an action must be
 controlled below the agent process. Those boundary patterns are preview and
 design-partner work, not general public release paths in this package.
+
+## What This Package Adds
+
+Agent runtimes execute agents and expose tools. `agentveil-mcp-proxy` adds a
+local action-control layer around configured paths:
+
+- project connectors for supported runtime hooks;
+- routed MCP policy and approval;
+- bounded local evidence;
+- starter policy packs for common routed action types.
+
+It does not replace Cursor, Claude Code, Codex, autonomous frameworks, or custom
+MCP clients.
 
 ## Install
 
@@ -136,6 +151,10 @@ agentveil-mcp-proxy client-config print --json
 
 This is dry-run only: it writes to stdout, not `~/.cursor`, Claude Desktop, or
 other application config directories.
+
+Any MCP-speaking client can use this route when it is explicitly configured to
+call `agentveil-mcp-proxy run`. That is routed MCP control, not global control
+of the client or host.
 
 ### Generic stdio configuration
 

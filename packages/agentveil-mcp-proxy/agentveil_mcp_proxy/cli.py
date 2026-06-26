@@ -714,7 +714,7 @@ def _build_config_payload(
             "evidence_upload": False,
         },
         "fallback": {
-            "read": "approval",
+            "read": "allow" if policy_pack == "filesystem" else "approval",
             "write": "approval",
             "destructive": "block",
             "production": "block",
@@ -4635,6 +4635,7 @@ def run_setup_claude_code_cli(
             init_proxy(
                 home=home,
                 config_path=None,
+                policy_pack="filesystem",
                 downstream_config=downstream,
                 plaintext=(passphrase_file is None),
                 passphrase_file=passphrase_file,

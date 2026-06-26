@@ -17,13 +17,17 @@ from typing import Any, Callable, Mapping
 from urllib.parse import parse_qs
 
 from agentveil_mcp_proxy.evidence.observability import (
+    approval_proof_detail_rows,
+    approval_raw_evidence_rows,
     bounded_action_display,
     bounded_reason_for_record,
     bounded_resource_display,
+    human_approval_reason_label,
+    human_approval_summary,
     pending_approval_dict,
+    risk_class_plain_label,
     terminal_state_for_record_status,
 )
-from agentveil_mcp_proxy.permission_doctor import blast_radius_lines
 
 
 MAX_POST_BODY_BYTES = 8192
@@ -423,6 +427,7 @@ class ApprovalServer:
 
         with self._lock:
             self._prune_terminal_requests_locked()
+            self._prune_expired_pending_locked()
             decided = set(self._decisions)
             terminal = set(self._terminal_requests)
             return [
@@ -556,6 +561,28 @@ class ApprovalServer:
         for request_id in expired:
             self._terminal_requests.pop(request_id, None)
             self._terminal_snapshots.pop(request_id, None)
+
+    def _prune_expired_pending_locked(self) -> None:
+        """Hide expired pending prompts from the default list without deleting evidence."""
+
+        now = int(time.time())
+        expired_ids = [
+            request_id
+            for request_id, prompt in self._prompts.items()
+            if request_id not in self._decisions
+            and request_id not in self._terminal_requests
+            and now > prompt.expires_at
+        ]
+        for request_id in expired_ids:
+            prompt = self._prompts.pop(request_id, None)
+            self._decision_events.pop(request_id, None)
+            if prompt is None:
+                continue
+            self._terminal_snapshots[request_id] = TerminalApprovalSnapshot.from_prompt(
+                prompt,
+                state=TERMINAL_APPROVAL_EXPIRED,
+            )
+            self._terminal_requests[request_id] = self._terminal_retain_until(prompt)
 
 
 class _ApprovalRequestHandler(BaseHTTPRequestHandler):
@@ -842,6 +869,14 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
         csrf_token: str,
     ) -> str:
         risk = escape(row["risk_class"])
+        risk_label = escape(risk_class_plain_label(str(row["risk_class"])))
+        summary = escape(
+            human_approval_summary(
+                tool_name=str(row["tool_name"]),
+                resource_display=str(row.get("resource")),
+            )
+        )
+        reason_label = escape(human_approval_reason_label(str(row.get("reason", ""))))
         decision_form = (
             f'<form method="post" action="{escape(detail_href)}">'
             f'<input type="hidden" name="csrf_token" value="{escape(csrf_token)}">'
@@ -853,22 +888,15 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
         return (
             '<article class="approval-card">'
             '<header class="approval-card-header">'
-            f'<span class="approval-tool">'
-            f'{escape(row["downstream_server"])}.{escape(row["tool_name"])}</span>'
-            f'<span class="approval-risk approval-risk-{risk}">{risk}</span>'
+            f'<span class="approval-tool">{summary}</span>'
+            f'<span class="approval-risk approval-risk-{risk}">{risk_label}</span>'
             "</header>"
-            f'<p class="approval-reason">{escape(row["reason"])}</p>'
+            f'<p class="approval-reason">{reason_label}</p>'
             '<dl class="approval-meta">'
-            f'<div><dt>Action</dt><dd class="approval-wrap">{escape(row["action"])}</dd></div>'
-            f'<div><dt>Resource</dt><dd class="approval-wrap">{escape(row["resource"])}</dd></div>'
+            f'<div><dt>Tool</dt><dd class="approval-wrap">{escape(row["tool_name"])}</dd></div>'
+            f'<div><dt>Target</dt><dd class="approval-wrap">{escape(row["resource"])}</dd></div>'
             f'<div><dt>Client</dt><dd class="approval-wrap">{escape(row["client_id"])}</dd></div>'
-            f'<div><dt>Session</dt><dd>{escape(row["session_id_prefix"])}</dd></div>'
-            f'<div><dt>Created</dt><dd>{row["created_at"]}</dd></div>'
-            f'<div><dt>Expires</dt><dd>{row["expires_at"]}</dd></div>'
-            f'<div><dt>Payload hash</dt><dd class="approval-wrap">{escape(row["payload_hash"])}</dd></div>'
-            f"{self._render_level2_metadata(row.get('action_gate_metadata'))}"
             "</dl>"
-            f'<p class="approval-request-id">request {escape(row["request_id"])}</p>'
             f'<p class="approval-card-actions">'
             f'<a class="approval-button" href="{escape(detail_href)}">Review &amp; decide</a>'
             "</p>"
@@ -878,7 +906,13 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
 
     def _render_prompt(self, prompt: ApprovalPrompt) -> str:
         token = self.server_owner.session_token
-        title = f"Approval pending: {prompt.client_id} session {prompt.session_id[:8]}"
+        summary = human_approval_summary(
+            tool_name=prompt.tool_name,
+            resource_display=prompt.resource_display,
+        )
+        risk_label = risk_class_plain_label(prompt.risk_class)
+        reason_label = human_approval_reason_label(prompt.reason)
+        title = f"Review: {prompt.tool_name}"
         back_link = (
             f'<p class="approval-back"><a href="/approval/{escape(token)}">'
             "&larr; Back to pending list</a></p>"
@@ -906,24 +940,41 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
                 "</form>"
             )
         session_prefix = prompt.session_id[:8]
+        proof_rows = approval_proof_detail_rows(
+            tool_name=prompt.tool_name,
+            resource_display=prompt.resource_display,
+            risk_class=prompt.risk_class,
+            reason=prompt.reason,
+            payload_hash=prompt.payload_hash,
+            policy_rule_id=prompt.policy_rule_id,
+            request_id=prompt.request_id,
+            created_at=prompt.created_at,
+            expires_at=prompt.expires_at,
+            action_gate_metadata=prompt.action_gate_metadata,
+        )
+        proof_items = "".join(
+            f"<dt>{escape(label)}</dt><dd>{escape(value)}</dd>"
+            for label, value in proof_rows
+        )
+        raw_rows = approval_raw_evidence_rows(
+            client_id=prompt.client_id,
+            session_id_prefix=session_prefix,
+            action_display=prompt.action_display,
+            action_gate_metadata=prompt.action_gate_metadata,
+        )
+        raw_items = "".join(
+            f"<dt>{escape(label)}</dt><dd>{escape(value)}</dd>"
+            for label, value in raw_rows
+        )
         body = f"""
 {back_link}
+<p class="approval-summary">{escape(summary)}</p>
+<p class="approval-reason">{escape(reason_label)}</p>
 <dl class="approval-detail">
-<dt>Client</dt><dd>{escape(prompt.client_id)}</dd>
-<dt>Session prefix</dt><dd>{escape(session_prefix)}</dd>
-<dt>Request</dt><dd>{escape(prompt.request_id)}</dd>
-<dt>Downstream</dt><dd>{escape(prompt.downstream_server)}</dd>
 <dt>Tool</dt><dd>{escape(prompt.tool_name)}</dd>
-<dt>Action</dt><dd>{escape(prompt.action_display)}</dd>
-<dt>Resource</dt><dd>{escape(prompt.resource_display or "none")}</dd>
-<dt>Risk</dt><dd>{escape(prompt.risk_class)}</dd>
-<dt>Payload hash</dt><dd>{escape(prompt.payload_hash)}</dd>
-<dt>Policy rule</dt><dd>{escape(prompt.policy_rule_id)}</dd>
-{self._render_level2_metadata(prompt.action_gate_metadata)}
-<dt>Created</dt><dd>{prompt.created_at}</dd>
-<dt>Expires</dt><dd>{prompt.expires_at}</dd>
+<dt>Target</dt><dd>{escape(prompt.resource_display or "none")}</dd>
+<dt>Risk</dt><dd>{escape(risk_label)}</dd>
 </dl>
-{detail}
 <form method=\"post\">
 <input type=\"hidden\" name=\"csrf_token\" value=\"{escape(prompt.csrf_token)}\">
 <input type=\"hidden\" name=\"approval_scope\" value=\"exact\">
@@ -931,57 +982,21 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
 <button type=\"submit\" name=\"decision\" value=\"deny\">Deny</button>
 </form>
 {similar}
+<details class="approval-proof-details">
+<summary>Proof details</summary>
+<dl class="approval-detail">
+{proof_items}
+</dl>
+<details class="approval-raw-evidence">
+<summary>Raw evidence</summary>
+<dl class="approval-detail">
+{raw_items}
+</dl>
+{detail}
+</details>
+</details>
 """
         return self._page(title, body, page_kind="detail")
-
-    def _render_blast_radius(self, metadata: Any) -> str:
-        if not isinstance(metadata, dict):
-            return ""
-        blast_radius = metadata.get("blast_radius")
-        if not isinstance(blast_radius, Mapping):
-            return ""
-        lines = blast_radius_lines(blast_radius)
-        if not lines:
-            return ""
-        rendered = "".join(
-            f"<div><dt>{escape(line.split(':', 1)[0])}</dt>"
-            f"<dd>{escape(line.split(':', 1)[1].strip())}</dd></div>"
-            for line in lines
-            if ":" in line
-        )
-        if not rendered:
-            return ""
-        return f"<dt>Blast radius</dt><dd><dl>{rendered}</dl></dd>"
-
-    def _render_level2_metadata(self, metadata: Any) -> str:
-        blast_radius_html = self._render_blast_radius(metadata)
-        if not isinstance(metadata, dict):
-            return blast_radius_html
-        labels = (
-            ("role", "Role"),
-            ("authority", "Authority"),
-            ("action_family", "Action family"),
-            ("policy_decision", "Policy decision"),
-            ("approval_status", "Approval status"),
-            ("execution_status", "Execution status"),
-            ("target_reached", "Target reached"),
-            ("redirect_playbook_id", "Redirect"),
-        )
-        items = []
-        for key, label in labels:
-            if key not in metadata:
-                continue
-            value = metadata[key]
-            if isinstance(value, bool):
-                rendered = "true" if value else "false"
-            elif isinstance(value, str):
-                rendered = value
-            else:
-                continue
-            items.append(f"<dt>{escape(label)}</dt><dd>{escape(rendered)}</dd>")
-        if not items:
-            return blast_radius_html
-        return blast_radius_html + "".join(items)
 
     def _security_notice_html(self) -> str:
         return (

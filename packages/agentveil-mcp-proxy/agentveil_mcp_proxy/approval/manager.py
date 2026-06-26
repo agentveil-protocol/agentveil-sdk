@@ -36,7 +36,11 @@ from agentveil_mcp_proxy.evidence.approval_grant import (
     ApprovalGrantError,
     build_approval_grant,
 )
-from agentveil_mcp_proxy.evidence.observability import parse_action_gate_metadata
+from agentveil_mcp_proxy.evidence.observability import (
+    approval_display_risk_class,
+    approval_resource_display,
+    parse_action_gate_metadata,
+)
 from agentveil_mcp_proxy.policy import (
     ApprovalUiOpenMode,
     PolicyRule,
@@ -784,9 +788,17 @@ class ApprovalManager:
             tool_name=classification.tool,
             action_display=classification.action,
             action_details=action_details,
-            resource_display=classification.resource,
+            resource_display=approval_resource_display(
+                resource_plain=classification.resource_plain,
+                resource_hashed=classification.resource,
+            ),
             resource_details=resource_details,
-            risk_class=classification.risk_class.value,
+            risk_class=approval_display_risk_class(
+                risk_class=classification.risk_class.value,
+                tool_name=classification.tool,
+                action_plain=classification.action_plain,
+                resource_plain=classification.resource_plain,
+            ),
             payload_hash=classification.payload_hash,
             policy_rule_id=classification.policy_evaluation.policy_rule_id,
             reason=reason,
