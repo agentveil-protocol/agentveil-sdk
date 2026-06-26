@@ -126,6 +126,10 @@ from agentveil_mcp_proxy.runtime_gate import (
     RuntimeGateUnavailableError,
     RuntimeGateUntrustedError,
 )
+from agentveil_mcp_proxy.evidence.observability import (
+    enrich_mcp_error_contract,
+    mcp_error_user_message,
+)
 
 
 JSONRPC_VERSION = "2.0"
@@ -825,6 +829,8 @@ def _blocked_error(
             reason=reason,
             default_message=message,
         )
+    tool_name = classification.tool if classification is not None else None
+    enrich_mcp_error_contract(data, tool_name=tool_name)
     return jsonrpc_error(request_id, JSONRPC_POLICY_BLOCKED, message, data=data)
 
 
@@ -839,6 +845,7 @@ def _runtime_evidence_unavailable_error(
     }
     if decision.audit_id is not None:
         data["audit_id"] = decision.audit_id
+    enrich_mcp_error_contract(data)
     return jsonrpc_error(
         request_id,
         JSONRPC_POLICY_BLOCKED,
@@ -891,6 +898,8 @@ def _approval_required_error(
             data,
             default_message=resolved_message or APPROVAL_REQUIRED_USER_MESSAGE,
         )
+    tool_name = classification.tool if classification is not None else None
+    enrich_mcp_error_contract(data, tool_name=tool_name)
     return jsonrpc_error(
         request_id,
         JSONRPC_APPROVAL_REQUIRED,
@@ -912,12 +921,24 @@ def _coalesce_approval_outcome(
     return new if new is not None else current
 
 
-def _policy_denied_error(request_id: Any, *, reason: str) -> dict[str, Any]:
+def _policy_denied_error(
+    request_id: Any,
+    *,
+    reason: str,
+    classification: ClassifiedToolCall | None = None,
+    tool: str | None = None,
+) -> dict[str, Any]:
+    data: dict[str, Any] = {"status": "policy_denied", "reason": reason}
+    tool_name = tool
+    if tool_name is None and classification is not None:
+        tool_name = classification.tool
+    enrich_mcp_error_contract(data, tool_name=tool_name)
+    message = mcp_error_user_message(data)
     return jsonrpc_error(
         request_id,
         JSONRPC_POLICY_BLOCKED,
-        "denied by MCP proxy policy",
-        data={"status": "policy_denied", "reason": reason},
+        message,
+        data=data,
     )
 
 
@@ -1356,11 +1377,14 @@ class McpPassthrough:
             if reason == INVALID_REDIRECT_CONTEXT
             else "blocked"  # claim-check: allow bounded error status; negative tests cover no downstream.
         )
+        data: dict[str, Any] = {"status": status, "reason": reason}
+        if status == "blocked":  # claim-check: allow bounded JSON-RPC status vocabulary; negative tests assert no downstream execution.
+            enrich_mcp_error_contract(data)
         return jsonrpc_error(
             request_id,
             code,
             message,
-            data={"status": status, "reason": reason},
+            data=data,
         )
 
     def _redirect_automation_precheck(
@@ -1768,7 +1792,12 @@ class McpPassthrough:
                 "tool": tool,
             })
             self._record_pre_approval_deny_evidence(classification, reason)
-            return _policy_denied_error(request_id, reason=reason)
+            return _policy_denied_error(
+                request_id,
+                reason=reason,
+                classification=classification,
+                tool=tool,
+            )
         return None
 
     def _is_instruction_path_mutation_tool(self, tool: str) -> bool:

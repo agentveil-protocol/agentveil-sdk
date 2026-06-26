@@ -291,6 +291,125 @@ def approval_raw_evidence_rows(
     return tuple(rows)
 
 
+_PATH_OUTSIDE_SANDBOX_USER_MESSAGE = (
+    "Path is outside the configured sandbox. "
+    "Use a relative path under the project workspace."
+)
+_DEFAULT_HARD_DENY_NEXT_STEP = (
+    "This action cannot be approved. Adjust the tool call or local policy."
+)
+_APPROVAL_REQUIRED_NEXT_STEP = (
+    "Open approval_url, approve or deny, then retry the same MCP tool call."
+)
+_TOOL_NOT_AVAILABLE_NEXT_STEP = (
+    "Configure or enable the MCP route that advertises this tool."
+)
+_DEFAULT_SANDBOX_PATH_HINT = (
+    "Use a relative path under the configured sandbox, for example notes/example.txt."
+)
+
+
+def mcp_error_reason_code(reason: str) -> str:
+    """Return a bounded public reason_code for MCP proxy errors."""
+
+    mapping = {
+        "local_approval_required": "approval_required",
+        "path_outside_workspace": "path_outside_sandbox",
+        "unknown_tool_not_advertised": "tool_not_available",
+        "tool_schema_unavailable": "tool_not_available",
+        "runtime_gate_not_configured": "runtime_gate_unavailable",
+        "runtime_gate_evidence_unavailable": "runtime_gate_unavailable",
+        "approval_evidence_unavailable": "approval_unavailable",
+    }
+    return mapping.get(reason, reason)
+
+
+def _leaf_tool_name(tool_name: str | None) -> str | None:
+    if not tool_name:
+        return None
+    leaf = tool_name.rsplit(".", 1)[-1].strip()
+    return leaf or None
+
+
+def enrich_mcp_error_contract(
+    data: dict[str, Any],
+    *,
+    tool_name: str | None = None,
+) -> dict[str, Any]:
+    """Attach minimal structured MCP error contract fields to JSON-RPC error data."""
+
+    status = str(data.get("status", ""))
+    reason = str(data.get("reason", ""))
+    reason_code = mcp_error_reason_code(reason)
+    data["reason_code"] = reason_code
+
+    if status == "approval_required":
+        data["approval_possible"] = True
+        data["retry_after_approval"] = True
+        if "next_step" not in data:
+            data["next_step"] = _APPROVAL_REQUIRED_NEXT_STEP
+        leaf = _leaf_tool_name(tool_name)
+        if leaf is not None:
+            data.setdefault("suggested_tool", leaf)
+        return data
+
+    data["approval_possible"] = False
+    data["retry_after_approval"] = False
+
+    if reason == "path_outside_workspace":
+        data["next_step"] = (
+            "Choose a relative path under the configured sandbox or project workspace."
+        )
+        data["safe_path_hint"] = _DEFAULT_SANDBOX_PATH_HINT
+        leaf = _leaf_tool_name(tool_name)
+        if leaf is not None:
+            data.setdefault("suggested_tool", leaf)
+        return data
+
+    if reason in {"unknown_tool_not_advertised", "tool_schema_unavailable"}:
+        data["next_step"] = _TOOL_NOT_AVAILABLE_NEXT_STEP
+        return data
+
+    if "next_step" not in data:
+        data["next_step"] = _DEFAULT_HARD_DENY_NEXT_STEP
+    return data
+
+
+def mcp_error_user_message(data: Mapping[str, Any]) -> str:
+    """Return a differentiated user-facing MCP error message."""
+
+    status = str(data.get("status", ""))
+    reason = str(data.get("reason", ""))
+    if status == "approval_required":
+        return (
+            "Approval required: open the approval page, approve or deny, "
+            "then retry this request."
+        )
+    if status == "policy_denied" and reason == "path_outside_workspace":
+        return _PATH_OUTSIDE_SANDBOX_USER_MESSAGE
+    if status == "blocked":  # claim-check: allow bounded JSON-RPC status vocabulary; negative tests assert no downstream execution.
+        if reason == "role_authority_denied":
+            return str(data.get("explanation") or _DEFAULT_HARD_DENY_NEXT_STEP)
+        if reason in {
+            "local_policy_block",
+            "filesystem_delete",
+            "secret_path_blocked",
+            "unknown_tool_not_advertised",
+            "runtime_gate_not_configured",
+            "runtime_gate_evidence_unavailable",
+            "approval_evidence_unavailable",
+        }:
+            return (
+                "Stopped by policy: this action is not allowed by local policy "
+                "and cannot be approved."
+            )
+    if status == "policy_denied":
+        return _PATH_OUTSIDE_SANDBOX_USER_MESSAGE if reason == "path_outside_workspace" else (
+            "Denied by MCP proxy policy."
+        )
+    return "Denied by MCP proxy policy."
+
+
 def pending_approval_dict(
     *,
     request_id: str,

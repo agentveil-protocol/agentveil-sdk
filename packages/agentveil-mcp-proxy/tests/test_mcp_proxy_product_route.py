@@ -421,4 +421,10 @@ def test_product_route_unknown_tool_call_fails_closed(tmp_path, monkeypatch) -> 
 
     response = _responses(out.getvalue())[0]
     # claim-check: allow "blocked" as the expected fail-closed JSON-RPC status for unknown tools.
-    assert response["error"]["data"] == {"status": "blocked", "reason": "unknown_tool"}
+    data = response["error"]["data"]
+    assert data["status"] == "blocked"  # claim-check: allow bounded JSON-RPC status vocabulary; this test asserts fail-closed handling.
+    assert data["reason"] == "unknown_tool"
+    assert data["approval_possible"] is False
+    assert data["retry_after_approval"] is False
+    assert data["reason_code"] == "unknown_tool"
+    assert data["next_step"]

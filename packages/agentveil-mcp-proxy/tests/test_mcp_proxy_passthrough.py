@@ -42,6 +42,24 @@ from mcp_fake_downstream import fake_target_reached, seed_tool_schemas, tool_ent
 SECRET = "SECRET_DOWNSTREAM_TOKEN"
 
 
+def _assert_policy_denied_contract(data: dict, *, reason: str) -> None:
+    assert data["status"] == "policy_denied"
+    assert data["reason"] == reason
+    assert data["approval_possible"] is False
+    assert data["retry_after_approval"] is False
+    assert isinstance(data["reason_code"], str) and data["reason_code"]
+    assert isinstance(data["next_step"], str) and data["next_step"]
+
+
+def _assert_blocked_contract(data: dict, *, reason: str) -> None:
+    assert data["status"] == "blocked"  # claim-check: allow bounded JSON-RPC status vocabulary; negative tests assert no downstream execution.
+    assert data["reason"] == reason
+    assert data["approval_possible"] is False
+    assert data["retry_after_approval"] is False
+    assert isinstance(data["reason_code"], str) and data["reason_code"]
+    assert isinstance(data["next_step"], str) and data["next_step"]
+
+
 @pytest.fixture(autouse=True)
 def _suppress_approval_browser_open(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep local pytest runs from opening real Approval Center browser tabs."""
@@ -905,6 +923,10 @@ def test_run_returns_approval_required_without_waiting_or_forwarding(tmp_path, m
     assert response["error"]["data"]["instructions"] == (
         "Approval required. Open approval_url, approve or deny, then retry the same request."
     )
+    assert response["error"]["data"]["approval_possible"] is True
+    assert response["error"]["data"]["retry_after_approval"] is True
+    assert response["error"]["data"]["reason_code"] == "approval_required"
+    assert response["error"]["data"]["next_step"]
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
 
 
@@ -1079,11 +1101,16 @@ def test_path_traversal_write_file_fails_before_approval(tmp_path, monkeypatch):
 
     response = _responses(client_out.getvalue())[0]
     assert response["error"]["code"] == JSONRPC_POLICY_BLOCKED
-    assert response["error"]["data"] == {
-        "status": "policy_denied",
-        "reason": "path_outside_workspace",
-    }
-    assert "approval_url" not in response["error"]["data"]
+    data = response["error"]["data"]
+    assert data["status"] == "policy_denied"
+    assert data["reason"] == "path_outside_workspace"
+    assert data["approval_possible"] is False
+    assert data["retry_after_approval"] is False
+    assert data["reason_code"] == "path_outside_sandbox"
+    assert data["safe_path_hint"]
+    assert data["suggested_tool"] == "write_file"
+    assert "sandbox" in response["error"]["message"].lower()
+    assert "approval_url" not in data
     assert "record_id" not in response["error"]["data"]
     assert _pending_approval_count(home) == 0
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
@@ -1123,11 +1150,16 @@ def test_absolute_outside_path_hard_denies_before_approval(tmp_path, monkeypatch
 
     response = _responses(client_out.getvalue())[0]
     assert response["error"]["code"] == JSONRPC_POLICY_BLOCKED
-    assert response["error"]["data"] == {
-        "status": "policy_denied",
-        "reason": "path_outside_workspace",
-    }
-    assert "approval_url" not in response["error"]["data"]
+    data = response["error"]["data"]
+    assert data["status"] == "policy_denied"
+    assert data["reason"] == "path_outside_workspace"
+    assert data["approval_possible"] is False
+    assert data["retry_after_approval"] is False
+    assert data["reason_code"] == "path_outside_sandbox"
+    assert data["safe_path_hint"]
+    assert data["suggested_tool"] == "write_file"
+    assert "sandbox" in response["error"]["message"].lower()
+    assert "approval_url" not in data
     assert "record_id" not in response["error"]["data"]
     assert _pending_approval_count(home) == 0
     # Downstream log contains only the schema-probe tools/list.
@@ -1207,10 +1239,7 @@ def test_secret_read_file_path_fails_before_downstream_read(tmp_path, monkeypatc
 
     response = _responses(client_out.getvalue())[0]
     assert response["error"]["code"] == JSONRPC_POLICY_BLOCKED
-    assert response["error"]["data"] == {
-        "status": "policy_denied",
-        "reason": "secret_path_blocked",
-    }
+    _assert_policy_denied_contract(response["error"]["data"], reason="secret_path_blocked")
     assert "approval_url" not in response["error"]["data"]
     assert "record_id" not in response["error"]["data"]
     assert _pending_approval_count(home) == 0
@@ -1245,10 +1274,7 @@ def test_secret_path_in_paths_list_blocks_broadened_tool(tmp_path):
 
     response = _responses(client_out.getvalue())[0]
     assert response["error"]["code"] == JSONRPC_POLICY_BLOCKED
-    assert response["error"]["data"] == {
-        "status": "policy_denied",
-        "reason": "secret_path_blocked",
-    }
+    _assert_policy_denied_contract(response["error"]["data"], reason="secret_path_blocked")
     # Not forwarded downstream: the fake downstream "called" result is absent.
     assert "called" not in client_out.getvalue()
     # Sanitized: the raw secret path does not appear in proxy output.
@@ -1293,10 +1319,7 @@ def test_secret_destination_blocks_move_file(tmp_path):
     ) == 0
 
     response = _responses(client_out.getvalue())[0]
-    assert response["error"]["data"] == {
-        "status": "policy_denied",
-        "reason": "secret_path_blocked",
-    }
+    _assert_policy_denied_contract(response["error"]["data"], reason="secret_path_blocked")
     assert "called" not in client_out.getvalue()
     assert passthrough.security_events == (
         {
@@ -1371,10 +1394,7 @@ def test_secret_segment_write_file_fails_before_approval(tmp_path, monkeypatch):
 
     response = _responses(client_out.getvalue())[0]
     assert response["error"]["code"] == JSONRPC_POLICY_BLOCKED
-    assert response["error"]["data"] == {
-        "status": "policy_denied",
-        "reason": "secret_path_blocked",
-    }
+    _assert_policy_denied_contract(response["error"]["data"], reason="secret_path_blocked")
     assert _pending_approval_count(home) == 0
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
 
@@ -1405,10 +1425,7 @@ def test_secret_path_blocks_destructive_file_tools(tmp_path, tool):
 
     response = _responses(client_out.getvalue())[0]
     assert response["error"]["code"] == JSONRPC_POLICY_BLOCKED
-    assert response["error"]["data"] == {
-        "status": "policy_denied",
-        "reason": "secret_path_blocked",
-    }
+    _assert_policy_denied_contract(response["error"]["data"], reason="secret_path_blocked")
     assert "called" not in client_out.getvalue()
     assert "/home/user/.ssh/id_rsa" not in client_out.getvalue()
     assert passthrough.security_events == (
@@ -1455,10 +1472,7 @@ def test_secret_delete_file_fails_before_approval(tmp_path, monkeypatch):
 
     response = _responses(client_out.getvalue())[0]
     assert response["error"]["code"] == JSONRPC_POLICY_BLOCKED
-    assert response["error"]["data"] == {
-        "status": "policy_denied",
-        "reason": "secret_path_blocked",
-    }
+    _assert_policy_denied_contract(response["error"]["data"], reason="secret_path_blocked")
     assert _pending_approval_count(home) == 0
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
 
@@ -1492,10 +1506,7 @@ def test_secret_path_hard_deny_writes_terminal_blocked_evidence(tmp_path, monkey
 
     response = _responses(client_out.getvalue())[0]
     assert response["error"]["code"] == JSONRPC_POLICY_BLOCKED
-    assert response["error"]["data"] == {
-        "status": "policy_denied",
-        "reason": "secret_path_blocked",
-    }
+    _assert_policy_denied_contract(response["error"]["data"], reason="secret_path_blocked")
     # Approval prompt fields stay absent for the hard-deny response.
     assert "approval_url" not in response["error"]["data"]
     assert "record_id" not in response["error"]["data"]
@@ -1561,10 +1572,7 @@ def test_trapdoor_package_credential_paths_hard_deny_before_approval(
 
     response = _responses(client_out.getvalue())[0]
     assert response["error"]["code"] == JSONRPC_POLICY_BLOCKED
-    assert response["error"]["data"] == {
-        "status": "policy_denied",
-        "reason": "secret_path_blocked",
-    }
+    _assert_policy_denied_contract(response["error"]["data"], reason="secret_path_blocked")
     assert "approval_url" not in response["error"]["data"]
     assert "record_id" not in response["error"]["data"]
     assert _pending_approval_count(home) == 0
@@ -1680,7 +1688,7 @@ def test_unknown_tool_hard_deny_writes_terminal_blocked_evidence(tmp_path, monke
 
     response = _responses(client_out.getvalue())[0]
     assert response["error"]["code"] == JSONRPC_POLICY_BLOCKED
-    assert response["error"]["data"] == {"status": "blocked", "reason": "unknown_tool"}  # claim-check: allow "blocked" is expected JSON-RPC error data vocabulary.
+    _assert_blocked_contract(response["error"]["data"], reason="unknown_tool")  # claim-check: allow "blocked" is expected JSON-RPC error data vocabulary.
     # No approval surface is offered for the hard-deny.
     assert "approval_url" not in response["error"]["data"]
     assert "record_id" not in response["error"]["data"]
@@ -1945,16 +1953,12 @@ def test_classifier_exception_on_tool_call_fails_closed(tmp_path):
     # claim-check: allow this comment describes the asserted fail-closed response; verified by this test
     # Fail closed: an unclassified tool call is blocked, never forwarded
     # downstream (the downstream "called" result is not returned).
-    assert _responses(client_out.getvalue()) == [{
-        "jsonrpc": "2.0",
-        "id": "call-1",
-        "error": {
-            "code": JSONRPC_POLICY_BLOCKED,
-            "message": "blocked by MCP proxy: tool call classification failed",
-            # claim-check: allow "blocked" appears in the literal expected JSON-RPC error payload
-            "data": {"status": "blocked", "reason": "classifier_error"},
-        },
-    }]
+    response = _responses(client_out.getvalue())[0]
+    assert response["jsonrpc"] == "2.0"
+    assert response["id"] == "call-1"
+    assert response["error"]["code"] == JSONRPC_POLICY_BLOCKED
+    assert response["error"]["message"] == "blocked by MCP proxy: tool call classification failed"  # claim-check: allow existing JSON-RPC error wording; this test asserts no downstream forwarding.
+    _assert_blocked_contract(response["error"]["data"], reason="classifier_error")
     assert passthrough.classifier_errors == 1
     # claim-check: allow "never"/"blocked" describe the sanitized expected response asserted below
     # Sanitized: raw tool arguments never appear in the blocked response.
@@ -2923,10 +2927,10 @@ def test_hidden_unicode_write_claude_md_hard_deny_before_approval(
 
     response = _responses(client_out.getvalue())[1]
     assert response["error"]["code"] == JSONRPC_POLICY_BLOCKED
-    assert response["error"]["data"] == {
-        "status": "policy_denied",
-        "reason": "hidden_unicode_instruction_file_blocked",
-    }
+    _assert_policy_denied_contract(
+        response["error"]["data"],
+        reason="hidden_unicode_instruction_file_blocked",
+    )
     assert "approval_url" not in response["error"]["data"]
     assert "record_id" not in response["error"]["data"]
     assert _pending_approval_count(home) == 0
@@ -3250,10 +3254,7 @@ def test_persistence_path_ssh_authorized_keys_stays_secret_path_blocked(tmp_path
 
     response = _responses(client_out.getvalue())[1]
     assert response["error"]["code"] == JSONRPC_POLICY_BLOCKED
-    assert response["error"]["data"] == {
-        "status": "policy_denied",
-        "reason": "secret_path_blocked",
-    }
+    _assert_policy_denied_contract(response["error"]["data"], reason="secret_path_blocked")
     assert "approval_url" not in response["error"]["data"]
     assert _pending_approval_count(home) == 0
     assert ".ssh/authorized_keys" not in client_out.getvalue()
@@ -3690,10 +3691,10 @@ def test_redirect_unsupported_playbook_does_not_execute_follow_up(tmp_path, monk
         approval_ui_mode="none",
     ) == 0
     response = _responses(client_out.getvalue())[0]
-    assert response["error"]["data"] == {
-        "status": "blocked",
-        "reason": "unsupported_redirect_playbook",
-    }
+    _assert_blocked_contract(
+        response["error"]["data"],
+        reason="unsupported_redirect_playbook",
+    )
     assert not fake_target_reached(outcome_path)
 
 
@@ -4028,7 +4029,12 @@ def test_differentiated_user_messages_for_approval_block_and_redirect() -> None:
     )
 
     assert approval["error"]["message"] == APPROVAL_REQUIRED_USER_MESSAGE
+    assert approval["error"]["data"]["approval_possible"] is True
+    assert approval["error"]["data"]["retry_after_approval"] is True
+    assert approval["error"]["data"]["reason_code"] == "approval_required"
     assert block["error"]["message"] == HARD_BLOCK_USER_MESSAGE
+    assert block["error"]["data"]["approval_possible"] is False
+    assert block["error"]["data"]["retry_after_approval"] is False
     assert redirect["error"]["message"] != approval["error"]["message"]
     assert redirect["error"]["message"] != block["error"]["message"]
     assert "Review Agent cannot write" in redirect["error"]["message"]
