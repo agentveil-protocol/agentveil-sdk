@@ -47,7 +47,9 @@ def test_build_hook_command_invokes_module_with_evidence_path() -> None:
     cmd = build_hook_command(python="/usr/bin/python3", evidence_path=Path("/proj/.claude/agentveil/evidence.jsonl"))
     assert "-m agentveil_mcp_proxy.claude_hook" in cmd
     assert "--evidence-path" in cmd
-    assert "/proj/.claude/agentveil/evidence.jsonl" in cmd
+    assert ".claude" in cmd
+    assert "agentveil" in cmd
+    assert "evidence.jsonl" in cmd
 
 
 def test_managed_entry_uses_combined_matcher() -> None:

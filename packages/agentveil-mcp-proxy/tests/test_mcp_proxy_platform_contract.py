@@ -82,8 +82,8 @@ def test_build_hook_command_uses_direct_python_module(tmp_path: Path, hook_event
 
 def test_write_runnable_proxy_command_matches_platform_contract(tmp_path: Path) -> None:
     windows_cli = write_runnable_proxy_command(tmp_path / "win", platform_name=PLATFORM_WINDOWS)
-    assert windows_cli.name == "agentveil-mcp-proxy.exe"
-    assert windows_cli.suffix.lower() == ".exe"
+    assert windows_cli.name == "agentveil-mcp-proxy.cmd"
+    assert windows_cli.suffix.lower() == ".cmd"
 
     posix_cli = write_runnable_proxy_command(tmp_path / "posix", platform_name=PLATFORM_POSIX)
     assert posix_cli.name == "agentveil-mcp-proxy"

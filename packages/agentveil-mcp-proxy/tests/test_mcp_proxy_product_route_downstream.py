@@ -295,8 +295,8 @@ def test_read_file_reads_sandbox_file(runtime: ProductRouteRuntime) -> None:
 
 def test_get_file_info_returns_bounded_metadata(runtime: ProductRouteRuntime) -> None:
     probe = runtime.profile.filesystem_sandbox / "info_probe.txt"
-    content = "meta\n"
-    probe.write_text(content, encoding="utf-8")
+    content = b"meta\n"
+    probe.write_bytes(content)
 
     response = handle_message(
         runtime,
@@ -311,7 +311,7 @@ def test_get_file_info_returns_bounded_metadata(runtime: ProductRouteRuntime) ->
     assert "error" not in response, response
     payload = json.loads(response["result"]["content"][0]["text"])
     assert payload["path"] == "info_probe.txt"
-    assert payload["size_bytes"] == len(content.encode("utf-8"))
+    assert payload["size_bytes"] == len(content)
     assert payload["size_bucket"] in {"tiny", "small", "medium", "large"}
 
 

@@ -57,7 +57,10 @@ def write_runnable_proxy_command(directory: Path, *, platform_name: str | None =
     pythonpath = os.pathsep.join((str(repo_root), str(proxy_root)))
     platform = platform_name or os.name
     if platform == PLATFORM_WINDOWS:
-        command = directory / installed_cli_filename(platform_name=PLATFORM_WINDOWS)
+        # This helper creates a runnable test wrapper, not an installed console
+        # script. A text file named .exe is not executable on Windows, so use a
+        # batch shim and let launch code exercise its .cmd shell path.
+        command = directory / f"{CONSOLE_SCRIPT_BASENAME}.cmd"
         command.write_text(
             "@echo off\r\n"
             f'set "PYTHONPATH={pythonpath}"\r\n'
