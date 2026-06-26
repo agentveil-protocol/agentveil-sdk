@@ -363,7 +363,7 @@ def test_product_route_get_file_info_succeeds_without_approval(tmp_path, monkeyp
     profile_root = tmp_path / "profile"
     _init_product_route_proxy(home, profile_root)
     probe = profile_root / PRODUCT_ROUTE_WORKSPACE_DIRNAME / "probe.txt"
-    probe.write_text("meta\n", encoding="utf-8")
+    probe.write_bytes(b"meta\n")
     _block_avp_agent(monkeypatch)
 
     out = io.StringIO()
@@ -378,7 +378,7 @@ def test_product_route_get_file_info_succeeds_without_approval(tmp_path, monkeyp
     assert "error" not in response
     payload = json.loads(response["result"]["content"][0]["text"])
     assert payload["path"] == "probe.txt"
-    assert payload["size_bytes"] == len("meta\n")
+    assert payload["size_bytes"] == len(b"meta\n")
 
 
 @pytest.mark.parametrize("bad_path", ["../outside.txt", "/etc/passwd", "nested/../../outside.txt"])
