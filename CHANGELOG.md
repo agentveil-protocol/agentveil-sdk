@@ -6,6 +6,30 @@ All notable changes to the `agentveil` SDK.
 
 No unreleased changes.
 
+## [0.7.24-mcp-proxy] - 2026-06-26
+
+Public beta approval UX hardening release for `agentveil-mcp-proxy`.
+
+### MCP Proxy fixed
+- Allowed read-only filesystem MCP tools such as `list_workspace`, `read_file`,
+  `get_file_info`, and `instruction_surface_status` without unnecessary
+  approval in the filesystem policy path.
+- Improved the local Approval Center first screen so the main view shows a
+  human-readable action summary, target, risk, and approve/deny controls, with
+  raw bounded evidence kept under technical details.
+- Added structured MCP error fields for approval-required and hard-denied
+  paths, including `reason_code`, `approval_possible`,
+  `retry_after_approval`, `next_step`, `suggested_tool`, and bounded sandbox
+  hints where applicable.
+- Clarified README positioning for AgentVeil as an independent action-control
+  layer around configured project connectors and routed MCP calls.
+
+### MCP Proxy verification
+- GitHub Actions passed for the merged public beta hardening PR across the
+  supported compatibility matrix.
+- Local non-live MCP Proxy suite passed with `1367 passed, 1 skipped` before
+  preparing this release bump.
+
 ## [0.7.20] - 2026-06-01
 
 Verifier-readiness release for `execution_receipt/3` and
