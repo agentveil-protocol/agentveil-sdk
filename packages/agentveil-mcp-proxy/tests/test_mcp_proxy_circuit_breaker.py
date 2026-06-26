@@ -712,6 +712,11 @@ def test_open_circuit_read_fallback_defaults_to_approval_not_forwarded(tmp_path)
     assert response["error"]["data"] == {
         "status": "approval_required",
         "reason": "runtime_gate_unavailable",
+        "reason_code": "runtime_gate_unavailable",
+        "approval_possible": True,
+        "retry_after_approval": True,
+        "next_step": "Open approval_url, approve or deny, then retry the same MCP tool call.",
+        "suggested_tool": "get_file_contents",
     }
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
     assert SECRET not in client_out.getvalue()
