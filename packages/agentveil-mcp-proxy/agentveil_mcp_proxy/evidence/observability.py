@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 import json
 from pathlib import Path
 from typing import Any
@@ -112,6 +112,183 @@ def human_approval_reason_label(reason: str) -> str:
     if "instruction" in reason:
         return "Instruction or repo surface risk detected"
     return "Needs review before it can run"
+
+
+def policy_decision_plain_label(decision: str) -> str:
+    """Return a plain-language policy decision label for approval proof."""
+
+    # claim-check: allow bounded UI decision labels; behavior is covered by
+    # approval proof/detail tests and does not claim host-wide protection.
+    labels = {
+        "approval": "Approval required",
+        "allow": "Allowed",
+        "block": "Stopped by policy",
+        "deny": "Denied",
+    }
+    return labels.get(decision, decision.replace("_", " ").title())
+
+
+def approval_access_plain_label(*, reason: str, policy_decision: str) -> str:
+    """Return whether approval is possible or policy stopped the action."""
+
+    if reason == "role_authority_denied" or policy_decision in {"block", "deny"}:
+        return "Stopped by policy"
+    if policy_decision == "approval":
+        return "Approval required"
+    return policy_decision_plain_label(policy_decision)
+
+
+_FILESYSTEM_TOOL_NAMES = frozenset({
+    "list_workspace",
+    "instruction_surface_status",
+    "write_file",
+    "read_file",
+    "get_file_info",
+    "delete_file",
+    "rmdir_tree",
+    "move_file",
+    "copy_file",
+    "chmod_file",
+    "create_symlink",
+})
+
+
+def _is_filesystem_operation(preview: Mapping[str, Any]) -> bool:
+    """Return True when blast-radius preview describes a filesystem tool action."""
+
+    tool = str(preview.get("tool", "")).lower()
+    server = str(preview.get("server", "")).lower()
+    if "filesystem" in server:
+        return True
+    if tool in _FILESYSTEM_TOOL_NAMES:
+        return True
+    return tool.startswith(("read_", "get_", "list_", "fetch_", "write_", "delete_", "remove_"))
+
+
+def blast_radius_has_unassessed_dimensions(preview: Mapping[str, Any]) -> bool:
+    """Return True when blast-radius preview includes unknown dimensions."""
+
+    caps = preview.get("capabilities")
+    if isinstance(caps, Mapping) and any(value == "unknown" for value in caps.values()):
+        return True
+    credential = preview.get("credential_posture")
+    return credential == "unknown"
+
+
+def assessed_blast_radius_lines(preview: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return blast-radius lines for dimensions that were actually assessed."""
+
+    from agentveil_mcp_proxy.permission_doctor import blast_radius_lines
+
+    return tuple(
+        line
+        for line in blast_radius_lines(preview)
+        if not line.endswith(": unknown")
+        and not line.startswith("Why approval required:")
+    )
+
+
+def blast_radius_unassessed_note(preview: Mapping[str, Any]) -> str | None:
+    """Return a compact note when some blast-radius dimensions were not assessed."""
+
+    if not blast_radius_has_unassessed_dimensions(preview):
+        return None
+    if _is_filesystem_operation(preview):
+        return "Not applicable to this filesystem operation."
+    return "Not evaluated by this policy mode."
+
+
+def approval_proof_detail_rows(
+    *,
+    tool_name: str,
+    resource_display: str | None,
+    risk_class: str,
+    reason: str,
+    payload_hash: str,
+    policy_rule_id: str,
+    request_id: str,
+    created_at: int,
+    expires_at: int,
+    action_gate_metadata: dict[str, Any] | None,
+) -> tuple[tuple[str, str], ...]:
+    """Return compact human proof rows for Approval Center detail pages."""
+
+    metadata = action_gate_metadata if isinstance(action_gate_metadata, dict) else {}
+    policy_decision = str(metadata.get("policy_decision", "approval"))
+    rows: list[tuple[str, str]] = [
+        ("Decision", approval_access_plain_label(reason=reason, policy_decision=policy_decision)),
+        ("Why approval is required", human_approval_reason_label(reason)),
+        ("Tool", tool_name),
+        ("Target", resource_display or "none"),
+        ("Risk", risk_class_plain_label(risk_class)),
+        ("Policy rule", policy_rule_id),
+    ]
+    action_family = metadata.get("action_family")
+    if isinstance(action_family, str) and action_family:
+        rows.append(("Action family", action_family))
+    for key, label in (
+        ("approval_status", "Approval status"),
+        ("execution_status", "Execution status"),
+        ("target_reached", "Target reached"),
+    ):
+        value = metadata.get(key)
+        if isinstance(value, bool):
+            rows.append((label, "true" if value else "false"))
+        elif isinstance(value, str) and value:
+            rows.append((label, value))
+    rows.extend([
+        ("Request id", request_id),
+        ("Payload hash", payload_hash),
+        ("Created", str(created_at)),
+        ("Expires", str(expires_at)),
+    ])
+    blast_radius = metadata.get("blast_radius")
+    if isinstance(blast_radius, Mapping):
+        for line in assessed_blast_radius_lines(blast_radius):
+            if ":" not in line:
+                continue
+            label, value = line.split(":", 1)
+            rows.append((label.strip(), value.strip()))
+        note = blast_radius_unassessed_note(blast_radius)
+        if note is not None:
+            rows.append(("Scope note", note))
+    return tuple(rows)
+
+
+def approval_raw_evidence_rows(
+    *,
+    client_id: str,
+    session_id_prefix: str,
+    action_display: str,
+    action_gate_metadata: dict[str, Any] | None,
+) -> tuple[tuple[str, str], ...]:
+    """Return bounded raw/debug rows for Approval Center advanced evidence."""
+
+    metadata = action_gate_metadata if isinstance(action_gate_metadata, dict) else {}
+    rows: list[tuple[str, str]] = [
+        ("Client", client_id),
+        ("Session prefix", session_id_prefix),
+        ("Action", action_display),
+    ]
+    for key, label in (
+        ("role", "Role"),
+        ("authority", "Authority"),
+        ("policy_decision", "Policy decision"),
+        ("redirect_playbook_id", "Redirect"),
+    ):
+        value = metadata.get(key)
+        if isinstance(value, str) and value:
+            rows.append((label, value))
+    blast_radius = metadata.get("blast_radius")
+    if isinstance(blast_radius, Mapping):
+        from agentveil_mcp_proxy.permission_doctor import blast_radius_lines
+
+        for line in blast_radius_lines(blast_radius):
+            if ":" not in line:
+                continue
+            label, value = line.split(":", 1)
+            rows.append((f"Blast radius: {label.strip()}", value.strip()))
+    return tuple(rows)
 
 
 def pending_approval_dict(

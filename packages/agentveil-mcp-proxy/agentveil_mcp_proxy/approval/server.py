@@ -17,6 +17,8 @@ from typing import Any, Callable, Mapping
 from urllib.parse import parse_qs
 
 from agentveil_mcp_proxy.evidence.observability import (
+    approval_proof_detail_rows,
+    approval_raw_evidence_rows,
     bounded_action_display,
     bounded_reason_for_record,
     bounded_resource_display,
@@ -26,7 +28,6 @@ from agentveil_mcp_proxy.evidence.observability import (
     risk_class_plain_label,
     terminal_state_for_record_status,
 )
-from agentveil_mcp_proxy.permission_doctor import blast_radius_lines
 
 
 MAX_POST_BODY_BYTES = 8192
@@ -939,6 +940,32 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
                 "</form>"
             )
         session_prefix = prompt.session_id[:8]
+        proof_rows = approval_proof_detail_rows(
+            tool_name=prompt.tool_name,
+            resource_display=prompt.resource_display,
+            risk_class=prompt.risk_class,
+            reason=prompt.reason,
+            payload_hash=prompt.payload_hash,
+            policy_rule_id=prompt.policy_rule_id,
+            request_id=prompt.request_id,
+            created_at=prompt.created_at,
+            expires_at=prompt.expires_at,
+            action_gate_metadata=prompt.action_gate_metadata,
+        )
+        proof_items = "".join(
+            f"<dt>{escape(label)}</dt><dd>{escape(value)}</dd>"
+            for label, value in proof_rows
+        )
+        raw_rows = approval_raw_evidence_rows(
+            client_id=prompt.client_id,
+            session_id_prefix=session_prefix,
+            action_display=prompt.action_display,
+            action_gate_metadata=prompt.action_gate_metadata,
+        )
+        raw_items = "".join(
+            f"<dt>{escape(label)}</dt><dd>{escape(value)}</dd>"
+            for label, value in raw_rows
+        )
         body = f"""
 {back_link}
 <p class="approval-summary">{escape(summary)}</p>
@@ -955,72 +982,21 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
 <button type=\"submit\" name=\"decision\" value=\"deny\">Deny</button>
 </form>
 {similar}
-<details class="approval-technical-details">
-<summary>Technical details</summary>
+<details class="approval-proof-details">
+<summary>Proof details</summary>
 <dl class="approval-detail">
-<dt>Client</dt><dd>{escape(prompt.client_id)}</dd>
-<dt>Session prefix</dt><dd>{escape(session_prefix)}</dd>
-<dt>Request</dt><dd>{escape(prompt.request_id)}</dd>
-<dt>Action</dt><dd>{escape(prompt.action_display)}</dd>
-<dt>Payload hash</dt><dd>{escape(prompt.payload_hash)}</dd>
-<dt>Policy rule</dt><dd>{escape(prompt.policy_rule_id)}</dd>
-{self._render_level2_metadata(prompt.action_gate_metadata)}
-<dt>Created</dt><dd>{prompt.created_at}</dd>
-<dt>Expires</dt><dd>{prompt.expires_at}</dd>
+{proof_items}
+</dl>
+<details class="approval-raw-evidence">
+<summary>Raw evidence</summary>
+<dl class="approval-detail">
+{raw_items}
 </dl>
 {detail}
 </details>
+</details>
 """
         return self._page(title, body, page_kind="detail")
-
-    def _render_blast_radius(self, metadata: Any) -> str:
-        if not isinstance(metadata, dict):
-            return ""
-        blast_radius = metadata.get("blast_radius")
-        if not isinstance(blast_radius, Mapping):
-            return ""
-        lines = blast_radius_lines(blast_radius)
-        if not lines:
-            return ""
-        rendered = "".join(
-            f"<div><dt>{escape(line.split(':', 1)[0])}</dt>"
-            f"<dd>{escape(line.split(':', 1)[1].strip())}</dd></div>"
-            for line in lines
-            if ":" in line
-        )
-        if not rendered:
-            return ""
-        return f"<dt>Blast radius</dt><dd><dl>{rendered}</dl></dd>"
-
-    def _render_level2_metadata(self, metadata: Any) -> str:
-        blast_radius_html = self._render_blast_radius(metadata)
-        if not isinstance(metadata, dict):
-            return blast_radius_html
-        labels = (
-            ("role", "Role"),
-            ("authority", "Authority"),
-            ("action_family", "Action family"),
-            ("policy_decision", "Policy decision"),
-            ("approval_status", "Approval status"),
-            ("execution_status", "Execution status"),
-            ("target_reached", "Target reached"),
-            ("redirect_playbook_id", "Redirect"),
-        )
-        items = []
-        for key, label in labels:
-            if key not in metadata:
-                continue
-            value = metadata[key]
-            if isinstance(value, bool):
-                rendered = "true" if value else "false"
-            elif isinstance(value, str):
-                rendered = value
-            else:
-                continue
-            items.append(f"<dt>{escape(label)}</dt><dd>{escape(rendered)}</dd>")
-        if not items:
-            return blast_radius_html
-        return blast_radius_html + "".join(items)
 
     def _security_notice_html(self) -> str:
         return (

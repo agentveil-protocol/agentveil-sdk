@@ -3079,7 +3079,8 @@ def test_dashboard_and_detail_render_level2_metadata_without_raw_payload(tmp_pat
         prompt = server.pending_prompts()[0]
         dashboard = _dashboard_list_html(server)
         detail = httpx.get(server.approval_url(prompt.request_id)).text
-        assert "Technical details" in detail
+        assert "Proof details" in detail
+        assert "Raw evidence" in detail
         assert "Payload hash" in detail
         for text in (dashboard, detail):
             assert "The agent wants to run" in text
@@ -3089,23 +3090,36 @@ def test_dashboard_and_detail_render_level2_metadata_without_raw_payload(tmp_pat
             assert "ghp_private" not in text
             assert "source_code" not in text
             assert "session-1234567890" not in text
-        for text in (detail,):
-            assert "Role" in text
-            assert "implementer" in text
-            assert "Authority" in text
-            assert "implement" in text
-            assert "Action family" in text
-            assert "create" in text
-            assert "Policy decision" in text
-            assert "approval" in text
-            assert "Approval status" in text
-            assert "pending" in text
-            assert "Execution status" in text
-            assert "not_reached" in text
-            assert "Target reached" in text
-            assert "false" in text
-            assert "Redirect" in text
-            assert "request_approval" in text
+        proof_view, _, _ = detail.partition('<details class="approval-raw-evidence">')
+        assert "Decision" in proof_view
+        assert "Approval required" in proof_view
+        assert "Why approval is required" in proof_view
+        assert "Policy rule" in proof_view
+        assert "Execution status" in proof_view
+        assert "not_reached" in proof_view
+        assert "Target reached" in proof_view
+        assert "false" in proof_view
+        assert "Request id" in proof_view
+        assert "Action family" in proof_view
+        assert "create" in proof_view
+        for unknown_row in (
+            "Secret access: unknown",
+            "Shell execution: unknown",
+            "Package install: unknown",
+            "Deploy/release: unknown",
+            "Credential posture: unknown",
+            "External network/send: unknown",
+        ):
+            assert unknown_row not in proof_view
+        assert "Not evaluated by this policy mode." in proof_view
+        raw_view = detail.split('<details class="approval-raw-evidence">', 1)[1]
+        assert "Role" in raw_view
+        assert "implementer" in raw_view
+        assert "Authority" in raw_view
+        assert "implement" in raw_view
+        assert "Redirect" in raw_view
+        assert "request_approval" in raw_view
+        assert "Blast radius: Secret access" in raw_view
     finally:
         server.stop()
         store.close()
@@ -3628,8 +3642,25 @@ def test_write_file_approval_detail_shows_bounded_target_and_write_risk(tmp_path
         assert "Unknown risk" not in detail
         assert "Approve</button>" in detail
         assert "Deny</button>" in detail
-        main_view, _, _ = detail.partition("<details class=\"approval-technical-details\">")
+        main_view, _, _ = detail.partition('<details class="approval-proof-details">')
         assert "sha256:" not in main_view
+        proof_view, _, raw_tail = detail.partition('<details class="approval-raw-evidence">')
+        assert "Proof details" in proof_view
+        assert "Decision" in proof_view
+        assert "Payload hash" in proof_view
+        assert "Request id" in proof_view
+        for unknown_row in (
+            "Secret access: unknown",
+            "Shell execution: unknown",
+            "Package install: unknown",
+            "Deploy/release: unknown",
+            "Credential posture: unknown",
+            "External network/send: unknown",
+        ):
+            assert unknown_row not in proof_view
+        assert "Not applicable to this filesystem operation." in proof_view
+        assert "Raw evidence" in raw_tail
+        assert "Blast radius: Secret access" in raw_tail
     finally:
         server.stop()
         store.close()

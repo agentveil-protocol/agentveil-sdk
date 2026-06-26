@@ -92,7 +92,7 @@ def _assert_read_tool_allowed(response: dict, *, tool: str) -> None:
 
 
 def _assert_main_view_human_friendly(html: str) -> None:
-    main_view, _, _ = html.partition('<details class="approval-technical-details">')
+    main_view, _, _ = html.partition('<details class="approval-proof-details">')
     assert WRITE_PROBE in main_view
     assert "write_file" in main_view
     assert "Write action" in main_view
@@ -100,6 +100,30 @@ def _assert_main_view_human_friendly(html: str) -> None:
     assert "Approve</button>" in main_view
     assert "Deny</button>" in main_view
     assert "sha256:" not in main_view
+
+
+def _assert_proof_details_compact(html: str) -> None:
+    proof_view, _, raw_tail = html.partition('<details class="approval-raw-evidence">')
+    assert "Proof details" in proof_view
+    assert "Decision" in proof_view
+    assert "Why approval is required" in proof_view
+    assert "Policy rule" in proof_view
+    assert "Execution status" in proof_view
+    assert "Target reached" in proof_view
+    assert "Request id" in proof_view
+    assert "Payload hash" in proof_view
+    assert "Secret access: unknown" not in proof_view
+    for unknown_row in (
+        "Shell execution: unknown",
+        "Package install: unknown",
+        "Deploy/release: unknown",
+        "Credential posture: unknown",
+        "External network/send: unknown",
+    ):
+        assert unknown_row not in proof_view
+    assert "Not applicable to this filesystem operation." in proof_view
+    assert "Raw evidence" in raw_tail
+    assert "Blast radius: Secret access" in raw_tail
 
 
 def main() -> int:
@@ -171,9 +195,10 @@ def main() -> int:
         with httpx.Client() as client:
             html = client.get(approval_url, timeout=5.0).text
         _assert_main_view_human_friendly(html)
+        _assert_proof_details_compact(html)
         assert "The agent wants to run write_file" in html
 
-        print("P0.1_CLAUDE_SETUP_APPROVAL_UX_SMOKE: ok")
+        print("P0.2_CLAUDE_SETUP_APPROVAL_UX_SMOKE: ok")
         print(f"setup_cmd={' '.join(setup_cmd)}")
         print(f"read_tools=list_workspace,read_file,get_file_info,instruction_surface_status")
         print(f"write_file_status={data.get('status')}")
