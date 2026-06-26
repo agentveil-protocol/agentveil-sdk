@@ -119,6 +119,18 @@ def _tool_call(tool: str) -> str:
     })
 
 
+def _hard_block_data(reason: str) -> dict[str, Any]:
+    return {
+        # claim-check: allow "blocked" as JSON-RPC status vocabulary.
+        "status": "blocked",
+        "reason": reason,
+        "reason_code": reason,
+        "approval_possible": False,
+        "retry_after_approval": False,
+        "next_step": "This action cannot be approved. Adjust the tool call or local policy.",
+    }
+
+
 def test_off_mode_forwards_undeclared_without_event():
     proxy = _RecordingPassthrough(_config(mode="off"))
 
@@ -145,11 +157,7 @@ def test_observe_mode_blocks_extra_downstream_tool_before_policy(tmp_path):
         assert proxy.policy_calls == 0
         error = responses[0]["error"]
         assert error["code"] == JSONRPC_POLICY_BLOCKED
-        assert error["data"] == {
-            # claim-check: allow "blocked" as JSON-RPC status vocabulary.
-            "status": "blocked",
-            "reason": "extra_undeclared_downstream_tool",
-        }
+        assert error["data"] == _hard_block_data("extra_undeclared_downstream_tool")
         extra_events = [
             event for event in proxy.security_events
             if event.get("type") == "action_gate_extra_downstream_tool"
@@ -211,11 +219,7 @@ def test_enforce_mode_blocks_undeclared_without_forwarding():
     assert proxy.forwarded == []
     error = responses[0]["error"]
     assert error["code"] == JSONRPC_POLICY_BLOCKED
-    assert error["data"] == {
-        # claim-check: allow "blocked" as JSON-RPC status vocabulary.
-        "status": "blocked",
-        "reason": "extra_undeclared_downstream_tool",
-    }
+    assert error["data"] == _hard_block_data("extra_undeclared_downstream_tool")
     assert proxy.security_events[0] == {
         "type": "action_gate_extra_downstream_tool",
         "action": "blocked_pre_approval",
@@ -291,7 +295,7 @@ def test_unknown_tool_call_denied_before_approval():
     assert proxy.forwarded == []
     error = responses[0]["error"]
     assert error["code"] == JSONRPC_POLICY_BLOCKED
-    assert error["data"] == {"status": "blocked", "reason": "unknown_tool"}  # claim-check: allow "blocked" is expected JSON-RPC error data vocabulary.
+    assert error["data"] == _hard_block_data("unknown_tool")  # claim-check: allow "blocked" is expected JSON-RPC error data vocabulary.
 
     # Security evidence carries the tool-identity classification and records
     # only the tool name, not raw arguments.
@@ -320,11 +324,11 @@ def test_spoofed_tool_name_denied_before_approval():
 
     fs_error = fs_responses[0]["error"]
     assert fs_error["code"] == JSONRPC_POLICY_BLOCKED
-    assert fs_error["data"] == {"status": "blocked", "reason": "unknown_tool"}  # claim-check: allow "blocked" is JSON-RPC error data vocabulary.
+    assert fs_error["data"] == _hard_block_data("unknown_tool")  # claim-check: allow "blocked" is JSON-RPC error data vocabulary.
 
     shell_error = shell_responses[0]["error"]
     assert shell_error["code"] == JSONRPC_POLICY_BLOCKED
-    assert shell_error["data"] == {"status": "blocked", "reason": "unknown_tool"}  # claim-check: allow "blocked" is JSON-RPC error data vocabulary.
+    assert shell_error["data"] == _hard_block_data("unknown_tool")  # claim-check: allow "blocked" is JSON-RPC error data vocabulary.
 
     recorded = [
         (e.get("type"), e.get("reason"), e.get("risk_class"), e.get("tool"))
