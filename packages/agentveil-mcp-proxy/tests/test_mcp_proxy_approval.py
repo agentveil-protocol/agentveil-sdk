@@ -35,9 +35,11 @@ from agentveil_mcp_proxy.approval import (
     HeadlessPolicyError,
 )
 from agentveil_mcp_proxy.approval.server import (
+    SECURITY_HEADERS,
     TERMINAL_ALREADY_DECIDED_APPROVE,
     TERMINAL_ALREADY_DECIDED_DENY,
     TERMINAL_APPROVAL_EXPIRED,
+    approval_content_security_policy,
 )
 from agentveil_mcp_proxy.approval.notification import NotificationResult
 from agentveil_mcp_proxy.classification import ToolCallClassifier
@@ -66,6 +68,17 @@ SECRET = "SECRET_APPROVAL_PAYLOAD"
 PACKAGE_MANAGER_SECRET = "marker-pkg"
 PACKAGE_MANAGER_COMMAND_FRAGMENT = "npm install"
 TOKEN_RE = re.compile(r'name="csrf_token" value="([^"]+)"')
+CSP_NONCE_RE = re.compile(r"nonce-([A-Za-z0-9_-]+)")
+
+
+def _assert_no_unsafe_inline_script_csp(csp: str) -> None:
+    assert "script-src 'self' 'unsafe-inline'" not in csp
+
+
+def _extract_script_nonce(csp: str) -> str:
+    match = CSP_NONCE_RE.search(csp)
+    assert match, csp
+    return match.group(1)
 APPROVAL_GRANT_SEED = bytes.fromhex("33" * 32)
 APPROVAL_GRANT_DID = _public_key_to_did(bytes(SigningKey(APPROVAL_GRANT_SEED).verify_key))
 
@@ -3389,6 +3402,17 @@ def test_approval_center_list_includes_inline_approve_deny_for_multiple_pending(
         store.close()
 
 
+def test_approval_security_headers_do_not_allow_unsafe_inline_scripts() -> None:
+    base_csp = SECURITY_HEADERS["Content-Security-Policy"]
+    _assert_no_unsafe_inline_script_csp(base_csp)
+    assert "script-src 'self'" in base_csp
+    assert "style-src 'self' 'unsafe-inline'" in base_csp
+
+    nonce_csp = approval_content_security_policy(script_nonce="test-nonce-value")
+    _assert_no_unsafe_inline_script_csp(nonce_csp)
+    assert "script-src 'self' 'nonce-test-nonce-value'" in nonce_csp
+
+
 def test_post_decision_page_instructs_retry():
     server = ApprovalServer()
     server.start()
@@ -3398,9 +3422,73 @@ def test_post_decision_page_instructs_retry():
             csrf = _get_csrf(client, url)
             response = _post_decision(client, url, decision="approve", csrf=csrf)
         assert response.status_code == 200
-        assert "Decision recorded" in response.text
-        assert "Retry the same MCP tool call" in response.text
-        assert "without changing tool, target, or payload" in response.text
+        text = response.text
+        csp = response.headers.get("content-security-policy", "")
+        _assert_no_unsafe_inline_script_csp(csp)
+        nonce = _extract_script_nonce(csp)
+        assert f'<script nonce="{nonce}"' in text
+        assert "Decision recorded" in text
+        assert "Retry the same MCP tool call" in text
+        assert "without changing tool, target, or payload" in text
+        assert "Local proof" in text
+        assert "approval-local-proof-command" in text
+        assert "agentveil-mcp-proxy events show --last --verify" in text
+        assert "Copy command" in text
+        assert "After the agent retries the same MCP call" in text
+        assert "/proof" not in text
+        assert "auto-resume" not in text.lower()
+    finally:
+        server.stop()
+
+
+def test_post_decision_deny_page_points_to_local_proof():
+    server = ApprovalServer()
+    server.start()
+    try:
+        url = server.register(_prompt_not_expired("req-deny-proof"))
+        with httpx.Client() as client:
+            csrf = _get_csrf(client, url)
+            response = _post_decision(client, url, decision="deny", csrf=csrf)
+        assert response.status_code == 200
+        text = response.text
+        csp = response.headers.get("content-security-policy", "")
+        _assert_no_unsafe_inline_script_csp(csp)
+        nonce = _extract_script_nonce(csp)
+        assert f'<script nonce="{nonce}"' in text
+        assert "Decision recorded" in text
+        assert "denied and will not run" in text
+        assert "Local proof" in text
+        assert "approval-local-proof-command" in text
+        assert "agentveil-mcp-proxy events show --last --verify" in text
+        assert "Copy command" in text
+        assert "This denial was recorded" in text
+        assert "Retry the same MCP tool call" not in text
+        assert "agent retries the same MCP call" not in text
+        assert "/proof" not in text
+    finally:
+        server.stop()
+
+
+def test_pending_approval_page_shows_quiet_local_recording_note():
+    server = ApprovalServer()
+    server.start()
+    try:
+        url = server.register(_prompt_not_expired("req-pending-proof"))
+        with httpx.Client() as client:
+            response = client.get(url)
+        assert response.status_code == 200
+        text = response.text
+        csp = response.headers.get("content-security-policy", "")
+        _assert_no_unsafe_inline_script_csp(csp)
+        assert "nonce-" not in csp
+        assert "<script" not in text
+        assert "This decision will be recorded locally" in text
+        assert "approval-local-proof-command" not in text
+        assert "Copy command" not in text
+        assert "agentveil-mcp-proxy events show --last --verify" not in text
+        assert "Local proof" not in text
+        assert "/proof" not in text
+        assert "auto-resume" not in text.lower()
     finally:
         server.stop()
 

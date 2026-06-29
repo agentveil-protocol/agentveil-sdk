@@ -24,8 +24,28 @@ from agentveil_mcp_proxy.evidence.store import (
 
 
 DEFAULT_SHOW_LAST = 10
+LOCAL_PROOF_INSPECTION_COMMAND = "agentveil-mcp-proxy events show --last --verify"
+LOCAL_PROOF_BLOCK_TITLE = "Local proof"
+LOCAL_PROOF_PENDING_QUIET_LINE = "This decision will be recorded locally."
+LOCAL_PROOF_POST_APPROVE_BODY = (
+    "After the agent retries the same MCP call, verify the decision and outcome locally:"
+)
+LOCAL_PROOF_POST_DENY_BODY = (
+    "This denial was recorded. Verify the decision locally:"
+)
+LOCAL_PROOF_INSPECTION_HINT = (
+    f"After retry, inspect local proof with `{LOCAL_PROOF_INSPECTION_COMMAND}`."
+)
+LOCAL_PROOF_INSPECTION_DISCOVER_HINT = (
+    f"Inspect local proof with `{LOCAL_PROOF_INSPECTION_COMMAND}`."
+)
+_LOCAL_PROOF_SUMMARY = (
+    "Local proof shows what was requested, decided, executed, and whether the "
+    "target was reached."
+)
 _EMPTY_NEXT_STEP = (
-    "Run a routed MCP action, then run `agentveil-mcp-proxy events show --last`."
+    "Run a routed MCP action, then run "
+    f"`{LOCAL_PROOF_INSPECTION_COMMAND}`."
 )
 _SETUP_NEXT_STEP = (
     "Run `agentveil-mcp-proxy setup status` or initialize the proxy with `init`."
@@ -105,13 +125,26 @@ def _reason_summary(record: PendingApproval, *, decision: str) -> str:
 
 def _next_step_for_decision(decision: str) -> str | None:
     if decision == "approval_required":
-        return "Open the approval page, decide, then retry the same MCP tool call."
+        return (
+            "Open the approval page, decide, then retry the same MCP tool call. "
+            f"{LOCAL_PROOF_INSPECTION_DISCOVER_HINT}"
+        )
+    if decision == "approved":
+        return (
+            "Retry the same MCP tool call without changing tool, target, or payload. "
+            f"{LOCAL_PROOF_INSPECTION_HINT}"
+        )
+    if decision == "target_reached":
+        return LOCAL_PROOF_INSPECTION_DISCOVER_HINT
     if decision == "redirected":
         return "Follow the redirect hint and retry with the suggested controlled tool."
     if decision == "hard_blocked":
         return "Adjust the tool call or policy; approval will not help for this action."
     if decision == "execution_not_reached":
-        return "Inspect approval status and retry if the action should still run."
+        return (
+            "Inspect approval status and retry if the action should still run. "
+            f"{LOCAL_PROOF_INSPECTION_DISCOVER_HINT}"
+        )
     return None
 
 
@@ -354,6 +387,7 @@ def format_events_show_human(payload: Mapping[str, Any]) -> str:
             lines.append(f"  {reason}")
     if payload.get("next_step") and not payload.get("empty"):
         lines.append(f"Next step: {payload['next_step']}")
+    lines.append(_LOCAL_PROOF_SUMMARY)
     lines.append("Use --json or --debug for structured or deeper bounded fields.")
     return "\n".join(lines)
 
@@ -364,6 +398,13 @@ def events_show_json(payload: Mapping[str, Any]) -> str:
 
 __all__ = [
     "DEFAULT_SHOW_LAST",
+    "LOCAL_PROOF_INSPECTION_COMMAND",
+    "LOCAL_PROOF_BLOCK_TITLE",
+    "LOCAL_PROOF_PENDING_QUIET_LINE",
+    "LOCAL_PROOF_POST_APPROVE_BODY",
+    "LOCAL_PROOF_POST_DENY_BODY",
+    "LOCAL_PROOF_INSPECTION_DISCOVER_HINT",
+    "LOCAL_PROOF_INSPECTION_HINT",
     "build_event_show_entry",
     "build_events_show_payload",
     "events_show_json",

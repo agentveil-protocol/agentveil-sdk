@@ -1000,6 +1000,7 @@ def test_run_returns_approval_required_without_waiting_or_forwarding(tmp_path, m
         "Approval required. Open the approval page, approve or deny, then retry the same "
         "MCP tool call without changing tool, target, or payload."
     )
+    assert "events show --last --verify" in response["error"]["data"]["proof_inspection_hint"]
     _assert_approval_retry_contract(response["error"]["data"])
     assert response["error"]["data"]["reason"] == "local_approval_required"
     assert response["error"]["data"]["reason_code"] == "approval_required"
