@@ -709,15 +709,20 @@ def test_open_circuit_read_fallback_defaults_to_approval_not_forwarded(tmp_path)
 
     response = _responses(client_out.getvalue())[0]
     assert response["error"]["code"] == JSONRPC_APPROVAL_REQUIRED
-    assert response["error"]["data"] == {
-        "status": "approval_required",
-        "reason": "runtime_gate_unavailable",
-        "reason_code": "runtime_gate_unavailable",
-        "approval_possible": True,
-        "retry_after_approval": True,
-        "next_step": "Open approval_url, approve or deny, then retry the same MCP tool call.",
-        "suggested_tool": "get_file_contents",
-    }
+    data = response["error"]["data"]
+    assert data["status"] == "approval_required"
+    assert data["reason"] == "runtime_gate_unavailable"
+    assert data["reason_code"] == "runtime_gate_unavailable"
+    assert data["approval_possible"] is True
+    assert data["retry_after_approval"] is True
+    assert data["retry_contract"] == "same_tool_call"
+    assert data["retry_same_tool_call"] is True
+    assert data["approved_retry_requires_same_tool"] is True
+    assert data["approved_retry_requires_same_resource"] is True
+    assert data["approved_retry_requires_same_payload"] is True
+    assert "same MCP tool call" in data["next_step"]
+    assert "without changing tool, target, or payload" in data["next_step"]
+    assert data["suggested_tool"] == "get_file_contents"
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
     assert SECRET not in client_out.getvalue()
 
