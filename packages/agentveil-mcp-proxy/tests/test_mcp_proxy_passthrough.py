@@ -82,11 +82,28 @@ def test_mcp_error_user_message_distinguishes_actionable_outcomes():
         "status": "policy_denied",
         "reason": "secret_path_blocked",
     })
+    classifier = mcp_error_user_message({
+        "status": "blocked",  # claim-check: allow bounded JSON-RPC status vocabulary in this unit test.
+        "reason": "classifier_error",
+    })
+    runtime_sanity = mcp_error_user_message({
+        "status": "blocked",  # claim-check: allow bounded JSON-RPC status vocabulary in this unit test.
+        "reason": "untrusted_runtime_decision",
+    })
+    policy_stop = mcp_error_user_message({
+        "status": "blocked",  # claim-check: allow bounded JSON-RPC status vocabulary in this unit test.
+        "reason": "local_policy_block",
+    })
 
     assert "approve or deny" in approval
     assert "sandbox" in outside.lower()
     assert "MCP tool is not available" in missing_tool
     assert "Approval will not help" in secret
+    assert "could not classify" in classifier.lower()
+    assert "Stopped by policy" not in classifier
+    assert "Proxy/runtime decision error" in runtime_sanity
+    assert "Stopped by policy" not in runtime_sanity
+    assert "Stopped by policy" in policy_stop
 
 
 @pytest.fixture(autouse=True)
@@ -1988,8 +2005,8 @@ def test_classifier_exception_on_tool_call_fails_closed(tmp_path):
     assert response["jsonrpc"] == "2.0"
     assert response["id"] == "call-1"
     assert response["error"]["code"] == JSONRPC_POLICY_BLOCKED
-    assert response["error"]["message"].startswith("Stopped by policy:")
-    assert "cannot be approved" in response["error"]["message"]
+    assert "could not classify" in response["error"]["message"].lower()
+    assert "Stopped by policy" not in response["error"]["message"]
     _assert_blocked_contract(response["error"]["data"], reason="classifier_error")
     assert passthrough.classifier_errors == 1
     # claim-check: allow "never"/"blocked" describe the sanitized expected response asserted below

@@ -819,10 +819,14 @@ def test_unverified_receipt_is_rejected_without_downstream_execution(tmp_path):
 
     response = _responses(client_out.getvalue())[0]
     assert response["error"]["code"] == JSONRPC_RUNTIME_GATE_UNTRUSTED
-    assert response["error"]["data"] == {
-        "status": "blocked",
-        "reason": "untrusted_runtime_decision",
-    }
+    data = response["error"]["data"]
+    assert data["status"] == "blocked"  # claim-check: allow bounded JSON-RPC status vocabulary in this runtime-gate test.
+    assert data["reason"] == "untrusted_runtime_decision"
+    assert data["reason_code"] == "untrusted_runtime_decision"
+    assert data["approval_possible"] is False
+    assert data["retry_after_approval"] is False
+    assert "Proxy/runtime decision error" in response["error"]["message"]
+    assert "Stopped by policy" not in response["error"]["message"]
     assert passthrough.security_events[-1] == {
         "type": "runtime_decision_untrusted",
         "action": "blocked",

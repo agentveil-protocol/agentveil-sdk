@@ -315,6 +315,31 @@ _DEFAULT_POLICY_STOP_USER_MESSAGE = (
     "Stopped by policy: this action is not allowed by local policy and cannot "
     "be approved."
 )
+_CLASSIFIER_ERROR_USER_MESSAGE = (
+    "Proxy could not classify this tool call. Approval will not help. "
+    "Retry; report if persistent."
+)
+_PROXY_RUNTIME_DECISION_ERROR_USER_MESSAGE = (
+    "Proxy/runtime decision error: this action could not be evaluated safely. "
+    "Approval will not help. Retry; report if persistent."
+)
+_DEDICATED_USER_MESSAGE_REASONS = frozenset({
+    "classifier_error",
+    "unknown_policy_decision",
+    "untrusted_runtime_decision",
+    "unsupported_runtime_decision",
+    "unknown_tool",
+    "unknown_tool_not_advertised",
+    "tool_schema_unavailable",
+    "runtime_gate_not_configured",
+    "runtime_gate_unavailable",
+    "runtime_gate_evidence_unavailable",
+    "approval_evidence_unavailable",
+    "runtime_gate_block",
+    "role_authority_denied",
+    "path_outside_workspace",
+    "secret_path_blocked",
+})
 _DEFAULT_HARD_DENY_NEXT_STEP = (
     "This action cannot be approved. Adjust the tool call or local policy."
 )
@@ -395,6 +420,12 @@ def enrich_mcp_error_contract(
     return data
 
 
+def reason_has_dedicated_user_message(reason: str) -> bool:
+    """Return True when ``mcp_error_user_message`` should replace internal text."""
+
+    return reason in _DEDICATED_USER_MESSAGE_REASONS
+
+
 def mcp_error_user_message(data: Mapping[str, Any]) -> str:
     """Return a differentiated user-facing MCP error message."""
 
@@ -411,6 +442,14 @@ def mcp_error_user_message(data: Mapping[str, Any]) -> str:
         return _TOOL_NOT_AVAILABLE_USER_MESSAGE
     if reason == "secret_path_blocked":
         return _SECRET_PATH_BLOCKED_USER_MESSAGE
+    if reason == "classifier_error":
+        return _CLASSIFIER_ERROR_USER_MESSAGE
+    if reason in {
+        "unknown_policy_decision",
+        "untrusted_runtime_decision",
+        "unsupported_runtime_decision",
+    }:
+        return _PROXY_RUNTIME_DECISION_ERROR_USER_MESSAGE
     if reason in {
         "runtime_gate_not_configured",
         "runtime_gate_unavailable",
@@ -426,15 +465,10 @@ def mcp_error_user_message(data: Mapping[str, Any]) -> str:
         if reason in {
             "local_policy_block",
             "filesystem_delete",
-            "unknown_policy_decision",
-            "untrusted_runtime_decision",
-            "unsupported_runtime_decision",
             "undeclared_tool",
             "extra_undeclared_downstream_tool",
         }:
             return _DEFAULT_POLICY_STOP_USER_MESSAGE
-    if status == "policy_denied":
-        return _DEFAULT_POLICY_STOP_USER_MESSAGE
     return _DEFAULT_POLICY_STOP_USER_MESSAGE
 
 
