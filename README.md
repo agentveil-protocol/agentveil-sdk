@@ -14,11 +14,10 @@
 **The risk isn't what AI says. It's what AI does.**
 
 AgentVeil is an independent action-control layer for AI agents and MCP tools.
-It works alongside agent runtimes such as Cursor and Claude Code by adding
-policy, approval, sandbox boundaries, and bounded evidence to configured native
-agent actions and routed MCP tool calls.
+It works alongside agent runtimes such as Cursor and Claude Code: attempt,
+decision, controlled path when available, local proof.
 
-[Quick Start](#quick-start) · [Connectors](#connectors-available-today) · [Evidence](#bounded-evidence) · [Scope](#scope) · [Design Basis](#design-basis) · [Docs](docs/)
+[Quick Start](#quick-start) · [The Loop](#the-agentveil-loop) · [Connectors](#connectors-available-today) · [Evidence](#bounded-evidence) · [Scope](#scope) · [Design Basis](#design-basis) · [Docs](docs/)
 
 </div>
 
@@ -29,10 +28,10 @@ pip install agentveil-mcp-proxy
 **Proxy PyPI**: [agentveil-mcp-proxy](https://pypi.org/project/agentveil-mcp-proxy/) | **Website**: [agentveil.dev](https://agentveil.dev) | **Package source**: [`packages/agentveil-mcp-proxy/`](packages/agentveil-mcp-proxy/)
 
 > **Agent action boundary:** AI runtimes execute agents. AgentVeil mediates
-> configured action paths around them. Project connectors can stop supported
-> native agent mutations and redirect the agent to controlled MCP tools. The
-> Core MCP Proxy classifies routed MCP calls, handles allow / approval-required
-> / redirect / policy-stop outcomes, and records bounded local evidence.
+> configured action paths around them. When a native or risky action hits the
+> boundary, AgentVeil decides allow, approval required, redirect guidance toward
+> a controlled path, or hard-block. Routed MCP calls follow the same decision
+> model and record bounded local evidence.
 >
 > AgentVeil is not machine-wide control. Actions outside configured AgentVeil boundaries are not classified or logged.
 
@@ -40,9 +39,25 @@ pip install agentveil-mcp-proxy
   <img src="docs/routed-action-control.png" alt="AgentVeil routed action control flow" width="840">
 </p>
 
-> **Visual overview:** request → AgentVeil boundary → redirect / approval / block → bounded evidence.
+> **Visual overview:** request → AgentVeil boundary → redirect / approval / hard-block → local proof.
 >
 > **Data handling:** AgentVeil is designed to keep raw MCP arguments local by default and to record bounded metadata and hashes for evidence. See [Data Handling](docs/DATA_HANDLING.md).
+
+## The AgentVeil Loop
+
+AgentVeil is one product loop, not a pile of separate components:
+
+| Step | What happens |
+|---|---|
+| Attempt | Agent tries a native mutation or routed MCP action in a configured project |
+| Decision | AgentVeil returns allow, approval required, redirect, or hard-block |
+| Controlled path | When one is available, redirect guidance tells the agent to retry through the managed MCP route |
+| Proof | Bounded local evidence records the decision; inspect it with `events show --last` |
+
+Approval fixes actions that need human review. Redirect tells the agent to
+retry through the controlled MCP route when one is available. Hard-block means
+approval will not help for that action. Local proof is available now through
+the CLI—not a future dashboard page.
 
 ## What AgentVeil Adds
 
@@ -73,8 +88,8 @@ Choose the project folder you want to protect, then reopen / reload Cursor for t
 
 After setup, in the configured project:
 
-- supported native risky agent actions can be denied before execution;
-- the agent is guided toward the AgentVeil MCP route;
+- supported native risky agent actions can be blocked before execution;
+- the agent receives redirect guidance toward the AgentVeil MCP route;
 - routed MCP writes can require approval;
 - AgentVeil records bounded local evidence for decisions and outcomes.
 
@@ -92,7 +107,7 @@ Choose the project folder you want to protect, then reopen / reload Claude Code 
 After setup, in the configured project:
 
 - supported native Claude Code mutation tools are checked by a project-local hook;
-- risky native mutations are denied with a redirect to the controlled MCP route;
+- risky native mutations are blocked with redirect guidance toward the controlled MCP route;
 - AgentVeil MCP writes go through the proxy approval path;
 - bounded evidence is written locally.
 
@@ -111,19 +126,30 @@ This starts the core route: MCP tool calls explicitly pointed at `agentveil-mcp-
 
 ### Verify your setup works
 
-After installing a project connector, ask your agent to do something risky in that project, for example:
+After installing a project connector, walk the current shipped path in that
+project:
+
+1. Ask the agent to read project context. Routed reads such as `list_workspace`,
+   `read_file`, `get_file_info`, and `instruction_surface_status` should allow.
+2. Ask the agent to create or edit a file, for example:
 
 ```text
 Create avp-test.txt with the text hello
 ```
 
-AgentVeil should deny the native risky action, guide the agent toward the controlled MCP route, and require approval before the routed write executes.
-
-Check recent bounded evidence:
+The configured connector should stop the native mutation with redirect
+guidance; the agent should then use the controlled MCP route, where risky
+writes require approval.
+3. Open the approval page when prompted and review the bounded proof details.
+4. Inspect local proof from the CLI:
 
 ```bash
-agentveil-mcp-proxy events list --limit 1
+agentveil-mcp-proxy events show --last
 ```
+
+The default human output should include lines like
+`decision=approval_required` and `tool=write_file` without dumping raw JSON.
+Use `--json` when you need structured fields.
 
 ## Connectors Available Today
 
@@ -133,8 +159,8 @@ for MCP clients that are explicitly configured to call it.
 
 | Surface | Mechanism | What it adds | Status |
 |---|---|---|---|
-| Cursor project connector | Project-local hooks + MCP route | Native mutation deny/redirect, routed MCP approval/evidence | Available |
-| Claude Code project connector | Project-local `PreToolUse` hook + MCP route | Native mutation deny/redirect, routed MCP approval/evidence | Available |
+| Cursor project connector | Project-local hooks + MCP route | Native mutation block + redirect guidance, routed MCP approval/evidence | Available |
+| Claude Code project connector | Project-local `PreToolUse` hook + MCP route | Native mutation block + redirect guidance, routed MCP approval/evidence | Available |
 | Core MCP Proxy | MCP transport boundary | Routed MCP policy, approval, redirect / policy-stop outcomes, bounded evidence | Available |
 
 The Python SDK also includes framework examples and optional helper modules for
@@ -165,8 +191,8 @@ AgentVeil has two public action-control surfaces:
 1. **Project connectors**
    - configured per project/workspace;
    - install managed local hooks and MCP route config;
-   - deny supported native risky agent mutation tools;
-   - redirect the agent toward AgentVeil MCP tools;
+   - block supported native risky agent mutation tools;
+   - return redirect guidance toward AgentVeil MCP tools;
    - use MCP Proxy approval and evidence for routed tool calls.
 
 2. **Core MCP Proxy**
@@ -194,7 +220,17 @@ Actions outside configured AgentVeil boundaries are not classified or logged.
 
 ## Bounded Evidence
 
-AgentVeil records bounded local evidence for controlled actions, so teams can review what an agent requested, what policy decided, whether approval was required, and whether the action executed.
+AgentVeil records bounded local evidence for controlled actions, so you can
+review what an agent requested, whether it was allowed, given redirect guidance,
+sent for approval, returned a hard-block decision, and whether the controlled
+path completed.
+
+Inspect recent decisions:
+
+```bash
+agentveil-mcp-proxy events show --last
+agentveil-mcp-proxy events show --last --json
+```
 
 Example evidence shape:
 
@@ -226,7 +262,7 @@ AgentVeil is designed to fail closed for risky actions. If a supported agent act
 Start with:
 
 ```bash
-agentveil-mcp-proxy events list --limit 10
+agentveil-mcp-proxy events show --last
 agentveil-mcp-proxy setup status --json
 ```
 
@@ -319,8 +355,8 @@ The risk is no longer only what an AI says. The risk is what an AI can do.
 
 AgentVeil focuses on action control:
 
-1. **Deny unsafe native agent actions** in configured project connectors.
-2. **Redirect risky work** toward controlled MCP tools.
+1. **Block unsafe native agent actions** in configured project connectors.
+2. **Return redirect guidance** so the agent can retry through controlled MCP tools.
 3. **Require approval** for routed writes and mutations.
 4. **Record bounded evidence** for audit, review, and compliance.
 

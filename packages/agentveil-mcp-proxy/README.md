@@ -1,19 +1,19 @@
 # agentveil-mcp-proxy
 
 `agentveil-mcp-proxy` is the public AgentVeil package for project connector
-setup and routed MCP action control. AgentVeil is an independent control layer:
-it works alongside agent runtimes and controls actions that are configured to
-pass through AgentVeil.
+setup and routed MCP action control. It works alongside agent runtimes and
+applies the same proof + redirect loop to configured action paths: attempt,
+decision, controlled path when available, local proof.
 
 It includes two public surfaces:
 
 1. **Project connector setup** for supported agent clients such as Cursor and
    Claude Code. Connectors install managed project-local hooks and MCP route
-   config so supported native agent mutations can be denied and redirected to
-   the AgentVeil MCP route.
+   config so supported native agent mutations can be blocked with redirect
+   guidance toward the AgentVeil MCP route.
 2. **Core MCP Proxy**, which wraps a downstream MCP server and applies
    AgentVeil policy to calls that pass through the proxy: allow,
-   approval-required, redirect, or policy-stop, with bounded local evidence.
+   approval-required, redirect, hard-block, with bounded local evidence.
 
 This package is source-available under the Business Source License 1.1. See
 [`LICENSE`](LICENSE).
@@ -85,6 +85,21 @@ agentveil-mcp-proxy setup claude-code --choose-folder --yes
 
 Choose the project folder to protect, then reopen / reload Claude Code for that
 project. See [Claude Code Connector — Scope and Quickstart](docs/CLAUDE_CODE_SCOPE.md).
+
+### Walkable example after setup
+
+In the configured project:
+
+1. Ask the agent to read project files. Routed reads should allow.
+2. Ask the agent to write a file. The configured connector should stop the
+   native mutation with redirect guidance; the agent should then use the
+   controlled MCP route, where risky writes require approval.
+3. Open the approval page and review bounded proof details.
+4. Confirm local proof:
+
+```bash
+agentveil-mcp-proxy events show --last
+```
 
 ### Core MCP Proxy
 
@@ -172,8 +187,17 @@ of the client or host.
 ## Local Evidence
 
 Approval-gated routed tool calls write durable local records to the MCP
-Proxy evidence store under the configured AVP home directory. Export an evidence
-bundle for offline checks:
+Proxy evidence store under the configured AVP home directory.
+
+Inspect recent bounded decisions:
+
+```bash
+agentveil-mcp-proxy events show --last
+agentveil-mcp-proxy events show --last --json
+agentveil-mcp-proxy events show --last --verify
+```
+
+Export an evidence bundle for offline checks:
 
 ```bash
 agentveil-mcp-proxy export-evidence ./bundle.json
@@ -212,8 +236,10 @@ for your specific downstream server.
 | `run` | Run stdio passthrough for MCP clients. |
 | `export-evidence <path>` | Export a local evidence bundle. |
 | `verify <bundle.json>` | Verify a previously exported bundle. |
-| `events list --limit 20` | Print recent privacy-bounded evidence records. |
+| `events show --last` | Show recent bounded evidence in human-readable form. |
+| `events show --last --json` | Show recent bounded evidence as JSON. |
 | `evidence-summary` | Print local evidence counts. |
+| `events list --limit 20` | Lower-level record listing for debugging or export prep. |
 | `setup cursor --choose-folder` | Configure a project-local Cursor connector. |
 | `setup claude-code --choose-folder --yes` | Configure a project-local Claude Code connector. |
 | `setup status --json` | Print bounded connector/proxy status. |
