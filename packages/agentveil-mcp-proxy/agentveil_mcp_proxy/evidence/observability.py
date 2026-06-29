@@ -295,6 +295,26 @@ _PATH_OUTSIDE_SANDBOX_USER_MESSAGE = (
     "Path is outside the configured sandbox. "
     "Use a relative path under the project workspace."
 )
+_TOOL_NOT_AVAILABLE_USER_MESSAGE = (
+    "Controlled MCP tool is not available. Configure or enable the MCP route "
+    "that advertises this tool."
+)
+_SECRET_PATH_BLOCKED_USER_MESSAGE = (
+    "Stopped by policy: this looks like a secret-bearing path. Approval will "
+    "not help for this route."
+)
+_RUNTIME_GATE_UNAVAILABLE_USER_MESSAGE = (
+    "Stopped by policy: Runtime Gate is unavailable for this action. Approval "
+    "will not help for this route."
+)
+_RUNTIME_GATE_BLOCKED_USER_MESSAGE = (
+    "Stopped by Runtime Gate: this action was denied before execution. "
+    "Approval will not help for this decision."
+)
+_DEFAULT_POLICY_STOP_USER_MESSAGE = (
+    "Stopped by policy: this action is not allowed by local policy and cannot "
+    "be approved."
+)
 _DEFAULT_HARD_DENY_NEXT_STEP = (
     "This action cannot be approved. Adjust the tool call or local policy."
 )
@@ -385,29 +405,37 @@ def mcp_error_user_message(data: Mapping[str, Any]) -> str:
             "Approval required: open the approval page, approve or deny, "
             "then retry this request."
         )
-    if status == "policy_denied" and reason == "path_outside_workspace":
+    if reason == "path_outside_workspace":
         return _PATH_OUTSIDE_SANDBOX_USER_MESSAGE
+    if reason in {"unknown_tool_not_advertised", "tool_schema_unavailable", "unknown_tool"}:
+        return _TOOL_NOT_AVAILABLE_USER_MESSAGE
+    if reason == "secret_path_blocked":
+        return _SECRET_PATH_BLOCKED_USER_MESSAGE
+    if reason in {
+        "runtime_gate_not_configured",
+        "runtime_gate_unavailable",
+        "runtime_gate_evidence_unavailable",
+        "approval_evidence_unavailable",
+    }:
+        return _RUNTIME_GATE_UNAVAILABLE_USER_MESSAGE
+    if reason == "runtime_gate_block":
+        return _RUNTIME_GATE_BLOCKED_USER_MESSAGE
     if status == "blocked":  # claim-check: allow bounded JSON-RPC status vocabulary; negative tests assert no downstream execution.
         if reason == "role_authority_denied":
             return str(data.get("explanation") or _DEFAULT_HARD_DENY_NEXT_STEP)
         if reason in {
             "local_policy_block",
             "filesystem_delete",
-            "secret_path_blocked",
-            "unknown_tool_not_advertised",
-            "runtime_gate_not_configured",
-            "runtime_gate_evidence_unavailable",
-            "approval_evidence_unavailable",
+            "unknown_policy_decision",
+            "untrusted_runtime_decision",
+            "unsupported_runtime_decision",
+            "undeclared_tool",
+            "extra_undeclared_downstream_tool",
         }:
-            return (
-                "Stopped by policy: this action is not allowed by local policy "
-                "and cannot be approved."
-            )
+            return _DEFAULT_POLICY_STOP_USER_MESSAGE
     if status == "policy_denied":
-        return _PATH_OUTSIDE_SANDBOX_USER_MESSAGE if reason == "path_outside_workspace" else (
-            "Denied by MCP proxy policy."
-        )
-    return "Denied by MCP proxy policy."
+        return _DEFAULT_POLICY_STOP_USER_MESSAGE
+    return _DEFAULT_POLICY_STOP_USER_MESSAGE
 
 
 def pending_approval_dict(

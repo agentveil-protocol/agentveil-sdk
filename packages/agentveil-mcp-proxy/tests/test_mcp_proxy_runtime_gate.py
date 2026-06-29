@@ -723,7 +723,8 @@ def test_block_does_not_forward_and_returns_sanitized_error(tmp_path):
 
     response = _responses(client_out.getvalue())[0]
     assert response["error"]["code"] == JSONRPC_POLICY_BLOCKED
-    assert response["error"]["message"] == "blocked by AVP Runtime Gate"
+    assert response["error"]["message"].startswith("Stopped by Runtime Gate:")
+    assert "Approval will not help" in response["error"]["message"]
     assert response["error"]["data"]["status"] == "blocked"
     assert response["error"]["data"]["audit_id"] == AUDIT_ID
     assert SECRET not in client_out.getvalue()

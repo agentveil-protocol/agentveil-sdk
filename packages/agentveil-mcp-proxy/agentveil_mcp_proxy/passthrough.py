@@ -831,7 +831,26 @@ def _blocked_error(
         )
     tool_name = classification.tool if classification is not None else None
     enrich_mcp_error_contract(data, tool_name=tool_name)
+    if _is_legacy_block_message(message):
+        message = mcp_error_user_message(data)
     return jsonrpc_error(request_id, JSONRPC_POLICY_BLOCKED, message, data=data)
+
+
+def _is_legacy_block_message(message: str) -> bool:
+    """Return True for old generic block strings that hide actionable context."""
+
+    # claim-check: allow "blocked" as legacy JSON-RPC message vocabulary matched
+    # and rewritten by P0.5c; tests assert the rewritten user-facing output.
+    if message in {
+        "blocked",  # claim-check: allow legacy JSON-RPC message vocabulary rewritten by P0.5c.
+        "blocked by approval decision",  # claim-check: allow legacy JSON-RPC message vocabulary rewritten by P0.5c.
+        "blocked by AVP Runtime Gate",  # claim-check: allow legacy JSON-RPC message vocabulary rewritten by P0.5c.
+        "blocked by local MCP policy",  # claim-check: allow legacy JSON-RPC message vocabulary rewritten by P0.5c.
+        "blocked by MCP policy",  # claim-check: allow legacy JSON-RPC message vocabulary rewritten by P0.5c.
+        "runtime decision evidence unavailable",
+    }:
+        return True
+    return message.startswith("blocked by MCP proxy:")  # claim-check: allow legacy JSON-RPC message prefix rewritten by P0.5c.
 
 
 def _runtime_evidence_unavailable_error(
