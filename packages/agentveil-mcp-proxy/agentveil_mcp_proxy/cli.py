@@ -55,6 +55,7 @@ from agentveil_mcp_proxy.evidence import (
     verify_evidence_bundle_file,
 )
 from agentveil_mcp_proxy.evidence.proof import _fsync_parent_directory
+from agentveil_mcp_proxy.evidence.events_show import DEFAULT_SHOW_LAST
 from agentveil_mcp_proxy.identity import (
     IdentityDecryptError,
     IdentityError,
@@ -2286,6 +2287,46 @@ def _format_event_record(
     )
 
 
+def show_events(
+    *,
+    home: Path | None = None,
+    config_path: Path | None = None,
+    last: int | None = None,
+    session_id: str | None = None,
+    output_json: bool = False,
+    debug: bool = False,
+    verify: bool = False,
+    out: TextIO | None = None,
+) -> int:
+    """Print a human-readable local evidence history."""
+
+    from agentveil_mcp_proxy.evidence.events_show import (
+        build_events_show_payload,
+        events_show_json,
+        format_events_show_human,
+    )
+
+    out = out or sys.stdout
+    paths = proxy_paths(home, config_path)
+    try:
+        payload = build_events_show_payload(
+            evidence_path=paths.proxy_dir / "evidence.sqlite",
+            config_path=paths.config_path,
+            last=last,
+            session_id=session_id,
+            include_debug=debug,
+            verify=verify,
+        )
+    except ValueError as exc:
+        raise ProxyCliError(str(exc)) from exc
+    if output_json:
+        out.write(events_show_json(payload))
+    else:
+        out.write(format_events_show_human(payload))
+        out.write("\n")
+    return payload.get("event_count", 0)
+
+
 def list_events(
     *,
     home: Path | None = None,
@@ -3253,8 +3294,33 @@ def build_parser() -> argparse.ArgumentParser:
     events = subparsers.add_parser("events", help="Manage local evidence records")
     _add_common_path_args(events)
     _add_json_arg(events)
-    events.add_argument("events_action", nargs="?", choices=["list", "tail", "vacuum"])
+    events.add_argument("events_action", nargs="?", choices=["list", "tail", "vacuum", "show"])
     events.add_argument("--limit", type=int, default=DEFAULT_EVENTS_LIMIT)
+    events.add_argument(
+        "--last",
+        nargs="?",
+        const=DEFAULT_SHOW_LAST,
+        type=int,
+        help=(
+            "For events show: show the last N records "
+            f"(default {DEFAULT_SHOW_LAST} when flag is present)"
+        ),
+    )
+    events.add_argument(
+        "--session",
+        default=None,
+        help="For events show: filter records to one session id",
+    )
+    events.add_argument(
+        "--debug",
+        action="store_true",
+        help="For events show: include deeper bounded debug fields",
+    )
+    events.add_argument(
+        "--verify",
+        action="store_true",
+        help="For events show: report local hash-chain integrity status",
+    )
     events.add_argument("--follow", action="store_true", help="Keep printing new records for events tail")
     events.add_argument("--vacuum", action="store_true", help="Prune old terminal evidence records")
     events.add_argument(
@@ -5072,8 +5138,24 @@ def main(argv: list[str] | None = None) -> int:
                     max_age_days=args.max_age_days,
                     before=args.before,
                 )
+            elif action == "show":
+                if args.last is None and args.session is None:
+                    show_last = None
+                elif args.last is None:
+                    show_last = None
+                else:
+                    show_last = args.last
+                show_events(
+                    home=args.home,
+                    config_path=args.config,
+                    last=show_last,
+                    session_id=args.session,
+                    output_json=args.json_output,
+                    debug=args.debug,
+                    verify=args.verify,
+                )
             else:
-                raise ProxyCliError("events action must be list, tail, or vacuum")
+                raise ProxyCliError("events action must be list, tail, vacuum, or show")
             return 0
         if args.command == "control":
             if args.control_action == "status":
