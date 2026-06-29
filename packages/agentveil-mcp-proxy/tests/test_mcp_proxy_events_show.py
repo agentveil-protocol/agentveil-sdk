@@ -311,6 +311,40 @@ def test_events_show_target_reached_after_execution() -> None:
     entry = build_event_show_entry(record)
     assert entry["decision"] == "target_reached"
     assert entry["target_reached"] is True
+    assert entry["reason_summary"] == "Action reached target."
+    assert "Approval required before execution" not in entry["reason_summary"]
+
+
+def test_events_show_why_copy_matches_decision_semantics() -> None:
+    pending = build_event_show_entry(_record("req-pending", status="pending"))
+    approved = build_event_show_entry(_record("req-approved", status="approved"))
+    reached_metadata = json.dumps({"target_reached": True}, separators=(",", ":"))
+    reached = build_event_show_entry(_record(
+        "req-reached",
+        status="executed",
+        metadata_jcs=reached_metadata,
+        granted_by="req-parent",
+    ))
+    denied = build_event_show_entry(_record("req-denied", status="denied"))
+
+    assert pending["decision"] == "approval_required"
+    assert "Approval required before execution" in pending["reason_summary"]
+    assert "Retry the same MCP tool call after approval" in pending["reason_summary"]
+
+    assert approved["decision"] == "approved"
+    assert "Approved by user" in approved["reason_summary"]
+    assert "Retry the same MCP tool call" in approved["reason_summary"]
+    assert approved["reason_summary"] != pending["reason_summary"]
+
+    assert reached["decision"] == "target_reached"
+    assert reached["reason_summary"] == "Action reached target."
+    assert "Approval required before execution" not in reached["reason_summary"]
+    assert reached["reason_summary"] != pending["reason_summary"]
+    assert reached["reason_summary"] != approved["reason_summary"]
+
+    assert denied["decision"] == "hard_blocked"
+    assert denied["reason_summary"] == "Denied by user."
+    assert denied["reason_summary"] != pending["reason_summary"]
 
 
 def test_events_show_execution_not_reached() -> None:
