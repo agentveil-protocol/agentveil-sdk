@@ -6,6 +6,31 @@ All notable changes to the `agentveil` SDK.
 
 No unreleased changes.
 
+## [0.7.25-mcp-proxy] - 2026-06-29
+
+Public beta hardening release for the `agentveil-mcp-proxy` proof and retry
+loop.
+
+### MCP Proxy added
+- Added `events show` as the bounded human-readable local evidence view, with
+  JSON and local hash-chain verification options for scripting and CI use.
+- Added explicit approval retry contract fields for approval-required MCP
+  calls, including same-tool, same-target, and same-payload retry requirements.
+
+### MCP Proxy changed
+- Clarified the public README and package README around the AgentVeil loop:
+  attempt, decision, controlled path when available, and local proof.
+- Improved approval and post-approval copy so users and agents are told to
+  retry the same MCP tool call without changing tool, target, or payload.
+- Refined decision messages for classifier and runtime sanity failures so they
+  no longer look like ordinary policy stops.
+
+### MCP Proxy verification
+- GitHub Actions passed for the merged hardening PR across the supported
+  compatibility matrix.
+- Local installed-path smoke passed after merge, covering read-only tools,
+  write approval, Approval Center UX, and `events show`.
+
 ## [0.7.24-mcp-proxy] - 2026-06-26
 
 Public beta approval UX hardening release for `agentveil-mcp-proxy`.
