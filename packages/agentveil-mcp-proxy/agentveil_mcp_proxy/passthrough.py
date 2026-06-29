@@ -141,12 +141,17 @@ JSONRPC_DOWNSTREAM_ERROR = -32000
 JSONRPC_POLICY_BLOCKED = -32010
 JSONRPC_APPROVAL_REQUIRED = -32011
 APPROVAL_REQUIRED_INSTRUCTIONS = (
-    "Approval required. Open approval_url, approve or deny, then retry the same request."
+    "Approval required. Open the approval page, approve or deny, then retry the same "
+    "MCP tool call without changing tool, target, or payload."
 )
-APPROVAL_REQUIRED_RETRY_SUFFIX = "approve or deny, then retry the same request."
+APPROVAL_REQUIRED_RETRY_SUFFIX = (
+    "approve or deny, then retry the same MCP tool call without changing tool, "
+    "target, or payload."
+)
 
 APPROVAL_REQUIRED_USER_MESSAGE = (
-    "Approval required: open the approval page, approve or deny, then retry this request."
+    "Approval required. Open the approval page, approve or deny, then retry the same "
+    "MCP tool call without changing tool, target, or payload."
 )
 HARD_BLOCK_USER_MESSAGE = (
     # claim-check: allow "Blocked" as a user-facing policy outcome label for denied local actions.

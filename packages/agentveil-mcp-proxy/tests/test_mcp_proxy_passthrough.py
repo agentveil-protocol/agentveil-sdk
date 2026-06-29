@@ -23,6 +23,7 @@ from agentveil_mcp_proxy.cli import ProxyCliError, init_proxy, run_proxy
 from agentveil_mcp_proxy.classification import ToolCallClassifier
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore
 from agentveil_mcp_proxy.evidence.observability import (
+    enrich_mcp_error_contract,
     mcp_error_user_message,
     parse_controlled_path_metadata,
 )
@@ -63,6 +64,32 @@ def _assert_blocked_contract(data: dict, *, reason: str) -> None:
     assert isinstance(data["next_step"], str) and data["next_step"]
 
 
+def _assert_approval_retry_contract(data: dict) -> None:
+    assert data["status"] == "approval_required"
+    assert data["approval_possible"] is True
+    assert data["retry_after_approval"] is True
+    assert data["retry_contract"] == "same_tool_call"
+    assert data["retry_same_tool_call"] is True
+    assert data["approved_retry_requires_same_tool"] is True
+    assert data["approved_retry_requires_same_resource"] is True
+    assert data["approved_retry_requires_same_payload"] is True
+    assert isinstance(data.get("reason_code"), str) and data["reason_code"]
+    assert isinstance(data.get("next_step"), str) and data["next_step"]
+    assert "auto-resume" not in json.dumps(data).lower()
+    assert "automatic rerouting" not in json.dumps(data).lower()
+
+
+def test_enrich_mcp_error_contract_adds_approval_retry_fields() -> None:
+    data = enrich_mcp_error_contract(
+        {"status": "approval_required", "reason": "local_approval_required"},
+        tool_name="github.create_issue",
+    )
+    _assert_approval_retry_contract(data)
+    assert data["reason_code"] == "approval_required"
+    assert data["suggested_tool"] == "create_issue"
+    assert "without changing tool, target, or payload" in data["next_step"]
+
+
 def test_mcp_error_user_message_distinguishes_actionable_outcomes():
     approval = mcp_error_user_message({
         "status": "approval_required",
@@ -96,6 +123,8 @@ def test_mcp_error_user_message_distinguishes_actionable_outcomes():
     })
 
     assert "approve or deny" in approval
+    assert "same MCP tool call" in approval
+    assert "without changing tool, target, or payload" in approval
     assert "sandbox" in outside.lower()
     assert "MCP tool is not available" in missing_tool
     assert "Approval will not help" in secret
@@ -965,14 +994,15 @@ def test_run_returns_approval_required_without_waiting_or_forwarding(tmp_path, m
     assert approval_url.startswith("http://127.0.0.1:")
     assert approval_url in response["error"]["message"]
     assert "Approval required" in response["error"]["message"]
-    assert "approve or deny, then retry the same request" in response["error"]["message"]
+    assert "same MCP tool call" in response["error"]["message"]
+    assert "without changing tool, target, or payload" in response["error"]["message"]
     assert response["error"]["data"]["instructions"] == (
-        "Approval required. Open approval_url, approve or deny, then retry the same request."
+        "Approval required. Open the approval page, approve or deny, then retry the same "
+        "MCP tool call without changing tool, target, or payload."
     )
-    assert response["error"]["data"]["approval_possible"] is True
-    assert response["error"]["data"]["retry_after_approval"] is True
+    _assert_approval_retry_contract(response["error"]["data"])
+    assert response["error"]["data"]["reason"] == "local_approval_required"
     assert response["error"]["data"]["reason_code"] == "approval_required"
-    assert response["error"]["data"]["next_step"]
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
 
 
@@ -4078,8 +4108,7 @@ def test_differentiated_user_messages_for_approval_block_and_redirect() -> None:
     )
 
     assert approval["error"]["message"] == APPROVAL_REQUIRED_USER_MESSAGE
-    assert approval["error"]["data"]["approval_possible"] is True
-    assert approval["error"]["data"]["retry_after_approval"] is True
+    _assert_approval_retry_contract(approval["error"]["data"])
     assert approval["error"]["data"]["reason_code"] == "approval_required"
     assert block["error"]["message"] == HARD_BLOCK_USER_MESSAGE
     assert block["error"]["data"]["approval_possible"] is False

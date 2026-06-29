@@ -344,14 +344,28 @@ _DEFAULT_HARD_DENY_NEXT_STEP = (
     "This action cannot be approved. Adjust the tool call or local policy."
 )
 _APPROVAL_REQUIRED_NEXT_STEP = (
-    "Open approval_url, approve or deny, then retry the same MCP tool call."
+    "Open the approval page, approve or deny, then retry the same MCP tool call "
+    "without changing tool, target, or payload."
 )
+_RETRY_CONTRACT_SAME_TOOL_CALL = "same_tool_call"
 _TOOL_NOT_AVAILABLE_NEXT_STEP = (
     "Configure or enable the MCP route that advertises this tool."
 )
 _DEFAULT_SANDBOX_PATH_HINT = (
     "Use a relative path under the configured sandbox, for example notes/example.txt."
 )
+
+
+def approval_retry_contract_fields() -> dict[str, Any]:
+    """Return bounded machine-readable fields for approval-required retry."""
+
+    return {
+        "retry_contract": _RETRY_CONTRACT_SAME_TOOL_CALL,
+        "retry_same_tool_call": True,
+        "approved_retry_requires_same_tool": True,
+        "approved_retry_requires_same_resource": True,
+        "approved_retry_requires_same_payload": True,
+    }
 
 
 def mcp_error_reason_code(reason: str) -> str:
@@ -391,6 +405,7 @@ def enrich_mcp_error_contract(
     if status == "approval_required":
         data["approval_possible"] = True
         data["retry_after_approval"] = True
+        data.update(approval_retry_contract_fields())
         if "next_step" not in data:
             data["next_step"] = _APPROVAL_REQUIRED_NEXT_STEP
         leaf = _leaf_tool_name(tool_name)
@@ -433,8 +448,8 @@ def mcp_error_user_message(data: Mapping[str, Any]) -> str:
     reason = str(data.get("reason", ""))
     if status == "approval_required":
         return (
-            "Approval required: open the approval page, approve or deny, "
-            "then retry this request."
+            "Approval required. Open the approval page, approve or deny, "
+            "then retry the same MCP tool call without changing tool, target, or payload."
         )
     if reason == "path_outside_workspace":
         return _PATH_OUTSIDE_SANDBOX_USER_MESSAGE

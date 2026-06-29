@@ -283,10 +283,18 @@ def test_git_add_write_gated_before_mutation(tmp_path, monkeypatch):
     assert "/pending/" in approval_url
     assert approval_url in response["error"]["message"]
     assert "Approval required" in response["error"]["message"]
-    assert "approve or deny, then retry the same request" in response["error"]["message"]
+    assert "same MCP tool call" in response["error"]["message"]
+    assert "without changing tool, target, or payload" in response["error"]["message"]
     assert response["error"]["data"]["instructions"] == (
-        "Approval required. Open approval_url, approve or deny, then retry the same request."
+        "Approval required. Open the approval page, approve or deny, then retry the same "
+        "MCP tool call without changing tool, target, or payload."
     )
+    data = response["error"]["data"]
+    assert data["retry_contract"] == "same_tool_call"
+    assert data["retry_same_tool_call"] is True
+    assert data["approved_retry_requires_same_tool"] is True
+    assert data["approved_retry_requires_same_resource"] is True
+    assert data["approved_retry_requires_same_payload"] is True
     assert response["error"]["data"]["instruction_surface_risk_message"] == GIT_INSTRUCTION_SURFACE_RISK_MESSAGE
     assert not git_target_reached(outcome_log, tool="git_add")
     metadata = _metadata_for_tool(home, "git_add")

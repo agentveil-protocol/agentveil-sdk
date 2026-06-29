@@ -802,8 +802,13 @@ def test_waiting_does_not_forward_and_returns_approval_required_shape(tmp_path):
     assert data["approval_id"] == "urn:uuid:approval"
     assert data["approval_possible"] is True
     assert data["retry_after_approval"] is True
+    assert data["retry_contract"] == "same_tool_call"
+    assert data["retry_same_tool_call"] is True
+    assert data["approved_retry_requires_same_tool"] is True
+    assert data["approved_retry_requires_same_resource"] is True
+    assert data["approved_retry_requires_same_payload"] is True
     assert data["reason_code"] == "runtime_gate_waiting_for_human_approval"
-    assert data["next_step"]
+    assert "without changing tool, target, or payload" in data["next_step"]
     assert SECRET not in client_out.getvalue()
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
 
