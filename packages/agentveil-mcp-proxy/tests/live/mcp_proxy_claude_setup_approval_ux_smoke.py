@@ -102,6 +102,64 @@ def _assert_main_view_human_friendly(html: str) -> None:
     assert "sha256:" not in main_view
 
 
+def _assert_installed_events_show(cli: Path, *, home: Path, env: dict[str, str]) -> None:
+    human = _run(
+        [str(cli), "events", "show", "--home", str(home), "--last"],
+        cwd=home.parent,
+        env=env,
+    )
+    if human.returncode != 0:
+        raise RuntimeError(
+            f"events show --last failed: rc={human.returncode}\n"
+            f"stdout={human.stdout}\nstderr={human.stderr}"
+        )
+    text = human.stdout
+    assert "decision=approval_required" in text, text
+    assert "tool=write_file" in text, text
+    assert "sha256:" not in text, text
+    assert not text.lstrip().startswith("{"), text
+
+    json_completed = _run(
+        [str(cli), "events", "show", "--home", str(home), "--last", "--json"],
+        cwd=home.parent,
+        env=env,
+    )
+    if json_completed.returncode != 0:
+        raise RuntimeError(
+            f"events show --last --json failed: rc={json_completed.returncode}\n"
+            f"stdout={json_completed.stdout}\nstderr={json_completed.stderr}"
+        )
+    payload = json.loads(json_completed.stdout)
+    assert payload.get("event_count", 0) >= 1, payload
+    write_events = [
+        event for event in payload.get("events", [])
+        if isinstance(event, dict) and event.get("tool") == "write_file"
+    ]
+    assert write_events, payload
+    event = write_events[-1]
+    assert event.get("decision") == "approval_required", event
+    assert event.get("record_id"), event
+    assert event.get("payload_hash", "").startswith("sha256:"), event
+
+    verify_completed = _run(
+        [str(cli), "events", "show", "--home", str(home), "--last", "--json", "--verify"],
+        cwd=home.parent,
+        env=env,
+    )
+    if verify_completed.returncode != 0:
+        raise RuntimeError(
+            f"events show --last --verify failed: rc={verify_completed.returncode}\n"
+            f"stdout={verify_completed.stdout}\nstderr={verify_completed.stderr}"
+        )
+    verify_payload = json.loads(verify_completed.stdout)
+    verify = verify_payload.get("verify")
+    if not isinstance(verify, dict):
+        raise AssertionError(f"events show --verify missing verify block: {verify_payload!r}")
+    status = verify.get("status")
+    if status not in {"not_available", "intact", "failed"}:
+        raise AssertionError(f"unexpected verify status: {status!r}")
+
+
 def _assert_proof_details_compact(html: str) -> None:
     proof_view, _, raw_tail = html.partition('<details class="approval-raw-evidence">')
     assert "Proof details" in proof_view
@@ -198,7 +256,9 @@ def main() -> int:
         _assert_proof_details_compact(html)
         assert "The agent wants to run write_file" in html
 
-        print("P0.2_CLAUDE_SETUP_APPROVAL_UX_SMOKE: ok")
+        _assert_installed_events_show(cli, home=home, env=env)
+
+        print("P0.4B_CLAUDE_SETUP_APPROVAL_UX_AND_EVENTS_SHOW_SMOKE: ok")
         print(f"setup_cmd={' '.join(setup_cmd)}")
         print(f"read_tools=list_workspace,read_file,get_file_info,instruction_surface_status")
         print(f"write_file_status={data.get('status')}")
