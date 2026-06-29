@@ -73,18 +73,33 @@ def _event_decision(record: PendingApproval, entry: Mapping[str, Any]) -> str:
     return "allowed"
 
 
-def _reason_summary(record: PendingApproval) -> str:
+def _reason_summary(record: PendingApproval, *, decision: str) -> str:
+    if decision == "target_reached":
+        return "Action reached target."
+    if decision == "approved":
+        return (
+            "Approved by user. Retry the same MCP tool call without changing "
+            "tool, target, or payload."
+        )
+    if decision == "approval_required":
+        return (
+            "Approval required before execution. Retry the same MCP tool call "
+            "after approval."
+        )
+    if decision == "execution_not_reached":
+        return "Execution did not reach target."
     if record.error_class:
         if record.error_class == "path_outside_workspace":
             return "Path was outside the configured sandbox."
         return record.error_class.replace("_", " ")
     reason = bounded_reason_for_record(record)
-    if reason == "local_approval_required":
-        return "Approval required before execution."
-    if reason == "user_approved":
-        return "Approved by user."
     if reason == "user_denied":
         return "Denied by user."
+    if reason == "user_approved":
+        return (
+            "Approved by user. Retry the same MCP tool call without changing "
+            "tool, target, or payload."
+        )
     return reason.replace("_", " ")
 
 
@@ -159,7 +174,7 @@ def build_event_show_entry(
         "decision": decision,
         "target": _target_display(record),
         "policy_rule": record.policy_rule_id or record.policy_id,
-        "reason_summary": _reason_summary(record),
+        "reason_summary": _reason_summary(record, decision=decision),
         "status": record.status,
         "risk_class": record.risk_class,
         "payload_hash": record.payload_hash,
