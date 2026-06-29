@@ -3291,7 +3291,10 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_path_args(summary)
     _add_json_arg(summary)
 
-    events = subparsers.add_parser("events", help="Manage local evidence records")
+    events = subparsers.add_parser(
+        "events",
+        help="Inspect local proof of MCP decisions, execution, and target reach",
+    )
     _add_common_path_args(events)
     _add_json_arg(events)
     events.add_argument("events_action", nargs="?", choices=["list", "tail", "vacuum", "show"])
@@ -3319,7 +3322,9 @@ def build_parser() -> argparse.ArgumentParser:
     events.add_argument(
         "--verify",
         action="store_true",
-        help="For events show: report local hash-chain integrity status",
+        help=(
+            "For events show: report local hash-chain integrity and proof status"
+        ),
     )
     events.add_argument("--follow", action="store_true", help="Keep printing new records for events tail")
     events.add_argument("--vacuum", action="store_true", help="Prune old terminal evidence records")

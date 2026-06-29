@@ -116,6 +116,8 @@ def _assert_installed_events_show(cli: Path, *, home: Path, env: dict[str, str])
     text = human.stdout
     assert "decision=approval_required" in text, text
     assert "tool=write_file" in text, text
+    assert "events show --last --verify" in text, text
+    assert "/proof" not in text, text
     assert "sha256:" not in text, text
     assert not text.lstrip().startswith("{"), text
 
@@ -255,6 +257,15 @@ def main() -> int:
         _assert_main_view_human_friendly(html)
         _assert_proof_details_compact(html)
         assert "The agent wants to run write_file" in html
+        assert "This decision will be recorded locally" in html
+        assert "Local proof" not in html
+        assert "approval-local-proof-command" not in html
+        assert "Copy command" not in html
+        assert "agentveil-mcp-proxy events show --last --verify" not in html
+        assert "/proof" not in html
+        proof_hint = data.get("proof_inspection_hint")
+        if not isinstance(proof_hint, str) or "events show --last --verify" not in proof_hint:
+            raise AssertionError(f"write_file missing proof_inspection_hint in {data!r}")
 
         _assert_installed_events_show(cli, home=home, env=env)
 

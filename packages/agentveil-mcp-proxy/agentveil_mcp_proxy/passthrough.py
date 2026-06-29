@@ -49,6 +49,7 @@ from agentveil_mcp_proxy.classification import (
     sha256_jcs,
 )
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceError, ApprovalStatus
+from agentveil_mcp_proxy.evidence.events_show import LOCAL_PROOF_INSPECTION_HINT
 from agentveil_mcp_proxy.client_config import downstream_startup_fingerprint
 from agentveil_mcp_proxy.evidence.observability import (
     parse_action_gate_metadata,
@@ -903,6 +904,7 @@ def _approval_required_error(
         if approval_outcome.approval_url is not None:
             data["approval_url"] = approval_outcome.approval_url
             data["instructions"] = APPROVAL_REQUIRED_INSTRUCTIONS
+            data["proof_inspection_hint"] = LOCAL_PROOF_INSPECTION_HINT
             resolved_message = actionable_approval_required_message(approval_outcome.approval_url)
     if enrich_guidance:
         redirect_original_id = (

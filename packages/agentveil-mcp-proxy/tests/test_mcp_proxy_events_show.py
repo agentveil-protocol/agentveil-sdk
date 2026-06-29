@@ -70,7 +70,7 @@ def test_events_show_empty_state_is_friendly(tmp_path: Path) -> None:
 
     assert count == 0
     assert "No local evidence yet" in text
-    assert "events show --last" in text
+    assert "events show --last --verify" in text
     assert "unknown" not in text.lower()
 
 
@@ -313,6 +313,7 @@ def test_events_show_target_reached_after_execution() -> None:
     assert entry["target_reached"] is True
     assert entry["reason_summary"] == "Action reached target."
     assert "Approval required before execution" not in entry["reason_summary"]
+    assert "events show --last --verify" in entry["next_step"]
 
 
 def test_events_show_why_copy_matches_decision_semantics() -> None:
@@ -358,6 +359,28 @@ def test_events_show_execution_not_reached() -> None:
     assert entry["decision"] == "execution_not_reached"
     assert entry["target_reached"] is False
     assert entry.get("next_step")
+
+
+def test_events_show_human_output_includes_local_proof_discoverability(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    paths = proxy_paths(home)
+    metadata = json.dumps({"target_reached": True}, separators=(",", ":"))
+    with ApprovalEvidenceStore(paths.proxy_dir / "evidence.sqlite") as store:
+        store.write_pending(_record(
+            "req-proof",
+            status="pending",
+            metadata_jcs=metadata,
+        ))
+        store.transition("req-proof", "executed", result_hash="sha256:" + "f" * 64)
+
+    out = io.StringIO()
+    show_events(home=home, last=1, out=out)
+    text = out.getvalue()
+
+    assert "Local proof shows what was requested, decided, executed" in text
+    assert "events show --last --verify" in text
+    assert "/proof" not in text
 
 
 def test_events_show_redirect_original_includes_next_step() -> None:
