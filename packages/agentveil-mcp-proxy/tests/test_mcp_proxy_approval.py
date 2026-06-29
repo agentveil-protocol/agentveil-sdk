@@ -1727,6 +1727,31 @@ def _persistence_bashrc_call(*, call_id: str = "call-1") -> str:
     }, separators=(",", ":")) + "\n"
 
 
+def _write_file_call(*, call_id: str, path: str, content: str) -> str:
+    return json.dumps({
+        "jsonrpc": "2.0",
+        "id": call_id,
+        "method": "tools/call",
+        "params": {
+            "name": "write_file",
+            "arguments": {"path": path, "content": content},
+        },
+    }, separators=(",", ":")) + "\n"
+
+
+def _assert_approval_retry_contract(data: dict[str, Any]) -> None:
+    assert data["status"] == "approval_required"
+    assert data["approval_possible"] is True
+    assert data["retry_after_approval"] is True
+    assert data["retry_contract"] == "same_tool_call"
+    assert data["retry_same_tool_call"] is True
+    assert data["approved_retry_requires_same_tool"] is True
+    assert data["approved_retry_requires_same_resource"] is True
+    assert data["approved_retry_requires_same_payload"] is True
+    assert "auto-resume" not in json.dumps(data).lower()
+    assert "automatic rerouting" not in json.dumps(data).lower()
+
+
 def _tool_call() -> str:
     return json.dumps({
         "jsonrpc": "2.0",
@@ -2210,6 +2235,7 @@ def test_immediate_retry_after_approve_post_matches_live_console(tmp_path):
         assert len(first) == 1
         assert "error" in first[0], first[0]
         assert first[0]["error"]["data"]["status"] == "approval_required"
+        _assert_approval_retry_contract(first[0]["error"]["data"])
 
         deadline = time.monotonic() + 2
         while not server.pending_prompts() and time.monotonic() < deadline:
@@ -2266,6 +2292,155 @@ def test_immediate_retry_after_approve_post_matches_live_console(tmp_path):
             blob = f"{record.tool_name}:{record.payload_hash}:{record.status}"
             assert SECRET not in blob
         assert SECRET not in json.dumps(bundle)
+    finally:
+        passthrough.stop()
+        server.stop()
+        store.close()
+
+
+def test_payload_drift_after_approval_requires_new_prompt(tmp_path):
+    """Changed content must request fresh approval."""
+
+    config = _config(policy_rule=_fake_downstream_write_approval_rule())
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        wait_for_decision=False,
+    )
+    log_path = tmp_path / "downstream.log"
+    passthrough = McpPassthrough(
+        DownstreamConfig(
+            command=sys.executable,
+            args=("-u", str(_filesystem_write_downstream(tmp_path, log_path))),
+            name="fake-downstream",
+            env={"DOWNSTREAM_LOG": str(log_path)},
+        ),
+        classifier=ToolCallClassifier(config, server_name="fake-downstream"),
+        approval_manager=manager,
+    )
+    passthrough.start()
+    try:
+        first = passthrough.handle_client_line(
+            _write_file_call(call_id="call-1", path="config.py", content="FEATURE_X=true")
+        )
+        assert first[0]["error"]["data"]["status"] == "approval_required"
+        _assert_approval_retry_contract(first[0]["error"]["data"])
+
+        deadline = time.monotonic() + 2
+        while not server.pending_prompts() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        parent_id = server.pending_prompts()[0].request_id
+        with httpx.Client() as client:
+            csrf = _get_csrf(client, server.approval_url(parent_id))
+            assert _post_decision(
+                client,
+                server.approval_url(parent_id),
+                decision="approve",
+                csrf=csrf,
+            ).status_code == 200
+
+        identical_retry = passthrough.handle_client_line(
+            _write_file_call(call_id="call-2", path="config.py", content="FEATURE_X=true")
+        )
+        assert "result" in identical_retry[0]
+        assert server.pending_prompts() == []
+
+        drifted_payload = passthrough.handle_client_line(
+            _write_file_call(call_id="call-3", path="config.py", content="FEATURE_X=true\n")
+        )
+        assert drifted_payload[0]["error"]["data"]["status"] == "approval_required"
+        assert len(server.pending_prompts()) == 1
+        assert server.pending_prompts()[0].request_id != parent_id
+    finally:
+        passthrough.stop()
+        server.stop()
+        store.close()
+
+
+def test_resource_drift_after_approval_requires_new_prompt(tmp_path):
+    """Exact grant is resource-bound: changed path must not reuse approval."""
+
+    config = _config(policy_rule=_fake_downstream_write_approval_rule())
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        wait_for_decision=False,
+    )
+    log_path = tmp_path / "downstream.log"
+    passthrough = McpPassthrough(
+        DownstreamConfig(
+            command=sys.executable,
+            args=("-u", str(_filesystem_write_downstream(tmp_path, log_path))),
+            name="fake-downstream",
+            env={"DOWNSTREAM_LOG": str(log_path)},
+        ),
+        classifier=ToolCallClassifier(config, server_name="fake-downstream"),
+        approval_manager=manager,
+    )
+    passthrough.start()
+    try:
+        first = passthrough.handle_client_line(
+            _write_file_call(call_id="call-1", path="a.txt", content="same-body")
+        )
+        assert first[0]["error"]["data"]["status"] == "approval_required"
+
+        deadline = time.monotonic() + 2
+        while not server.pending_prompts() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        parent_id = server.pending_prompts()[0].request_id
+        with httpx.Client() as client:
+            csrf = _get_csrf(client, server.approval_url(parent_id))
+            assert _post_decision(
+                client,
+                server.approval_url(parent_id),
+                decision="approve",
+                csrf=csrf,
+            ).status_code == 200
+
+        identical_retry = passthrough.handle_client_line(
+            _write_file_call(call_id="call-2", path="a.txt", content="same-body")
+        )
+        assert "result" in identical_retry[0]
+        assert server.pending_prompts() == []
+
+        drifted_resource = passthrough.handle_client_line(
+            _write_file_call(call_id="call-3", path="b.txt", content="same-body")
+        )
+        assert drifted_resource[0]["error"]["data"]["status"] == "approval_required"
+        assert len(server.pending_prompts()) == 1
+        assert server.pending_prompts()[0].request_id != parent_id
+    finally:
+        passthrough.stop()
+        server.stop()
+        store.close()
+
+
+def test_retry_contract_response_does_not_leak_secret_payload(tmp_path):
+    config = _config(policy_rule=_write_rule())
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        wait_for_decision=False,
+    )
+    log_path = tmp_path / "downstream.log"
+    passthrough = McpPassthrough(
+        DownstreamConfig(
+            command=sys.executable,
+            args=("-u", str(_approval_downstream(tmp_path, log_path))),
+            name="github",
+            env={"DOWNSTREAM_LOG": str(log_path)},
+        ),
+        classifier=ToolCallClassifier(config, server_name="github"),
+        approval_manager=manager,
+    )
+    passthrough.start()
+    try:
+        response = passthrough.handle_client_line(_tool_call())
+        data = response[0]["error"]["data"]
+        _assert_approval_retry_contract(data)
+        rendered = json.dumps(response[0])
+        assert SECRET not in rendered
+        assert SECRET not in response[0]["error"]["message"]
     finally:
         passthrough.stop()
         server.stop()
@@ -3224,7 +3399,8 @@ def test_post_decision_page_instructs_retry():
             response = _post_decision(client, url, decision="approve", csrf=csrf)
         assert response.status_code == 200
         assert "Decision recorded" in response.text
-        assert "Retry the same request" in response.text
+        assert "Retry the same MCP tool call" in response.text
+        assert "without changing tool, target, or payload" in response.text
     finally:
         server.stop()
 

@@ -129,6 +129,7 @@ from agentveil_mcp_proxy.runtime_gate import (
 from agentveil_mcp_proxy.evidence.observability import (
     enrich_mcp_error_contract,
     mcp_error_user_message,
+    reason_has_dedicated_user_message,
 )
 
 
@@ -140,12 +141,17 @@ JSONRPC_DOWNSTREAM_ERROR = -32000
 JSONRPC_POLICY_BLOCKED = -32010
 JSONRPC_APPROVAL_REQUIRED = -32011
 APPROVAL_REQUIRED_INSTRUCTIONS = (
-    "Approval required. Open approval_url, approve or deny, then retry the same request."
+    "Approval required. Open the approval page, approve or deny, then retry the same "
+    "MCP tool call without changing tool, target, or payload."
 )
-APPROVAL_REQUIRED_RETRY_SUFFIX = "approve or deny, then retry the same request."
+APPROVAL_REQUIRED_RETRY_SUFFIX = (
+    "approve or deny, then retry the same MCP tool call without changing tool, "
+    "target, or payload."
+)
 
 APPROVAL_REQUIRED_USER_MESSAGE = (
-    "Approval required: open the approval page, approve or deny, then retry this request."
+    "Approval required. Open the approval page, approve or deny, then retry the same "
+    "MCP tool call without changing tool, target, or payload."
 )
 HARD_BLOCK_USER_MESSAGE = (
     # claim-check: allow "Blocked" as a user-facing policy outcome label for denied local actions.
@@ -831,7 +837,24 @@ def _blocked_error(
         )
     tool_name = classification.tool if classification is not None else None
     enrich_mcp_error_contract(data, tool_name=tool_name)
+    if _is_legacy_block_message(message) or reason_has_dedicated_user_message(reason):
+        message = mcp_error_user_message(data)
     return jsonrpc_error(request_id, JSONRPC_POLICY_BLOCKED, message, data=data)
+
+
+def _is_legacy_block_message(message: str) -> bool:
+    """Return True for old generic block strings that hide actionable context."""
+
+    # claim-check: allow "blocked" as legacy JSON-RPC message vocabulary matched
+    # and rewritten by P0.5c; tests assert the rewritten user-facing output.
+    return message in {
+        "blocked",  # claim-check: allow legacy JSON-RPC message vocabulary rewritten by P0.5c.
+        "blocked by approval decision",  # claim-check: allow legacy JSON-RPC message vocabulary rewritten by P0.5c.
+        "blocked by AVP Runtime Gate",  # claim-check: allow legacy JSON-RPC message vocabulary rewritten by P0.5c.
+        "blocked by local MCP policy",  # claim-check: allow legacy JSON-RPC message vocabulary rewritten by P0.5c.
+        "blocked by MCP policy",  # claim-check: allow legacy JSON-RPC message vocabulary rewritten by P0.5c.
+        "runtime decision evidence unavailable",
+    }
 
 
 def _runtime_evidence_unavailable_error(
@@ -2521,11 +2544,16 @@ class McpPassthrough:
                 "action": "blocked",
                 "reason": "untrusted_runtime_decision",
             })
+            untrusted_data: dict[str, Any] = {
+                "status": "blocked",  # claim-check: allow bounded JSON-RPC status vocabulary for runtime gate rejection.
+                "reason": "untrusted_runtime_decision",
+            }
+            enrich_mcp_error_contract(untrusted_data, tool_name=classification.tool)
             return jsonrpc_error(
                 request_id,
                 JSONRPC_RUNTIME_GATE_UNTRUSTED,
-                "runtime decision receipt untrusted",
-                data={"status": "blocked", "reason": "untrusted_runtime_decision"},
+                mcp_error_user_message(untrusted_data),
+                data=untrusted_data,
             ), None
         except RuntimeGateUnavailableError:
             self._increment_runtime_gate_errors()
@@ -2571,11 +2599,16 @@ class McpPassthrough:
                 decision=decision,
             ), None
         self._increment_runtime_gate_errors()
+        unsupported_data: dict[str, Any] = {
+            "status": "blocked",  # claim-check: allow bounded JSON-RPC status vocabulary for runtime gate rejection.
+            "reason": "unsupported_runtime_decision",
+        }
+        enrich_mcp_error_contract(unsupported_data, tool_name=classification.tool)
         return jsonrpc_error(
             request_id,
             JSONRPC_RUNTIME_GATE_UNTRUSTED,
-            "runtime decision unsupported",
-            data={"status": "blocked", "reason": "unsupported_runtime_decision"},
+            mcp_error_user_message(unsupported_data),
+            data=unsupported_data,
         ), None
 
     def _read_only_sandbox_tool_allowed_when_gate_unavailable(

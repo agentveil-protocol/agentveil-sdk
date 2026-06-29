@@ -22,7 +22,11 @@ import agentveil_mcp_proxy.cli as proxy_cli
 from agentveil_mcp_proxy.cli import ProxyCliError, init_proxy, run_proxy
 from agentveil_mcp_proxy.classification import ToolCallClassifier
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore
-from agentveil_mcp_proxy.evidence.observability import parse_controlled_path_metadata
+from agentveil_mcp_proxy.evidence.observability import (
+    enrich_mcp_error_contract,
+    mcp_error_user_message,
+    parse_controlled_path_metadata,
+)
 from agentveil_mcp_proxy.evidence.summary import evidence_summary_record
 from agentveil_mcp_proxy.policy import ProxyConfig
 from agentveil_mcp_proxy.passthrough import (
@@ -58,6 +62,77 @@ def _assert_blocked_contract(data: dict, *, reason: str) -> None:
     assert data["retry_after_approval"] is False
     assert isinstance(data["reason_code"], str) and data["reason_code"]
     assert isinstance(data["next_step"], str) and data["next_step"]
+
+
+def _assert_approval_retry_contract(data: dict) -> None:
+    assert data["status"] == "approval_required"
+    assert data["approval_possible"] is True
+    assert data["retry_after_approval"] is True
+    assert data["retry_contract"] == "same_tool_call"
+    assert data["retry_same_tool_call"] is True
+    assert data["approved_retry_requires_same_tool"] is True
+    assert data["approved_retry_requires_same_resource"] is True
+    assert data["approved_retry_requires_same_payload"] is True
+    assert isinstance(data.get("reason_code"), str) and data["reason_code"]
+    assert isinstance(data.get("next_step"), str) and data["next_step"]
+    assert "auto-resume" not in json.dumps(data).lower()
+    assert "automatic rerouting" not in json.dumps(data).lower()
+
+
+def test_enrich_mcp_error_contract_adds_approval_retry_fields() -> None:
+    data = enrich_mcp_error_contract(
+        {"status": "approval_required", "reason": "local_approval_required"},
+        tool_name="github.create_issue",
+    )
+    _assert_approval_retry_contract(data)
+    assert data["reason_code"] == "approval_required"
+    assert data["suggested_tool"] == "create_issue"
+    assert "without changing tool, target, or payload" in data["next_step"]
+
+
+def test_mcp_error_user_message_distinguishes_actionable_outcomes():
+    approval = mcp_error_user_message({
+        "status": "approval_required",
+        "reason": "local_approval_required",
+    })
+    outside = mcp_error_user_message({
+        "status": "policy_denied",
+        "reason": "path_outside_workspace",
+    })
+    missing_tool = mcp_error_user_message({
+        # claim-check: allow "blocked" as bounded JSON-RPC status vocabulary in
+        # this message-format unit test.
+        "status": "blocked",  # claim-check: allow bounded JSON-RPC status vocabulary in this unit test.
+        "reason": "unknown_tool",
+    })
+    secret = mcp_error_user_message({
+        "status": "policy_denied",
+        "reason": "secret_path_blocked",
+    })
+    classifier = mcp_error_user_message({
+        "status": "blocked",  # claim-check: allow bounded JSON-RPC status vocabulary in this unit test.
+        "reason": "classifier_error",
+    })
+    runtime_sanity = mcp_error_user_message({
+        "status": "blocked",  # claim-check: allow bounded JSON-RPC status vocabulary in this unit test.
+        "reason": "untrusted_runtime_decision",
+    })
+    policy_stop = mcp_error_user_message({
+        "status": "blocked",  # claim-check: allow bounded JSON-RPC status vocabulary in this unit test.
+        "reason": "local_policy_block",
+    })
+
+    assert "approve or deny" in approval
+    assert "same MCP tool call" in approval
+    assert "without changing tool, target, or payload" in approval
+    assert "sandbox" in outside.lower()
+    assert "MCP tool is not available" in missing_tool
+    assert "Approval will not help" in secret
+    assert "could not classify" in classifier.lower()
+    assert "Stopped by policy" not in classifier
+    assert "Proxy/runtime decision error" in runtime_sanity
+    assert "Stopped by policy" not in runtime_sanity
+    assert "Stopped by policy" in policy_stop
 
 
 @pytest.fixture(autouse=True)
@@ -919,14 +994,15 @@ def test_run_returns_approval_required_without_waiting_or_forwarding(tmp_path, m
     assert approval_url.startswith("http://127.0.0.1:")
     assert approval_url in response["error"]["message"]
     assert "Approval required" in response["error"]["message"]
-    assert "approve or deny, then retry the same request" in response["error"]["message"]
+    assert "same MCP tool call" in response["error"]["message"]
+    assert "without changing tool, target, or payload" in response["error"]["message"]
     assert response["error"]["data"]["instructions"] == (
-        "Approval required. Open approval_url, approve or deny, then retry the same request."
+        "Approval required. Open the approval page, approve or deny, then retry the same "
+        "MCP tool call without changing tool, target, or payload."
     )
-    assert response["error"]["data"]["approval_possible"] is True
-    assert response["error"]["data"]["retry_after_approval"] is True
+    _assert_approval_retry_contract(response["error"]["data"])
+    assert response["error"]["data"]["reason"] == "local_approval_required"
     assert response["error"]["data"]["reason_code"] == "approval_required"
-    assert response["error"]["data"]["next_step"]
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
 
 
@@ -1689,6 +1765,8 @@ def test_unknown_tool_hard_deny_writes_terminal_blocked_evidence(tmp_path, monke
     response = _responses(client_out.getvalue())[0]
     assert response["error"]["code"] == JSONRPC_POLICY_BLOCKED
     _assert_blocked_contract(response["error"]["data"], reason="unknown_tool")  # claim-check: allow "blocked" is expected JSON-RPC error data vocabulary.
+    assert "MCP tool is not available" in response["error"]["message"]
+    assert "approval" not in response["error"]["message"].lower()
     # No approval surface is offered for the hard-deny.
     assert "approval_url" not in response["error"]["data"]
     assert "record_id" not in response["error"]["data"]
@@ -1957,7 +2035,8 @@ def test_classifier_exception_on_tool_call_fails_closed(tmp_path):
     assert response["jsonrpc"] == "2.0"
     assert response["id"] == "call-1"
     assert response["error"]["code"] == JSONRPC_POLICY_BLOCKED
-    assert response["error"]["message"] == "blocked by MCP proxy: tool call classification failed"  # claim-check: allow existing JSON-RPC error wording; this test asserts no downstream forwarding.
+    assert "could not classify" in response["error"]["message"].lower()
+    assert "Stopped by policy" not in response["error"]["message"]
     _assert_blocked_contract(response["error"]["data"], reason="classifier_error")
     assert passthrough.classifier_errors == 1
     # claim-check: allow "never"/"blocked" describe the sanitized expected response asserted below
@@ -4029,8 +4108,7 @@ def test_differentiated_user_messages_for_approval_block_and_redirect() -> None:
     )
 
     assert approval["error"]["message"] == APPROVAL_REQUIRED_USER_MESSAGE
-    assert approval["error"]["data"]["approval_possible"] is True
-    assert approval["error"]["data"]["retry_after_approval"] is True
+    _assert_approval_retry_contract(approval["error"]["data"])
     assert approval["error"]["data"]["reason_code"] == "approval_required"
     assert block["error"]["message"] == HARD_BLOCK_USER_MESSAGE
     assert block["error"]["data"]["approval_possible"] is False

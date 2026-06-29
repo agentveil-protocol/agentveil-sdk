@@ -52,7 +52,7 @@ APPROVAL_LOCAL_URL_WARNING = (
     "This local approval URL is a bearer-style session URL. Do not share it."
 )
 APPROVAL_DECISION_RECORDED_BODY = (
-    "Decision recorded. Retry the same request."
+    "Decision recorded. Retry the same MCP tool call without changing tool, target, or payload."
 )
 
 TERMINAL_ALREADY_DECIDED_APPROVE = "already_decided_approve"

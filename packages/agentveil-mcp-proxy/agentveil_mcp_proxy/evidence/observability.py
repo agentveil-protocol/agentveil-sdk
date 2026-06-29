@@ -295,18 +295,77 @@ _PATH_OUTSIDE_SANDBOX_USER_MESSAGE = (
     "Path is outside the configured sandbox. "
     "Use a relative path under the project workspace."
 )
+_TOOL_NOT_AVAILABLE_USER_MESSAGE = (
+    "Controlled MCP tool is not available. Configure or enable the MCP route "
+    "that advertises this tool."
+)
+_SECRET_PATH_BLOCKED_USER_MESSAGE = (
+    "Stopped by policy: this looks like a secret-bearing path. Approval will "
+    "not help for this route."
+)
+_RUNTIME_GATE_UNAVAILABLE_USER_MESSAGE = (
+    "Stopped by policy: Runtime Gate is unavailable for this action. Approval "
+    "will not help for this route."
+)
+_RUNTIME_GATE_BLOCKED_USER_MESSAGE = (
+    "Stopped by Runtime Gate: this action was denied before execution. "
+    "Approval will not help for this decision."
+)
+_DEFAULT_POLICY_STOP_USER_MESSAGE = (
+    "Stopped by policy: this action is not allowed by local policy and cannot "
+    "be approved."
+)
+_CLASSIFIER_ERROR_USER_MESSAGE = (
+    "Proxy could not classify this tool call. Approval will not help. "
+    "Retry; report if persistent."
+)
+_PROXY_RUNTIME_DECISION_ERROR_USER_MESSAGE = (
+    "Proxy/runtime decision error: this action could not be evaluated safely. "
+    "Approval will not help. Retry; report if persistent."
+)
+_DEDICATED_USER_MESSAGE_REASONS = frozenset({
+    "classifier_error",
+    "unknown_policy_decision",
+    "untrusted_runtime_decision",
+    "unsupported_runtime_decision",
+    "unknown_tool",
+    "unknown_tool_not_advertised",
+    "tool_schema_unavailable",
+    "runtime_gate_not_configured",
+    "runtime_gate_unavailable",
+    "runtime_gate_evidence_unavailable",
+    "approval_evidence_unavailable",
+    "runtime_gate_block",
+    "role_authority_denied",
+    "path_outside_workspace",
+    "secret_path_blocked",
+})
 _DEFAULT_HARD_DENY_NEXT_STEP = (
     "This action cannot be approved. Adjust the tool call or local policy."
 )
 _APPROVAL_REQUIRED_NEXT_STEP = (
-    "Open approval_url, approve or deny, then retry the same MCP tool call."
+    "Open the approval page, approve or deny, then retry the same MCP tool call "
+    "without changing tool, target, or payload."
 )
+_RETRY_CONTRACT_SAME_TOOL_CALL = "same_tool_call"
 _TOOL_NOT_AVAILABLE_NEXT_STEP = (
     "Configure or enable the MCP route that advertises this tool."
 )
 _DEFAULT_SANDBOX_PATH_HINT = (
     "Use a relative path under the configured sandbox, for example notes/example.txt."
 )
+
+
+def approval_retry_contract_fields() -> dict[str, Any]:
+    """Return bounded machine-readable fields for approval-required retry."""
+
+    return {
+        "retry_contract": _RETRY_CONTRACT_SAME_TOOL_CALL,
+        "retry_same_tool_call": True,
+        "approved_retry_requires_same_tool": True,
+        "approved_retry_requires_same_resource": True,
+        "approved_retry_requires_same_payload": True,
+    }
 
 
 def mcp_error_reason_code(reason: str) -> str:
@@ -346,6 +405,7 @@ def enrich_mcp_error_contract(
     if status == "approval_required":
         data["approval_possible"] = True
         data["retry_after_approval"] = True
+        data.update(approval_retry_contract_fields())
         if "next_step" not in data:
             data["next_step"] = _APPROVAL_REQUIRED_NEXT_STEP
         leaf = _leaf_tool_name(tool_name)
@@ -375,6 +435,12 @@ def enrich_mcp_error_contract(
     return data
 
 
+def reason_has_dedicated_user_message(reason: str) -> bool:
+    """Return True when ``mcp_error_user_message`` should replace internal text."""
+
+    return reason in _DEDICATED_USER_MESSAGE_REASONS
+
+
 def mcp_error_user_message(data: Mapping[str, Any]) -> str:
     """Return a differentiated user-facing MCP error message."""
 
@@ -382,32 +448,43 @@ def mcp_error_user_message(data: Mapping[str, Any]) -> str:
     reason = str(data.get("reason", ""))
     if status == "approval_required":
         return (
-            "Approval required: open the approval page, approve or deny, "
-            "then retry this request."
+            "Approval required. Open the approval page, approve or deny, "
+            "then retry the same MCP tool call without changing tool, target, or payload."
         )
-    if status == "policy_denied" and reason == "path_outside_workspace":
+    if reason == "path_outside_workspace":
         return _PATH_OUTSIDE_SANDBOX_USER_MESSAGE
+    if reason in {"unknown_tool_not_advertised", "tool_schema_unavailable", "unknown_tool"}:
+        return _TOOL_NOT_AVAILABLE_USER_MESSAGE
+    if reason == "secret_path_blocked":
+        return _SECRET_PATH_BLOCKED_USER_MESSAGE
+    if reason == "classifier_error":
+        return _CLASSIFIER_ERROR_USER_MESSAGE
+    if reason in {
+        "unknown_policy_decision",
+        "untrusted_runtime_decision",
+        "unsupported_runtime_decision",
+    }:
+        return _PROXY_RUNTIME_DECISION_ERROR_USER_MESSAGE
+    if reason in {
+        "runtime_gate_not_configured",
+        "runtime_gate_unavailable",
+        "runtime_gate_evidence_unavailable",
+        "approval_evidence_unavailable",
+    }:
+        return _RUNTIME_GATE_UNAVAILABLE_USER_MESSAGE
+    if reason == "runtime_gate_block":
+        return _RUNTIME_GATE_BLOCKED_USER_MESSAGE
     if status == "blocked":  # claim-check: allow bounded JSON-RPC status vocabulary; negative tests assert no downstream execution.
         if reason == "role_authority_denied":
             return str(data.get("explanation") or _DEFAULT_HARD_DENY_NEXT_STEP)
         if reason in {
             "local_policy_block",
             "filesystem_delete",
-            "secret_path_blocked",
-            "unknown_tool_not_advertised",
-            "runtime_gate_not_configured",
-            "runtime_gate_evidence_unavailable",
-            "approval_evidence_unavailable",
+            "undeclared_tool",
+            "extra_undeclared_downstream_tool",
         }:
-            return (
-                "Stopped by policy: this action is not allowed by local policy "
-                "and cannot be approved."
-            )
-    if status == "policy_denied":
-        return _PATH_OUTSIDE_SANDBOX_USER_MESSAGE if reason == "path_outside_workspace" else (
-            "Denied by MCP proxy policy."
-        )
-    return "Denied by MCP proxy policy."
+            return _DEFAULT_POLICY_STOP_USER_MESSAGE
+    return _DEFAULT_POLICY_STOP_USER_MESSAGE
 
 
 def pending_approval_dict(
