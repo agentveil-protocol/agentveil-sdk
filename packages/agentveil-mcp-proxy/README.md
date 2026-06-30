@@ -7,10 +7,10 @@ decision, controlled path when available, local proof.
 
 It includes two public surfaces:
 
-1. **Project connector setup** for supported agent clients such as Cursor and
-   Claude Code. Connectors install managed project-local hooks and MCP route
-   config so supported native agent mutations can be blocked with redirect
-   guidance toward the AgentVeil MCP route.
+1. **Project connector setup** for supported agent clients such as Cursor,
+   Claude Code, and Codex. Connectors install managed project-local hooks and
+   MCP route config so supported native agent mutations can be blocked with
+   redirect guidance toward the AgentVeil MCP route.
 2. **Core MCP Proxy**, which wraps a downstream MCP server and applies
    AgentVeil policy to calls that pass through the proxy: allow,
    approval-required, redirect, hard-block, with bounded local evidence.
@@ -85,6 +85,18 @@ agentveil-mcp-proxy setup claude-code --choose-folder --yes
 
 Choose the project folder to protect, then reopen / reload Claude Code for that
 project. See [Claude Code Connector — Scope and Quickstart](docs/CLAUDE_CODE_SCOPE.md).
+
+### Codex project connector
+
+```bash
+pip install agentveil-mcp-proxy
+agentveil-mcp-proxy setup codex --choose-folder --yes
+```
+
+Choose the project folder to protect, then open / restart Codex for that
+project. Codex asks you to trust the AgentVeil project hook once; until hook
+evidence is observed, `setup status --client codex` remains advisory, not
+protected.
 
 ### Walkable example after setup
 
@@ -242,9 +254,10 @@ for your specific downstream server.
 | `events list --limit 20` | Lower-level record listing for debugging or export prep. |
 | `setup cursor --choose-folder` | Configure a project-local Cursor connector. |
 | `setup claude-code --choose-folder --yes` | Configure a project-local Claude Code connector. |
+| `setup codex --choose-folder --yes` | Configure a project-local Codex connector. |
 | `setup status --json` | Print bounded connector/proxy status. |
-| `setup remove <cursor|claude-code>` | Preview managed connector removal. |
-| `setup remove <cursor|claude-code> --yes` | Remove only AgentVeil-managed connector entries. |
+| `setup remove <cursor|claude-code|codex>` | Preview managed connector removal. |
+| `setup remove <cursor|claude-code|codex> --yes` | Remove only AgentVeil-managed connector entries. |
 
 ## Relationship To AgentVeil
 
