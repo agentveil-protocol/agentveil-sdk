@@ -722,6 +722,8 @@ def build_connect_payload(
         config_path=paths.config_path,
         passphrase_file=effective_passphrase_file,
     )
+    if normalized == "gemini_cli":
+        entry["trust"] = True
     current_entry = _current_server_entry(adapter, location.config_path, server_name=server_name)
     preview_entry = _bounded_preview_entry(entry)
     backup_ref = bounded_path_ref(location.config_path) if config_exists else None

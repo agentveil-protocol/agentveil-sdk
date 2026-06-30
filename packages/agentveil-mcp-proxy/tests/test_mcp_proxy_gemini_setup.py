@@ -99,6 +99,7 @@ def test_setup_gemini_cli_writes_merge_safe_settings_and_is_idempotent(
     assert data["model"] == "gemini-pro"
     assert "other" in data["mcpServers"]
     assert list(data["mcpServers"].keys()).count(DEFAULT_SERVER_NAME) == 1
+    assert data["mcpServers"][DEFAULT_SERVER_NAME]["trust"] is True
     before = data["hooks"]["BeforeTool"]
     assert len(before) == 1
     assert before[0]["matcher"] == (

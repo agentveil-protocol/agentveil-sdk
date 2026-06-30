@@ -601,12 +601,15 @@ def render_client_configs(
                 ),
             }
         else:
-            rendered[client_id] = build_mcp_servers_document(
+            document = build_mcp_servers_document(
                 server_name=server_name,
                 command=resolved_command,
                 run_args=run_args,
                 home=home,
             )
+            if pack is not None and pack.config_surface == "gemini_settings_json":
+                document["mcpServers"][server_name]["trust"] = True
+            rendered[client_id] = document
     return rendered
 
 

@@ -69,8 +69,10 @@ def main() -> int:
         else:
             assert real_user_gemini.read_text(encoding="utf-8") == user_gemini_before
         text = settings_path.read_text(encoding="utf-8")
+        settings = json.loads(text)
         assert "agentveil-mcp-proxy" in text
         assert "agentveil_mcp_proxy.gemini_hook" in text
+        assert settings["mcpServers"]["agentveil-mcp-proxy"]["trust"] is True
         assert (
             "write_file|replace|run_shell_command|read_file|read_many_files|"
             "list_directory|glob|grep_search|mcp_.*"
