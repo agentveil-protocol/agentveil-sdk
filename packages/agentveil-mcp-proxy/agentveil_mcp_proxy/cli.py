@@ -3936,7 +3936,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     setup_codex = setup_subparsers.add_parser(
         "codex",
-        help="One-command Codex connector setup (proxy route + Codex MCP route)",
+        help="One-command Codex connector setup (proxy route + Codex MCP route + project hook)",
     )
     setup_codex.add_argument(
         "--project-dir", type=Path, default=None,
@@ -4873,8 +4873,11 @@ def run_setup_codex_cli(
     """One-command Codex connector setup.
 
     Reuses the existing Codex TOML connect path, project-local proxy route, and
-    managed local Approval Center. It does not hook or control provider-native
-    Codex tools; it configures routed AgentVeil MCP tools.
+    managed local Approval Center. It also installs a project-local Codex
+    PreToolUse hook so native mutating tools are denied before mutation and
+    guided toward the controlled MCP route when one is available. claim-check:
+    allow bounded Codex hook claim; status remains advisory until hook evidence
+    is observed.
     """
     from agentveil_mcp_proxy import codex_setup
 
@@ -4889,7 +4892,8 @@ def run_setup_codex_cli(
     if not assume_yes:
         message = (
             f"Would set up the Codex connector in {target}: proxy quickstart "
-            "route, Codex MCP config, and managed Approval Center. Re-run with --yes."
+            "route, Codex MCP config, project hook, and managed Approval Center. "
+            "Re-run with --yes."
         )
         if output_json:
             _print_json({
@@ -4902,6 +4906,11 @@ def run_setup_codex_cli(
         else:
             print(message)
         return 0
+
+    try:
+        codex_setup.validate_hook_config(project_dir=target)
+    except codex_setup.CodexSetupError as exc:
+        raise ProxyCliError(str(exc), exit_code=2) from exc
 
     quiet = io.StringIO()
     proxy_present = config_path.exists()
@@ -4930,15 +4939,24 @@ def run_setup_codex_cli(
             exit_code=1,
         )
 
-    run_connect_cli(
-        client_id="codex",
-        home=home,
-        project_root=target,
-        write=True,
-        proxy_command=proxy_cmd,
-        passphrase_file=passphrase_file,
-        out=quiet,
-    )
+    try:
+        hook_result = codex_setup.install_hook(project_dir=target, python=sys.executable)
+    except codex_setup.CodexSetupError as exc:
+        raise ProxyCliError(str(exc), exit_code=2) from exc
+
+    try:
+        run_connect_cli(
+            client_id="codex",
+            home=home,
+            project_root=target,
+            write=True,
+            proxy_command=proxy_cmd,
+            passphrase_file=passphrase_file,
+            out=quiet,
+        )
+    except Exception:
+        codex_setup.remove_hook(project_dir=target)
+        raise
     route_status = codex_setup.connect_status(
         project_dir=target,
         home=home,
@@ -4946,6 +4964,7 @@ def run_setup_codex_cli(
         proxy_command=proxy_cmd,
     )
     if not codex_setup.managed_route_present(route_status):
+        codex_setup.remove_hook(project_dir=target)
         raise ProxyCliError(
             "could not write the Codex MCP route; ensure Codex config is writable",
             exit_code=1,
@@ -4976,6 +4995,7 @@ def run_setup_codex_cli(
                 "scope": "project",
                 "proxy_route_initialized": proxy_initialized,
                 "mcp_route": "present",
+                "hook": "present",
                 "sandbox_relpath": sandbox_label,
                 "identity_encrypted": passphrase_file is not None,
                 "approval_center": {"state": center_result.status.state, "reason": center_result.reason},
@@ -4989,6 +5009,7 @@ def run_setup_codex_cli(
             print("Codex connector partially set up:")
             print(f"  proxy route: {'initialized' if proxy_initialized else 'already present'}")
             print("  MCP route:   ~/.codex/config.toml updated")
+            print("  hook:        .codex/hooks.json present")
             print(f"  approval_center: {center_result.status.state} ({center_result.reason})")
             print("ERROR: setup is NOT ready — Approval Center could not start.", file=sys.stderr)
         return 1
@@ -5001,6 +5022,9 @@ def run_setup_codex_cli(
             "scope": "project",
             "proxy_route_initialized": proxy_initialized,
             "mcp_route": "present",
+            "hook": "present",
+            "hooks_relpath": ".codex/hooks.json",
+            "evidence_relpath": ".codex/agentveil/evidence.jsonl",
             "codex_config_ref": route_status.get("config_ref"),
             "sandbox_relpath": sandbox_label,
             "identity_encrypted": passphrase_file is not None,
@@ -5011,18 +5035,23 @@ def run_setup_codex_cli(
                 "restarted": center_result.restarted,
             },
             "reload_required": True,
+            "codex_hook_trust_required": status.get("hook_trust_required"),
+            "codex_hook_trust_message": codex_setup.CODEX_HOOK_TRUST_MESSAGE,
             "status": status,
         })
     else:
         print("Codex connector set up for this project:")
         print(f"  proxy route: {'initialized' if proxy_initialized else 'already present'}")
         print("  MCP route:   ~/.codex/config.toml updated")
+        print("  hook:        .codex/hooks.json present")
         if passphrase_file is None:
             print("  identity:    stored unencrypted (quickstart); use --passphrase-file to encrypt")
         action = "reused" if center_result.reused else ("restarted" if center_result.restarted else "started")
         print(f"  approval_center: running ({action})")
         print(f"  status:      {status['status']}")
-        print("Restart Codex so it reloads MCP config, then run `agentveil-mcp-proxy setup status --client codex`.")
+        print("  hook trust:  Codex will ask you to trust the AgentVeil project hook once.")
+        print("               Until that hook fires, status remains advisory, not protected.")
+        print("Open or restart Codex in this project, trust the AgentVeil hook if prompted, then run `agentveil-mcp-proxy setup status --client codex`.")
     return 0
 
 
@@ -5048,10 +5077,12 @@ def run_setup_codex_status_cli(
     else:
         print(f"status: {status['status']}")
         print(f"  connector:       {status['connector']}")
+        print(f"  hook:            {status['hook']} ({status['hook_state']})")
         print(f"  mcp route:       {status['mcp_route']}")
         print(f"  proxy route:     {status['proxy_route']}")
         print(f"  approval_center: {status['approval_center']}")
         print(f"  route proved:    {status['route_launch_proved']}")
+        print(f"  hook trust req.: {status['hook_trust_required']}")
         print(f"  restart required:{status['restart_required']}")
         print(f"  next: {status['next_step']}")
     return 0
@@ -5068,7 +5099,7 @@ def run_setup_remove_codex_cli(
 
     if not assume_yes:
         message = (
-            "Would remove only the AgentVeil Codex MCP route from Codex config "
+            "Would remove only AgentVeil-managed Codex hook and MCP route entries "
             f"for project {target}. Re-run with --yes."
         )
         if output_json:
@@ -5084,11 +5115,16 @@ def run_setup_remove_codex_cli(
         return 0
 
     try:
+        hook_result = codex_setup.remove_hook(project_dir=target)
         route_result = codex_setup.disconnect(project_dir=target, home=home, write=True)
     except (ClientConnectError, ClientConfigError, ClientPackError) as exc:
         raise ProxyCliError(str(exc), exit_code=2) from exc
     center_stop = claude_center_lifecycle.stop_if_managed(home)
-    removed_any = bool(route_result.get("removed_entry")) or center_stop["stopped"]
+    removed_any = (
+        bool(hook_result.get("removed_entries"))
+        or bool(route_result.get("removed_entry"))
+        or center_stop["stopped"]
+    )
 
     if output_json:
         _print_operator_json({
@@ -5096,6 +5132,7 @@ def run_setup_remove_codex_cli(
             "action": "setup-remove-codex",
             "applied": True,
             "scope": "project",
+            "hook_entries_removed": int(hook_result.get("removed_entries", 0)),
             "mcp_route_removed": bool(route_result.get("removed_entry")),
             "codex_config_ref": route_result.get("config_ref"),
             "approval_center_stopped": center_stop["stopped"],
@@ -5103,10 +5140,11 @@ def run_setup_remove_codex_cli(
         })
     else:
         print(
-            f"Removed: mcp route={bool(route_result.get('removed_entry'))}, "
+            f"Removed: hook entries={int(hook_result.get('removed_entries', 0))}, "
+            f"mcp route={bool(route_result.get('removed_entry'))}, "
             f"approval_center={'stopped' if center_stop['stopped'] else 'not running'}"
         )
-        print("Unrelated Codex config and MCP servers preserved.")
+        print("Unrelated Codex config, hooks, and MCP servers preserved.")
         if removed_any:
             print("Restart Codex to drop the connector.")
     return 0

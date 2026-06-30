@@ -55,10 +55,19 @@ def main() -> int:
         assert payload["action"] == "setup-codex"
         assert payload["approval_center"]["state"] == "running"
         assert "url" not in payload["approval_center"]
+        assert payload["codex_hook_trust_required"] is True
+        assert "trust" in payload["codex_hook_trust_message"].lower()
+        assert payload["status"]["status"] == "advisory"
+        assert payload["status"]["hook_trust_required"] is True
         assert codex_config.is_file()
+        hooks_path = project / ".codex" / "hooks.json"
+        assert hooks_path.is_file()
         text = codex_config.read_text(encoding="utf-8")
         assert "[mcp_servers.agentveil-mcp-proxy]" in text
         assert 'default_tools_approval_mode = "approve"' in text
+        hooks_text = hooks_path.read_text(encoding="utf-8")
+        assert "agentveil_mcp_proxy.codex_hook" in hooks_text
+        assert "Bash|apply_patch|Edit|Write|mcp__.*" in hooks_text
         assert (project / ".avp" / "mcp-proxy" / "config.json").is_file()
 
         status = _run(
@@ -69,6 +78,10 @@ def main() -> int:
         assert status.returncode == 0, status.stderr
         status_payload = json.loads(status.stdout)
         assert status_payload["connector"] == "codex"
+        assert status_payload["hook"] == "present"
+        assert status_payload["hook_state"] == "advisory"
+        assert status_payload["hook_trust_required"] is True
+        assert "trust the AgentVeil hook" in status_payload["next_step"]
         assert status_payload["mcp_route"] == "present"
         assert status_payload["approval_center"] == "running"
 
@@ -80,14 +93,17 @@ def main() -> int:
         assert remove.returncode == 0, remove.stderr
         remove_payload = json.loads(remove.stdout)
         assert remove_payload["ok"] is True
+        assert remove_payload["hook_entries_removed"] == 1
         assert remove_payload["mcp_route_removed"] is True
         assert remove_payload["approval_center_stopped"] is True or not (
             project / ".avp" / "mcp-proxy" / "approval-center.manifest.json"
         ).exists()
         if codex_config.exists():
             assert "[mcp_servers.agentveil-mcp-proxy]" not in codex_config.read_text(encoding="utf-8")
+        if hooks_path.exists():
+            assert "agentveil_mcp_proxy.codex_hook" not in hooks_path.read_text(encoding="utf-8")
 
-    print("P0_7_CODEX_SETUP_INSTALLED_SMOKE: ok", flush=True)
+    print("P0_8_CODEX_SETUP_HOOK_INSTALLED_SMOKE: ok", flush=True)
     return 0
 
 
