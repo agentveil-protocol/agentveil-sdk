@@ -49,7 +49,13 @@ from agentveil_mcp_proxy.classification import (
     sha256_jcs,
 )
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceError, ApprovalStatus
-from agentveil_mcp_proxy.evidence.events_show import LOCAL_PROOF_INSPECTION_HINT
+from agentveil_mcp_proxy.evidence.events_show import (
+    DEFAULT_SHOW_LAST,
+    LOCAL_PROOF_AGENT_INSPECTION_HINT,
+    LOCAL_PROOF_INSPECTION_HINT,
+    LOCAL_PROOF_MCP_TOOL_NAME,
+    build_local_proof_mcp_payload,
+)
 from agentveil_mcp_proxy.client_config import downstream_startup_fingerprint
 from agentveil_mcp_proxy.evidence.observability import (
     parse_action_gate_metadata,
@@ -904,7 +910,7 @@ def _approval_required_error(
         if approval_outcome.approval_url is not None:
             data["approval_url"] = approval_outcome.approval_url
             data["instructions"] = APPROVAL_REQUIRED_INSTRUCTIONS
-            data["proof_inspection_hint"] = LOCAL_PROOF_INSPECTION_HINT
+            data["proof_inspection_hint"] = LOCAL_PROOF_AGENT_INSPECTION_HINT
             resolved_message = actionable_approval_required_message(approval_outcome.approval_url)
     if enrich_guidance:
         redirect_original_id = (
@@ -1294,6 +1300,12 @@ class McpPassthrough:
             )
             if policy_error is not None:
                 return [policy_error] if has_id else []
+            local_proof_response = self._local_proof_tool_response(
+                message,
+                request_id,
+            )
+            if local_proof_response is not None:
+                return [local_proof_response] if has_id else []
             if (
                 approval_outcome is not None
                 and approval_outcome.approved
@@ -2634,6 +2646,80 @@ class McpPassthrough:
             resource=classification.resource_plain,
             arguments={},
         ) is RiskClass.READ
+
+    def _local_proof_tool_response(
+        self,
+        message: Mapping[str, Any],
+        request_id: Any,
+    ) -> dict[str, Any] | None:
+        if message.get("method") != "tools/call":
+            return None
+        params = message.get("params")
+        if not isinstance(params, Mapping):
+            return None
+        tool = params.get("name")
+        if tool != LOCAL_PROOF_MCP_TOOL_NAME:
+            return None
+        arguments = params.get("arguments", {})
+        if not isinstance(arguments, Mapping):
+            arguments = {}
+        last = arguments.get("last", DEFAULT_SHOW_LAST)
+        verify = arguments.get("verify", True)
+        session = arguments.get("session")
+        if last is not None and not isinstance(last, int):
+            return jsonrpc_error(
+                request_id,
+                JSONRPC_INVALID_PARAMS,
+                "local_proof last must be an integer",
+            )
+        if not isinstance(verify, bool):
+            return jsonrpc_error(
+                request_id,
+                JSONRPC_INVALID_PARAMS,
+                "local_proof verify must be a boolean",
+            )
+        if session is not None and not isinstance(session, str):
+            return jsonrpc_error(
+                request_id,
+                JSONRPC_INVALID_PARAMS,
+                "local_proof session must be a string",
+            )
+        manager = self.approval_manager
+        store = getattr(manager, "evidence_store", None) if manager is not None else None
+        if store is None or not hasattr(store, "db_path"):
+            return jsonrpc_error(
+                request_id,
+                JSONRPC_DOWNSTREAM_ERROR,
+                "local proof is unavailable",
+                # claim-check: allow "blocked" is a bounded JSON-RPC status, not a runtime safety claim.
+                data={"status": "blocked", "reason": "local_proof_unavailable"},
+            )
+        try:
+            payload = build_local_proof_mcp_payload(
+                evidence_path=store.db_path,
+                config_path=None,
+                last=last if isinstance(last, int) else DEFAULT_SHOW_LAST,
+                session_id=session,
+                verify=verify,
+            )
+        except ValueError as exc:
+            return jsonrpc_error(
+                request_id,
+                JSONRPC_INVALID_PARAMS,
+                str(exc),
+            )
+        return {
+            "jsonrpc": JSONRPC_VERSION,
+            "id": request_id,
+            "result": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(payload, separators=(",", ":"), sort_keys=True),
+                    }
+                ],
+            },
+        }
 
     def _fallback_error_response(
         self,

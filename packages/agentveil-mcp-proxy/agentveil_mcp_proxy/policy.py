@@ -1429,6 +1429,7 @@ def builtin_policy_pack(name: str) -> PolicyConfig:
                         "stat_*",
                         "get_file_info",
                         "instruction_surface_*",
+                        "local_proof",
                     ],
                 },
             },

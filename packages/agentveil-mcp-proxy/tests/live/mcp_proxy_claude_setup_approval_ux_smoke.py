@@ -229,6 +229,7 @@ def main() -> int:
             ("read_file", {"path": READ_PROBE}, "read-file"),
             ("get_file_info", {"path": READ_PROBE}, "read-info"),
             ("instruction_surface_status", {}, "read-surface"),
+            ("local_proof", {"last": 5, "verify": True}, "read-proof"),
         ):
             response = _proxy_run(cli, home=home, env=env, tool=tool, arguments=args, call_id=call_id)
             _assert_read_tool_allowed(response, tool=tool)
@@ -264,14 +265,36 @@ def main() -> int:
         assert "agentveil-mcp-proxy events show --last --verify" not in html
         assert "/proof" not in html
         proof_hint = data.get("proof_inspection_hint")
-        if not isinstance(proof_hint, str) or "events show --last --verify" not in proof_hint:
-            raise AssertionError(f"write_file missing proof_inspection_hint in {data!r}")
+        if not isinstance(proof_hint, str) or "local_proof" not in proof_hint:
+            raise AssertionError(f"write_file missing local_proof proof_inspection_hint in {data!r}")
 
         _assert_installed_events_show(cli, home=home, env=env)
 
+        proof_response = _proxy_run(
+            cli,
+            home=home,
+            env=env,
+            tool="local_proof",
+            arguments={"last": 5, "verify": True},
+            call_id="local-proof",
+        )
+        proof_payload = json.loads(proof_response["result"]["content"][0]["text"])
+        if proof_payload.get("status") != "ok":
+            raise AssertionError(f"local_proof expected status ok: {proof_payload!r}")
+        if not proof_payload.get("proof", {}).get("events"):
+            raise AssertionError(f"local_proof missing proof events: {proof_payload!r}")
+        events = proof_payload["proof"]["events"]
+        write_proof = [
+            event
+            for event in events
+            if event.get("tool") == "write_file" and event.get("decision") == "approval_required"
+        ]
+        if not write_proof:
+            raise AssertionError(f"local_proof missing write_file approval_required event: {proof_payload!r}")
+
         print("P0.4B_CLAUDE_SETUP_APPROVAL_UX_AND_EVENTS_SHOW_SMOKE: ok")
         print(f"setup_cmd={' '.join(setup_cmd)}")
-        print(f"read_tools=list_workspace,read_file,get_file_info,instruction_surface_status")
+        print(f"read_tools=list_workspace,read_file,get_file_info,instruction_surface_status,local_proof")
         print(f"write_file_status={data.get('status')}")
         print(f"write_file_reason={data.get('reason')}")
         print(f"approval_url={approval_url}")

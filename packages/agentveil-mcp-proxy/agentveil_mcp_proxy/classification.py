@@ -111,6 +111,7 @@ _FILESYSTEM_READ_TOOL_RISK_CLASSES: Mapping[str, RiskClass] = {
     "read_file": RiskClass.READ,
     "get_file_info": RiskClass.READ,
     "instruction_surface_status": RiskClass.READ,
+    "local_proof": RiskClass.READ,
 }
 
 # Python package-manager MCP tool surface. Ecosystem scope: pip only.

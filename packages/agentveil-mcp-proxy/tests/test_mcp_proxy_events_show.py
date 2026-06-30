@@ -10,8 +10,11 @@ import pytest
 
 from agentveil_mcp_proxy.cli import ProxyCliError, init_proxy, main, proxy_paths, show_events
 from agentveil_mcp_proxy.evidence.events_show import (
+    LOCAL_PROOF_AGENT_INSPECTION_HINT,
+    LOCAL_PROOF_MCP_TOOL_NAME,
     build_event_show_entry,
     build_events_show_payload,
+    build_local_proof_mcp_payload,
     verify_local_evidence_chain,
 )
 from agentveil_mcp_proxy.evidence.store import (
@@ -70,6 +73,7 @@ def test_events_show_empty_state_is_friendly(tmp_path: Path) -> None:
 
     assert count == 0
     assert "No local evidence yet" in text
+    assert LOCAL_PROOF_MCP_TOOL_NAME in text
     assert "events show --last --verify" in text
     assert "unknown" not in text.lower()
 
@@ -313,7 +317,7 @@ def test_events_show_target_reached_after_execution() -> None:
     assert entry["target_reached"] is True
     assert entry["reason_summary"] == "Action reached target."
     assert "Approval required before execution" not in entry["reason_summary"]
-    assert "events show --last --verify" in entry["next_step"]
+    assert LOCAL_PROOF_MCP_TOOL_NAME in entry["next_step"]
 
 
 def test_events_show_why_copy_matches_decision_semantics() -> None:
@@ -414,3 +418,42 @@ def test_events_show_user_denied_vs_policy_hard_block() -> None:
     assert blocked["decision"] == "hard_blocked"  # claim-check: allow hard_blocked decision enum assertion.
     assert denied["reason_summary"] == "Denied by user."
     assert blocked["reason_summary"] == "local policy block"  # claim-check: allow policy block fixture text.
+
+
+def test_local_proof_mcp_payload_is_bounded_and_includes_verify(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    paths = proxy_paths(home)
+    metadata = json.dumps({
+        "action_family": "write",
+        "policy_decision": "approval",
+        "approval_status": "pending",
+        "execution_status": "not_reached",
+        "target_reached": False,
+    }, separators=(",", ":"))
+    with ApprovalEvidenceStore(paths.proxy_dir / "evidence.sqlite") as store:
+        store.write_pending(_record("req-write", metadata_jcs=metadata))
+
+    payload = build_local_proof_mcp_payload(
+        evidence_path=paths.proxy_dir / "evidence.sqlite",
+        config_path=paths.config_path,
+        last=5,
+        verify=True,
+    )
+
+    assert payload["status"] == "ok"
+    assert payload["proof"]["events"]
+    event = payload["proof"]["events"][-1]
+    assert event["decision"] == "approval_required"
+    assert event["tool"] == "write_file"
+    assert event["why"]
+    assert LOCAL_PROOF_MCP_TOOL_NAME in event["next_step"]
+    assert payload["proof"]["verify"]["status"] in {"not_available", "intact", "failed"}
+    serialized = json.dumps(payload)
+    assert "/Users/" not in serialized
+    assert "sha256:" not in serialized
+
+
+def test_local_proof_agent_hint_prefers_mcp_tool() -> None:
+    assert LOCAL_PROOF_MCP_TOOL_NAME in LOCAL_PROOF_AGENT_INSPECTION_HINT
+    assert "events show --last --verify" in LOCAL_PROOF_AGENT_INSPECTION_HINT

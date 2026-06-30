@@ -24,7 +24,12 @@ from agentveil_mcp_proxy.evidence.store import (
 
 
 DEFAULT_SHOW_LAST = 10
+LOCAL_PROOF_MCP_TOOL_NAME = "local_proof"
 LOCAL_PROOF_INSPECTION_COMMAND = "agentveil-mcp-proxy events show --last --verify"
+LOCAL_PROOF_AGENT_INSPECTION_HINT = (
+    "Use the AgentVeil local_proof MCP tool to inspect local proof. "
+    f"A human can also run `{LOCAL_PROOF_INSPECTION_COMMAND}` manually."
+)
 LOCAL_PROOF_BLOCK_TITLE = "Local proof"
 LOCAL_PROOF_PENDING_QUIET_LINE = "This decision will be recorded locally."
 LOCAL_PROOF_POST_APPROVE_BODY = (
@@ -34,18 +39,18 @@ LOCAL_PROOF_POST_DENY_BODY = (
     "This denial was recorded. Verify the decision locally:"
 )
 LOCAL_PROOF_INSPECTION_HINT = (
-    f"After retry, inspect local proof with `{LOCAL_PROOF_INSPECTION_COMMAND}`."
+    "After retry, use the AgentVeil local_proof MCP tool to inspect local proof. "
+    f"A human can also run `{LOCAL_PROOF_INSPECTION_COMMAND}` manually."
 )
-LOCAL_PROOF_INSPECTION_DISCOVER_HINT = (
-    f"Inspect local proof with `{LOCAL_PROOF_INSPECTION_COMMAND}`."
-)
+LOCAL_PROOF_INSPECTION_DISCOVER_HINT = LOCAL_PROOF_AGENT_INSPECTION_HINT
 _LOCAL_PROOF_SUMMARY = (
     "Local proof shows what was requested, decided, executed, and whether the "
     "target was reached."
 )
 _EMPTY_NEXT_STEP = (
-    "Run a routed MCP action, then run "
-    f"`{LOCAL_PROOF_INSPECTION_COMMAND}`."
+    "Run a routed MCP action, then use the AgentVeil local_proof MCP tool to "
+    "inspect local proof. "
+    f"A human can also run `{LOCAL_PROOF_INSPECTION_COMMAND}` manually."
 )
 _SETUP_NEXT_STEP = (
     "Run `agentveil-mcp-proxy setup status` or initialize the proxy with `init`."
@@ -339,6 +344,73 @@ def build_events_show_payload(
     return payload
 
 
+def _local_proof_event_row(entry: Mapping[str, Any]) -> dict[str, Any]:
+    if entry.get("valid") is False:
+        return {
+            "valid": False,
+            "record_id": entry.get("record_id"),
+            "reason": entry.get("reason"),
+        }
+    row: dict[str, Any] = {
+        "time": entry.get("timestamp_utc"),
+        "decision": entry.get("decision"),
+        "tool": entry.get("tool"),
+    }
+    if entry.get("action_family"):
+        row["action"] = entry["action_family"]
+    target = entry.get("target")
+    if target not in (None, "none"):
+        row["target"] = target
+    if entry.get("policy_rule"):
+        row["policy"] = entry["policy_rule"]
+    if entry.get("reason_summary"):
+        row["why"] = entry["reason_summary"]
+    if entry.get("next_step"):
+        row["next_step"] = entry["next_step"]
+    if "target_reached" in entry:
+        row["target_reached"] = entry["target_reached"]
+    return row
+
+
+def build_local_proof_mcp_payload(
+    *,
+    evidence_path: Path,
+    config_path: Path | None,
+    last: int | None = None,
+    session_id: str | None = None,
+    verify: bool = True,
+) -> dict[str, Any]:
+    """Build bounded MCP ``local_proof`` response payload."""
+
+    show_payload = build_events_show_payload(
+        evidence_path=evidence_path,
+        config_path=config_path,
+        last=last,
+        session_id=session_id,
+        verify=verify,
+    )
+    proof: dict[str, Any] = {
+        "events": [
+            _local_proof_event_row(event)
+            for event in show_payload.get("events", [])
+            if isinstance(event, Mapping)
+        ],
+    }
+    if verify:
+        verify_block = show_payload.get("verify")
+        if isinstance(verify_block, Mapping):
+            proof["verify"] = {"status": verify_block.get("status", "not_available")}
+        else:
+            proof["verify"] = {"status": "not_available"}
+    payload: dict[str, Any] = {"status": "ok", "proof": proof}
+    if show_payload.get("empty"):
+        payload["empty"] = True
+    warnings = show_payload.get("warnings")
+    if warnings:
+        payload["warnings"] = list(warnings)
+    return payload
+
+
 def format_events_show_human(payload: Mapping[str, Any]) -> str:
     """Render human-readable ``events show`` output."""
 
@@ -398,8 +470,10 @@ def events_show_json(payload: Mapping[str, Any]) -> str:
 
 __all__ = [
     "DEFAULT_SHOW_LAST",
+    "LOCAL_PROOF_AGENT_INSPECTION_HINT",
     "LOCAL_PROOF_INSPECTION_COMMAND",
     "LOCAL_PROOF_BLOCK_TITLE",
+    "LOCAL_PROOF_MCP_TOOL_NAME",
     "LOCAL_PROOF_PENDING_QUIET_LINE",
     "LOCAL_PROOF_POST_APPROVE_BODY",
     "LOCAL_PROOF_POST_DENY_BODY",
@@ -407,6 +481,7 @@ __all__ = [
     "LOCAL_PROOF_INSPECTION_HINT",
     "build_event_show_entry",
     "build_events_show_payload",
+    "build_local_proof_mcp_payload",
     "events_show_json",
     "format_events_show_human",
     "verify_local_evidence_chain",

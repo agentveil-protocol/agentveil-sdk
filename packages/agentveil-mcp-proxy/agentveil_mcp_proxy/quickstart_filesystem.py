@@ -166,6 +166,30 @@ def _tools() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "local_proof",
+            "description": (
+                "Return bounded local AgentVeil proof/evidence summary without shell."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "last": {
+                        "type": "integer",
+                        "description": "Maximum number of recent evidence events to return.",
+                    },
+                    "verify": {
+                        "type": "boolean",
+                        "description": "When true, include local hash-chain verify status.",
+                    },
+                    "session": {
+                        "type": ["string", "null"],
+                        "description": "Optional session id filter.",
+                    },
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "write_file",
             "description": "Write a UTF-8 text file under the quickstart sandbox root.",
             "inputSchema": {
@@ -361,6 +385,12 @@ def _handle_tools_call(root: Path, request_id: Any, params: Mapping[str, Any]) -
         return _response(
             request_id,
             {"content": [{"type": "text", "text": json.dumps(summary, separators=(",", ":"))}]},
+        )
+    if name == "local_proof":
+        return _error(
+            request_id,
+            -32603,
+            "local_proof is handled by the AgentVeil MCP proxy, not the filesystem downstream",
         )
     if name == "write_file":
         path = arguments.get("path")
