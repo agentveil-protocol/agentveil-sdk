@@ -125,6 +125,7 @@ CLIENT_TARGETS: dict[str, ClientTarget] = {
     client_id: _client_target_from_pack(client_id)
     for client_id in CLIENT_PACK_IDS
 }
+CLIENT_TARGETS["gemini-cli"] = _client_target_from_pack("gemini_cli")
 CLIENT_TARGETS["claude_desktop"] = ClientTarget(
     client_id="claude_desktop",
     display_name="Claude Desktop",

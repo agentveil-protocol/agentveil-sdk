@@ -18,7 +18,7 @@ from agentveil_mcp_proxy.cli import main
 
 
 def test_client_pack_ids_cover_required_clients():
-    assert set(CLIENT_PACK_IDS) == {"cursor", "claude_code", "codex"}
+    assert set(CLIENT_PACK_IDS) == {"cursor", "claude_code", "codex", "gemini_cli"}
 
 
 def test_build_client_packs_payload_includes_required_metadata():
@@ -50,8 +50,17 @@ def test_get_client_pack_returns_cursor_pack():
     assert pack.renders_runnable_config is True
 
 
+def test_get_client_pack_gemini_cli_guidance_uses_real_setup_command():
+    pack = get_client_pack("gemini_cli")
+    assert pack.client_id == "gemini_cli"
+    assert "setup gemini-cli --project-dir" in pack.guidance_summary
+    assert "--choose-folder --yes" in pack.guidance_summary
+    assert "--write" not in pack.guidance_summary
+    assert "protected work" not in pack.guidance_summary.lower()
+
+
 def test_cli_client_config_packs_json_output(capsys):
     assert main(["client-config", "packs", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out.strip())
-    assert payload["pack_count"] == 3
+    assert payload["pack_count"] == len(CLIENT_PACK_IDS)
     assert set(payload["packs"]) == set(CLIENT_PACK_IDS)

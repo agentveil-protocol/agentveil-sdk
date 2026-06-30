@@ -77,10 +77,10 @@ class ClientConnectAdapter(ABC):
             raise ClientConnectError("client config is not valid JSON") from exc
         if not isinstance(payload, dict):
             raise ClientConnectError("client config must be a JSON object")
-        servers = payload.get("mcpServers", {})
+        servers = payload.get("mcpServers")
         if servers is None:
             payload["mcpServers"] = {}
-        elif not isinstance(payload["mcpServers"], dict):
+        elif not isinstance(servers, dict):
             raise ClientConnectError("client config mcpServers must be an object")
         return payload
 
@@ -232,12 +232,27 @@ class CodexConnectAdapter(ClientConnectAdapter):
         )
 
 
+class GeminiCliConnectAdapter(ClientConnectAdapter):
+    client_id = "gemini_cli"
+    support_level: ConnectSupportLevel = "auto_write"
+
+    def resolve_config_location(self, *, project_root: Path) -> ClientConfigLocation:
+        pack = get_client_pack(self.client_id)
+        return ClientConfigLocation(
+            client_id=self.client_id,
+            config_path=project_root / ".gemini" / "settings.json",
+            config_surface=pack.config_surface,
+            support_level=self.support_level,
+        )
+
+
 CONNECT_ADAPTERS: dict[str, ClientConnectAdapter] = {
     adapter.client_id: adapter
     for adapter in (
         CursorConnectAdapter(),
         ClaudeCodeConnectAdapter(),
         CodexConnectAdapter(),
+        GeminiCliConnectAdapter(),
     )
 }
 
