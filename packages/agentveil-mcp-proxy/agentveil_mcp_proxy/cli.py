@@ -3934,13 +3934,43 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_json_arg(setup_claude_code)
 
+    setup_codex = setup_subparsers.add_parser(
+        "codex",
+        help="One-command Codex connector setup (proxy route + Codex MCP route)",
+    )
+    setup_codex.add_argument(
+        "--project-dir", type=Path, default=None,
+        help="Project directory to set up (default: current directory)",
+    )
+    setup_codex.add_argument(
+        "--choose-folder", action="store_true",
+        help="Open the macOS folder picker to choose the project directory",
+    )
+    setup_codex.add_argument(
+        "--sandbox", type=Path, default=None,
+        help="Quickstart filesystem sandbox path (default: selected project directory)",
+    )
+    setup_codex.add_argument(
+        "--yes", action="store_true",
+        help="Apply the setup; without it the command only previews",
+    )
+    setup_codex.add_argument(
+        "--passphrase-file", type=Path, default=None,
+        help="Encrypt the proxy identity with this passphrase file (default: plaintext quickstart)",
+    )
+    setup_codex.add_argument(
+        "--force", action="store_true",
+        help="Re-initialize the proxy route even if its config already exists",
+    )
+    _add_json_arg(setup_codex)
+
     setup_remove = setup_subparsers.add_parser(
         "remove",
         help="Remove a one-command connector (AgentVeil-managed entries only)",
     )
     setup_remove.add_argument(
         "target",
-        choices=["cursor", "claude-code"],
+        choices=["cursor", "claude-code", "codex"],
         help="Connector to remove",
     )
     setup_remove.add_argument(
@@ -4830,6 +4860,258 @@ def run_setup_claude_code_cli(
     return 0
 
 
+def run_setup_codex_cli(
+    *,
+    project_dir: Path | None,
+    choose_folder: bool,
+    sandbox: Path | None,
+    assume_yes: bool,
+    passphrase_file: Path | None,
+    force: bool,
+    output_json: bool,
+) -> int:
+    """One-command Codex connector setup.
+
+    Reuses the existing Codex TOML connect path, project-local proxy route, and
+    managed local Approval Center. It does not hook or control provider-native
+    Codex tools; it configures routed AgentVeil MCP tools.
+    """
+    from agentveil_mcp_proxy import codex_setup
+
+    if choose_folder and project_dir is not None:
+        raise ProxyCliError("--choose-folder cannot be combined with --project-dir", exit_code=2)
+    selected_project = _choose_setup_project_folder() if choose_folder else project_dir
+    target = (Path(selected_project) if selected_project is not None else Path.cwd()).resolve()
+    sandbox_path = Path(sandbox).resolve() if sandbox is not None else target
+    home = codex_setup.setup_home(target)
+    config_path = codex_setup.proxy_config_path(home)
+
+    if not assume_yes:
+        message = (
+            f"Would set up the Codex connector in {target}: proxy quickstart "
+            "route, Codex MCP config, and managed Approval Center. Re-run with --yes."
+        )
+        if output_json:
+            _print_json({
+                "ok": False,
+                "action": "setup-codex",
+                "applied": False,
+                "errors": ["confirmation required: pass --yes"],
+                "warnings": [message],
+            })
+        else:
+            print(message)
+        return 0
+
+    quiet = io.StringIO()
+    proxy_present = config_path.exists()
+    proxy_initialized = False
+    if force or not proxy_present:
+        downstream = quickstart_filesystem_downstream(sandbox_path)
+        try:
+            init_proxy(
+                home=home,
+                config_path=None,
+                policy_pack="filesystem",
+                downstream_config=downstream,
+                plaintext=(passphrase_file is None),
+                passphrase_file=passphrase_file,
+                force=force,
+                err=quiet,
+            )
+        except ProxyCliError:
+            raise
+        proxy_initialized = True
+
+    proxy_cmd = _resolve_setup_proxy_command()
+    if not proxy_cmd:
+        raise ProxyCliError(
+            "agentveil-mcp-proxy console script not on PATH; cannot configure Codex MCP route",
+            exit_code=1,
+        )
+
+    run_connect_cli(
+        client_id="codex",
+        home=home,
+        project_root=target,
+        write=True,
+        proxy_command=proxy_cmd,
+        passphrase_file=passphrase_file,
+        out=quiet,
+    )
+    route_status = codex_setup.connect_status(
+        project_dir=target,
+        home=home,
+        passphrase_file=passphrase_file,
+        proxy_command=proxy_cmd,
+    )
+    if not codex_setup.managed_route_present(route_status):
+        raise ProxyCliError(
+            "could not write the Codex MCP route; ensure Codex config is writable",
+            exit_code=1,
+        )
+
+    from agentveil_mcp_proxy import claude_center_lifecycle
+
+    center_result = claude_center_lifecycle.ensure_running(
+        home=home,
+        proxy_command=proxy_cmd,
+        passphrase_file=passphrase_file,
+    )
+    center_running = center_result.status.state == "running"
+    status = codex_setup.connector_status(
+        project_dir=target,
+        center_state=center_result.status.state,
+        passphrase_file=passphrase_file,
+        proxy_command=proxy_cmd,
+    )
+    sandbox_label = "project" if sandbox is None else "custom"
+
+    if not center_running:
+        if output_json:
+            _print_json({
+                "ok": False,
+                "action": "setup-codex",
+                "applied": True,
+                "scope": "project",
+                "proxy_route_initialized": proxy_initialized,
+                "mcp_route": "present",
+                "sandbox_relpath": sandbox_label,
+                "identity_encrypted": passphrase_file is not None,
+                "approval_center": {"state": center_result.status.state, "reason": center_result.reason},
+                "errors": [
+                    "approval_center not running; controlled MCP writes would surface "
+                    "unreachable approval URLs. Setup is not ready/protected."
+                ],
+                "warnings": [],
+            })
+        else:
+            print("Codex connector partially set up:")
+            print(f"  proxy route: {'initialized' if proxy_initialized else 'already present'}")
+            print("  MCP route:   ~/.codex/config.toml updated")
+            print(f"  approval_center: {center_result.status.state} ({center_result.reason})")
+            print("ERROR: setup is NOT ready — Approval Center could not start.", file=sys.stderr)
+        return 1
+
+    if output_json:
+        _print_operator_json({
+            "ok": True,
+            "action": "setup-codex",
+            "applied": True,
+            "scope": "project",
+            "proxy_route_initialized": proxy_initialized,
+            "mcp_route": "present",
+            "codex_config_ref": route_status.get("config_ref"),
+            "sandbox_relpath": sandbox_label,
+            "identity_encrypted": passphrase_file is not None,
+            "approval_center": {
+                "state": center_result.status.state,
+                "started": center_result.started,
+                "reused": center_result.reused,
+                "restarted": center_result.restarted,
+            },
+            "reload_required": True,
+            "status": status,
+        })
+    else:
+        print("Codex connector set up for this project:")
+        print(f"  proxy route: {'initialized' if proxy_initialized else 'already present'}")
+        print("  MCP route:   ~/.codex/config.toml updated")
+        if passphrase_file is None:
+            print("  identity:    stored unencrypted (quickstart); use --passphrase-file to encrypt")
+        action = "reused" if center_result.reused else ("restarted" if center_result.restarted else "started")
+        print(f"  approval_center: running ({action})")
+        print(f"  status:      {status['status']}")
+        print("Restart Codex so it reloads MCP config, then run `agentveil-mcp-proxy setup status --client codex`.")
+    return 0
+
+
+def run_setup_codex_status_cli(
+    *,
+    project_dir: Path | None,
+    proxy_command: str | None,
+    output_json: bool,
+) -> int:
+    """Project-local Codex connector status."""
+    from agentveil_mcp_proxy import claude_center_lifecycle, codex_setup
+
+    target = (Path(project_dir) if project_dir is not None else Path.cwd()).resolve()
+    home = codex_setup.setup_home(target)
+    center = claude_center_lifecycle.check_status(home)
+    status = codex_setup.connector_status(
+        project_dir=target,
+        center_state=center.state,
+        proxy_command=proxy_command or _resolve_setup_proxy_command(),
+    )
+    if output_json:
+        _print_operator_json(status)
+    else:
+        print(f"status: {status['status']}")
+        print(f"  connector:       {status['connector']}")
+        print(f"  mcp route:       {status['mcp_route']}")
+        print(f"  proxy route:     {status['proxy_route']}")
+        print(f"  approval_center: {status['approval_center']}")
+        print(f"  route proved:    {status['route_launch_proved']}")
+        print(f"  restart required:{status['restart_required']}")
+        print(f"  next: {status['next_step']}")
+    return 0
+
+
+def run_setup_remove_codex_cli(
+    *, project_dir: Path | None, assume_yes: bool, output_json: bool
+) -> int:
+    """Remove the one-command Codex connector — AgentVeil-managed entry only."""
+    from agentveil_mcp_proxy import claude_center_lifecycle, codex_setup
+
+    target = (Path(project_dir) if project_dir is not None else Path.cwd()).resolve()
+    home = codex_setup.setup_home(target)
+
+    if not assume_yes:
+        message = (
+            "Would remove only the AgentVeil Codex MCP route from Codex config "
+            f"for project {target}. Re-run with --yes."
+        )
+        if output_json:
+            _print_json({
+                "ok": False,
+                "action": "setup-remove-codex",
+                "applied": False,
+                "errors": ["confirmation required: pass --yes"],
+                "warnings": [message],
+            })
+        else:
+            print(message)
+        return 0
+
+    try:
+        route_result = codex_setup.disconnect(project_dir=target, home=home, write=True)
+    except (ClientConnectError, ClientConfigError, ClientPackError) as exc:
+        raise ProxyCliError(str(exc), exit_code=2) from exc
+    center_stop = claude_center_lifecycle.stop_if_managed(home)
+    removed_any = bool(route_result.get("removed_entry")) or center_stop["stopped"]
+
+    if output_json:
+        _print_operator_json({
+            "ok": True,
+            "action": "setup-remove-codex",
+            "applied": True,
+            "scope": "project",
+            "mcp_route_removed": bool(route_result.get("removed_entry")),
+            "codex_config_ref": route_result.get("config_ref"),
+            "approval_center_stopped": center_stop["stopped"],
+            "reload_required": removed_any,
+        })
+    else:
+        print(
+            f"Removed: mcp route={bool(route_result.get('removed_entry'))}, "
+            f"approval_center={'stopped' if center_stop['stopped'] else 'not running'}"
+        )
+        print("Unrelated Codex config and MCP servers preserved.")
+        if removed_any:
+            print("Restart Codex to drop the connector.")
+    return 0
+
+
 def run_setup_connector_status_cli(*, project_dir: Path | None, output_json: bool) -> int:
     """Project-local Claude connector status (bare `setup status`)."""
     from agentveil_mcp_proxy import claude_center_lifecycle, claude_hook_setup
@@ -5338,7 +5620,13 @@ def main(argv: list[str] | None = None) -> int:
                         assume_yes=args.yes,
                         output_json=args.json_output,
                     )
-                raise ProxyCliError("setup remove target must be cursor or claude-code")
+                if args.target == "codex":
+                    return run_setup_remove_codex_cli(
+                        project_dir=args.project_dir,
+                        assume_yes=args.yes,
+                        output_json=args.json_output,
+                    )
+                raise ProxyCliError("setup remove target must be cursor, claude-code, or codex")
             if args.setup_action == "run":
                 return run_setup_wizard_cli(
                     home=args.home,
@@ -5354,6 +5642,12 @@ def main(argv: list[str] | None = None) -> int:
                 )
             if args.setup_action == "status":
                 if args.home is None:
+                    if args.client == "codex":
+                        return run_setup_codex_status_cli(
+                            project_dir=args.project_dir,
+                            proxy_command=args.proxy_command,
+                            output_json=args.json_output,
+                        )
                     if args.project_dir is not None:
                         return run_setup_connector_status_cli(
                             project_dir=args.project_dir,
@@ -5388,8 +5682,18 @@ def main(argv: list[str] | None = None) -> int:
                     force=args.force,
                     output_json=args.json_output,
                 )
+            if args.setup_action == "codex":
+                return run_setup_codex_cli(
+                    project_dir=args.project_dir,
+                    choose_folder=args.choose_folder,
+                    sandbox=args.sandbox,
+                    assume_yes=args.yes,
+                    passphrase_file=args.passphrase_file,
+                    force=args.force,
+                    output_json=args.json_output,
+                )
             raise ProxyCliError(
-                "setup action must be cursor, claude-code, status, remove, run, or restore"
+                "setup action must be cursor, claude-code, codex, status, remove, run, or restore"
             )
         if args.command == "install-claude-hook":
             return run_install_claude_hook_cli(
