@@ -26,6 +26,10 @@ from agentveil_mcp_proxy.evidence.store import (
 DEFAULT_SHOW_LAST = 10
 LOCAL_PROOF_MCP_TOOL_NAME = "local_proof"
 LOCAL_PROOF_INSPECTION_COMMAND = "agentveil-mcp-proxy events show --last --verify"
+LOCAL_PROOF_AGENT_PROMPT = (
+    "Show AgentVeil local proof using the local_proof MCP tool. "
+    "Do not run shell commands."
+)
 LOCAL_PROOF_AGENT_INSPECTION_HINT = (
     "Use the AgentVeil local_proof MCP tool to inspect local proof. "
     f"A human can also run `{LOCAL_PROOF_INSPECTION_COMMAND}` manually."
@@ -33,10 +37,10 @@ LOCAL_PROOF_AGENT_INSPECTION_HINT = (
 LOCAL_PROOF_BLOCK_TITLE = "Local proof"
 LOCAL_PROOF_PENDING_QUIET_LINE = "This decision will be recorded locally."
 LOCAL_PROOF_POST_APPROVE_BODY = (
-    "After the agent retries the same MCP call, verify the decision and outcome locally:"
+    "After the agent retries the same MCP call, copy this prompt into the agent chat:"
 )
 LOCAL_PROOF_POST_DENY_BODY = (
-    "This denial was recorded. Verify the decision locally:"
+    "This denial was recorded. Copy this prompt into the agent chat to inspect local proof:"
 )
 LOCAL_PROOF_INSPECTION_HINT = (
     "After retry, use the AgentVeil local_proof MCP tool to inspect local proof. "
@@ -471,6 +475,7 @@ def events_show_json(payload: Mapping[str, Any]) -> str:
 __all__ = [
     "DEFAULT_SHOW_LAST",
     "LOCAL_PROOF_AGENT_INSPECTION_HINT",
+    "LOCAL_PROOF_AGENT_PROMPT",
     "LOCAL_PROOF_INSPECTION_COMMAND",
     "LOCAL_PROOF_BLOCK_TITLE",
     "LOCAL_PROOF_MCP_TOOL_NAME",

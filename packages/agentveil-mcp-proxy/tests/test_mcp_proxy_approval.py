@@ -3432,8 +3432,10 @@ def test_post_decision_page_instructs_retry():
         assert "without changing tool, target, or payload" in text
         assert "Local proof" in text
         assert "approval-local-proof-command" in text
-        assert "agentveil-mcp-proxy events show --last --verify" in text
-        assert "Copy command" in text
+        assert "Show AgentVeil local proof using the local_proof MCP tool" in text
+        assert "Do not run shell commands" in text
+        assert "agentveil-mcp-proxy events show --last --verify" not in text
+        assert "Copy prompt" in text
         assert "After the agent retries the same MCP call" in text
         assert "/proof" not in text
         assert "auto-resume" not in text.lower()
@@ -3459,8 +3461,10 @@ def test_post_decision_deny_page_points_to_local_proof():
         assert "denied and will not run" in text
         assert "Local proof" in text
         assert "approval-local-proof-command" in text
-        assert "agentveil-mcp-proxy events show --last --verify" in text
-        assert "Copy command" in text
+        assert "Show AgentVeil local proof using the local_proof MCP tool" in text
+        assert "Do not run shell commands" in text
+        assert "agentveil-mcp-proxy events show --last --verify" not in text
+        assert "Copy prompt" in text
         assert "This denial was recorded" in text
         assert "Retry the same MCP tool call" not in text
         assert "agent retries the same MCP call" not in text
@@ -3485,6 +3489,7 @@ def test_pending_approval_page_shows_quiet_local_recording_note():
         assert "This decision will be recorded locally" in text
         assert "approval-local-proof-command" not in text
         assert "Copy command" not in text
+        assert "Copy prompt" not in text
         assert "agentveil-mcp-proxy events show --last --verify" not in text
         assert "Local proof" not in text
         assert "/proof" not in text

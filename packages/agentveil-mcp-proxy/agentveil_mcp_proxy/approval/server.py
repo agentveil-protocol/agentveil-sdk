@@ -17,8 +17,8 @@ from typing import Any, Callable, Mapping
 from urllib.parse import parse_qs
 
 from agentveil_mcp_proxy.evidence.events_show import (
+    LOCAL_PROOF_AGENT_PROMPT,
     LOCAL_PROOF_BLOCK_TITLE,
-    LOCAL_PROOF_INSPECTION_COMMAND,
     LOCAL_PROOF_PENDING_QUIET_LINE,
     LOCAL_PROOF_POST_APPROVE_BODY,
     LOCAL_PROOF_POST_DENY_BODY,
@@ -66,7 +66,7 @@ APPROVAL_DECISION_DENIED_BODY = (
 )
 
 
-LOCAL_PROOF_COPY_COMMAND_LABEL = "Copy command"
+LOCAL_PROOF_COPY_COMMAND_LABEL = "Copy prompt"
 _LOCAL_PROOF_COMMAND_ELEMENT_ID = "approval-local-proof-command"
 
 
@@ -110,7 +110,7 @@ def _local_proof_copy_script(script_nonce: str) -> str:
         "      if (navigator.clipboard && navigator.clipboard.writeText) {\n"
         "        navigator.clipboard.writeText(text).then(function () {\n"
         '          button.textContent = "Copied";\n'
-        '          setTimeout(function () { button.textContent = "Copy command"; }, 1500);\n'
+        '          setTimeout(function () { button.textContent = "Copy prompt"; }, 1500);\n'
         "        }).catch(function () {\n"
         "          var range = document.createRange();\n"
         "          range.selectNodeContents(target);\n"
@@ -139,7 +139,7 @@ def render_local_proof_block(body_text: str, *, script_nonce: str) -> str:
         f'<p class="approval-local-proof-body">{escape(body_text)}</p>'
         '<div class="approval-local-proof-command-row">'
         f'<code class="approval-local-proof-command" id="{_LOCAL_PROOF_COMMAND_ELEMENT_ID}">'
-        f"{escape(LOCAL_PROOF_INSPECTION_COMMAND)}</code>"
+        f"{escape(LOCAL_PROOF_AGENT_PROMPT)}</code>"
         f'<button type="button" class="approval-copy-command" '
         f'data-copy-target="{_LOCAL_PROOF_COMMAND_ELEMENT_ID}">'
         f"{escape(LOCAL_PROOF_COPY_COMMAND_LABEL)}</button>"
