@@ -185,6 +185,15 @@ def _tools() -> list[dict[str, Any]]:
                         "type": ["string", "null"],
                         "description": "Optional session id filter.",
                     },
+                    "format": {
+                        "type": "string",
+                        "enum": ["text", "json"],
+                        "description": "Output format. Default is human-readable text.",
+                    },
+                    "debug": {
+                        "type": "boolean",
+                        "description": "When true, return bounded JSON with debug fields.",
+                    },
                 },
                 "additionalProperties": False,
             },

@@ -461,7 +461,27 @@ def test_product_route_local_proof_succeeds_without_approval(tmp_path, monkeypat
     ) == 0
     proof_response = _responses(proof_out.getvalue())[0]
     assert "error" not in proof_response
-    payload = json.loads(proof_response["result"]["content"][0]["text"])
+    proof_text = proof_response["result"]["content"][0]["text"]
+    assert proof_text.startswith("AgentVeil proof")
+    assert "Verification:" in proof_text
+    assert "Result:" in proof_text
+    assert '"status"' not in proof_text
+
+    json_proof_out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(
+            _tool_call(
+                "local_proof",
+                {"last": 5, "verify": True, "format": "json"},
+                call_id="proof-json-1",
+            )
+        ),
+        out=json_proof_out,
+        approval_ui_mode="none",
+    ) == 0
+    json_proof_response = _responses(json_proof_out.getvalue())[0]
+    payload = json.loads(json_proof_response["result"]["content"][0]["text"])
     assert payload["status"] == "ok"
     assert payload["proof"]["events"]
     assert payload["proof"]["events"][-1]["decision"] == "approval_required"

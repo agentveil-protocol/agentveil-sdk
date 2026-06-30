@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 from agentveil_mcp_proxy.control_surface import build_timeline_entry
 from agentveil_mcp_proxy.evidence.observability import (
@@ -383,6 +383,7 @@ def build_local_proof_mcp_payload(
     last: int | None = None,
     session_id: str | None = None,
     verify: bool = True,
+    include_debug: bool = False,
 ) -> dict[str, Any]:
     """Build bounded MCP ``local_proof`` response payload."""
 
@@ -391,6 +392,7 @@ def build_local_proof_mcp_payload(
         config_path=config_path,
         last=last,
         session_id=session_id,
+        include_debug=include_debug,
         verify=verify,
     )
     proof: dict[str, Any] = {
@@ -413,6 +415,280 @@ def build_local_proof_mcp_payload(
     if warnings:
         payload["warnings"] = list(warnings)
     return payload
+
+
+_WRITE_OUTCOME_ACTIONS: Final[frozenset[str]] = frozenset({"write", "destructive"})
+_DECISION_PATH_LABELS: Final[Mapping[str, str]] = {
+    "approval_required": "approval required",
+    "approved": "approved",
+    "target_reached": "target reached",
+    "allowed": "allowed",
+    "hard_blocked": "stopped",
+    "execution_not_reached": "execution not reached",
+    "redirected": "redirected",
+}
+
+
+def _format_time_hms(timestamp_utc: str) -> str:
+    if "T" in timestamp_utc:
+        return timestamp_utc.split("T", 1)[1].replace("Z", "")
+    return timestamp_utc
+
+
+def _valid_show_events(events: object) -> list[Mapping[str, Any]]:
+    if not isinstance(events, list):
+        return []
+    return [
+        event
+        for event in events
+        if isinstance(event, Mapping) and event.get("valid") is not False
+    ]
+
+
+def _is_read_only_event(entry: Mapping[str, Any]) -> bool:
+    decision = entry.get("decision")
+    if decision not in {"allowed", "target_reached"}:
+        return False
+    action = entry.get("action_family") or entry.get("action") or ""
+    risk = entry.get("risk_class") or ""
+    return action == "read" or risk == "read"
+
+
+def _is_primary_write_outcome(entry: Mapping[str, Any]) -> bool:
+    if entry.get("decision") != "target_reached":
+        return False
+    action = entry.get("action_family") or ""
+    risk = entry.get("risk_class") or ""
+    return action in _WRITE_OUTCOME_ACTIONS or risk in _WRITE_OUTCOME_ACTIONS
+
+
+def _find_primary_outcome_event(events: Sequence[Mapping[str, Any]]) -> Mapping[str, Any] | None:
+    for event in reversed(events):
+        if _is_primary_write_outcome(event):
+            return event
+    for event in reversed(events):
+        if event.get("decision") == "approval_required":
+            return event
+    for event in reversed(events):
+        decision = event.get("decision")
+        if decision not in {"allowed"}:
+            return event
+    return events[-1] if events else None
+
+
+def _record_id(entry: Mapping[str, Any]) -> str | None:
+    record_id = entry.get("record_id")
+    if isinstance(record_id, str) and record_id:
+        return record_id
+    return None
+
+
+def _action_identity(entry: Mapping[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(entry.get("tool") or ""),
+        str(entry.get("target") or "none"),
+        str(entry.get("payload_hash") or ""),
+    )
+
+
+def _decision_chain_for_primary(
+    events: Sequence[Mapping[str, Any]],
+    *,
+    primary: Mapping[str, Any],
+) -> list[Mapping[str, Any]]:
+    """Return events linked to one primary outcome for a concise summary."""
+
+    by_id = {
+        record_id: event
+        for event in events
+        if (record_id := _record_id(event)) is not None
+    }
+    chain_ids: set[str] = set()
+    primary_id = _record_id(primary)
+    if primary_id is not None:
+        chain_ids.add(primary_id)
+
+    changed = True
+    while changed:
+        changed = False
+        for event in events:
+            record_id = _record_id(event)
+            if record_id is None:
+                continue
+            linked_ids: list[str] = []
+            granted_by = event.get("granted_by_request_id")
+            follow_up = event.get("linked_follow_up_id")
+            if isinstance(granted_by, str) and granted_by:
+                linked_ids.append(granted_by)
+            if isinstance(follow_up, str) and follow_up:
+                linked_ids.append(follow_up)
+            if record_id in chain_ids:
+                for linked_id in linked_ids:
+                    if linked_id in by_id and linked_id not in chain_ids:
+                        chain_ids.add(linked_id)
+                        changed = True
+            for linked_id in linked_ids:
+                if linked_id in chain_ids and record_id not in chain_ids:
+                    chain_ids.add(record_id)
+                    changed = True
+
+    chain = [event for event in events if _record_id(event) in chain_ids]
+    if len(chain) <= 1:
+        tool, target, payload_hash = _action_identity(primary)
+        if tool and target not in {"", "none"} and payload_hash:
+            same_identity = [
+                event
+                for event in events
+                if _action_identity(event) == (tool, target, payload_hash)
+            ]
+            if len(same_identity) > 1:
+                chain = same_identity
+        elif primary_id is not None:
+            chain = [primary]
+
+    chain.sort(key=lambda event: int(event.get("timestamp", 0)))
+    return chain
+
+
+def _decision_path(chain: Sequence[Mapping[str, Any]]) -> str:
+    labels: list[str] = []
+    seen: set[str] = set()
+    for event in chain:
+        decision = str(event.get("decision", "unknown"))
+        label = _DECISION_PATH_LABELS.get(decision, decision.replace("_", " "))
+        if label in seen:
+            continue
+        seen.add(label)
+        labels.append(label)
+    return " -> ".join(labels) if labels else "recorded"
+
+
+def _result_summary_line(
+    primary: Mapping[str, Any],
+    chain: Sequence[Mapping[str, Any]],
+) -> str:
+    decisions = {str(event.get("decision")) for event in chain}
+    tool = str(primary.get("tool") or "unknown")
+    if "target_reached" in decisions and "approved" in decisions:
+        return "write approved and completed"
+    if "target_reached" in decisions:
+        action = primary.get("action_family") or primary.get("action") or ""
+        risk = primary.get("risk_class") or ""
+        if action == "read" or risk == "read":
+            return "read action completed"
+        return f"{tool} completed"
+    if "approval_required" in decisions and "approved" not in decisions:
+        return f"approval required for {tool}"
+    if "approved" in decisions:
+        return f"{tool} approved, awaiting retry"
+    if primary.get("decision") == "hard_blocked":
+        return f"{tool} stopped"
+    decision = str(primary.get("decision", "recorded")).replace("_", " ")
+    return f"{tool} {decision}"
+
+
+def _verification_status_line(show_payload: Mapping[str, Any]) -> str:
+    verify = show_payload.get("verify")
+    if isinstance(verify, Mapping):
+        return str(verify.get("status", "not_available"))
+    return "not_available"
+
+
+def format_local_proof_human_summary(show_payload: Mapping[str, Any]) -> str:
+    """Render concise human-readable ``local_proof`` output."""
+
+    lines = ["AgentVeil proof", ""]
+    if show_payload.get("empty"):
+        lines.extend([
+            "No local evidence yet.",
+            "",
+            f"Verification: {_verification_status_line(show_payload)}",
+            "",
+            "Run a routed MCP action, then inspect proof again.",
+        ])
+        return "\n".join(lines)
+
+    events = _valid_show_events(show_payload.get("events"))
+    primary = _find_primary_outcome_event(events)
+    if primary is None:
+        lines.extend([
+            "Result: no bounded events available",
+            f"Verification: {_verification_status_line(show_payload)}",
+            "",
+            "Use debug/json for full bounded evidence.",
+        ])
+        return "\n".join(lines)
+
+    tool = str(primary.get("tool") or "unknown")
+    chain = _decision_chain_for_primary(events, primary=primary)
+    lines.append(f"Result: {_result_summary_line(primary, chain)}")
+    lines.append(f"Verification: {_verification_status_line(show_payload)}")
+    lines.append(f"Tool: {tool}")
+    lines.append(f"Decision path: {_decision_path(chain)}")
+    target = primary.get("target")
+    if target not in (None, "none"):
+        lines.append(f"Target: {target}")
+    timestamps = [
+        str(event.get("timestamp_utc"))
+        for event in chain
+        if event.get("timestamp_utc")
+    ]
+    if len(timestamps) >= 2:
+        lines.append(
+            f"Time: {_format_time_hms(timestamps[0])} -> {_format_time_hms(timestamps[-1])}"
+        )
+    elif timestamps:
+        lines.append(f"Time: {_format_time_hms(timestamps[0])}")
+
+    chain_ids = {event.get("record_id") for event in chain}
+    read_events = [
+        event
+        for event in events
+        if event.get("record_id") not in chain_ids and _is_read_only_event(event)
+    ]
+    if read_events:
+        lines.append("")
+        lines.append("Observed read-only actions:")
+        for event in read_events:
+            read_tool = str(event.get("tool") or "unknown")
+            decision = str(event.get("decision", "recorded"))
+            label = "allowed" if decision in {"allowed", "target_reached"} else decision.replace("_", " ")
+            lines.append(f"- {read_tool} {label}")
+
+    lines.extend(["", "Use debug/json for full bounded evidence."])
+    return "\n".join(lines)
+
+
+def render_local_proof_mcp_content(
+    *,
+    evidence_path: Path,
+    config_path: Path | None,
+    last: int | None = None,
+    session_id: str | None = None,
+    verify: bool = True,
+    output_format: str = "text",
+    debug: bool = False,
+) -> str:
+    """Return MCP ``local_proof`` text content for the requested output mode."""
+
+    if output_format == "json" or debug:
+        payload = build_local_proof_mcp_payload(
+            evidence_path=evidence_path,
+            config_path=config_path,
+            last=last,
+            session_id=session_id,
+            verify=verify,
+            include_debug=debug,
+        )
+        return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    show_payload = build_events_show_payload(
+        evidence_path=evidence_path,
+        config_path=config_path,
+        last=last,
+        session_id=session_id,
+        verify=verify,
+    )
+    return format_local_proof_human_summary(show_payload)
 
 
 def format_events_show_human(payload: Mapping[str, Any]) -> str:
@@ -489,5 +765,7 @@ __all__ = [
     "build_local_proof_mcp_payload",
     "events_show_json",
     "format_events_show_human",
+    "format_local_proof_human_summary",
+    "render_local_proof_mcp_content",
     "verify_local_evidence_chain",
 ]

@@ -54,7 +54,7 @@ from agentveil_mcp_proxy.evidence.events_show import (
     LOCAL_PROOF_AGENT_INSPECTION_HINT,
     LOCAL_PROOF_INSPECTION_HINT,
     LOCAL_PROOF_MCP_TOOL_NAME,
-    build_local_proof_mcp_payload,
+    render_local_proof_mcp_content,
 )
 from agentveil_mcp_proxy.client_config import downstream_startup_fingerprint
 from agentveil_mcp_proxy.evidence.observability import (
@@ -2666,6 +2666,8 @@ class McpPassthrough:
         last = arguments.get("last", DEFAULT_SHOW_LAST)
         verify = arguments.get("verify", True)
         session = arguments.get("session")
+        output_format = arguments.get("format", "text")
+        debug = arguments.get("debug", False)
         if last is not None and not isinstance(last, int):
             return jsonrpc_error(
                 request_id,
@@ -2684,6 +2686,18 @@ class McpPassthrough:
                 JSONRPC_INVALID_PARAMS,
                 "local_proof session must be a string",
             )
+        if output_format not in {"text", "json"}:
+            return jsonrpc_error(
+                request_id,
+                JSONRPC_INVALID_PARAMS,
+                "local_proof format must be text or json",
+            )
+        if not isinstance(debug, bool):
+            return jsonrpc_error(
+                request_id,
+                JSONRPC_INVALID_PARAMS,
+                "local_proof debug must be a boolean",
+            )
         manager = self.approval_manager
         store = getattr(manager, "evidence_store", None) if manager is not None else None
         if store is None or not hasattr(store, "db_path"):
@@ -2695,12 +2709,14 @@ class McpPassthrough:
                 data={"status": "blocked", "reason": "local_proof_unavailable"},
             )
         try:
-            payload = build_local_proof_mcp_payload(
+            content_text = render_local_proof_mcp_content(
                 evidence_path=store.db_path,
                 config_path=None,
                 last=last if isinstance(last, int) else DEFAULT_SHOW_LAST,
                 session_id=session,
                 verify=verify,
+                output_format=output_format,
+                debug=debug,
             )
         except ValueError as exc:
             return jsonrpc_error(
@@ -2715,7 +2731,7 @@ class McpPassthrough:
                 "content": [
                     {
                         "type": "text",
-                        "text": json.dumps(payload, separators=(",", ":"), sort_keys=True),
+                        "text": content_text,
                     }
                 ],
             },

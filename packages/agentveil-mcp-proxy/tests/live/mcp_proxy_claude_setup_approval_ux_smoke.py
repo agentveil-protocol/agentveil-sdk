@@ -278,11 +278,29 @@ def main() -> int:
             arguments={"last": 5, "verify": True},
             call_id="local-proof",
         )
-        proof_payload = json.loads(proof_response["result"]["content"][0]["text"])
+        proof_text = proof_response["result"]["content"][0]["text"]
+        if proof_text.startswith("{"):
+            raise AssertionError(f"local_proof default should be human text: {proof_text!r}")
+        if "AgentVeil proof" not in proof_text:
+            raise AssertionError(f"local_proof missing human header: {proof_text!r}")
+        if "Verification:" not in proof_text:
+            raise AssertionError(f"local_proof missing verification line: {proof_text!r}")
+        if "next_step" in proof_text:
+            raise AssertionError(f"local_proof default should not include next_step rows: {proof_text!r}")
+
+        json_proof_response = _proxy_run(
+            cli,
+            home=home,
+            env=env,
+            tool="local_proof",
+            arguments={"last": 5, "verify": True, "format": "json"},
+            call_id="local-proof-json",
+        )
+        proof_payload = json.loads(json_proof_response["result"]["content"][0]["text"])
         if proof_payload.get("status") != "ok":
-            raise AssertionError(f"local_proof expected status ok: {proof_payload!r}")
+            raise AssertionError(f"local_proof json expected status ok: {proof_payload!r}")
         if not proof_payload.get("proof", {}).get("events"):
-            raise AssertionError(f"local_proof missing proof events: {proof_payload!r}")
+            raise AssertionError(f"local_proof json missing proof events: {proof_payload!r}")
         events = proof_payload["proof"]["events"]
         write_proof = [
             event
