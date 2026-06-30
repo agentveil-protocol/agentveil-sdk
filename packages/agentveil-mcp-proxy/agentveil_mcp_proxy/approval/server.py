@@ -23,6 +23,7 @@ from agentveil_mcp_proxy.evidence.events_show import (
     LOCAL_PROOF_POST_APPROVE_BODY,
     LOCAL_PROOF_POST_DENY_BODY,
 )
+from agentveil_mcp_proxy.evidence.observability import APPROVAL_CONTINUE_AGENT_PROMPT
 from agentveil_mcp_proxy.evidence.observability import (
     approval_proof_detail_rows,
     approval_raw_evidence_rows,
@@ -130,16 +131,22 @@ def _local_proof_copy_script(script_nonce: str) -> str:
     )
 
 
-def render_local_proof_block(body_text: str, *, script_nonce: str) -> str:
+def render_local_proof_block(
+    body_text: str,
+    *,
+    script_nonce: str,
+    agent_prompt: str | None = None,
+) -> str:
     """Return a compact Approval Center block for local proof inspection."""
 
+    prompt = LOCAL_PROOF_AGENT_PROMPT if agent_prompt is None else agent_prompt
     return (
         '<section class="approval-local-proof">'
         f'<h2 class="approval-local-proof-title">{escape(LOCAL_PROOF_BLOCK_TITLE)}</h2>'
         f'<p class="approval-local-proof-body">{escape(body_text)}</p>'
         '<div class="approval-local-proof-command-row">'
         f'<code class="approval-local-proof-command" id="{_LOCAL_PROOF_COMMAND_ELEMENT_ID}">'
-        f"{escape(LOCAL_PROOF_AGENT_PROMPT)}</code>"
+        f"{escape(prompt)}</code>"
         f'<button type="button" class="approval-copy-command" '
         f'data-copy-target="{_LOCAL_PROOF_COMMAND_ELEMENT_ID}">'
         f"{escape(LOCAL_PROOF_COPY_COMMAND_LABEL)}</button>"
@@ -789,7 +796,7 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
                 "Approval recorded",
                 (
                     f"<p>{escape(recorded_body)}</p>"
-                    f"{render_local_proof_block(proof_body, script_nonce=script_nonce)}"
+                    f"{render_local_proof_block(proof_body, script_nonce=script_nonce, agent_prompt=(APPROVAL_CONTINUE_AGENT_PROMPT if decision == 'approve' else None))}"
                 ),
                 page_kind="detail",
                 include_card_styles=False,

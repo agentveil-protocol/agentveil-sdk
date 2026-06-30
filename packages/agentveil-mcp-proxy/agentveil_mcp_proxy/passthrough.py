@@ -134,6 +134,9 @@ from agentveil_mcp_proxy.runtime_gate import (
     RuntimeGateUntrustedError,
 )
 from agentveil_mcp_proxy.evidence.observability import (
+    APPROVAL_REQUIRED_INSTRUCTIONS,
+    APPROVAL_REQUIRED_USER_MESSAGE,
+    approval_required_actionable_message,
     enrich_mcp_error_contract,
     mcp_error_user_message,
     reason_has_dedicated_user_message,
@@ -147,19 +150,6 @@ JSONRPC_INVALID_PARAMS = -32602
 JSONRPC_DOWNSTREAM_ERROR = -32000
 JSONRPC_POLICY_BLOCKED = -32010
 JSONRPC_APPROVAL_REQUIRED = -32011
-APPROVAL_REQUIRED_INSTRUCTIONS = (
-    "Approval required. Open the approval page, approve or deny, then retry the same "
-    "MCP tool call without changing tool, target, or payload."
-)
-APPROVAL_REQUIRED_RETRY_SUFFIX = (
-    "approve or deny, then retry the same MCP tool call without changing tool, "
-    "target, or payload."
-)
-
-APPROVAL_REQUIRED_USER_MESSAGE = (
-    "Approval required. Open the approval page, approve or deny, then retry the same "
-    "MCP tool call without changing tool, target, or payload."
-)
 HARD_BLOCK_USER_MESSAGE = (
     # claim-check: allow "Blocked" as a user-facing policy outcome label for denied local actions.
     "Blocked: this action is not allowed by local policy and cannot be approved."
@@ -190,7 +180,7 @@ def approval_required_user_message(*, approval_url: str | None = None) -> str:
 def actionable_approval_required_message(approval_url: str) -> str:
     """Return a client-visible MCP error message that includes the approval URL."""
 
-    return f"Approval required. Open {approval_url}, {APPROVAL_REQUIRED_RETRY_SUFFIX}"
+    return approval_required_actionable_message(approval_url)
 
 
 JSONRPC_RUNTIME_GATE_UNAVAILABLE = -32012
