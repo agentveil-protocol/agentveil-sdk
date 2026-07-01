@@ -449,6 +449,22 @@ def test_parse_hermes_agentveil_stdio_config_roundtrip(tmp_path):
     assert "terminal" in parsed["disabled_toolsets"]
 
 
+def test_parse_hermes_agentveil_stdio_config_unescapes_windows_paths(tmp_path):
+    hermes_home = tmp_path / "hermes-home"
+    avp_home = Path(r"C:\Users\runneradmin\AppData\Local\Temp\agentveil\.avp")
+    write_hermes_config(
+        hermes_home=hermes_home,
+        proxy_command="agentveil-mcp-proxy",
+        run_args=["run", "--home", str(avp_home)],
+        avp_home=avp_home,
+    )
+
+    parsed = parse_hermes_agentveil_stdio_config(hermes_home)
+
+    assert parsed["args"][-1] == str(avp_home)
+    assert parsed["env"][AGENTVEIL_AVP_HOME_ENV] == str(avp_home)
+
+
 def test_verify_hermes_config_bootstrap_rejects_missing_route(tmp_path):
     hermes_home = tmp_path / "hermes-home"
     hermes_home.mkdir(parents=True)

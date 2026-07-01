@@ -19,6 +19,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any, Callable, Mapping, Sequence
 
 from agentveil_mcp_proxy.agent_runtime_profiles import (
@@ -245,6 +246,13 @@ def _yaml_scalar(value: str) -> str:
         return value
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
+
+
+def _yaml_unquote_scalar(value: str) -> str:
+    text = value.strip()
+    if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+        return text[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+    return text
 
 
 def _hermes_proxy_stdio_invocation(
@@ -522,7 +530,7 @@ def parse_hermes_agentveil_stdio_config(hermes_home: Path) -> dict[str, Any]:
         if not in_agentveil:
             continue
         if stripped.startswith("command:"):
-            command = stripped.split(":", 1)[1].strip().strip('"')
+            command = _yaml_unquote_scalar(stripped.split(":", 1)[1])
             in_args = False
             in_env = False
         elif stripped == "args:":
@@ -532,10 +540,10 @@ def parse_hermes_agentveil_stdio_config(hermes_home: Path) -> dict[str, Any]:
             in_env = True
             in_args = False
         elif in_args and stripped.startswith("- "):
-            args.append(stripped[2:].strip().strip('"'))
+            args.append(_yaml_unquote_scalar(stripped[2:]))
         elif in_env and ":" in stripped:
             key, _, value = stripped.partition(":")
-            env[key.strip()] = value.strip().strip('"')
+            env[key.strip()] = _yaml_unquote_scalar(value)
         elif not raw_line.startswith("  "):
             in_agentveil = False
 
@@ -593,10 +601,12 @@ def _proxy_cli_argv(proxy_command: str, subcommand: list[str]) -> list[str]:
 def _proxy_command_display(proxy_command: str) -> str:
     command_path = Path(proxy_command)
     name = command_path.name
+    if "/" in proxy_command:
+        name = PurePosixPath(proxy_command).name
     if name in {"python", "python3"} or name.startswith("python3."):
         return "agentveil-mcp-proxy"
-    if command_path.is_absolute():
-        return command_path.name
+    if command_path.is_absolute() or "/" in proxy_command:
+        return name
     return proxy_command
 
 
