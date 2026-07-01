@@ -3212,6 +3212,70 @@ def build_parser() -> argparse.ArgumentParser:
         help="Loopback port for the Approval Center (0 = reuse manifest or assign)",
     )
 
+    launch = subparsers.add_parser(
+        "launch",
+        help="Launch a managed agent runtime profile",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  agentveil-mcp-proxy launch --profile generic-process --project-dir . -- python script.py\n"
+            "  agentveil-mcp-proxy launch --profile generic-process --choose-folder -- python script.py\n"
+            "  agentveil-mcp-proxy launch --profile hermes-cli --project-dir . -- \\\n"
+            "    hermes chat --toolsets agentveil -q \"…\"\n"
+            "  agentveil-mcp-proxy launch status --project-dir .\n"
+            "  agentveil-mcp-proxy launch stop --project-dir ."
+        ),
+    )
+    launch.add_argument(
+        "--launch-status",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    launch.add_argument(
+        "--launch-stop",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    launch.add_argument(
+        "--launch-child",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    launch.add_argument(
+        "--profile",
+        default=None,
+        help="Runtime profile id (required for launch; default generic-process for status/stop)",
+    )
+    launch.add_argument(
+        "--project-dir",
+        type=Path,
+        default=None,
+        help="Project directory for project-local AVP home and runtime state",
+    )
+    launch.add_argument(
+        "--choose-folder",
+        action="store_true",
+        help="Open a native folder picker to select the project directory (macOS)",
+    )
+    launch.add_argument(
+        "--sandbox",
+        type=Path,
+        default=None,
+        help="Filesystem sandbox root for first-time proxy init (default: project dir)",
+    )
+    launch.add_argument(
+        "--proxy-command",
+        default=None,
+        help="Proxy executable passed to the managed child runtime route",
+    )
+    _add_passphrase_args(launch)
+    _add_json_arg(launch)
+    launch.add_argument(
+        "child_argv",
+        nargs=argparse.REMAINDER,
+        help="Child command after '--'",
+    )
+
     run = subparsers.add_parser("run", help="Run stdio MCP passthrough")
     _add_common_path_args(run)
     _add_passphrase_args(run)
@@ -4512,6 +4576,29 @@ def _normalize_connect_argv(argv: list[str]) -> list[str]:
     return argv
 
 
+def _normalize_launch_argv(argv: list[str]) -> list[str]:
+    """Support ``launch status|stop`` and ``launch -- ...`` child commands."""
+
+    if len(argv) < 1 or argv[0] != "launch":
+        return argv
+    if len(argv) >= 2 and argv[1] == "status":
+        return ["launch", "--launch-status", *argv[2:]]
+    if len(argv) >= 2 and argv[1] == "stop":
+        return ["launch", "--launch-stop", *argv[2:]]
+    if "--launch-child" in argv or "--launch-status" in argv or "--launch-stop" in argv:
+        return argv
+    rest = argv[1:]
+    if "--" in rest:
+        separator_index = rest.index("--")
+        return [
+            "launch",
+            *rest[:separator_index],
+            "--launch-child",
+            *rest[separator_index:],
+        ]
+    return ["launch", *rest, "--launch-child"]
+
+
 def _normalize_downstream_arg_values(argv: list[str]) -> list[str]:
     """Let downstream arg flags accept values that look like CLI options."""
 
@@ -4652,6 +4739,208 @@ def run_uninstall_claude_hook_cli(
     return 0
 
 
+def _launch_init_proxy(
+    *,
+    home: Path,
+    policy_pack: str,
+    downstream_root: Path,
+    passphrase_file: Path | None,
+) -> None:
+    """Initialize project-local proxy route for managed runtime launch."""
+
+    downstream = quickstart_filesystem_downstream(downstream_root)
+    quiet = io.StringIO()
+    init_proxy(
+        home=home,
+        config_path=None,
+        policy_pack=policy_pack,
+        downstream_config=downstream,
+        plaintext=(passphrase_file is None),
+        passphrase_file=passphrase_file,
+        err=quiet,
+    )
+
+
+def _resolve_launch_project_dir(
+    *,
+    project_dir: Path | None,
+    choose_folder: bool,
+) -> Path:
+    """Resolve the managed runtime project directory for launch."""
+
+    if choose_folder and project_dir is not None:
+        raise ProxyCliError("--choose-folder cannot be combined with --project-dir", exit_code=2)
+    if choose_folder:
+        return _choose_setup_project_folder().resolve()
+    if project_dir is not None:
+        return project_dir.resolve()
+    return Path.cwd().resolve()
+
+
+def run_launch_cli(
+    *,
+    profile_id: str | None,
+    project_dir: Path | None,
+    choose_folder: bool,
+    sandbox: Path | None,
+    proxy_command: str | None,
+    passphrase_file: Path | None,
+    child_argv: list[str],
+    output_json: bool,
+) -> int:
+    """Launch a child process under a managed AgentVeil runtime profile."""
+
+    from agentveil_mcp_proxy.agent_launcher import AgentLauncherError, launch_managed_process
+    from agentveil_mcp_proxy.agent_runtime_profiles import HERMES_CLI_PROFILE
+
+    if not profile_id:
+        raise ProxyCliError("--profile is required for launch", exit_code=2)
+
+    target = _resolve_launch_project_dir(project_dir=project_dir, choose_folder=choose_folder)
+    resolved_proxy_command = proxy_command or _resolve_setup_proxy_command() or sys.executable
+
+    try:
+        result = launch_managed_process(
+            project_dir=target,
+            profile_id=profile_id,
+            child_command=child_argv,
+            proxy_command=resolved_proxy_command,
+            passphrase_file=passphrase_file,
+            init_proxy_if_missing=_launch_init_proxy,
+            sandbox_root=Path(sandbox).resolve() if sandbox is not None else None,
+        )
+    except AgentLauncherError as exc:
+        raise ProxyCliError(str(exc), exit_code=exc.exit_code) from exc
+
+    status = result.status
+    if output_json:
+        payload = {
+            "ok": result.child_exit_code in (None, 0),
+            "action": "launch",
+            "profile_id": status.profile_id,
+            "profile_status": status.profile_status,
+            "project_dir_ref": status.project_dir_ref,
+            "session_id": status.session_id,
+            "approval_center": status.approval_center.state,
+            "child_started": result.child_started,
+            "child_running": status.child_running,
+            "child_foreground": result.child_foreground,
+            "child_exit_code": result.child_exit_code,
+            "proxy_initialized": result.proxy_initialized,
+            "evidence_enabled": status.evidence_enabled,
+            "scope": status.scope,
+            "host_wide_control_claim": status.host_wide_control_claim,
+            "reason": result.reason,
+        }
+        if profile_id == HERMES_CLI_PROFILE.profile_id:
+            from agentveil_mcp_proxy.agent_launcher import (
+                hermes_native_tool_containment_note,
+                project_avp_home,
+                runtime_route_path,
+            )
+
+            route_path = runtime_route_path(project_avp_home(target))
+            if route_path.is_file():
+                try:
+                    route = json.loads(route_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    route = {}
+                payload["hermes_mcp_server"] = route.get("hermes_mcp_server")
+                payload["hermes_toolset"] = route.get("hermes_toolset")
+            payload["native_tool_containment"] = hermes_native_tool_containment_note()
+        _print_operator_json(payload)
+    else:
+        print("Managed runtime launch:")
+        print(f"  profile:          {status.profile_id} ({status.profile_status})")
+        print(f"  scope:            {status.scope} (no host-wide control claim)")
+        print(f"  approval_center:  {status.approval_center.state}")
+        print(f"  evidence/proof:   {'enabled' if status.evidence_enabled else 'not initialized'}")
+        if result.child_foreground:
+            exit_code = result.child_exit_code if result.child_exit_code is not None else "unknown"
+            label = "finished" if result.child_exit_code == 0 else "failed"
+            print(f"  child:            {label} (exit {exit_code})")
+        else:
+            print(f"  child:            {'started' if result.child_started else 'not started'}")
+        if result.proxy_initialized:
+            print("  proxy route:      initialized for this project")
+        if profile_id == HERMES_CLI_PROFILE.profile_id:
+            print(
+                "  hermes note:      AgentVeil MCP route only; native Hermes tools are "
+                "limited, not host-wide. Use --toolsets agentveil."
+            )
+    if result.child_exit_code is not None and result.child_exit_code != 0:
+        return int(result.child_exit_code)
+    return 0
+
+
+def run_launch_status_cli(
+    *,
+    profile_id: str | None,
+    project_dir: Path | None,
+    output_json: bool,
+) -> int:
+    """Bounded status for a managed runtime launch session."""
+
+    from agentveil_mcp_proxy.agent_launcher import (
+        AgentLauncherError,
+        build_launch_status,
+        project_avp_home,
+        resolve_project_dir,
+    )
+    from agentveil_mcp_proxy.agent_runtime_profiles import (
+        RuntimeProfileError,
+        resolve_runtime_profile,
+    )
+
+    resolved_profile = profile_id or "generic-process"
+    try:
+        profile = resolve_runtime_profile(resolved_profile)
+        target = resolve_project_dir(project_dir)
+        home = project_avp_home(target)
+        status = build_launch_status(home=home, profile=profile, project_dir=target)
+    except (AgentLauncherError, RuntimeProfileError) as exc:
+        exit_code = exc.exit_code if isinstance(exc, AgentLauncherError) else 2
+        raise ProxyCliError(str(exc), exit_code=exit_code) from exc
+
+    if output_json:
+        _print_operator_json({"ok": True, "action": "launch-status", **status.to_dict()})
+    else:
+        print("Managed runtime status:")
+        print(f"  profile:          {status.profile_id} ({status.profile_status})")
+        print(f"  scope:            {status.scope} (no host-wide control claim)")
+        print(f"  approval_center:  {status.approval_center.state}")
+        print(f"  child_running:    {status.child_running}")
+        print(f"  evidence/proof:   {'enabled' if status.evidence_enabled else 'not initialized'}")
+    return 0
+
+
+def run_launch_stop_cli(
+    *,
+    project_dir: Path | None,
+    output_json: bool,
+) -> int:
+    """Stop managed child process and Approval Center for this project."""
+
+    from agentveil_mcp_proxy.agent_launcher import AgentLauncherError, stop_managed_launch
+
+    try:
+        outcome = stop_managed_launch(
+            project_dir=project_dir if project_dir is not None else Path.cwd(),
+        )
+    except AgentLauncherError as exc:
+        raise ProxyCliError(str(exc), exit_code=exc.exit_code) from exc
+
+    if output_json:
+        _print_operator_json({"ok": True, "action": "launch-stop", **outcome})
+    else:
+        print("Managed runtime stop:")
+        print(f"  child stopped:    {outcome['stopped_child']}")
+        print(f"  center stopped:   {outcome['stopped_center']}")
+        for reason in outcome["reasons"]:
+            print(f"  note:             {reason}")
+    return 0
+
+
 def _setup_claude_code_home(project_dir: Path) -> Path:
     """Project-local proxy home for the one-command connector."""
     return project_dir / ".avp"
@@ -4720,13 +5009,9 @@ def _configure_claude_setup_approval_ui(config_path: Path) -> None:
 def _configure_interactive_connector_defaults(config_path: Path) -> None:
     """Enable bounded approval wait-mode for interactive MCP client setups."""
 
-    config_payload = _read_json(config_path, "proxy config")
-    approval = config_payload.get("approval")
-    if not isinstance(approval, dict):
-        approval = {}
-        config_payload["approval"] = approval
-    approval["wait_for_decision"] = True
-    _secure_write_json(config_path, config_payload, force=True)
+    from agentveil_mcp_proxy.agent_launcher import ensure_interactive_connector_defaults
+
+    ensure_interactive_connector_defaults(config_path)
 
 
 def run_setup_claude_code_cli(
@@ -5572,7 +5857,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     parse_argv = sys.argv[1:] if argv is None else argv
     args = parser.parse_args(
-        _normalize_connect_argv(_normalize_downstream_arg_values(parse_argv))
+        _normalize_launch_argv(
+            _normalize_connect_argv(_normalize_downstream_arg_values(parse_argv))
+        )
     )
     try:
         if args.command == "init":
@@ -5690,6 +5977,33 @@ def main(argv: list[str] | None = None) -> int:
                 passphrase=args.passphrase,
                 passphrase_file=args.passphrase_file,
                 port=args.port,
+            )
+        if args.command == "launch":
+            if args.choose_folder and (args.launch_status or args.launch_stop):
+                raise ProxyCliError(
+                    "--choose-folder is only supported for launch, not launch status/stop",
+                    exit_code=2,
+                )
+            if args.launch_status:
+                return run_launch_status_cli(
+                    profile_id=args.profile,
+                    project_dir=args.project_dir,
+                    output_json=args.json_output,
+                )
+            if args.launch_stop:
+                return run_launch_stop_cli(
+                    project_dir=args.project_dir,
+                    output_json=args.json_output,
+                )
+            return run_launch_cli(
+                profile_id=args.profile,
+                project_dir=args.project_dir,
+                choose_folder=args.choose_folder,
+                sandbox=args.sandbox,
+                proxy_command=args.proxy_command,
+                passphrase_file=args.passphrase_file,
+                child_argv=args.child_argv,
+                output_json=args.json_output,
             )
         if args.command == "run":
             return run_proxy(

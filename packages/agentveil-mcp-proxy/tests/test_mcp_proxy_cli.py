@@ -2473,3 +2473,332 @@ def test_setup_proxy_command_prefers_invoked_script_over_path(tmp_path, monkeypa
     monkeypatch.setattr(sys, "argv", [str(invoked), "setup", "claude-code"])
 
     assert proxy_cli._resolve_setup_proxy_command() == str(invoked.resolve())
+
+
+# ----- P0.12: Managed Agent Runtime Profiles ----------------------------------
+
+
+def test_cli_launch_rejects_missing_profile(tmp_path, capsys):
+    rc = main([
+        "launch",
+        "--project-dir",
+        str(tmp_path),
+        "--",
+        sys.executable,
+        "-c",
+        "print(1)",
+    ])
+    assert rc == 2
+    assert "profile" in capsys.readouterr().err.lower()
+
+
+def test_cli_launch_status_bounded_without_paths(tmp_path, capsys):
+    rc = main(["launch", "status", "--project-dir", str(tmp_path), "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["profile_id"] == "generic-process"
+    assert payload["host_wide_control_claim"] is False
+    assert str(tmp_path) not in json.dumps(payload)
+
+
+def test_cli_launch_status_reports_hermes_cli_from_manifest(tmp_path, capsys, monkeypatch):
+    from agentveil_mcp_proxy.agent_launcher import (
+        LAUNCH_MANIFEST_SCHEMA_VERSION,
+        LaunchManifest,
+        project_avp_home,
+        save_launch_manifest,
+    )
+
+    project = tmp_path / "project"
+    project.mkdir()
+    home = project_avp_home(project)
+    (home / "mcp-proxy").mkdir(parents=True)
+    (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+    save_launch_manifest(
+        home,
+        LaunchManifest(
+            schema_version=LAUNCH_MANIFEST_SCHEMA_VERSION,
+            profile_id="hermes-cli",
+            session_id="session-cli-status",
+            child_pid=None,
+            child_argv0="hermes",
+            child_command_ref="hermes chat -q hello",
+            started_at=1,
+            project_dir_ref="project",
+        ),
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.agent_launcher.check_approval_center_status",
+        lambda _home: SimpleNamespace(state="running", pid=111, port=8765),
+    )
+
+    rc = main(["launch", "status", "--project-dir", str(project), "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["profile_id"] == "hermes-cli"
+
+
+def test_cli_launch_preflight_fail_closed(tmp_path, monkeypatch, capsys):
+    from agentveil_mcp_proxy import agent_launcher
+
+    project = tmp_path / "project"
+    project.mkdir()
+
+    def fake_launch(**kwargs):
+        raise agent_launcher.AgentLauncherError(
+            "preflight failed: approval center unavailable; child process was not started",
+            exit_code=1,
+        )
+
+    monkeypatch.setattr(agent_launcher, "launch_managed_process", fake_launch)
+    monkeypatch.setattr(proxy_cli, "_resolve_setup_proxy_command", lambda: "agentveil-mcp-proxy")
+
+    rc = main([
+        "launch",
+        "--profile",
+        "generic-process",
+        "--project-dir",
+        str(project),
+        "--",
+        sys.executable,
+        "-c",
+        "print(1)",
+    ])
+    assert rc == 1
+    assert "preflight failed" in capsys.readouterr().err.lower()
+
+
+# ----- P0.12b: launch --choose-folder parity ----------------------------------
+
+
+def test_cli_launch_rejects_choose_folder_with_project_dir(tmp_path, capsys):
+    rc = main([
+        "launch",
+        "--profile",
+        "generic-process",
+        "--choose-folder",
+        "--project-dir",
+        str(tmp_path),
+        "--",
+        sys.executable,
+        "-c",
+        "print(1)",
+    ])
+    assert rc == 2
+    assert "cannot be combined" in capsys.readouterr().err.lower()
+
+
+def test_cli_launch_choose_folder_cancel_fail_closed(tmp_path, monkeypatch, capsys):
+    from agentveil_mcp_proxy import agent_launcher
+
+    called = {"launch": False}
+
+    def fake_launch(**_kwargs):
+        called["launch"] = True
+
+    monkeypatch.setattr(agent_launcher, "launch_managed_process", fake_launch)
+    monkeypatch.setattr(
+        proxy_cli,
+        "_choose_setup_project_folder",
+        lambda: (_ for _ in ()).throw(
+            proxy_cli.ProxyCliError("folder selection cancelled", exit_code=2)
+        ),
+    )
+
+    rc = main([
+        "launch",
+        "--profile",
+        "generic-process",
+        "--choose-folder",
+        "--",
+        sys.executable,
+        "-c",
+        "print(1)",
+    ])
+    assert rc == 2
+    assert "cancel" in capsys.readouterr().err.lower()
+    assert called["launch"] is False
+
+
+def test_cli_launch_choose_folder_uses_selected_project(tmp_path, monkeypatch, capsys):
+    from agentveil_mcp_proxy import agent_launcher
+
+    selected = tmp_path / "picked-project"
+    selected.mkdir()
+    seen: dict[str, Path] = {}
+
+    def fake_launch(**kwargs):
+        seen["project_dir"] = kwargs["project_dir"]
+        raise agent_launcher.AgentLauncherError(
+            "preflight failed: approval center unavailable; child process was not started",
+            exit_code=1,
+        )
+
+    monkeypatch.setattr(agent_launcher, "launch_managed_process", fake_launch)
+    monkeypatch.setattr(proxy_cli, "_choose_setup_project_folder", lambda: selected)
+    monkeypatch.setattr(proxy_cli, "_resolve_setup_proxy_command", lambda: "agentveil-mcp-proxy")
+
+    rc = main([
+        "launch",
+        "--profile",
+        "generic-process",
+        "--choose-folder",
+        "--json",
+        "--",
+        sys.executable,
+        "-c",
+        "print(1)",
+    ])
+    assert rc == 1
+    assert seen["project_dir"] == selected.resolve()
+    err = capsys.readouterr()
+    assert str(selected) not in err.out
+    assert str(selected) not in err.err
+
+
+def test_cli_launch_status_rejects_choose_folder(tmp_path, monkeypatch, capsys):
+    picker_called = {"value": False}
+
+    def fake_picker():
+        picker_called["value"] = True
+        return tmp_path
+
+    monkeypatch.setattr(proxy_cli, "_choose_setup_project_folder", fake_picker)
+
+    rc = main(["launch", "status", "--choose-folder", "--project-dir", str(tmp_path)])
+    assert rc == 2
+    assert "only supported for launch" in capsys.readouterr().err.lower()
+    assert picker_called["value"] is False
+
+
+def test_cli_launch_stop_rejects_choose_folder(tmp_path, monkeypatch, capsys):
+    picker_called = {"value": False}
+
+    def fake_picker():
+        picker_called["value"] = True
+        return tmp_path
+
+    monkeypatch.setattr(proxy_cli, "_choose_setup_project_folder", fake_picker)
+
+    rc = main(["launch", "stop", "--choose-folder", "--project-dir", str(tmp_path)])
+    assert rc == 2
+    assert "only supported for launch" in capsys.readouterr().err.lower()
+    assert picker_called["value"] is False
+
+
+# ----- P0.13b: hermes-cli profile ------------------------------------------------
+
+
+def test_cli_launch_hermes_cli_missing_executable_fail_closed(tmp_path, monkeypatch, capsys):
+    project = tmp_path / "project"
+    project.mkdir()
+    home = project / ".avp" / "mcp-proxy"
+    home.mkdir(parents=True)
+    (home / "config.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr("agentveil_mcp_proxy.agent_launcher.shutil.which", lambda _name: None)
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.agent_launcher.ensure_approval_center_running",
+        lambda **_kwargs: (
+            __import__("types").SimpleNamespace(state="running", pid=111, port=8765),
+            True,
+            "approval center started",
+        ),
+    )
+
+    rc = main([
+        "launch",
+        "--profile",
+        "hermes-cli",
+        "--project-dir",
+        str(project),
+        "--",
+        "hermes",
+        "chat",
+        "-q",
+        "hello",
+    ])
+    assert rc == 1
+    assert "hermes executable not found" in capsys.readouterr().err.lower()
+
+
+def test_cli_launch_hermes_cli_missing_provider_fail_closed(tmp_path, monkeypatch, capsys):
+    project = tmp_path / "project"
+    project.mkdir()
+    home = project / ".avp" / "mcp-proxy"
+    home.mkdir(parents=True)
+    (home / "config.json").write_text("{}", encoding="utf-8")
+    operator_hermes = tmp_path / "bin" / "hermes"
+    operator_hermes.parent.mkdir(parents=True)
+    operator_hermes.write_text("#!/bin/sh\n", encoding="utf-8")
+    operator_hermes.chmod(0o755)
+
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    def fake_which(name):
+        if name == "hermes":
+            return str(operator_hermes)
+        return None
+
+    monkeypatch.setattr("agentveil_mcp_proxy.agent_launcher.shutil.which", fake_which)
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.agent_launcher.ensure_approval_center_running",
+        lambda **_kwargs: (
+            __import__("types").SimpleNamespace(state="running", pid=111, port=8765),
+            True,
+            "approval center started",
+        ),
+    )
+
+    rc = main([
+        "launch",
+        "--profile",
+        "hermes-cli",
+        "--project-dir",
+        str(project),
+        "--",
+        "hermes",
+        "chat",
+        "-q",
+        "hello",
+    ])
+    assert rc == 1
+    assert "llm provider key" in capsys.readouterr().err.lower()
+
+
+def test_cli_launch_hermes_cli_choose_folder_routes_to_launch(tmp_path, monkeypatch, capsys):
+    from agentveil_mcp_proxy import agent_launcher
+
+    selected = tmp_path / "picked-project"
+    selected.mkdir()
+    seen: dict[str, object] = {}
+
+    def fake_launch(**kwargs):
+        seen["project_dir"] = kwargs["project_dir"]
+        raise agent_launcher.AgentLauncherError(
+            "preflight failed: approval center unavailable; child process was not started",
+            exit_code=1,
+        )
+
+    monkeypatch.setattr(agent_launcher, "launch_managed_process", fake_launch)
+    monkeypatch.setattr(proxy_cli, "_choose_setup_project_folder", lambda: selected)
+    monkeypatch.setattr(proxy_cli, "_resolve_setup_proxy_command", lambda: "agentveil-mcp-proxy")
+
+    rc = main([
+        "launch",
+        "--profile",
+        "hermes-cli",
+        "--choose-folder",
+        "--json",
+        "--",
+        "hermes",
+        "chat",
+        "-q",
+        "hello",
+    ])
+    assert rc == 1
+    assert seen["project_dir"] == selected.resolve()
+    err = capsys.readouterr()
+    assert str(selected) not in err.out
+    assert str(selected) not in err.err

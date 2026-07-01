@@ -66,6 +66,13 @@ APPROVAL_POST_APPROVE_HUMAN_BODY = (
 )
 APPROVAL_POST_APPROVE_PROOF_BODY = "To inspect what happened, ask your agent:"
 APPROVAL_POST_APPROVE_PROOF_PROMPT = "Show AgentVeil local proof for the last action."
+TERMINAL_ALREADY_APPROVED_BODY = "This request was already approved."
+TERMINAL_ALREADY_APPROVED_NEXT = (
+    "Return to your agent. AgentVeil is ready for the approved action to continue."
+)
+TERMINAL_ALREADY_DENIED_BODY = "This request was already denied."
+TERMINAL_EXPIRED_BODY = "This approval request has expired."
+TERMINAL_NO_LONGER_ACTIONABLE_BODY = "This approval request is no longer actionable."
 APPROVAL_DECISION_DENIED_BODY = (
     "Decision recorded. This action was denied and will not run."
 )
@@ -948,34 +955,54 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
 
     def _terminal_titles(self, state: str) -> tuple[str, str]:
         if state == TERMINAL_APPROVAL_EXPIRED:
-            return "Approval expired", "This approval request has expired."
+            return "Approval expired", TERMINAL_EXPIRED_BODY
         if state == TERMINAL_ALREADY_DECIDED_APPROVE:
-            return "Already decided", "Approved"
+            return "Approved", TERMINAL_ALREADY_APPROVED_BODY
         if state == TERMINAL_ALREADY_DECIDED_DENY:
-            return "Already decided", "Denied"
-        return "Already decided", "This approval request is no longer actionable."
+            return "Denied", TERMINAL_ALREADY_DENIED_BODY
+        return "Already decided", TERMINAL_NO_LONGER_ACTIONABLE_BODY
+
+    def _render_terminal_technical_details(self, snapshot: TerminalApprovalSnapshot) -> str:
+        items = (
+            f"<dt>Request</dt><dd>{escape(snapshot.request_id)}</dd>"
+            f"<dt>Client</dt><dd>{escape(snapshot.client_id)}</dd>"
+            f"<dt>Session prefix</dt><dd>{escape(snapshot.session_id_prefix)}</dd>"
+            f"<dt>Downstream</dt><dd>{escape(snapshot.downstream_server)}</dd>"
+            f"<dt>Tool</dt><dd>{escape(snapshot.tool_name)}</dd>"
+            f"<dt>Action</dt><dd>{escape(snapshot.action_display)}</dd>"
+            f"<dt>Resource</dt><dd>{escape(snapshot.resource_display)}</dd>"
+            f"<dt>Risk</dt><dd>{escape(snapshot.risk_class)}</dd>"
+            f"<dt>Reason</dt><dd>{escape(snapshot.reason)}</dd>"
+            f"<dt>Policy rule</dt><dd>{escape(snapshot.policy_rule_id)}</dd>"
+            f"<dt>Created</dt><dd>{snapshot.created_at}</dd>"
+            f"<dt>Expires</dt><dd>{snapshot.expires_at}</dd>"
+        )
+        return (
+            '<details class="approval-proof-details">'
+            "<summary>Technical details</summary>"
+            f'<dl class="approval-detail">{items}</dl>'
+            "</details>"
+        )
 
     def _render_terminal(self, snapshot: TerminalApprovalSnapshot) -> str:
-        title, subtitle = self._terminal_titles(snapshot.state)
-        body = f"""
-<p>{escape(subtitle)}</p>
-<p class="approval-request-id">request {escape(snapshot.request_id)}</p>
-<dl>
-<dt>Client</dt><dd>{escape(snapshot.client_id)}</dd>
-<dt>Session prefix</dt><dd>{escape(snapshot.session_id_prefix)}</dd>
-<dt>Downstream</dt><dd>{escape(snapshot.downstream_server)}</dd>
-<dt>Tool</dt><dd>{escape(snapshot.tool_name)}</dd>
-<dt>Action</dt><dd>{escape(snapshot.action_display)}</dd>
-<dt>Resource</dt><dd>{escape(snapshot.resource_display)}</dd>
-<dt>Risk</dt><dd>{escape(snapshot.risk_class)}</dd>
-<dt>Reason</dt><dd>{escape(snapshot.reason)}</dd>
-<dt>Policy rule</dt><dd>{escape(snapshot.policy_rule_id)}</dd>
-<dt>Created</dt><dd>{snapshot.created_at}</dd>
-<dt>Expires</dt><dd>{snapshot.expires_at}</dd>
-</dl>
-<p>Open your Approval Center pending list from the original notification link.</p>
-"""
-        return self._page(title, body)
+        title, lead = self._terminal_titles(snapshot.state)
+        body_parts = [f"<p>{escape(lead)}</p>"]
+        if snapshot.state == TERMINAL_ALREADY_DECIDED_APPROVE:
+            body_parts.append(f"<p>{escape(TERMINAL_ALREADY_APPROVED_NEXT)}</p>")
+        body_parts.append(
+            render_local_proof_prompt_block(
+                APPROVAL_POST_APPROVE_PROOF_BODY,
+                APPROVAL_POST_APPROVE_PROOF_PROMPT,
+            )
+        )
+        body_parts.append(self._render_terminal_technical_details(snapshot))
+        return self._page(
+            title,
+            "".join(body_parts),
+            page_kind="detail",
+            include_card_styles=False,
+            include_local_proof_styles=True,
+        )
 
     def _render_list(self) -> str:
         prompts = self.server_owner.pending_prompts()
