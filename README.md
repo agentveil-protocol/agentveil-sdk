@@ -4,7 +4,7 @@
 
 # AgentVeil
 
-[![PyPI](https://img.shields.io/badge/PyPI-0.7.25-blue)](https://pypi.org/project/agentveil-mcp-proxy/0.7.25/)
+[![PyPI](https://img.shields.io/badge/PyPI-0.7.26-blue)](https://pypi.org/project/agentveil-mcp-proxy/0.7.26/)
 [![Python](https://img.shields.io/pypi/pyversions/agentveil-mcp-proxy)](https://pypi.org/project/agentveil-mcp-proxy/)
 [![Tests](https://github.com/agentveil-protocol/agentveil-sdk/actions/workflows/tests.yml/badge.svg)](https://github.com/agentveil-protocol/agentveil-sdk/actions)
 [![SDK License: MIT](https://img.shields.io/badge/SDK-MIT-informational)](LICENSING.md)

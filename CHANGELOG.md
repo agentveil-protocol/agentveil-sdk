@@ -6,6 +6,34 @@ All notable changes to the `agentveil` SDK.
 
 No unreleased changes.
 
+## [0.7.26-mcp-proxy] - 2026-07-01
+
+Public connector and approval-loop release for `agentveil-mcp-proxy`.
+
+### MCP Proxy added
+- Added Gemini CLI connector foundation with project-local setup, MCP route,
+  managed Approval Center startup, and documented one-time folder trust
+  boundary.
+- Added Codex connector foundation for interactive Codex TUI with project-local
+  setup, hook trust status, MCP route, and explicit `codex exec` non-claim.
+- Added `local_proof` as a read-only MCP tool so agents can inspect bounded
+  local proof without asking for shell access.
+
+### MCP Proxy changed
+- Enabled interactive setup paths to wait for browser approval before returning
+  from the MCP call, so approved actions can continue in the same agent turn
+  when the client keeps the tool call open.
+- Improved local proof output so the default agent-facing proof is a concise
+  human summary, while JSON/debug evidence remains available on request.
+- Updated README and package README connector quickstarts for Cursor, Claude
+  Code, Codex, and Gemini CLI.
+
+### MCP Proxy verification
+- GitHub Actions passed for the merged connector and release-doc PRs across the
+  supported compatibility matrix.
+- Live Gemini CLI testing confirmed folder trust, MCP approval, approved write
+  continuation, and `local_proof` inspection on the tested local setup.
+
 ## [0.7.25-mcp-proxy] - 2026-06-29
 
 Public beta hardening release for the `agentveil-mcp-proxy` proof and retry
