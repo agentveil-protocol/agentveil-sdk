@@ -2473,3 +2473,59 @@ def test_setup_proxy_command_prefers_invoked_script_over_path(tmp_path, monkeypa
     monkeypatch.setattr(sys, "argv", [str(invoked), "setup", "claude-code"])
 
     assert proxy_cli._resolve_setup_proxy_command() == str(invoked.resolve())
+
+
+# ----- P0.12: Managed Agent Runtime Profiles ----------------------------------
+
+
+def test_cli_launch_rejects_missing_profile(tmp_path, capsys):
+    rc = main([
+        "launch",
+        "--project-dir",
+        str(tmp_path),
+        "--",
+        sys.executable,
+        "-c",
+        "print(1)",
+    ])
+    assert rc == 2
+    assert "profile" in capsys.readouterr().err.lower()
+
+
+def test_cli_launch_status_bounded_without_paths(tmp_path, capsys):
+    rc = main(["launch", "status", "--project-dir", str(tmp_path), "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["profile_id"] == "generic-process"
+    assert payload["host_wide_control_claim"] is False
+    assert str(tmp_path) not in json.dumps(payload)
+
+
+def test_cli_launch_preflight_fail_closed(tmp_path, monkeypatch, capsys):
+    from agentveil_mcp_proxy import agent_launcher
+
+    project = tmp_path / "project"
+    project.mkdir()
+
+    def fake_launch(**kwargs):
+        raise agent_launcher.AgentLauncherError(
+            "preflight failed: approval center unavailable; child process was not started",
+            exit_code=1,
+        )
+
+    monkeypatch.setattr(agent_launcher, "launch_managed_process", fake_launch)
+    monkeypatch.setattr(proxy_cli, "_resolve_setup_proxy_command", lambda: "agentveil-mcp-proxy")
+
+    rc = main([
+        "launch",
+        "--profile",
+        "generic-process",
+        "--project-dir",
+        str(project),
+        "--",
+        sys.executable,
+        "-c",
+        "print(1)",
+    ])
+    assert rc == 1
+    assert "preflight failed" in capsys.readouterr().err.lower()
