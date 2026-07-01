@@ -28,6 +28,11 @@ def _codex_hooks(project: Path) -> Path:
     return project / ".codex" / "hooks.json"
 
 
+def _isolate_cli_home(monkeypatch, home: Path) -> None:
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+
+
 def _install_fast_codex_setup_fakes(monkeypatch, *, proxy_command: str) -> None:
     from agentveil_mcp_proxy import claude_center_lifecycle
 
@@ -67,7 +72,7 @@ def test_setup_codex_writes_merge_safe_toml_and_is_idempotent(
     capsys,
 ):
     isolated_home = tmp_path / "home"
-    monkeypatch.setenv("HOME", str(isolated_home))
+    _isolate_cli_home(monkeypatch, isolated_home)
     proxy_command = _make_proxy_command(tmp_path)
     _install_fast_codex_setup_fakes(monkeypatch, proxy_command=proxy_command)
 
@@ -118,7 +123,7 @@ def test_setup_codex_status_is_bounded_and_advisory_without_runtime_proof(
     capsys,
 ):
     isolated_home = tmp_path / "home"
-    monkeypatch.setenv("HOME", str(isolated_home))
+    _isolate_cli_home(monkeypatch, isolated_home)
     proxy_command = _make_proxy_command(tmp_path)
     _install_fast_codex_setup_fakes(monkeypatch, proxy_command=proxy_command)
 
@@ -151,7 +156,7 @@ def test_setup_codex_status_becomes_protected_only_after_hook_evidence(
     capsys,
 ):
     isolated_home = tmp_path / "home"
-    monkeypatch.setenv("HOME", str(isolated_home))
+    _isolate_cli_home(monkeypatch, isolated_home)
     proxy_command = _make_proxy_command(tmp_path)
     _install_fast_codex_setup_fakes(monkeypatch, proxy_command=proxy_command)
 
@@ -182,7 +187,7 @@ def test_setup_codex_human_output_mentions_one_time_hook_trust(
     capsys,
 ):
     isolated_home = tmp_path / "home"
-    monkeypatch.setenv("HOME", str(isolated_home))
+    _isolate_cli_home(monkeypatch, isolated_home)
     proxy_command = _make_proxy_command(tmp_path)
     _install_fast_codex_setup_fakes(monkeypatch, proxy_command=proxy_command)
 
@@ -204,7 +209,7 @@ def test_setup_remove_codex_preserves_unrelated_config(
     capsys,
 ):
     isolated_home = tmp_path / "home"
-    monkeypatch.setenv("HOME", str(isolated_home))
+    _isolate_cli_home(monkeypatch, isolated_home)
     proxy_command = _make_proxy_command(tmp_path)
     _install_fast_codex_setup_fakes(monkeypatch, proxy_command=proxy_command)
 
@@ -258,7 +263,7 @@ def test_setup_remove_codex_preserves_unrelated_config(
 
 def test_setup_codex_preview_does_not_write(tmp_path, monkeypatch, capsys):
     isolated_home = tmp_path / "home"
-    monkeypatch.setenv("HOME", str(isolated_home))
+    _isolate_cli_home(monkeypatch, isolated_home)
     project = tmp_path / "project"
     project.mkdir()
 
@@ -276,7 +281,7 @@ def test_setup_codex_choose_folder_uses_selected_project(
     capsys,
 ):
     isolated_home = tmp_path / "home"
-    monkeypatch.setenv("HOME", str(isolated_home))
+    _isolate_cli_home(monkeypatch, isolated_home)
     proxy_command = _make_proxy_command(tmp_path)
     _install_fast_codex_setup_fakes(monkeypatch, proxy_command=proxy_command)
 
@@ -301,7 +306,7 @@ def test_setup_codex_choose_folder_uses_selected_project(
 
 def test_setup_codex_fails_closed_on_invalid_hooks_json(tmp_path, monkeypatch):
     isolated_home = tmp_path / "home"
-    monkeypatch.setenv("HOME", str(isolated_home))
+    _isolate_cli_home(monkeypatch, isolated_home)
     proxy_command = _make_proxy_command(tmp_path)
     _install_fast_codex_setup_fakes(monkeypatch, proxy_command=proxy_command)
 
