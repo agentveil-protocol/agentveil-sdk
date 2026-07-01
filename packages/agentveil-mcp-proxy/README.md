@@ -8,9 +8,9 @@ decision, controlled path when available, local proof.
 It includes two public surfaces:
 
 1. **Project connector setup** for supported agent clients such as Cursor,
-   Claude Code, and Codex. Connectors install managed project-local hooks and
-   MCP route config so supported native agent mutations can be blocked with
-   redirect guidance toward the AgentVeil MCP route.
+   Claude Code, Codex, and Gemini CLI. Connectors install managed project-local
+   hooks and MCP route config so supported native agent mutations can be
+   blocked with redirect guidance toward the AgentVeil MCP route.
 2. **Core MCP Proxy**, which wraps a downstream MCP server and applies
    AgentVeil policy to calls that pass through the proxy: allow,
    approval-required, redirect, hard-block, with bounded local evidence.
@@ -31,7 +31,8 @@ calls.
   file edits.
 - AgentVeil does not control direct human terminal commands, direct git, pip,
   deploy, or package-manager commands outside configured AgentVeil paths.
-- It does not create a Cursor, Codex, Claude, or desktop-wide lock.
+- It does not create a Cursor, Claude Code, Codex, Gemini CLI, or desktop-wide
+  lock.
 - Actions outside configured connectors and routed proxy calls are not
   classified or logged.
 
@@ -97,6 +98,17 @@ Choose the project folder to protect, then open / restart Codex for that
 project. Codex asks you to trust the AgentVeil project hook once; until hook
 evidence is observed, `setup status --client codex` remains advisory, not
 protected.
+
+### Gemini CLI project connector
+
+```bash
+pip install agentveil-mcp-proxy
+agentveil-mcp-proxy setup gemini-cli --choose-folder --yes
+```
+
+Choose the project folder to protect, then open / restart Gemini CLI for that
+project. Gemini CLI asks you to trust the project folder before it loads local
+settings, hooks, and MCP servers.
 
 ### Walkable example after setup
 
@@ -255,9 +267,10 @@ for your specific downstream server.
 | `setup cursor --choose-folder` | Configure a project-local Cursor connector. |
 | `setup claude-code --choose-folder --yes` | Configure a project-local Claude Code connector. |
 | `setup codex --choose-folder --yes` | Configure a project-local Codex connector. |
+| `setup gemini-cli --choose-folder --yes` | Configure a project-local Gemini CLI connector. |
 | `setup status --json` | Print bounded connector/proxy status. |
-| `setup remove <cursor|claude-code|codex>` | Preview managed connector removal. |
-| `setup remove <cursor|claude-code|codex> --yes` | Remove only AgentVeil-managed connector entries. |
+| `setup remove <cursor|claude-code|codex|gemini-cli>` | Preview managed connector removal. |
+| `setup remove <cursor|claude-code|codex|gemini-cli> --yes` | Remove only AgentVeil-managed connector entries. |
 
 ## Relationship To AgentVeil
 
