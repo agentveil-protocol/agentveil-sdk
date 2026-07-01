@@ -6,6 +6,39 @@ All notable changes to the `agentveil` SDK.
 
 No unreleased changes.
 
+## [0.7.27-mcp-proxy] - 2026-07-01
+
+Autonomous agent launcher and Hermes controlled MCP profile release for
+`agentveil-mcp-proxy`.
+
+### MCP Proxy added
+- Added managed runtime launcher support for local agent processes, including a
+  `generic-process` profile with project-local runtime state, managed Approval
+  Center startup, bounded status, and local proof-ready routing.
+- Added `launch --choose-folder` for launcher setup parity with project
+  connectors.
+- Added the `hermes-cli` controlled MCP profile. Hermes launches with a
+  project-local Hermes home, AgentVeil MCP route, foreground output, bounded
+  provider environment passthrough, approval, sandbox boundaries, redirect
+  guidance inside the AgentVeil route, and local proof.
+
+### MCP Proxy changed
+- Updated README and package README with a Hermes CLI quickstart and explicit
+  claim boundary: controlled MCP route foundation, not host-wide native
+  containment.
+- Improved already-decided Approval Center pages so stale approval URLs show
+  human-first approved/denied/expired messages with technical details collapsed.
+
+### MCP Proxy verification
+- GitHub Actions passed for PR #93 across the supported compatibility matrix.
+- Local public SDK PR gate ran; two wheel-build tests failed only under the
+  Codex sandbox because `pip wheel` could not update `agentveil.egg-info`, and
+  targeted rerun of those two tests outside the sandbox passed.
+- Live Hermes CLI testing confirmed routed read/write behavior, approval
+  continuation, sandbox hard-blocking, redirect follow-up inside the AgentVeil
+  MCP route, shell-pressure routing through `mcp_agentveil_write_file`, and
+  intact local proof.
+
 ## [0.7.26-mcp-proxy] - 2026-07-01
 
 Public connector and approval-loop release for `agentveil-mcp-proxy`.
