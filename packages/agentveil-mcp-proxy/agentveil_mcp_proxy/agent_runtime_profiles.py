@@ -41,8 +41,17 @@ GENERIC_PROCESS_PROFILE = RuntimeProfileSpec(
     requires_child_command=True,
 )
 
+HERMES_CLI_PROFILE = RuntimeProfileSpec(
+    profile_id="hermes-cli",
+    display_name="Hermes Agent CLI",
+    default_status="configured",
+    child_detach=False,
+    requires_child_command=True,
+)
+
 _KNOWN_PROFILES: dict[str, RuntimeProfileSpec] = {
     GENERIC_PROCESS_PROFILE.profile_id: GENERIC_PROCESS_PROFILE,
+    HERMES_CLI_PROFILE.profile_id: HERMES_CLI_PROFILE,
 }
 
 
@@ -67,6 +76,7 @@ def resolve_runtime_profile(profile_id: str) -> RuntimeProfileSpec:
 
 __all__ = [
     "GENERIC_PROCESS_PROFILE",
+    "HERMES_CLI_PROFILE",
     "RuntimeProfileError",
     "RuntimeProfileSpec",
     "known_profile_ids",

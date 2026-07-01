@@ -3220,6 +3220,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Examples:\n"
             "  agentveil-mcp-proxy launch --profile generic-process --project-dir . -- python script.py\n"
             "  agentveil-mcp-proxy launch --profile generic-process --choose-folder -- python script.py\n"
+            "  agentveil-mcp-proxy launch --profile hermes-cli --project-dir . -- \\\n"
+            "    hermes chat --toolsets agentveil -q \"…\"\n"
             "  agentveil-mcp-proxy launch status --project-dir .\n"
             "  agentveil-mcp-proxy launch stop --project-dir ."
         ),
@@ -4789,6 +4791,7 @@ def run_launch_cli(
     """Launch a child process under a managed AgentVeil runtime profile."""
 
     from agentveil_mcp_proxy.agent_launcher import AgentLauncherError, launch_managed_process
+    from agentveil_mcp_proxy.agent_runtime_profiles import HERMES_CLI_PROFILE
 
     if not profile_id:
         raise ProxyCliError("--profile is required for launch", exit_code=2)
@@ -4811,8 +4814,8 @@ def run_launch_cli(
 
     status = result.status
     if output_json:
-        _print_operator_json({
-            "ok": True,
+        payload = {
+            "ok": result.child_exit_code in (None, 0),
             "action": "launch",
             "profile_id": status.profile_id,
             "profile_status": status.profile_status,
@@ -4821,21 +4824,52 @@ def run_launch_cli(
             "approval_center": status.approval_center.state,
             "child_started": result.child_started,
             "child_running": status.child_running,
+            "child_foreground": result.child_foreground,
+            "child_exit_code": result.child_exit_code,
             "proxy_initialized": result.proxy_initialized,
             "evidence_enabled": status.evidence_enabled,
             "scope": status.scope,
             "host_wide_control_claim": status.host_wide_control_claim,
             "reason": result.reason,
-        })
+        }
+        if profile_id == HERMES_CLI_PROFILE.profile_id:
+            from agentveil_mcp_proxy.agent_launcher import (
+                hermes_native_tool_containment_note,
+                project_avp_home,
+                runtime_route_path,
+            )
+
+            route_path = runtime_route_path(project_avp_home(target))
+            if route_path.is_file():
+                try:
+                    route = json.loads(route_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    route = {}
+                payload["hermes_mcp_server"] = route.get("hermes_mcp_server")
+                payload["hermes_toolset"] = route.get("hermes_toolset")
+            payload["native_tool_containment"] = hermes_native_tool_containment_note()
+        _print_operator_json(payload)
     else:
         print("Managed runtime launch:")
         print(f"  profile:          {status.profile_id} ({status.profile_status})")
         print(f"  scope:            {status.scope} (no host-wide control claim)")
         print(f"  approval_center:  {status.approval_center.state}")
         print(f"  evidence/proof:   {'enabled' if status.evidence_enabled else 'not initialized'}")
-        print(f"  child:            {'started' if result.child_started else 'not started'}")
+        if result.child_foreground:
+            exit_code = result.child_exit_code if result.child_exit_code is not None else "unknown"
+            label = "finished" if result.child_exit_code == 0 else "failed"
+            print(f"  child:            {label} (exit {exit_code})")
+        else:
+            print(f"  child:            {'started' if result.child_started else 'not started'}")
         if result.proxy_initialized:
             print("  proxy route:      initialized for this project")
+        if profile_id == HERMES_CLI_PROFILE.profile_id:
+            print(
+                "  hermes note:      AgentVeil MCP route only; native Hermes tools are "
+                "limited, not host-wide. Use --toolsets agentveil."
+            )
+    if result.child_exit_code is not None and result.child_exit_code != 0:
+        return int(result.child_exit_code)
     return 0
 
 
@@ -4975,13 +5009,9 @@ def _configure_claude_setup_approval_ui(config_path: Path) -> None:
 def _configure_interactive_connector_defaults(config_path: Path) -> None:
     """Enable bounded approval wait-mode for interactive MCP client setups."""
 
-    config_payload = _read_json(config_path, "proxy config")
-    approval = config_payload.get("approval")
-    if not isinstance(approval, dict):
-        approval = {}
-        config_payload["approval"] = approval
-    approval["wait_for_decision"] = True
-    _secure_write_json(config_path, config_payload, force=True)
+    from agentveil_mcp_proxy.agent_launcher import ensure_interactive_connector_defaults
+
+    ensure_interactive_connector_defaults(config_path)
 
 
 def run_setup_claude_code_cli(

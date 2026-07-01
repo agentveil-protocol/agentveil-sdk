@@ -51,6 +51,25 @@ AGENTVEIL_MCP_PROXY_RUN_ARGS_ENV = "AGENTVEIL_MCP_PROXY_RUN_ARGS"
 AGENTVEIL_RUNTIME_PROFILE_ENV = "AGENTVEIL_RUNTIME_PROFILE"
 AGENTVEIL_RUNTIME_SESSION_ENV = "AGENTVEIL_RUNTIME_SESSION_ID"
 
+HERMES_HOME_ENV = "HERMES_HOME"
+HERMES_MCP_SERVER_NAME = "agentveil"
+HERMES_MCP_TOOLSET = HERMES_MCP_SERVER_NAME
+HERMES_CONFIG_FILENAME = "config.yaml"
+
+# Best-effort native-tool suppression for Hermes CLI launches. Live proof is still
+# required before claiming full containment; users should also pass
+# `--toolsets agentveil` (configured MCP server name) on the Hermes command line.
+_HERMES_DISABLED_NATIVE_TOOLSETS = (
+    "terminal",
+    "web",
+    "browser",
+    "memory",
+    "session_search",
+    "cronjob",
+    "code_execution",
+    "delegation",
+)
+
 _CENTER_START_TIMEOUT_SECONDS = 12.0
 _CENTER_POLL_INTERVAL_SECONDS = 0.2
 _CENTER_HEALTH_TIMEOUT_SECONDS = 1.5
@@ -71,6 +90,13 @@ _PRESERVED_ENV_KEYS = (
     "PYTHONPATH",
     "PYTHONHOME",
     "VIRTUAL_ENV",
+)
+
+_HERMES_PROVIDER_ENV_KEYS = (
+    "DEEPSEEK_API_KEY",
+    "DEEPSEEK_BASE_URL",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
 )
 
 
@@ -169,6 +195,8 @@ class LaunchResult:
     approval_center_started: bool
     proxy_initialized: bool
     reason: str
+    child_exit_code: int | None = None
+    child_foreground: bool = False
 
 
 def project_avp_home(project_dir: Path) -> Path:
@@ -200,6 +228,329 @@ def runtime_state_home(home: Path, profile_id: str, session_id: str) -> Path:
     """Project-local runtime HOME for a managed child process."""
 
     return home / "runtime" / profile_id / session_id / "home"
+
+
+def hermes_runtime_home(home: Path, profile_id: str, session_id: str) -> Path:
+    """Project-local Hermes data directory for the hermes-cli profile."""
+
+    return home / "runtime" / profile_id / session_id / "hermes-home"
+
+
+def hermes_config_path(hermes_home: Path) -> Path:
+    return hermes_home / HERMES_CONFIG_FILENAME
+
+
+def _yaml_scalar(value: str) -> str:
+    if value and not any(ch in value for ch in ":#\"'\\{}\n\t"):
+        return value
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _hermes_proxy_stdio_invocation(
+    proxy_command: str,
+    run_args: list[str],
+) -> tuple[str, list[str]]:
+    """Return Hermes stdio MCP command/args for the AgentVeil proxy."""
+
+    resolved = resolve_proxy_command(proxy_command)
+    name = Path(resolved).name
+    if name in {"python", "python3"} or name.startswith("python3."):
+        return str(resolved), ["-m", "agentveil_mcp_proxy.cli", *run_args]
+    which = shutil.which(resolved)
+    return (which or resolved), list(run_args)
+
+
+def _hermes_proxy_uses_python_module(proxy_command: str) -> bool:
+    resolved = resolve_proxy_command(proxy_command)
+    name = Path(resolved).name
+    return name in {"python", "python3"} or name.startswith("python3.")
+
+
+def _hermes_mcp_server_env(
+    *,
+    avp_home: Path,
+    proxy_command: str,
+    parent_env: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Build bounded env for the Hermes MCP stdio subprocess."""
+
+    env: dict[str, str] = {AGENTVEIL_AVP_HOME_ENV: str(avp_home)}
+    if not _hermes_proxy_uses_python_module(proxy_command):
+        return env
+    source = dict(parent_env or os.environ)
+    pythonpath = source.get("PYTHONPATH")
+    if isinstance(pythonpath, str) and pythonpath.strip():
+        env["PYTHONPATH"] = pythonpath
+    return env
+
+
+def build_hermes_config_document(
+    *,
+    proxy_command: str,
+    run_args: list[str],
+    avp_home: Path,
+    parent_env: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    command, args = _hermes_proxy_stdio_invocation(proxy_command, run_args)
+    mcp_entry: dict[str, Any] = {
+        "command": command,
+        "args": args,
+        "env": _hermes_mcp_server_env(
+            avp_home=avp_home,
+            proxy_command=proxy_command,
+            parent_env=parent_env,
+        ),
+    }
+    return {
+        "mcp_servers": {
+            HERMES_MCP_SERVER_NAME: mcp_entry,
+        },
+        "agent": {
+            "disabled_toolsets": list(_HERMES_DISABLED_NATIVE_TOOLSETS),
+        },
+    }
+
+
+def render_hermes_config_yaml(document: Mapping[str, Any]) -> str:
+    """Render a minimal Hermes config.yaml without external YAML dependencies."""
+
+    lines: list[str] = []
+
+    mcp_servers = document.get("mcp_servers")
+    if isinstance(mcp_servers, Mapping):
+        lines.append("mcp_servers:")
+        for server_name, server_cfg in mcp_servers.items():
+            if not isinstance(server_cfg, Mapping):
+                continue
+            lines.append(f"  {_yaml_scalar(str(server_name))}:")
+            command = server_cfg.get("command")
+            if isinstance(command, str) and command:
+                lines.append(f"    command: {_yaml_scalar(command)}")
+            args = server_cfg.get("args")
+            if isinstance(args, list) and args:
+                lines.append("    args:")
+                for arg in args:
+                    lines.append(f"      - {_yaml_scalar(str(arg))}")
+            env = server_cfg.get("env")
+            if isinstance(env, Mapping) and env:
+                lines.append("    env:")
+                for key, value in env.items():
+                    lines.append(f"      {_yaml_scalar(str(key))}: {_yaml_scalar(str(value))}")
+
+    agent = document.get("agent")
+    if isinstance(agent, Mapping):
+        disabled = agent.get("disabled_toolsets")
+        if isinstance(disabled, list) and disabled:
+            lines.append("agent:")
+            lines.append("  disabled_toolsets:")
+            for item in disabled:
+                lines.append(f"    - {_yaml_scalar(str(item))}")
+
+    return "\n".join(lines) + "\n"
+
+
+def write_hermes_config(
+    *,
+    hermes_home: Path,
+    proxy_command: str,
+    run_args: list[str],
+    avp_home: Path,
+    parent_env: Mapping[str, str] | None = None,
+) -> Path:
+    """Bootstrap project-local Hermes config with the AgentVeil stdio MCP route."""
+
+    ensure_runtime_state_home(hermes_home)
+    document = build_hermes_config_document(
+        proxy_command=proxy_command,
+        run_args=run_args,
+        avp_home=avp_home,
+        parent_env=parent_env,
+    )
+    path = hermes_config_path(hermes_home)
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    payload = render_hermes_config_yaml(document)
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        handle.write(payload)
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, path)
+    verify_hermes_config_bootstrap(hermes_home)
+    return path
+
+
+def hermes_native_tool_containment_note() -> str:
+    return (
+        "Hermes native tools are limited via disabled_toolsets and --toolsets "
+        f"{HERMES_MCP_TOOLSET}; full host-wide containment is not claimed"
+    )
+
+
+def preflight_hermes_cli_executable(command: Sequence[str]) -> None:
+    """Reject launch when the Hermes CLI is missing or the child command is wrong."""
+
+    if not command:
+        raise AgentLauncherError(
+            "hermes-cli profile requires a Hermes child command after '--'",
+            exit_code=2,
+        )
+    argv0 = str(command[0])
+    name = Path(argv0).name
+    if name != "hermes":
+        raise AgentLauncherError(
+            "hermes-cli profile expects the child command to invoke hermes; "
+            "example: launch --profile hermes-cli -- hermes chat --toolsets agentveil -q \"…\"",
+            exit_code=2,
+        )
+    resolved = argv0 if Path(argv0).is_absolute() else shutil.which(argv0)
+    if not resolved or not Path(resolved).exists():
+        raise AgentLauncherError(
+            "hermes executable not found; install Hermes Agent before launching hermes-cli profile",
+            exit_code=1,
+        )
+
+
+def preflight_hermes_cli_provider(parent_env: Mapping[str, str] | None = None) -> None:
+    """Reject launch when no usable LLM provider key is present for Hermes."""
+
+    source = dict(parent_env or os.environ)
+    for key in ("DEEPSEEK_API_KEY", "OPENAI_API_KEY"):
+        value = source.get(key)
+        if isinstance(value, str) and value.strip():
+            return
+    raise AgentLauncherError(
+        "hermes-cli requires an LLM provider key in the operator environment "
+        "(set DEEPSEEK_API_KEY or OPENAI_API_KEY before launch)",
+        exit_code=1,
+    )
+
+
+def _merge_hermes_provider_env(
+    env: dict[str, str],
+    parent_env: Mapping[str, str],
+) -> None:
+    for key in _HERMES_PROVIDER_ENV_KEYS:
+        value = parent_env.get(key)
+        if isinstance(value, str) and value:
+            env[key] = value
+
+
+def prepare_hermes_cli_command(command: Sequence[str]) -> list[str]:
+    """Inject the recommended MCP-only toolset when the launch omits --toolsets."""
+
+    tokens = [str(item) for item in command]
+    if "--toolsets" in tokens:
+        return tokens
+    try:
+        chat_index = tokens.index("chat")
+    except ValueError:
+        return tokens
+    return [
+        *tokens[: chat_index + 1],
+        "--toolsets",
+        HERMES_MCP_TOOLSET,
+        *tokens[chat_index + 1 :],
+    ]
+
+
+def _hermes_proxy_run_args(args: Sequence[str]) -> list[str]:
+    """Return the ``agentveil-mcp-proxy run`` argv from a Hermes MCP args block."""
+
+    if not args:
+        raise AgentLauncherError("hermes config missing AgentVeil MCP args", exit_code=1)
+    if str(args[0]) == "run":
+        return list(args)
+    if (
+        len(args) >= 3
+        and str(args[0]) == "-m"
+        and str(args[1]) == "agentveil_mcp_proxy.cli"
+        and str(args[2]) == "run"
+    ):
+        return list(args[2:])
+    raise AgentLauncherError(
+        "hermes config AgentVeil MCP args must start with run or "
+        "python -m agentveil_mcp_proxy.cli run",
+        exit_code=1,
+    )
+
+
+def verify_hermes_config_bootstrap(hermes_home: Path) -> dict[str, Any]:
+    """Reject launch when Hermes config is missing the AgentVeil stdio MCP route."""
+
+    parsed = parse_hermes_agentveil_stdio_config(hermes_home)
+    if not str(parsed.get("command", "")).strip():
+        raise AgentLauncherError("hermes config missing AgentVeil MCP command", exit_code=1)
+    _hermes_proxy_run_args(parsed.get("args", []))
+    return parsed
+
+
+def parse_hermes_agentveil_stdio_config(hermes_home: Path) -> dict[str, Any]:
+    """Parse the AgentVeil stdio MCP block from a bootstrap-generated Hermes config."""
+
+    path = hermes_config_path(hermes_home)
+    if not path.is_file():
+        raise AgentLauncherError("hermes config missing after bootstrap", exit_code=1)
+
+    in_agentveil = False
+    in_args = False
+    in_env = False
+    in_disabled = False
+    command: str | None = None
+    args: list[str] = []
+    env: dict[str, str] = {}
+    disabled: list[str] = []
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped == f"{HERMES_MCP_SERVER_NAME}:":
+            in_agentveil = True
+            in_args = False
+            in_env = False
+            continue
+        if stripped == "agent:":
+            in_agentveil = False
+            in_disabled = False
+            continue
+        if stripped == "disabled_toolsets:":
+            in_disabled = True
+            in_agentveil = False
+            continue
+        if in_disabled and stripped.startswith("- "):
+            disabled.append(stripped[2:].strip().strip('"'))
+            continue
+        if not in_agentveil:
+            continue
+        if stripped.startswith("command:"):
+            command = stripped.split(":", 1)[1].strip().strip('"')
+            in_args = False
+            in_env = False
+        elif stripped == "args:":
+            in_args = True
+            in_env = False
+        elif stripped == "env:":
+            in_env = True
+            in_args = False
+        elif in_args and stripped.startswith("- "):
+            args.append(stripped[2:].strip().strip('"'))
+        elif in_env and ":" in stripped:
+            key, _, value = stripped.partition(":")
+            env[key.strip()] = value.strip().strip('"')
+        elif not raw_line.startswith("  "):
+            in_agentveil = False
+
+    if not command:
+        raise AgentLauncherError("hermes config missing AgentVeil MCP command", exit_code=1)
+    if not args:
+        raise AgentLauncherError("hermes config missing AgentVeil MCP args", exit_code=1)
+
+    return {
+        "server_name": HERMES_MCP_SERVER_NAME,
+        "command": command,
+        "args": args,
+        "env": env,
+        "disabled_toolsets": disabled,
+    }
 
 
 def bounded_command_metadata(command: Sequence[str]) -> dict[str, str]:
@@ -407,6 +758,8 @@ def _bounded_child_env(
     env[AGENTVEIL_MCP_PROXY_RUN_ARGS_ENV] = json.dumps(run_args, separators=(",", ":"))
     env[AGENTVEIL_RUNTIME_PROFILE_ENV] = profile.profile_id
     env[AGENTVEIL_RUNTIME_SESSION_ENV] = session_id
+    if profile.profile_id == "hermes-cli":
+        _merge_hermes_provider_env(env, source)
     return env
 
 
@@ -418,9 +771,10 @@ def write_runtime_route_config(
     proxy_command: str,
     run_args: list[str],
     runtime_home: Path | None = None,
+    hermes_home: Path | None = None,
 ) -> None:
     command_display = Path(proxy_command).name if Path(proxy_command).is_absolute() else proxy_command
-    payload = {
+    payload: dict[str, Any] = {
         "schema_version": 1,
         "profile_id": profile.profile_id,
         "session_id": session_id,
@@ -434,6 +788,11 @@ def write_runtime_route_config(
     }
     if runtime_home is not None:
         payload["runtime_home_ref"] = bounded_path_ref(runtime_home)
+    if hermes_home is not None:
+        payload["hermes_home_ref"] = bounded_path_ref(hermes_home)
+        payload["hermes_mcp_server"] = HERMES_MCP_SERVER_NAME
+        payload["hermes_toolset"] = HERMES_MCP_TOOLSET
+        payload["native_tool_containment"] = hermes_native_tool_containment_note()
     path = runtime_route_path(home)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f".{path.name}.tmp")
@@ -444,6 +803,37 @@ def write_runtime_route_config(
     os.replace(tmp_path, path)
 
 
+def _write_proxy_config_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, path)
+
+
+def ensure_interactive_connector_defaults(config_path: Path) -> None:
+    """Enable bounded approval wait-mode for interactive MCP client launches."""
+
+    if not config_path.is_file():
+        return
+    try:
+        config_payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return
+    if not isinstance(config_payload, dict):
+        return
+    approval = config_payload.get("approval")
+    if not isinstance(approval, dict):
+        approval = {}
+        config_payload["approval"] = approval
+    if approval.get("wait_for_decision") is True:
+        return
+    approval["wait_for_decision"] = True
+    _write_proxy_config_json(config_path, config_payload)
+
+
 def build_launch_status(
     *,
     home: Path,
@@ -451,6 +841,14 @@ def build_launch_status(
     project_dir: Path,
 ) -> LaunchStatus:
     launch_manifest = load_launch_manifest(home)
+    manifest_profile_id = (
+        getattr(launch_manifest, "profile_id", None) if launch_manifest is not None else None
+    )
+    if manifest_profile_id:
+        try:
+            profile = resolve_runtime_profile(manifest_profile_id)
+        except RuntimeProfileError:
+            pass
     center = check_approval_center_status(home)
     child_pid = launch_manifest.child_pid if launch_manifest is not None else None
     child_running = is_process_alive(child_pid)
@@ -493,6 +891,10 @@ def launch_managed_process(
 
     target = resolve_project_dir(project_dir)
     command = normalize_child_command(child_command)
+    if profile.profile_id == "hermes-cli":
+        preflight_hermes_cli_executable(command)
+        preflight_hermes_cli_provider()
+        command = prepare_hermes_cli_command(command)
     home = project_avp_home(target)
     config_path = proxy_dir(home) / "config.json"
     proxy_initialized = False
@@ -518,6 +920,9 @@ def launch_managed_process(
         if not config_path.exists():
             raise AgentLauncherError("proxy route initialization did not create config", exit_code=1)
 
+    if profile.profile_id == "hermes-cli":
+        ensure_interactive_connector_defaults(config_path)
+
     center, center_started, center_reason = ensure_approval_center_running(
         home=home,
         proxy_command=resolved_proxy_command,
@@ -530,8 +935,26 @@ def launch_managed_process(
         )
 
     session_id = uuid.uuid4().hex
-    runtime_home = runtime_state_home(home, profile.profile_id, session_id)
-    ensure_runtime_state_home(runtime_home)
+    hermes_home: Path | None = None
+    if profile.profile_id == "hermes-cli":
+        hermes_home = hermes_runtime_home(home, profile.profile_id, session_id)
+        try:
+            write_hermes_config(
+                hermes_home=hermes_home,
+                proxy_command=resolved_proxy_command,
+                run_args=run_args,
+                avp_home=home,
+                parent_env=os.environ,
+            )
+        except OSError as exc:
+            raise AgentLauncherError(
+                f"hermes config bootstrap failed: {exc.__class__.__name__}",
+                exit_code=1,
+            ) from exc
+        runtime_home = hermes_home
+    else:
+        runtime_home = runtime_state_home(home, profile.profile_id, session_id)
+        ensure_runtime_state_home(runtime_home)
     write_runtime_route_config(
         home=home,
         profile=profile,
@@ -539,6 +962,7 @@ def launch_managed_process(
         proxy_command=proxy_command_display,
         run_args=run_args,
         runtime_home=runtime_home,
+        hermes_home=hermes_home,
     )
     child_env = _bounded_child_env(
         home=home,
@@ -547,7 +971,10 @@ def launch_managed_process(
         session_id=session_id,
         proxy_command=proxy_command_display,
         run_args=run_args,
+        parent_env=os.environ,
     )
+    if hermes_home is not None:
+        child_env[HERMES_HOME_ENV] = str(hermes_home)
 
     popen_kwargs: dict[str, Any] = {
         "cwd": str(target),
@@ -569,6 +996,11 @@ def launch_managed_process(
             exit_code=1,
         ) from exc
 
+    child_exit_code: int | None = None
+    child_foreground = not profile.child_detach
+    if child_foreground:
+        child_exit_code = process.wait()
+
     command_meta = bounded_command_metadata(command)
     manifest = LaunchManifest(
         schema_version=LAUNCH_MANIFEST_SCHEMA_VERSION,
@@ -589,6 +1021,8 @@ def launch_managed_process(
         approval_center_started=center_started,
         proxy_initialized=proxy_initialized,
         reason=center_reason,
+        child_exit_code=child_exit_code,
+        child_foreground=child_foreground,
     )
 
 
@@ -669,21 +1103,36 @@ __all__ = [
     "AGENTVEIL_RUNTIME_SESSION_ENV",
     "AgentLauncherError",
     "CenterStatus",
+    "HERMES_HOME_ENV",
+    "HERMES_MCP_SERVER_NAME",
+    "HERMES_MCP_TOOLSET",
     "LaunchManifest",
     "LaunchResult",
     "LaunchStatus",
     "bounded_command_metadata",
+    "build_hermes_config_document",
     "build_launch_status",
     "check_approval_center_status",
     "ensure_approval_center_running",
+    "ensure_interactive_connector_defaults",
     "ensure_runtime_state_home",
+    "hermes_config_path",
+    "hermes_native_tool_containment_note",
+    "hermes_runtime_home",
     "launch_managed_process",
     "load_launch_manifest",
     "normalize_child_command",
+    "parse_hermes_agentveil_stdio_config",
+    "preflight_hermes_cli_executable",
+    "preflight_hermes_cli_provider",
+    "prepare_hermes_cli_command",
     "project_avp_home",
+    "render_hermes_config_yaml",
     "resolve_project_dir",
     "runtime_state_home",
     "save_launch_manifest",
     "stop_managed_launch",
+    "verify_hermes_config_bootstrap",
+    "write_hermes_config",
     "write_runtime_route_config",
 ]

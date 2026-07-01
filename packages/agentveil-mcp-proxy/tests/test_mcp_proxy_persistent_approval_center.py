@@ -374,8 +374,9 @@ def test_old_approved_url_after_run_exit_uses_evidence_terminal_page(tmp_path):
         with httpx.Client() as client:
             stale = client.get(approval_url)
         assert stale.status_code == 410
-        assert "Already decided" in stale.text
         assert "Approved" in stale.text
+        assert "This request was already approved." in stale.text
+        assert "Already decided" not in stale.text
         _assert_stale_html_privacy_safe(
             stale.text,
             session_token=persistent_server.session_token,
@@ -411,8 +412,9 @@ def test_old_denied_url_after_run_exit_uses_evidence_terminal_page(tmp_path):
         with httpx.Client() as client:
             stale = client.get(approval_url)
         assert stale.status_code == 410
-        assert "Already decided" in stale.text
         assert "Denied" in stale.text
+        assert "This request was already denied." in stale.text
+        assert "Already decided" not in stale.text
         _assert_stale_html_privacy_safe(
             stale.text,
             session_token=persistent_server.session_token,

@@ -35,10 +35,15 @@ from agentveil_mcp_proxy.approval import (
     HeadlessPolicyError,
 )
 from agentveil_mcp_proxy.approval.server import (
+    APPROVAL_POST_APPROVE_PROOF_PROMPT,
     SECURITY_HEADERS,
+    TERMINAL_ALREADY_APPROVED_BODY,
+    TERMINAL_ALREADY_APPROVED_NEXT,
     TERMINAL_ALREADY_DECIDED_APPROVE,
     TERMINAL_ALREADY_DECIDED_DENY,
+    TERMINAL_ALREADY_DENIED_BODY,
     TERMINAL_APPROVAL_EXPIRED,
+    TERMINAL_EXPIRED_BODY,
     approval_content_security_policy,
 )
 from agentveil_mcp_proxy.approval.notification import NotificationResult
@@ -3799,6 +3804,40 @@ def _assert_stale_html_response(
     _assert_stale_html_privacy_safe(response.text, session_token=session_token)
 
 
+def _terminal_first_screen(text: str) -> str:
+    _, _, body = text.partition("<body>")
+    main_view, _, _ = body.partition('<details class="approval-proof-details">')
+    return main_view
+
+
+def _assert_terminal_first_screen_human(text: str) -> None:
+    first_screen = _terminal_first_screen(text)
+    for fragment in (
+        "Client",
+        "Session prefix",
+        "Policy rule",
+        "Action redacted",
+        "agentveil-mcp-proxy events show",
+        "Copy command",
+        "approval-local-proof-command",
+    ):
+        assert fragment not in first_screen, f"unexpected first-screen fragment: {fragment!r}"
+    assert "Technical details" not in first_screen
+    assert "To inspect what happened, ask your agent:" in first_screen
+    assert APPROVAL_POST_APPROVE_PROOF_PROMPT in first_screen
+
+
+def _assert_terminal_technical_details_collapsed(text: str) -> None:
+    assert '<details class="approval-proof-details">' in text
+    assert "<summary>Technical details</summary>" in text
+    _, _, body = text.partition("<body>")
+    details_start = body.index('<details class="approval-proof-details">')
+    assert "Client" not in body[:details_start]
+    collapsed = body.split("<summary>Technical details</summary>", 1)[1]
+    for label in ("Client", "Session prefix", "Policy rule", "Tool"):
+        assert label in collapsed
+
+
 def test_get_after_approve_returns_stale_html_terminal_no_forms():
     server = ApprovalServer()
     server.start()
@@ -3811,10 +3850,13 @@ def test_get_after_approve_returns_stale_html_terminal_no_forms():
         assert stale.status_code == 410
         _assert_stale_html_response(
             stale,
-            headline="Already decided",
+            headline="Approved",
             session_token=server.session_token,
         )
-        assert "Approved" in stale.text
+        assert TERMINAL_ALREADY_APPROVED_BODY in stale.text
+        assert TERMINAL_ALREADY_APPROVED_NEXT in stale.text
+        _assert_terminal_first_screen_human(stale.text)
+        _assert_terminal_technical_details_collapsed(stale.text)
         snapshot = server.stale_terminal_snapshot_for("req-1")
         assert snapshot is not None
         assert snapshot.state == TERMINAL_ALREADY_DECIDED_APPROVE
@@ -3834,10 +3876,12 @@ def test_get_after_deny_returns_stale_html_terminal_no_forms():
         assert stale.status_code == 410
         _assert_stale_html_response(
             stale,
-            headline="Already decided",
+            headline="Denied",
             session_token=server.session_token,
         )
-        assert "Denied" in stale.text
+        assert TERMINAL_ALREADY_DENIED_BODY in stale.text
+        _assert_terminal_first_screen_human(stale.text)
+        _assert_terminal_technical_details_collapsed(stale.text)
         snapshot = server.stale_terminal_snapshot_for("req-deny")
         assert snapshot is not None
         assert snapshot.state == TERMINAL_ALREADY_DECIDED_DENY
@@ -3873,6 +3917,9 @@ def test_get_after_timeout_unregister_returns_expired_html_page(tmp_path):
             headline="Approval expired",
             session_token=server.session_token,
         )
+        assert TERMINAL_EXPIRED_BODY in stale.text
+        _assert_terminal_first_screen_human(stale.text)
+        _assert_terminal_technical_details_collapsed(stale.text)
     finally:
         server.stop()
         store.close()
@@ -3932,6 +3979,9 @@ def test_get_expired_prompt_before_unregister_shows_expired_html(monkeypatch):
             headline="Approval expired",
             session_token=server.session_token,
         )
+        assert TERMINAL_EXPIRED_BODY in response.text
+        _assert_terminal_first_screen_human(response.text)
+        _assert_terminal_technical_details_collapsed(response.text)
         assert not server.pending_prompts()
         assert server.terminal_snapshot_for(prompt.request_id) is not None
     finally:

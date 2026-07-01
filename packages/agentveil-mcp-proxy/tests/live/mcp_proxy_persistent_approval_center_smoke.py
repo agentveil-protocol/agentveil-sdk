@@ -179,8 +179,9 @@ def main() -> int:
 
             stale = client.get(approval_url)
             assert stale.status_code == 410
-            assert "Already decided" in stale.text
             assert "Approved" in stale.text
+            assert "This request was already approved." in stale.text
+            assert "Already decided" not in stale.text
             _assert_privacy(stale.text, session_token=manifest.session_token)
 
         with ApprovalEvidenceStore(home / "mcp-proxy" / "evidence.sqlite") as store:
