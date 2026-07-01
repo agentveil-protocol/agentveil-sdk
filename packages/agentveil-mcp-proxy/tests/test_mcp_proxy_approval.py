@@ -3491,7 +3491,7 @@ def test_approval_security_headers_do_not_allow_unsafe_inline_scripts() -> None:
     assert "script-src 'self' 'nonce-test-nonce-value'" in nonce_csp
 
 
-def test_post_decision_page_instructs_retry():
+def test_post_decision_approve_page_is_human_without_agent_prompt():
     server = ApprovalServer()
     server.start()
     try:
@@ -3503,20 +3503,22 @@ def test_post_decision_page_instructs_retry():
         text = response.text
         csp = response.headers.get("content-security-policy", "")
         _assert_no_unsafe_inline_script_csp(csp)
-        nonce = _extract_script_nonce(csp)
-        assert f'<script nonce="{nonce}"' in text
-        assert "Decision recorded" in text
-        assert "Retry the same MCP tool call" in text
-        assert "without changing tool, target, or payload" in text
+        assert "nonce-" not in csp
+        assert "<script" not in text
+        assert "Approval recorded" in text
+        assert "Return to your agent" in text
+        assert "ready for the approved action to continue" in text
         assert "Local proof" in text
-        assert "approval-local-proof-command" in text
-        assert "Immediately retry the exact same AgentVeil MCP tool call" in text
-        assert "Do not ask the user for another message" in text
-        assert "local_proof MCP tool" in text
-        assert "Do not run shell commands" in text
-        assert "agentveil-mcp-proxy events show --last --verify" not in text
-        assert "Copy prompt" in text
-        assert "After the agent retries the same MCP call" in text
+        assert "To inspect what happened, ask your agent:" in text
+        assert "Show AgentVeil local proof for the last action." in text
+        assert "Retry the same MCP tool call" not in text
+        assert "Immediately retry the exact same AgentVeil MCP tool call" not in text
+        assert '<code class="approval-local-proof-command"' not in text
+        assert 'class="approval-copy-command"' not in text
+        assert "Copy prompt" not in text
+        assert "Copy command" not in text
+        assert "local_proof MCP tool" not in text
+        assert "agentveil-mcp-proxy events show" not in text
         assert "/proof" not in text
         assert "auto-resume" not in text.lower()
     finally:

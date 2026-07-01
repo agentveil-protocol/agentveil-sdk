@@ -350,13 +350,19 @@ class ApprovalConfig:
     approval_timeout_seconds: int = 300
     on_timeout: TimeoutAction = TimeoutAction.DENY
     ui_open_mode: ApprovalUiOpenMode = ApprovalUiOpenMode.BROWSER
+    wait_for_decision: bool = False
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any] | None = None) -> "ApprovalConfig":
         data = _require_mapping(data or {}, "approval")
         _reject_unknown(
             data,
-            {"approval_timeout_seconds", "on_timeout", "ui_open_mode"},
+            {
+                "approval_timeout_seconds",
+                "on_timeout",
+                "ui_open_mode",
+                "wait_for_decision",
+            },
             "approval",
         )
         timeout_action = data.get("on_timeout", "deny")
@@ -375,6 +381,10 @@ class ApprovalConfig:
                 ApprovalUiOpenMode,
                 data.get("ui_open_mode", ApprovalUiOpenMode.BROWSER.value),
                 "approval.ui_open_mode",
+            ),
+            wait_for_decision=_bool(
+                data.get("wait_for_decision", False),
+                "approval.wait_for_decision",
             ),
         )
 

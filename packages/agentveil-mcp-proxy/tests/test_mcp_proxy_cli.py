@@ -2129,6 +2129,7 @@ def test_cli_setup_claude_code_starts_center_with_passphrase_without_url_leak(
     assert seen["downstream_root"] == str(tmp_path.resolve())
     config = json.loads((tmp_path / ".avp" / "mcp-proxy" / "config.json").read_text(encoding="utf-8"))
     assert config["approval"]["ui_open_mode"] == "terminal"
+    assert config["approval"]["wait_for_decision"] is True
 
 
 def test_cli_setup_claude_code_choose_folder_uses_selected_project(
@@ -2181,6 +2182,138 @@ def test_cli_setup_claude_code_choose_folder_uses_selected_project(
     assert seen["project_root"] == selected.resolve()
     assert seen["home"] == selected.resolve() / ".avp"
     assert seen["downstream_root"] == str(selected.resolve())
+    config = json.loads((selected / ".avp" / "mcp-proxy" / "config.json").read_text(encoding="utf-8"))
+    assert config["approval"]["wait_for_decision"] is True
+
+
+def _assert_setup_enables_approval_wait_mode(
+    project_dir: Path,
+    *,
+    home_relpath: str = ".avp",
+) -> None:
+    config_path = project_dir / home_relpath / "mcp-proxy" / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    assert config["approval"]["wait_for_decision"] is True
+
+
+def _fake_running_approval_center(**_kwargs):
+    return SimpleNamespace(
+        status=SimpleNamespace(state="running"),
+        started=True,
+        reused=False,
+        restarted=False,
+    )
+
+
+def test_cli_setup_gemini_cli_enables_approval_wait_mode(tmp_path, monkeypatch, capsys):
+    from agentveil_mcp_proxy import claude_center_lifecycle, gemini_setup
+
+    def fake_init_proxy(**kwargs):
+        home = kwargs["home"]
+        (home / "mcp-proxy").mkdir(parents=True, exist_ok=True)
+        (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(proxy_cli, "init_proxy", fake_init_proxy)
+    monkeypatch.setattr(proxy_cli, "run_connect_cli", lambda **_kwargs: 0)
+    monkeypatch.setattr("shutil.which", lambda _name: "agentveil-mcp-proxy")
+    monkeypatch.setattr(gemini_setup, "validate_hook_config", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        gemini_setup,
+        "install_hook",
+        lambda **_kwargs: SimpleNamespace(applied=True),
+    )
+    monkeypatch.setattr(
+        gemini_setup,
+        "connect_status",
+        lambda **_kwargs: {"config_ref": "gemini"},
+    )
+    monkeypatch.setattr(gemini_setup, "managed_route_present", lambda _status: True)
+    monkeypatch.setattr(gemini_setup, "connector_status", lambda **_kwargs: {"ok": True})
+    monkeypatch.setattr(claude_center_lifecycle, "ensure_running", _fake_running_approval_center)
+
+    rc = main(["setup", "gemini-cli", "--project-dir", str(tmp_path), "--yes", "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    _assert_setup_enables_approval_wait_mode(tmp_path)
+
+
+def test_cli_setup_codex_enables_approval_wait_mode(tmp_path, monkeypatch, capsys):
+    from agentveil_mcp_proxy import claude_center_lifecycle, codex_setup
+
+    def fake_init_proxy(**kwargs):
+        home = kwargs["home"]
+        (home / "mcp-proxy").mkdir(parents=True, exist_ok=True)
+        (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(proxy_cli, "init_proxy", fake_init_proxy)
+    monkeypatch.setattr(proxy_cli, "run_connect_cli", lambda **_kwargs: 0)
+    monkeypatch.setattr("shutil.which", lambda _name: "agentveil-mcp-proxy")
+    monkeypatch.setattr(codex_setup, "validate_hook_config", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        codex_setup,
+        "install_hook",
+        lambda **_kwargs: SimpleNamespace(applied=True),
+    )
+    monkeypatch.setattr(
+        codex_setup,
+        "connect_status",
+        lambda **_kwargs: {"config_ref": "codex"},
+    )
+    monkeypatch.setattr(codex_setup, "managed_route_present", lambda _status: True)
+    monkeypatch.setattr(codex_setup, "connector_status", lambda **_kwargs: {"ok": True})
+    monkeypatch.setattr(claude_center_lifecycle, "ensure_running", _fake_running_approval_center)
+
+    rc = main(["setup", "codex", "--project-dir", str(tmp_path), "--yes", "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    _assert_setup_enables_approval_wait_mode(tmp_path)
+
+
+def test_cli_setup_cursor_enables_approval_wait_mode(tmp_path, monkeypatch, capsys):
+    from agentveil_mcp_proxy import cursor_setup
+
+    def fake_init_proxy(**kwargs):
+        home = kwargs["home"]
+        (home / "mcp-proxy").mkdir(parents=True, exist_ok=True)
+        (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(proxy_cli, "init_proxy", fake_init_proxy)
+    monkeypatch.setattr(proxy_cli, "initialize_product_route_profile", lambda _prof: None)
+    monkeypatch.setattr(
+        proxy_cli,
+        "build_product_route_downstream_config",
+        lambda _prof: {"command": sys.executable, "args": ["downstream.py"]},
+    )
+    monkeypatch.setattr("shutil.which", lambda _name: "agentveil-mcp-proxy")
+    monkeypatch.setattr(cursor_setup, "prepare_proxy_home", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cursor_setup, "profile_root", lambda home: home / "profiles" / "product_route")
+    monkeypatch.setattr(cursor_setup, "proxy_config_path", lambda home: home / "mcp-proxy" / "config.json")
+    monkeypatch.setattr(cursor_setup, "passphrase_path", lambda home: home / "identity.passphrase")
+    monkeypatch.setattr(
+        cursor_setup,
+        "neutralize_competing_global_route",
+        lambda *_args, **_kwargs: SimpleNamespace(changed=False),
+    )
+    monkeypatch.setattr(cursor_setup, "install_mcp_route", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cursor_setup,
+        "install_hooks",
+        lambda *_args, **_kwargs: SimpleNamespace(created_hooks=["beforeSubmitPrompt"]),
+    )
+    monkeypatch.setattr(
+        cursor_setup,
+        "ensure_approval_center_running",
+        _fake_running_approval_center,
+    )
+    monkeypatch.setattr(cursor_setup, "connector_status", lambda *_args, **_kwargs: {"ok": True})
+
+    rc = main(["setup", "cursor", "--workspace", str(tmp_path), "--yes", "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    _assert_setup_enables_approval_wait_mode(tmp_path, home_relpath=".agentveil")
 
 
 def test_cli_setup_claude_code_fails_when_center_not_running(

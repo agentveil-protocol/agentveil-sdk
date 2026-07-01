@@ -1013,6 +1013,98 @@ def test_run_returns_approval_required_without_waiting_or_forwarding(tmp_path, m
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
 
 
+class _TtyStringIO(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+def _set_wait_for_decision(config_path: Path) -> None:
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    approval = config.get("approval")
+    if not isinstance(approval, dict):
+        approval = {}
+        config["approval"] = approval
+    approval["wait_for_decision"] = True
+    _write_json(config_path, config)
+
+
+def test_run_proxy_wait_mode_returns_success_after_approve_without_second_tools_call(
+    tmp_path,
+    monkeypatch,
+):
+    import httpx
+    import re
+
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    _set_downstream(init.config_path, _normal_downstream(tmp_path), log_path=log_path)
+    _set_approval_policy(init.config_path, server="fake-downstream", tool="write_file")
+    _set_wait_for_decision(init.config_path)
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("wait-mode approval must not construct AVPAgent before approve")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    monkeypatch.setattr(webbrowser, "open", lambda _url: False)
+
+    client_out = io.StringIO()
+    client_err = _TtyStringIO()
+    tool_call = _json_line({
+        "jsonrpc": "2.0",
+        "id": "call-1",
+        "method": "tools/call",
+        "params": {"name": "write_file", "arguments": {"path": "wait-mode-proof.txt", "content": "WAIT_MODE_PROOF"}},
+    })
+    result_box: dict[str, int] = {}
+
+    def _run_proxy() -> None:
+        result_box["rc"] = run_proxy(
+            home=home,
+            client_in=io.StringIO(tool_call),
+            out=client_out,
+            err=client_err,
+            approval_ui_mode="none",
+        )
+
+    worker = threading.Thread(target=_run_proxy, daemon=True)
+    worker.start()
+
+    deadline = time.monotonic() + 5
+    approval_url = ""
+    while time.monotonic() < deadline:
+        match = re.search(r"record_id=[^:\s]+:\s+(http://127\.0\.0\.1:\d+/approval/\S+)", client_err.getvalue())
+        if match:
+            approval_url = match.group(1)
+            break
+        time.sleep(0.01)
+    assert approval_url, client_err.getvalue()
+
+    with httpx.Client() as client:
+        csrf_match = re.search(r'name="csrf_token" value="([^"]+)"', client.get(approval_url).text)
+        assert csrf_match, "expected csrf token on approval page"
+        approve = client.post(
+            approval_url,
+            data={"decision": "approve", "csrf_token": csrf_match.group(1), "approval_scope": "exact"},
+        )
+    assert approve.status_code == 200
+
+    worker.join(timeout=5)
+    assert result_box.get("rc") == 0
+
+    responses = _responses(client_out.getvalue())
+    assert len(responses) == 1
+    assert "result" in responses[0], responses[0]
+    assert "error" not in responses[0]
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list", "tools/call"]
+
+    records = _evidence_records(home)
+    approved = [record for record in records if record.get("status") in {"approved", "executed"}]
+    assert approved, records
+    assert any(record.get("result_status") == "executed" for record in approved)
+
+
 def test_invalid_write_file_args_do_not_create_approval(tmp_path, monkeypatch):
     home = tmp_path / "avp-home"
     init = init_proxy(home=home, agent_name="proxy", plaintext=True)

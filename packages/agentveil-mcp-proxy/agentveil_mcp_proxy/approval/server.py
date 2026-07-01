@@ -20,10 +20,8 @@ from agentveil_mcp_proxy.evidence.events_show import (
     LOCAL_PROOF_AGENT_PROMPT,
     LOCAL_PROOF_BLOCK_TITLE,
     LOCAL_PROOF_PENDING_QUIET_LINE,
-    LOCAL_PROOF_POST_APPROVE_BODY,
     LOCAL_PROOF_POST_DENY_BODY,
 )
-from agentveil_mcp_proxy.evidence.observability import APPROVAL_CONTINUE_AGENT_PROMPT
 from agentveil_mcp_proxy.evidence.observability import (
     approval_proof_detail_rows,
     approval_raw_evidence_rows,
@@ -62,6 +60,12 @@ APPROVAL_LOCAL_URL_WARNING = (
 APPROVAL_DECISION_RECORDED_BODY = (
     "Decision recorded. Retry the same MCP tool call without changing tool, target, or payload."
 )
+APPROVAL_POST_APPROVE_HUMAN_BODY = (
+    "Approval recorded. Return to your agent. "
+    "AgentVeil is ready for the approved action to continue."
+)
+APPROVAL_POST_APPROVE_PROOF_BODY = "To inspect what happened, ask your agent:"
+APPROVAL_POST_APPROVE_PROOF_PROMPT = "Show AgentVeil local proof for the last action."
 APPROVAL_DECISION_DENIED_BODY = (
     "Decision recorded. This action was denied and will not run."
 )
@@ -152,6 +156,18 @@ def render_local_proof_block(
         f"{escape(LOCAL_PROOF_COPY_COMMAND_LABEL)}</button>"
         "</div>"
         f"{_local_proof_copy_script(script_nonce)}"
+        "</section>"
+    )
+
+
+def render_local_proof_prompt_block(body_text: str, prompt: str) -> str:
+    """Return a human-facing local proof hint without scripts or command UI."""
+
+    return (
+        '<section class="approval-local-proof approval-local-proof-human">'
+        f'<h2 class="approval-local-proof-title">{escape(LOCAL_PROOF_BLOCK_TITLE)}</h2>'
+        f'<p class="approval-local-proof-body">{escape(body_text)}</p>'
+        f'<p class="approval-local-proof-prompt">{escape(prompt)}</p>'
         "</section>"
     )
 
@@ -780,24 +796,28 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
             self._send_html(HTTPStatus.FORBIDDEN, self._render_forbidden_session())
             return
         recorded_body = (
-            APPROVAL_DECISION_RECORDED_BODY
+            APPROVAL_POST_APPROVE_HUMAN_BODY
             if decision == "approve"
             else APPROVAL_DECISION_DENIED_BODY
         )
-        proof_body = (
-            LOCAL_PROOF_POST_APPROVE_BODY
-            if decision == "approve"
-            else LOCAL_PROOF_POST_DENY_BODY
-        )
-        script_nonce = generate_approval_script_nonce()
+        if decision == "approve":
+            page_body = (
+                f"<p>{escape(recorded_body)}</p>"
+                f"{render_local_proof_prompt_block(APPROVAL_POST_APPROVE_PROOF_BODY, APPROVAL_POST_APPROVE_PROOF_PROMPT)}"
+            )
+            script_nonce = None
+        else:
+            proof_body = LOCAL_PROOF_POST_DENY_BODY
+            script_nonce = generate_approval_script_nonce()
+            page_body = (
+                f"<p>{escape(APPROVAL_DECISION_DENIED_BODY)}</p>"
+                f"{render_local_proof_block(proof_body, script_nonce=script_nonce)}"
+            )
         self._send_html(
             HTTPStatus.OK,
             self._page(
                 "Approval recorded",
-                (
-                    f"<p>{escape(recorded_body)}</p>"
-                    f"{render_local_proof_block(proof_body, script_nonce=script_nonce, agent_prompt=(APPROVAL_CONTINUE_AGENT_PROMPT if decision == 'approve' else None))}"
-                ),
+                page_body,
                 page_kind="detail",
                 include_card_styles=False,
                 include_local_proof_styles=True,
@@ -1337,6 +1357,19 @@ details {{ margin: 8px 0 12px; }}
   flex: 0 0 auto;
   align-self: stretch;
 }
+.approval-local-proof-human {
+  background: var(--bg);
+}
+.approval-local-proof-prompt {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--card-bg);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.4;
+}
 """
 
     def _page(
@@ -1439,6 +1472,9 @@ details {{ margin: 8px 0 12px; }}
 __all__ = [
     "APPROVAL_DECISION_DENIED_BODY",
     "APPROVAL_DECISION_RECORDED_BODY",
+    "APPROVAL_POST_APPROVE_HUMAN_BODY",
+    "APPROVAL_POST_APPROVE_PROOF_BODY",
+    "APPROVAL_POST_APPROVE_PROOF_PROMPT",
     "APPROVAL_LOCAL_URL_WARNING",
     "INTERNAL_REGISTER_TOKEN_HEADER",
     "ApprovalPrompt",
@@ -1451,6 +1487,7 @@ __all__ = [
     "approval_security_headers",
     "generate_approval_script_nonce",
     "render_local_proof_block",
+    "render_local_proof_prompt_block",
     "TERMINAL_ALREADY_DECIDED",
     "TERMINAL_ALREADY_DECIDED_APPROVE",
     "TERMINAL_ALREADY_DECIDED_DENY",

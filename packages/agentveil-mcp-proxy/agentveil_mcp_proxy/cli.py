@@ -2696,7 +2696,7 @@ def run_proxy(
             auto_deny=auto_deny,
             headless_policy=headless_policy,
             cli_out=err,
-            wait_for_decision=False,
+            wait_for_decision=config.approval.wait_for_decision,
             approval_grant_private_key_seed=approval_grant_private_key_seed,
             approval_grant_agent_did=approval_grant_agent_did,
         )
@@ -4334,6 +4334,9 @@ def run_setup_cursor_cli(
     except ProxyCliError:
         raise
 
+    if config_path.exists():
+        _configure_interactive_connector_defaults(config_path)
+
     proxy_cmd = _resolve_setup_proxy_command()
     if not proxy_cmd:
         raise ProxyCliError(
@@ -4714,6 +4717,18 @@ def _configure_claude_setup_approval_ui(config_path: Path) -> None:
     _secure_write_json(config_path, config_payload, force=True)
 
 
+def _configure_interactive_connector_defaults(config_path: Path) -> None:
+    """Enable bounded approval wait-mode for interactive MCP client setups."""
+
+    config_payload = _read_json(config_path, "proxy config")
+    approval = config_payload.get("approval")
+    if not isinstance(approval, dict):
+        approval = {}
+        config_payload["approval"] = approval
+    approval["wait_for_decision"] = True
+    _secure_write_json(config_path, config_payload, force=True)
+
+
 def run_setup_claude_code_cli(
     *,
     project_dir: Path | None,
@@ -4778,6 +4793,7 @@ def run_setup_claude_code_cli(
         proxy_initialized = True
     if config_path.exists():
         _configure_claude_setup_approval_ui(config_path)
+        _configure_interactive_connector_defaults(config_path)
 
     # 2. Claude Code MCP route (.mcp.json) — reuse the connect command. Resolve
     # the installed console script explicitly (matches the supported manual
@@ -4961,6 +4977,8 @@ def run_setup_codex_cli(
         except ProxyCliError:
             raise
         proxy_initialized = True
+    if config_path.exists():
+        _configure_interactive_connector_defaults(config_path)
 
     proxy_cmd = _resolve_setup_proxy_command()
     if not proxy_cmd:
@@ -5243,6 +5261,8 @@ def run_setup_gemini_cli(
         except ProxyCliError:
             raise
         proxy_initialized = True
+    if config_path.exists():
+        _configure_interactive_connector_defaults(config_path)
 
     proxy_cmd = _resolve_setup_proxy_command()
     if not proxy_cmd:
