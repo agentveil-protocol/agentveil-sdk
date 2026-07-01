@@ -14,8 +14,8 @@
 **The risk isn't what AI says. It's what AI does.**
 
 AgentVeil is an independent action-control layer for AI agents and MCP tools.
-It works alongside agent runtimes such as Cursor, Claude Code, and Codex:
-attempt, decision, controlled path when available, local proof.
+It works alongside agent runtimes such as Cursor, Claude Code, Codex, and
+Gemini CLI: attempt, decision, controlled path when available, local proof.
 
 [Quick Start](#quick-start) · [The Loop](#the-agentveil-loop) · [Connectors](#connectors-available-today) · [Evidence](#bounded-evidence) · [Scope](#scope) · [Design Basis](#design-basis) · [Docs](docs/)
 
@@ -130,6 +130,24 @@ After setup and hook trust, in the configured project:
 - AgentVeil MCP writes go through the proxy approval path;
 - bounded evidence is written locally.
 
+### Gemini CLI project connector
+
+```bash
+pip install agentveil-mcp-proxy
+agentveil-mcp-proxy setup gemini-cli --choose-folder --yes
+```
+
+Choose the project folder you want to protect, then open / restart Gemini CLI
+for that project. Gemini CLI asks you to trust the project folder before it
+loads local settings, hooks, and MCP servers.
+
+After setup and folder trust, in the configured project:
+
+- supported native Gemini CLI mutation tools are checked by a project-local hook;
+- risky native mutations are blocked with redirect guidance toward the controlled MCP route;
+- AgentVeil MCP writes go through the proxy approval path;
+- bounded evidence is written locally.
+
 ### Core MCP Proxy path
 
 For lower-level MCP routing without an IDE connector:
@@ -172,15 +190,17 @@ Use `--json` when you need structured fields.
 
 ## Connectors Available Today
 
-AgentVeil is built around action-control boundaries. Cursor, Claude Code, and
-Codex are the first supported project connectors. The Core MCP Proxy is
-runtime-agnostic for MCP clients that are explicitly configured to call it.
+AgentVeil is built around action-control boundaries. Cursor, Claude Code,
+Codex, and Gemini CLI are the first supported project connectors. The Core MCP
+Proxy is runtime-agnostic for MCP clients that are explicitly configured to
+call it.
 
 | Surface | Mechanism | What it adds | Status |
 |---|---|---|---|
 | Cursor project connector | Project-local hooks + MCP route | Native mutation block + redirect guidance, routed MCP approval/evidence | Available |
 | Claude Code project connector | Project-local `PreToolUse` hook + MCP route | Native mutation block + redirect guidance, routed MCP approval/evidence | Available |
 | Codex project connector | Project-local `PreToolUse` hook + MCP route | Native mutation block after one-time hook trust, redirect guidance, routed MCP approval/evidence | Available |
+| Gemini CLI project connector | Project-local `BeforeTool` hook + MCP route | Native mutation block after one-time folder trust, redirect guidance, routed MCP approval/evidence | Available |
 | Core MCP Proxy | MCP transport boundary | Routed MCP policy, approval, redirect / policy-stop outcomes, bounded evidence | Available |
 
 The Python SDK also includes framework examples and optional helper modules for
@@ -201,6 +221,7 @@ Current connector checks have been run with:
 | Cursor | 3.6.31 |
 | Claude Code | 2.1.126 |
 | Codex | interactive TUI hook trust path |
+| Gemini CLI | 0.49.0 folder trust path |
 | Python package metadata | Python 3.10-3.13 |
 
 Other versions may work, but are not listed here until verified.
@@ -229,7 +250,7 @@ AgentVeil does **not** claim machine-wide control.
 It does not control:
 
 - your whole machine;
-- every Cursor / Claude / Codex chat globally;
+- every Cursor / Claude / Codex / Gemini chat globally;
 - every autonomous agent runtime globally;
 - direct human terminal commands outside configured AgentVeil paths;
 - IDE actions outside supported agent tool surfaces;
@@ -292,13 +313,16 @@ For routed MCP actions, approval and policy behavior are documented in:
 - [Approval Routing](docs/APPROVAL_ROUTING.md)
 - [MCP Proxy Operations](docs/MCP_PROXY_OPERATIONS.md)
 
-If a connector is not right for a project, remove only the managed AgentVeil entries for that project instead of editing Cursor / Claude config by hand.
+If a connector is not right for a project, remove only the managed AgentVeil
+entries for that project instead of editing client config by hand.
 
 Preview managed removal:
 
 ```bash
 agentveil-mcp-proxy setup remove cursor
 agentveil-mcp-proxy setup remove claude-code
+agentveil-mcp-proxy setup remove codex
+agentveil-mcp-proxy setup remove gemini-cli
 ```
 
 Apply removal after review:
@@ -306,6 +330,8 @@ Apply removal after review:
 ```bash
 agentveil-mcp-proxy setup remove cursor --yes
 agentveil-mcp-proxy setup remove claude-code --yes
+agentveil-mcp-proxy setup remove codex --yes
+agentveil-mcp-proxy setup remove gemini-cli --yes
 ```
 
 ## Scope
@@ -315,6 +341,8 @@ Available today:
 - MCP Proxy for routed MCP tool calls;
 - project-local Cursor connector;
 - project-local Claude Code connector;
+- project-local Codex connector;
+- project-local Gemini CLI connector;
 - approval / redirect / block / evidence outcomes for routed actions;
 - bounded local evidence export.
 
@@ -336,7 +364,7 @@ Preview / design-partner product flows:
 Not included in the public connector:
 
 - machine-wide shell interception;
-- global Cursor / Claude / Codex lock;
+- global Cursor / Claude / Codex / Gemini lock;
 - automatic control of unrelated chats;
 - private enterprise policy packs;
 - hosted auth, licensing, telemetry, or enterprise custody logic.
