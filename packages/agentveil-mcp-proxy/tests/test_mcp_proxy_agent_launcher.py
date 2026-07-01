@@ -152,8 +152,9 @@ def test_launch_managed_process_starts_child_with_bounded_env(tmp_path, monkeypa
     assert json.loads(env[AGENTVEIL_MCP_PROXY_RUN_ARGS_ENV])[0] == "run"
     runtime_home = env["HOME"]
     assert runtime_home != str(host_home)
-    assert runtime_home.endswith("/home")
-    assert f"{home}/runtime/generic-process/" in runtime_home
+    runtime_home_path = Path(runtime_home)
+    assert runtime_home_path.name == "home"
+    assert runtime_home_path.parent.parent == home / "runtime" / "generic-process"
     manifest = load_launch_manifest(home)
     assert manifest is not None
     assert manifest.child_pid == 4242
