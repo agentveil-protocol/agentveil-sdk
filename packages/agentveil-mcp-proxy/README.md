@@ -10,7 +10,8 @@ It includes two public surfaces:
 1. **Project connector setup** for supported agent clients such as Cursor,
    Claude Code, Codex, and Gemini CLI. Connectors install managed project-local
    hooks and MCP route config so supported native agent mutations can be
-   blocked with redirect guidance toward the AgentVeil MCP route.
+   blocked with redirect guidance toward the AgentVeil MCP route. Hermes CLI is
+   supported as a controlled MCP launch profile.
 2. **Core MCP Proxy**, which wraps a downstream MCP server and applies
    AgentVeil policy to calls that pass through the proxy: allow,
    approval-required, redirect, hard-block, with bounded local evidence.
@@ -31,8 +32,8 @@ calls.
   file edits.
 - AgentVeil does not control direct human terminal commands, direct git, pip,
   deploy, or package-manager commands outside configured AgentVeil paths.
-- It does not create a Cursor, Claude Code, Codex, Gemini CLI, or desktop-wide
-  lock.
+- It does not create a Cursor, Claude Code, Codex, Gemini CLI, Hermes, or
+  desktop-wide lock.
 - Actions outside configured connectors and routed proxy calls are not
   classified or logged.
 
@@ -109,6 +110,23 @@ agentveil-mcp-proxy setup gemini-cli --choose-folder --yes
 Choose the project folder to protect, then open / restart Gemini CLI for that
 project. Gemini CLI asks you to trust the project folder before it loads local
 settings, hooks, and MCP servers.
+
+### Hermes CLI controlled MCP profile
+
+Hermes CLI is launched through AgentVeil rather than installed as a persistent
+project hook:
+
+```bash
+pip install agentveil-mcp-proxy
+agentveil-mcp-proxy launch --profile hermes-cli --choose-folder -- \
+  hermes chat -q "Create a project note"
+```
+
+This configures a project-local Hermes home and routes Hermes to the AgentVeil
+MCP tools. Routed reads, writes, approval, sandbox boundaries, redirect
+guidance, and local proof use the shared AgentVeil control layer. Native Hermes
+tools are limited by profile settings; AgentVeil does not claim host-wide
+control of Hermes or the machine.
 
 ### Walkable example after setup
 
@@ -268,6 +286,7 @@ for your specific downstream server.
 | `setup claude-code --choose-folder --yes` | Configure a project-local Claude Code connector. |
 | `setup codex --choose-folder --yes` | Configure a project-local Codex connector. |
 | `setup gemini-cli --choose-folder --yes` | Configure a project-local Gemini CLI connector. |
+| `launch --profile hermes-cli --choose-folder -- hermes chat -q "..."` | Launch Hermes CLI with the AgentVeil controlled MCP profile. |
 | `setup status --json` | Print bounded connector/proxy status. |
 | `setup remove <cursor|claude-code|codex|gemini-cli>` | Preview managed connector removal. |
 | `setup remove <cursor|claude-code|codex|gemini-cli> --yes` | Remove only AgentVeil-managed connector entries. |

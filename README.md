@@ -14,8 +14,9 @@
 **The risk isn't what AI says. It's what AI does.**
 
 AgentVeil is an independent action-control layer for AI agents and MCP tools.
-It works alongside agent runtimes such as Cursor, Claude Code, Codex, and
-Gemini CLI: attempt, decision, controlled path when available, local proof.
+It works alongside agent runtimes such as Cursor, Claude Code, Codex, Gemini
+CLI, and Hermes CLI: attempt, decision, controlled path when available, local
+proof.
 
 [Quick Start](#quick-start) · [The Loop](#the-agentveil-loop) · [Connectors](#connectors-available-today) · [Evidence](#bounded-evidence) · [Scope](#scope) · [Design Basis](#design-basis) · [Docs](docs/)
 
@@ -148,6 +149,28 @@ After setup and folder trust, in the configured project:
 - AgentVeil MCP writes go through the proxy approval path;
 - bounded evidence is written locally.
 
+### Hermes CLI controlled MCP profile
+
+Hermes CLI is launched through AgentVeil rather than installed as a persistent
+project hook:
+
+```bash
+pip install agentveil-mcp-proxy
+agentveil-mcp-proxy launch --profile hermes-cli --choose-folder -- \
+  hermes chat -q "Create a project note"
+```
+
+The launcher configures a project-local Hermes home, routes Hermes to the
+AgentVeil MCP tools, and keeps local proof/evidence in the selected project.
+
+In this profile:
+
+- Hermes project work is routed through the AgentVeil MCP route;
+- routed reads, writes, approval, sandbox boundaries, redirect guidance, and
+  local proof use the shared AgentVeil control layer;
+- native Hermes tools are limited by profile settings, but AgentVeil does not
+  claim host-wide control of Hermes or the machine.
+
 ### Core MCP Proxy path
 
 For lower-level MCP routing without an IDE connector:
@@ -191,9 +214,9 @@ Use `--json` when you need structured fields.
 ## Connectors Available Today
 
 AgentVeil is built around action-control boundaries. Cursor, Claude Code,
-Codex, and Gemini CLI are the first supported project connectors. The Core MCP
-Proxy is runtime-agnostic for MCP clients that are explicitly configured to
-call it.
+Codex, and Gemini CLI are supported project hook connectors. Hermes CLI is
+available as a controlled MCP launch profile. The Core MCP Proxy is
+runtime-agnostic for MCP clients that are explicitly configured to call it.
 
 | Surface | Mechanism | What it adds | Status |
 |---|---|---|---|
@@ -201,6 +224,7 @@ call it.
 | Claude Code project connector | Project-local `PreToolUse` hook + MCP route | Native mutation block + redirect guidance, routed MCP approval/evidence | Available |
 | Codex project connector | Project-local `PreToolUse` hook + MCP route | Native mutation block after one-time hook trust, redirect guidance, routed MCP approval/evidence | Available |
 | Gemini CLI project connector | Project-local `BeforeTool` hook + MCP route | Native mutation block after one-time folder trust, redirect guidance, routed MCP approval/evidence | Available |
+| Hermes CLI profile | AgentVeil launcher + project-local Hermes MCP route | Routed MCP approval/evidence, sandbox boundaries, redirect guidance inside the AgentVeil route | Available |
 | Core MCP Proxy | MCP transport boundary | Routed MCP policy, approval, redirect / policy-stop outcomes, bounded evidence | Available |
 
 The Python SDK also includes framework examples and optional helper modules for
@@ -222,6 +246,7 @@ Current connector checks have been run with:
 | Claude Code | 2.1.126 |
 | Codex | interactive TUI hook trust path |
 | Gemini CLI | 0.49.0 folder trust path |
+| Hermes CLI | live controlled MCP route path |
 | Python package metadata | Python 3.10-3.13 |
 
 Other versions may work, but are not listed here until verified.
@@ -250,7 +275,7 @@ AgentVeil does **not** claim machine-wide control.
 It does not control:
 
 - your whole machine;
-- every Cursor / Claude / Codex / Gemini chat globally;
+- every Cursor / Claude / Codex / Gemini / Hermes chat globally;
 - every autonomous agent runtime globally;
 - direct human terminal commands outside configured AgentVeil paths;
 - IDE actions outside supported agent tool surfaces;
@@ -343,6 +368,7 @@ Available today:
 - project-local Claude Code connector;
 - project-local Codex connector;
 - project-local Gemini CLI connector;
+- Hermes CLI controlled MCP launch profile;
 - approval / redirect / block / evidence outcomes for routed actions;
 - bounded local evidence export.
 
@@ -364,7 +390,7 @@ Preview / design-partner product flows:
 Not included in the public connector:
 
 - machine-wide shell interception;
-- global Cursor / Claude / Codex / Gemini lock;
+- global Cursor / Claude / Codex / Gemini / Hermes lock;
 - automatic control of unrelated chats;
 - private enterprise policy packs;
 - hosted auth, licensing, telemetry, or enterprise custody logic.
