@@ -3219,6 +3219,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "Examples:\n"
             "  agentveil-mcp-proxy launch --profile generic-process --project-dir . -- python script.py\n"
+            "  agentveil-mcp-proxy launch --profile generic-process --choose-folder -- python script.py\n"
             "  agentveil-mcp-proxy launch status --project-dir .\n"
             "  agentveil-mcp-proxy launch stop --project-dir ."
         ),
@@ -3248,6 +3249,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Project directory for project-local AVP home and runtime state",
+    )
+    launch.add_argument(
+        "--choose-folder",
+        action="store_true",
+        help="Open a native folder picker to select the project directory (macOS)",
     )
     launch.add_argument(
         "--sandbox",
@@ -4753,10 +4759,27 @@ def _launch_init_proxy(
     )
 
 
+def _resolve_launch_project_dir(
+    *,
+    project_dir: Path | None,
+    choose_folder: bool,
+) -> Path:
+    """Resolve the managed runtime project directory for launch."""
+
+    if choose_folder and project_dir is not None:
+        raise ProxyCliError("--choose-folder cannot be combined with --project-dir", exit_code=2)
+    if choose_folder:
+        return _choose_setup_project_folder().resolve()
+    if project_dir is not None:
+        return project_dir.resolve()
+    return Path.cwd().resolve()
+
+
 def run_launch_cli(
     *,
     profile_id: str | None,
     project_dir: Path | None,
+    choose_folder: bool,
     sandbox: Path | None,
     proxy_command: str | None,
     passphrase_file: Path | None,
@@ -4770,11 +4793,12 @@ def run_launch_cli(
     if not profile_id:
         raise ProxyCliError("--profile is required for launch", exit_code=2)
 
+    target = _resolve_launch_project_dir(project_dir=project_dir, choose_folder=choose_folder)
     resolved_proxy_command = proxy_command or _resolve_setup_proxy_command() or sys.executable
 
     try:
         result = launch_managed_process(
-            project_dir=project_dir if project_dir is not None else Path.cwd(),
+            project_dir=target,
             profile_id=profile_id,
             child_command=child_argv,
             proxy_command=resolved_proxy_command,
@@ -5925,6 +5949,11 @@ def main(argv: list[str] | None = None) -> int:
                 port=args.port,
             )
         if args.command == "launch":
+            if args.choose_folder and (args.launch_status or args.launch_stop):
+                raise ProxyCliError(
+                    "--choose-folder is only supported for launch, not launch status/stop",
+                    exit_code=2,
+                )
             if args.launch_status:
                 return run_launch_status_cli(
                     profile_id=args.profile,
@@ -5939,6 +5968,7 @@ def main(argv: list[str] | None = None) -> int:
             return run_launch_cli(
                 profile_id=args.profile,
                 project_dir=args.project_dir,
+                choose_folder=args.choose_folder,
                 sandbox=args.sandbox,
                 proxy_command=args.proxy_command,
                 passphrase_file=args.passphrase_file,

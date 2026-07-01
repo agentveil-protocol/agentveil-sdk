@@ -2529,3 +2529,121 @@ def test_cli_launch_preflight_fail_closed(tmp_path, monkeypatch, capsys):
     ])
     assert rc == 1
     assert "preflight failed" in capsys.readouterr().err.lower()
+
+
+# ----- P0.12b: launch --choose-folder parity ----------------------------------
+
+
+def test_cli_launch_rejects_choose_folder_with_project_dir(tmp_path, capsys):
+    rc = main([
+        "launch",
+        "--profile",
+        "generic-process",
+        "--choose-folder",
+        "--project-dir",
+        str(tmp_path),
+        "--",
+        sys.executable,
+        "-c",
+        "print(1)",
+    ])
+    assert rc == 2
+    assert "cannot be combined" in capsys.readouterr().err.lower()
+
+
+def test_cli_launch_choose_folder_cancel_fail_closed(tmp_path, monkeypatch, capsys):
+    from agentveil_mcp_proxy import agent_launcher
+
+    called = {"launch": False}
+
+    def fake_launch(**_kwargs):
+        called["launch"] = True
+
+    monkeypatch.setattr(agent_launcher, "launch_managed_process", fake_launch)
+    monkeypatch.setattr(
+        proxy_cli,
+        "_choose_setup_project_folder",
+        lambda: (_ for _ in ()).throw(
+            proxy_cli.ProxyCliError("folder selection cancelled", exit_code=2)
+        ),
+    )
+
+    rc = main([
+        "launch",
+        "--profile",
+        "generic-process",
+        "--choose-folder",
+        "--",
+        sys.executable,
+        "-c",
+        "print(1)",
+    ])
+    assert rc == 2
+    assert "cancel" in capsys.readouterr().err.lower()
+    assert called["launch"] is False
+
+
+def test_cli_launch_choose_folder_uses_selected_project(tmp_path, monkeypatch, capsys):
+    from agentveil_mcp_proxy import agent_launcher
+
+    selected = tmp_path / "picked-project"
+    selected.mkdir()
+    seen: dict[str, Path] = {}
+
+    def fake_launch(**kwargs):
+        seen["project_dir"] = kwargs["project_dir"]
+        raise agent_launcher.AgentLauncherError(
+            "preflight failed: approval center unavailable; child process was not started",
+            exit_code=1,
+        )
+
+    monkeypatch.setattr(agent_launcher, "launch_managed_process", fake_launch)
+    monkeypatch.setattr(proxy_cli, "_choose_setup_project_folder", lambda: selected)
+    monkeypatch.setattr(proxy_cli, "_resolve_setup_proxy_command", lambda: "agentveil-mcp-proxy")
+
+    rc = main([
+        "launch",
+        "--profile",
+        "generic-process",
+        "--choose-folder",
+        "--json",
+        "--",
+        sys.executable,
+        "-c",
+        "print(1)",
+    ])
+    assert rc == 1
+    assert seen["project_dir"] == selected.resolve()
+    err = capsys.readouterr()
+    assert str(selected) not in err.out
+    assert str(selected) not in err.err
+
+
+def test_cli_launch_status_rejects_choose_folder(tmp_path, monkeypatch, capsys):
+    picker_called = {"value": False}
+
+    def fake_picker():
+        picker_called["value"] = True
+        return tmp_path
+
+    monkeypatch.setattr(proxy_cli, "_choose_setup_project_folder", fake_picker)
+
+    rc = main(["launch", "status", "--choose-folder", "--project-dir", str(tmp_path)])
+    assert rc == 2
+    assert "only supported for launch" in capsys.readouterr().err.lower()
+    assert picker_called["value"] is False
+
+
+def test_cli_launch_stop_rejects_choose_folder(tmp_path, monkeypatch, capsys):
+    picker_called = {"value": False}
+
+    def fake_picker():
+        picker_called["value"] = True
+        return tmp_path
+
+    monkeypatch.setattr(proxy_cli, "_choose_setup_project_folder", fake_picker)
+
+    rc = main(["launch", "stop", "--choose-folder", "--project-dir", str(tmp_path)])
+    assert rc == 2
+    assert "only supported for launch" in capsys.readouterr().err.lower()
+    assert picker_called["value"] is False
