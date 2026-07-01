@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 from agentveil_mcp_proxy import cli as proxy_cli
 from agentveil_mcp_proxy.cli import main
-from agentveil_mcp_proxy.client_config import DEFAULT_SERVER_NAME
+from agentveil_mcp_proxy.client_config import DEFAULT_SERVER_NAME, parse_codex_mcp_server_entry
 
 
 def _make_proxy_command(tmp_path: Path) -> str:
@@ -301,7 +301,10 @@ def test_setup_codex_choose_folder_uses_selected_project(
     assert _codex_hooks(selected_project).exists()
     config = _codex_config(isolated_home).read_text(encoding="utf-8")
     assert "AVP_HOME" in config
-    assert str(selected_project) in config
+    entry = parse_codex_mcp_server_entry(config, server_name=DEFAULT_SERVER_NAME)
+    assert entry is not None
+    assert str(selected_project / ".avp") in entry["args"]
+    assert entry["env"]["AVP_HOME"] == str(selected_project / ".avp")
 
 
 def test_setup_codex_fails_closed_on_invalid_hooks_json(tmp_path, monkeypatch):
