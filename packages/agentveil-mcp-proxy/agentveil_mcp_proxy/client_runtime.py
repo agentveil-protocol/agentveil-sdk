@@ -119,6 +119,18 @@ RUNTIME_ATTACH_ADAPTERS: dict[str, RuntimeAttachAdapter] = {
             "Provider-native Codex action routing stays unclaimed until an agent tool-call proof passes.",
         ),
     ),
+    "gemini_cli": _unsupported_primary_adapter(
+        client_id="gemini_cli",
+        display_name="Gemini CLI",
+        unavailable_reason=(
+            "Gemini CLI is configured through project-local settings, hooks, and MCP route setup; "
+            "non-invasive runtime attach is not registered for this client."
+        ),
+        limitations=(
+            "Use setup gemini-cli for the project-local connector path.",
+            "Provider-native Gemini CLI runtime attach stays unclaimed.",
+        ),
+    ),
 }
 
 

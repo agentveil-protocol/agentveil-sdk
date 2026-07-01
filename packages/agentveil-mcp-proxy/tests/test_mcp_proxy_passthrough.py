@@ -23,6 +23,7 @@ from agentveil_mcp_proxy.cli import ProxyCliError, init_proxy, run_proxy
 from agentveil_mcp_proxy.classification import ToolCallClassifier
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore
 from agentveil_mcp_proxy.evidence.observability import (
+    APPROVAL_REQUIRED_INSTRUCTIONS,
     enrich_mcp_error_contract,
     mcp_error_user_message,
     parse_controlled_path_metadata,
@@ -73,6 +74,8 @@ def _assert_approval_retry_contract(data: dict) -> None:
     assert data["approved_retry_requires_same_tool"] is True
     assert data["approved_retry_requires_same_resource"] is True
     assert data["approved_retry_requires_same_payload"] is True
+    assert data["agent_continue_after_approval"] == "retry_same_tool_call_immediately"
+    assert data["retry_requires_new_user_message"] is False
     assert isinstance(data.get("reason_code"), str) and data["reason_code"]
     assert isinstance(data.get("next_step"), str) and data["next_step"]
     assert "auto-resume" not in json.dumps(data).lower()
@@ -88,6 +91,8 @@ def test_enrich_mcp_error_contract_adds_approval_retry_fields() -> None:
     assert data["reason_code"] == "approval_required"
     assert data["suggested_tool"] == "create_issue"
     assert "without changing tool, target, or payload" in data["next_step"]
+    assert "Do not ask the user for another message" in data["next_step"]
+    assert data["agent_continue_after_approval"] == "retry_same_tool_call_immediately"
 
 
 def test_mcp_error_user_message_distinguishes_actionable_outcomes():
@@ -122,9 +127,11 @@ def test_mcp_error_user_message_distinguishes_actionable_outcomes():
         "reason": "local_policy_block",
     })
 
-    assert "approve or deny" in approval
-    assert "same MCP tool call" in approval
+    assert "approves or denies" in approval
+    assert "AgentVeil MCP tool call" in approval
     assert "without changing tool, target, or payload" in approval
+    assert "Do not ask the user for another message" in approval
+    assert "immediately retry" in approval.lower()
     assert "sandbox" in outside.lower()
     assert "MCP tool is not available" in missing_tool
     assert "Approval will not help" in secret
@@ -996,15 +1003,106 @@ def test_run_returns_approval_required_without_waiting_or_forwarding(tmp_path, m
     assert "Approval required" in response["error"]["message"]
     assert "same MCP tool call" in response["error"]["message"]
     assert "without changing tool, target, or payload" in response["error"]["message"]
-    assert response["error"]["data"]["instructions"] == (
-        "Approval required. Open the approval page, approve or deny, then retry the same "
-        "MCP tool call without changing tool, target, or payload."
-    )
-    assert "events show --last --verify" in response["error"]["data"]["proof_inspection_hint"]
+    assert "Do not ask the user for another message" in response["error"]["message"]
+    assert response["error"]["data"]["instructions"] == APPROVAL_REQUIRED_INSTRUCTIONS
+    proof_hint = response["error"]["data"]["proof_inspection_hint"]
+    assert "local_proof" in proof_hint
     _assert_approval_retry_contract(response["error"]["data"])
     assert response["error"]["data"]["reason"] == "local_approval_required"
     assert response["error"]["data"]["reason_code"] == "approval_required"
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
+
+
+class _TtyStringIO(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+def _set_wait_for_decision(config_path: Path) -> None:
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    approval = config.get("approval")
+    if not isinstance(approval, dict):
+        approval = {}
+        config["approval"] = approval
+    approval["wait_for_decision"] = True
+    _write_json(config_path, config)
+
+
+def test_run_proxy_wait_mode_returns_success_after_approve_without_second_tools_call(
+    tmp_path,
+    monkeypatch,
+):
+    import httpx
+    import re
+
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    _set_downstream(init.config_path, _normal_downstream(tmp_path), log_path=log_path)
+    _set_approval_policy(init.config_path, server="fake-downstream", tool="write_file")
+    _set_wait_for_decision(init.config_path)
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("wait-mode approval must not construct AVPAgent before approve")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    monkeypatch.setattr(webbrowser, "open", lambda _url: False)
+
+    client_out = io.StringIO()
+    client_err = _TtyStringIO()
+    tool_call = _json_line({
+        "jsonrpc": "2.0",
+        "id": "call-1",
+        "method": "tools/call",
+        "params": {"name": "write_file", "arguments": {"path": "wait-mode-proof.txt", "content": "WAIT_MODE_PROOF"}},
+    })
+    result_box: dict[str, int] = {}
+
+    def _run_proxy() -> None:
+        result_box["rc"] = run_proxy(
+            home=home,
+            client_in=io.StringIO(tool_call),
+            out=client_out,
+            err=client_err,
+            approval_ui_mode="none",
+        )
+
+    worker = threading.Thread(target=_run_proxy, daemon=True)
+    worker.start()
+
+    deadline = time.monotonic() + 5
+    approval_url = ""
+    while time.monotonic() < deadline:
+        match = re.search(r"record_id=[^:\s]+:\s+(http://127\.0\.0\.1:\d+/approval/\S+)", client_err.getvalue())
+        if match:
+            approval_url = match.group(1)
+            break
+        time.sleep(0.01)
+    assert approval_url, client_err.getvalue()
+
+    with httpx.Client() as client:
+        csrf_match = re.search(r'name="csrf_token" value="([^"]+)"', client.get(approval_url).text)
+        assert csrf_match, "expected csrf token on approval page"
+        approve = client.post(
+            approval_url,
+            data={"decision": "approve", "csrf_token": csrf_match.group(1), "approval_scope": "exact"},
+        )
+    assert approve.status_code == 200
+
+    worker.join(timeout=5)
+    assert result_box.get("rc") == 0
+
+    responses = _responses(client_out.getvalue())
+    assert len(responses) == 1
+    assert "result" in responses[0], responses[0]
+    assert "error" not in responses[0]
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list", "tools/call"]
+
+    records = _evidence_records(home)
+    approved = [record for record in records if record.get("status") in {"approved", "executed"}]
+    assert approved, records
+    assert any(record.get("result_status") == "executed" for record in approved)
 
 
 def test_invalid_write_file_args_do_not_create_approval(tmp_path, monkeypatch):

@@ -1,4 +1,4 @@
-"""Client compatibility pack metadata for Cursor, Claude Code, and Codex."""
+"""Client compatibility pack metadata for Cursor, Claude Code, Codex, and Gemini CLI."""
 
 from __future__ import annotations
 
@@ -12,9 +12,10 @@ ConfigSurface = Literal[
     "claude_settings_json",
     "codex_config_toml",
     "codex_config_toml_manual",
+    "gemini_settings_json",
 ]
 
-CLIENT_PACK_IDS: tuple[str, ...] = ("cursor", "claude_code", "codex")
+CLIENT_PACK_IDS: tuple[str, ...] = ("cursor", "claude_code", "codex", "gemini_cli")
 
 
 @dataclass(frozen=True)
@@ -95,6 +96,29 @@ CLIENT_PACKS: dict[str, ClientPack] = {
         known_limitations=(
             "Codex uses TOML MCP config under ~/.codex/config.toml.",
             "Provider-native Codex tools stay outside AgentVeil routing.",
+        ),
+        support_status="supported",
+        renders_runnable_config=True,
+    ),
+    "gemini_cli": ClientPack(
+        client_id="gemini_cli",
+        display_name="Gemini CLI",
+        config_surface="gemini_settings_json",
+        config_path_hint=".gemini/settings.json (project root)",
+        guidance_summary=(
+            "Run `agentveil-mcp-proxy setup gemini-cli --project-dir <path> --yes` "
+            "(or `--choose-folder --yes`) for project-local Gemini settings, then route "
+            "configured work through AgentVeil MCP tools."
+        ),
+        health_check_capabilities=(
+            "config_render",
+            "tools_list",
+            "routed_read_action",
+            "list_only_diagnostic",
+        ),
+        known_limitations=(
+            "Gemini CLI must trust the project folder before loading project settings.",
+            "Provider-native Gemini tools stay outside AgentVeil routing until hook evidence.",
         ),
         support_status="supported",
         renders_runnable_config=True,

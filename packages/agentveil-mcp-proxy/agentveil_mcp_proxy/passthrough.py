@@ -49,7 +49,13 @@ from agentveil_mcp_proxy.classification import (
     sha256_jcs,
 )
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceError, ApprovalStatus
-from agentveil_mcp_proxy.evidence.events_show import LOCAL_PROOF_INSPECTION_HINT
+from agentveil_mcp_proxy.evidence.events_show import (
+    DEFAULT_SHOW_LAST,
+    LOCAL_PROOF_AGENT_INSPECTION_HINT,
+    LOCAL_PROOF_INSPECTION_HINT,
+    LOCAL_PROOF_MCP_TOOL_NAME,
+    render_local_proof_mcp_content,
+)
 from agentveil_mcp_proxy.client_config import downstream_startup_fingerprint
 from agentveil_mcp_proxy.evidence.observability import (
     parse_action_gate_metadata,
@@ -128,6 +134,9 @@ from agentveil_mcp_proxy.runtime_gate import (
     RuntimeGateUntrustedError,
 )
 from agentveil_mcp_proxy.evidence.observability import (
+    APPROVAL_REQUIRED_INSTRUCTIONS,
+    APPROVAL_REQUIRED_USER_MESSAGE,
+    approval_required_actionable_message,
     enrich_mcp_error_contract,
     mcp_error_user_message,
     reason_has_dedicated_user_message,
@@ -141,19 +150,6 @@ JSONRPC_INVALID_PARAMS = -32602
 JSONRPC_DOWNSTREAM_ERROR = -32000
 JSONRPC_POLICY_BLOCKED = -32010
 JSONRPC_APPROVAL_REQUIRED = -32011
-APPROVAL_REQUIRED_INSTRUCTIONS = (
-    "Approval required. Open the approval page, approve or deny, then retry the same "
-    "MCP tool call without changing tool, target, or payload."
-)
-APPROVAL_REQUIRED_RETRY_SUFFIX = (
-    "approve or deny, then retry the same MCP tool call without changing tool, "
-    "target, or payload."
-)
-
-APPROVAL_REQUIRED_USER_MESSAGE = (
-    "Approval required. Open the approval page, approve or deny, then retry the same "
-    "MCP tool call without changing tool, target, or payload."
-)
 HARD_BLOCK_USER_MESSAGE = (
     # claim-check: allow "Blocked" as a user-facing policy outcome label for denied local actions.
     "Blocked: this action is not allowed by local policy and cannot be approved."
@@ -184,7 +180,7 @@ def approval_required_user_message(*, approval_url: str | None = None) -> str:
 def actionable_approval_required_message(approval_url: str) -> str:
     """Return a client-visible MCP error message that includes the approval URL."""
 
-    return f"Approval required. Open {approval_url}, {APPROVAL_REQUIRED_RETRY_SUFFIX}"
+    return approval_required_actionable_message(approval_url)
 
 
 JSONRPC_RUNTIME_GATE_UNAVAILABLE = -32012
@@ -904,7 +900,7 @@ def _approval_required_error(
         if approval_outcome.approval_url is not None:
             data["approval_url"] = approval_outcome.approval_url
             data["instructions"] = APPROVAL_REQUIRED_INSTRUCTIONS
-            data["proof_inspection_hint"] = LOCAL_PROOF_INSPECTION_HINT
+            data["proof_inspection_hint"] = LOCAL_PROOF_AGENT_INSPECTION_HINT
             resolved_message = actionable_approval_required_message(approval_outcome.approval_url)
     if enrich_guidance:
         redirect_original_id = (
@@ -1294,6 +1290,12 @@ class McpPassthrough:
             )
             if policy_error is not None:
                 return [policy_error] if has_id else []
+            local_proof_response = self._local_proof_tool_response(
+                message,
+                request_id,
+            )
+            if local_proof_response is not None:
+                return [local_proof_response] if has_id else []
             if (
                 approval_outcome is not None
                 and approval_outcome.approved
@@ -2634,6 +2636,96 @@ class McpPassthrough:
             resource=classification.resource_plain,
             arguments={},
         ) is RiskClass.READ
+
+    def _local_proof_tool_response(
+        self,
+        message: Mapping[str, Any],
+        request_id: Any,
+    ) -> dict[str, Any] | None:
+        if message.get("method") != "tools/call":
+            return None
+        params = message.get("params")
+        if not isinstance(params, Mapping):
+            return None
+        tool = params.get("name")
+        if tool != LOCAL_PROOF_MCP_TOOL_NAME:
+            return None
+        arguments = params.get("arguments", {})
+        if not isinstance(arguments, Mapping):
+            arguments = {}
+        last = arguments.get("last", DEFAULT_SHOW_LAST)
+        verify = arguments.get("verify", True)
+        session = arguments.get("session")
+        output_format = arguments.get("format", "text")
+        debug = arguments.get("debug", False)
+        if last is not None and not isinstance(last, int):
+            return jsonrpc_error(
+                request_id,
+                JSONRPC_INVALID_PARAMS,
+                "local_proof last must be an integer",
+            )
+        if not isinstance(verify, bool):
+            return jsonrpc_error(
+                request_id,
+                JSONRPC_INVALID_PARAMS,
+                "local_proof verify must be a boolean",
+            )
+        if session is not None and not isinstance(session, str):
+            return jsonrpc_error(
+                request_id,
+                JSONRPC_INVALID_PARAMS,
+                "local_proof session must be a string",
+            )
+        if output_format not in {"text", "json"}:
+            return jsonrpc_error(
+                request_id,
+                JSONRPC_INVALID_PARAMS,
+                "local_proof format must be text or json",
+            )
+        if not isinstance(debug, bool):
+            return jsonrpc_error(
+                request_id,
+                JSONRPC_INVALID_PARAMS,
+                "local_proof debug must be a boolean",
+            )
+        manager = self.approval_manager
+        store = getattr(manager, "evidence_store", None) if manager is not None else None
+        if store is None or not hasattr(store, "db_path"):
+            return jsonrpc_error(
+                request_id,
+                JSONRPC_DOWNSTREAM_ERROR,
+                "local proof is unavailable",
+                # claim-check: allow "blocked" is a bounded JSON-RPC status, not a runtime safety claim.
+                data={"status": "blocked", "reason": "local_proof_unavailable"},
+            )
+        try:
+            content_text = render_local_proof_mcp_content(
+                evidence_path=store.db_path,
+                config_path=None,
+                last=last if isinstance(last, int) else DEFAULT_SHOW_LAST,
+                session_id=session,
+                verify=verify,
+                output_format=output_format,
+                debug=debug,
+            )
+        except ValueError as exc:
+            return jsonrpc_error(
+                request_id,
+                JSONRPC_INVALID_PARAMS,
+                str(exc),
+            )
+        return {
+            "jsonrpc": JSONRPC_VERSION,
+            "id": request_id,
+            "result": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": content_text,
+                    }
+                ],
+            },
+        }
 
     def _fallback_error_response(
         self,

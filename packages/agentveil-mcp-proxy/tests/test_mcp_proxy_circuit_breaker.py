@@ -720,7 +720,7 @@ def test_open_circuit_read_fallback_defaults_to_approval_not_forwarded(tmp_path)
     assert data["approved_retry_requires_same_tool"] is True
     assert data["approved_retry_requires_same_resource"] is True
     assert data["approved_retry_requires_same_payload"] is True
-    assert "same MCP tool call" in data["next_step"]
+    assert "same AgentVeil MCP tool call" in data["next_step"]
     assert "without changing tool, target, or payload" in data["next_step"]
     assert data["suggested_tool"] == "get_file_contents"
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]

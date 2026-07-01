@@ -2696,7 +2696,7 @@ def run_proxy(
             auto_deny=auto_deny,
             headless_policy=headless_policy,
             cli_out=err,
-            wait_for_decision=False,
+            wait_for_decision=config.approval.wait_for_decision,
             approval_grant_private_key_seed=approval_grant_private_key_seed,
             approval_grant_agent_did=approval_grant_agent_did,
         )
@@ -3964,13 +3964,43 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_json_arg(setup_codex)
 
+    setup_gemini_cli = setup_subparsers.add_parser(
+        "gemini-cli",
+        help="One-command Gemini CLI connector setup (proxy route + MCP route + BeforeTool hook)",
+    )
+    setup_gemini_cli.add_argument(
+        "--project-dir", type=Path, default=None,
+        help="Project directory to set up (default: current directory)",
+    )
+    setup_gemini_cli.add_argument(
+        "--choose-folder", action="store_true",
+        help="Open the macOS folder picker to choose the project directory",
+    )
+    setup_gemini_cli.add_argument(
+        "--sandbox", type=Path, default=None,
+        help="Quickstart filesystem sandbox path (default: selected project directory)",
+    )
+    setup_gemini_cli.add_argument(
+        "--yes", action="store_true",
+        help="Apply the setup; without it the command only previews",
+    )
+    setup_gemini_cli.add_argument(
+        "--passphrase-file", type=Path, default=None,
+        help="Encrypt the proxy identity with this passphrase file (default: plaintext quickstart)",
+    )
+    setup_gemini_cli.add_argument(
+        "--force", action="store_true",
+        help="Re-initialize the proxy route even if its config already exists",
+    )
+    _add_json_arg(setup_gemini_cli)
+
     setup_remove = setup_subparsers.add_parser(
         "remove",
         help="Remove a one-command connector (AgentVeil-managed entries only)",
     )
     setup_remove.add_argument(
         "target",
-        choices=["cursor", "claude-code", "codex"],
+        choices=["cursor", "claude-code", "codex", "gemini-cli"],
         help="Connector to remove",
     )
     setup_remove.add_argument(
@@ -4303,6 +4333,9 @@ def run_setup_cursor_cli(
             proxy_initialized = True
     except ProxyCliError:
         raise
+
+    if config_path.exists():
+        _configure_interactive_connector_defaults(config_path)
 
     proxy_cmd = _resolve_setup_proxy_command()
     if not proxy_cmd:
@@ -4684,6 +4717,18 @@ def _configure_claude_setup_approval_ui(config_path: Path) -> None:
     _secure_write_json(config_path, config_payload, force=True)
 
 
+def _configure_interactive_connector_defaults(config_path: Path) -> None:
+    """Enable bounded approval wait-mode for interactive MCP client setups."""
+
+    config_payload = _read_json(config_path, "proxy config")
+    approval = config_payload.get("approval")
+    if not isinstance(approval, dict):
+        approval = {}
+        config_payload["approval"] = approval
+    approval["wait_for_decision"] = True
+    _secure_write_json(config_path, config_payload, force=True)
+
+
 def run_setup_claude_code_cli(
     *,
     project_dir: Path | None,
@@ -4748,6 +4793,7 @@ def run_setup_claude_code_cli(
         proxy_initialized = True
     if config_path.exists():
         _configure_claude_setup_approval_ui(config_path)
+        _configure_interactive_connector_defaults(config_path)
 
     # 2. Claude Code MCP route (.mcp.json) — reuse the connect command. Resolve
     # the installed console script explicitly (matches the supported manual
@@ -4931,6 +4977,8 @@ def run_setup_codex_cli(
         except ProxyCliError:
             raise
         proxy_initialized = True
+    if config_path.exists():
+        _configure_interactive_connector_defaults(config_path)
 
     proxy_cmd = _resolve_setup_proxy_command()
     if not proxy_cmd:
@@ -5147,6 +5195,293 @@ def run_setup_remove_codex_cli(
         print("Unrelated Codex config, hooks, and MCP servers preserved.")
         if removed_any:
             print("Restart Codex to drop the connector.")
+    return 0
+
+
+def run_setup_gemini_cli(
+    *,
+    project_dir: Path | None,
+    choose_folder: bool,
+    sandbox: Path | None,
+    assume_yes: bool,
+    passphrase_file: Path | None,
+    force: bool,
+    output_json: bool,
+) -> int:
+    """One-command Gemini CLI connector setup."""
+    from agentveil_mcp_proxy import gemini_setup
+
+    if choose_folder and project_dir is not None:
+        raise ProxyCliError("--choose-folder cannot be combined with --project-dir", exit_code=2)
+    selected_project = _choose_setup_project_folder() if choose_folder else project_dir
+    target = (Path(selected_project) if selected_project is not None else Path.cwd()).resolve()
+    sandbox_path = Path(sandbox).resolve() if sandbox is not None else target
+    home = gemini_setup.setup_home(target)
+    config_path = gemini_setup.proxy_config_path(home)
+
+    if not assume_yes:
+        message = (
+            f"Would set up the Gemini CLI connector in {target}: proxy quickstart "
+            "route, Gemini MCP config, BeforeTool hook, and managed Approval Center. "
+            "Re-run with --yes."
+        )
+        if output_json:
+            _print_json({
+                "ok": False,
+                "action": "setup-gemini-cli",
+                "applied": False,
+                "errors": ["confirmation required: pass --yes"],
+                "warnings": [message],
+            })
+        else:
+            print(message)
+        return 0
+
+    try:
+        gemini_setup.validate_hook_config(project_dir=target)
+    except gemini_setup.GeminiSetupError as exc:
+        raise ProxyCliError(str(exc), exit_code=2) from exc
+
+    quiet = io.StringIO()
+    proxy_present = config_path.exists()
+    proxy_initialized = False
+    if force or not proxy_present:
+        downstream = quickstart_filesystem_downstream(sandbox_path)
+        try:
+            init_proxy(
+                home=home,
+                config_path=None,
+                policy_pack="filesystem",
+                downstream_config=downstream,
+                plaintext=(passphrase_file is None),
+                passphrase_file=passphrase_file,
+                force=force,
+                err=quiet,
+            )
+        except ProxyCliError:
+            raise
+        proxy_initialized = True
+    if config_path.exists():
+        _configure_interactive_connector_defaults(config_path)
+
+    proxy_cmd = _resolve_setup_proxy_command()
+    if not proxy_cmd:
+        raise ProxyCliError(
+            "agentveil-mcp-proxy console script not on PATH; cannot configure Gemini MCP route",
+            exit_code=1,
+        )
+
+    try:
+        hook_result = gemini_setup.install_hook(project_dir=target, python=sys.executable)
+    except gemini_setup.GeminiSetupError as exc:
+        raise ProxyCliError(str(exc), exit_code=2) from exc
+
+    try:
+        run_connect_cli(
+            client_id="gemini_cli",
+            home=home,
+            project_root=target,
+            write=True,
+            proxy_command=proxy_cmd,
+            passphrase_file=passphrase_file,
+            out=quiet,
+        )
+    except Exception:
+        gemini_setup.remove_hook(project_dir=target)
+        raise
+    route_status = gemini_setup.connect_status(
+        project_dir=target,
+        home=home,
+        passphrase_file=passphrase_file,
+        proxy_command=proxy_cmd,
+    )
+    if not gemini_setup.managed_route_present(route_status):
+        gemini_setup.remove_hook(project_dir=target)
+        raise ProxyCliError(
+            "could not write the Gemini MCP route; ensure .gemini/settings.json is writable",
+            exit_code=1,
+        )
+
+    from agentveil_mcp_proxy import claude_center_lifecycle
+
+    center_result = claude_center_lifecycle.ensure_running(
+        home=home,
+        proxy_command=proxy_cmd,
+        passphrase_file=passphrase_file,
+    )
+    center_running = center_result.status.state == "running"
+    status = gemini_setup.connector_status(
+        project_dir=target,
+        center_state=center_result.status.state,
+        passphrase_file=passphrase_file,
+        proxy_command=proxy_cmd,
+    )
+    sandbox_label = "project" if sandbox is None else "custom"
+
+    if not center_running:
+        if output_json:
+            _print_json({
+                "ok": False,
+                "action": "setup-gemini-cli",
+                "applied": True,
+                "scope": "project",
+                "proxy_route_initialized": proxy_initialized,
+                "mcp_route": "present",
+                "hook": "present",
+                "sandbox_relpath": sandbox_label,
+                "identity_encrypted": passphrase_file is not None,
+                "approval_center": {"state": center_result.status.state, "reason": center_result.reason},
+                "errors": [
+                    "approval_center not running; controlled MCP writes would surface "
+                    "unreachable approval URLs. Setup is not ready/protected."
+                ],
+                "warnings": [],
+            })
+        else:
+            print("Gemini CLI connector partially set up:")
+            print(f"  proxy route: {'initialized' if proxy_initialized else 'already present'}")
+            print("  MCP route:   .gemini/settings.json updated")
+            print("  hook:        .gemini/settings.json BeforeTool present")
+            print(f"  approval_center: {center_result.status.state} ({center_result.reason})")
+            print("ERROR: setup is NOT ready — Approval Center could not start.", file=sys.stderr)
+        return 1
+
+    if output_json:
+        _print_operator_json({
+            "ok": True,
+            "action": "setup-gemini-cli",
+            "applied": True,
+            "scope": "project",
+            "proxy_route_initialized": proxy_initialized,
+            "mcp_route": "present",
+            "hook": "present",
+            "settings_relpath": ".gemini/settings.json",
+            "evidence_relpath": ".gemini/agentveil/evidence.jsonl",
+            "gemini_config_ref": route_status.get("config_ref"),
+            "sandbox_relpath": sandbox_label,
+            "identity_encrypted": passphrase_file is not None,
+            "approval_center": {
+                "state": center_result.status.state,
+                "started": center_result.started,
+                "reused": center_result.reused,
+                "restarted": center_result.restarted,
+            },
+            "reload_required": True,
+            "gemini_folder_trust_required": status.get("hook_trust_required"),
+            "gemini_folder_trust_message": gemini_setup.GEMINI_FOLDER_TRUST_MESSAGE,
+            "status": status,
+        })
+    else:
+        print("Gemini CLI connector set up for this project:")
+        print(f"  proxy route: {'initialized' if proxy_initialized else 'already present'}")
+        print("  MCP route:   .gemini/settings.json updated")
+        print("  hook:        .gemini/settings.json BeforeTool present")
+        if passphrase_file is None:
+            print("  identity:    stored unencrypted (quickstart); use --passphrase-file to encrypt")
+        action = "reused" if center_result.reused else ("restarted" if center_result.restarted else "started")
+        print(f"  approval_center: running ({action})")
+        print(f"  status:      {status['status']}")
+        print("  folder trust: Gemini may ignore project settings until the folder is trusted.")
+        print("               Until hook evidence is observed, status remains advisory, not protected.")
+        print(
+            "Open or restart Gemini CLI in this project, trust the folder if prompted, "
+            "then run `agentveil-mcp-proxy setup status --client gemini-cli`."
+        )
+    return 0
+
+
+def run_setup_gemini_status_cli(
+    *,
+    project_dir: Path | None,
+    proxy_command: str | None,
+    output_json: bool,
+) -> int:
+    """Project-local Gemini CLI connector status."""
+    from agentveil_mcp_proxy import claude_center_lifecycle, gemini_setup
+
+    target = (Path(project_dir) if project_dir is not None else Path.cwd()).resolve()
+    home = gemini_setup.setup_home(target)
+    center = claude_center_lifecycle.check_status(home)
+    status = gemini_setup.connector_status(
+        project_dir=target,
+        center_state=center.state,
+        proxy_command=proxy_command or _resolve_setup_proxy_command(),
+    )
+    if output_json:
+        _print_operator_json(status)
+    else:
+        print(f"status: {status['status']}")
+        print(f"  connector:       {status['connector']}")
+        print(f"  hook:            {status['hook']} ({status['hook_state']})")
+        print(f"  mcp route:       {status['mcp_route']}")
+        print(f"  proxy route:     {status['proxy_route']}")
+        print(f"  approval_center: {status['approval_center']}")
+        print(f"  route proved:    {status['route_launch_proved']}")
+        print(f"  folder trust req:{status['hook_trust_required']}")
+        print(f"  restart required:{status['restart_required']}")
+        print(f"  next: {status['next_step']}")
+    return 0
+
+
+def run_setup_remove_gemini_cli(
+    *, project_dir: Path | None, assume_yes: bool, output_json: bool
+) -> int:
+    """Remove the one-command Gemini CLI connector — AgentVeil-managed entries only."""
+    from agentveil_mcp_proxy import claude_center_lifecycle, gemini_setup
+
+    target = (Path(project_dir) if project_dir is not None else Path.cwd()).resolve()
+    home = gemini_setup.setup_home(target)
+
+    if not assume_yes:
+        message = (
+            "Would remove only AgentVeil-managed Gemini hook and MCP route entries "
+            f"for project {target}. Re-run with --yes."
+        )
+        if output_json:
+            _print_json({
+                "ok": False,
+                "action": "setup-remove-gemini-cli",
+                "applied": False,
+                "errors": ["confirmation required: pass --yes"],
+                "warnings": [message],
+            })
+        else:
+            print(message)
+        return 0
+
+    try:
+        hook_result = gemini_setup.remove_hook(project_dir=target)
+        route_result = gemini_setup.disconnect(project_dir=target, home=home, write=True)
+    except (ClientConnectError, ClientConfigError, ClientPackError) as exc:
+        raise ProxyCliError(str(exc), exit_code=2) from exc
+    center_stop = claude_center_lifecycle.stop_if_managed(home)
+    removed_any = (
+        bool(hook_result.get("removed_entries"))
+        or bool(route_result.get("removed_entry"))
+        or center_stop["stopped"]
+    )
+
+    if output_json:
+        _print_operator_json({
+            "ok": True,
+            "action": "setup-remove-gemini-cli",
+            "applied": True,
+            "scope": "project",
+            "hook_entries_removed": int(hook_result.get("removed_entries", 0)),
+            "mcp_route_removed": bool(route_result.get("removed_entry")),
+            "gemini_config_ref": route_result.get("config_ref"),
+            "approval_center_stopped": center_stop["stopped"],
+            "reload_required": removed_any,
+        })
+    else:
+        print(
+            f"Removed: hook entries={int(hook_result.get('removed_entries', 0))}, "
+            f"mcp route={bool(route_result.get('removed_entry'))}, "
+            f"approval_center={'stopped' if center_stop['stopped'] else 'not running'}"
+        )
+        print("Unrelated Gemini settings, MCP servers, hooks, skills, and commands preserved.")
+        if removed_any:
+            print("Restart Gemini CLI to drop the connector.")
     return 0
 
 
@@ -5664,7 +5999,15 @@ def main(argv: list[str] | None = None) -> int:
                         assume_yes=args.yes,
                         output_json=args.json_output,
                     )
-                raise ProxyCliError("setup remove target must be cursor, claude-code, or codex")
+                if args.target == "gemini-cli":
+                    return run_setup_remove_gemini_cli(
+                        project_dir=args.project_dir,
+                        assume_yes=args.yes,
+                        output_json=args.json_output,
+                    )
+                raise ProxyCliError(
+                    "setup remove target must be cursor, claude-code, codex, or gemini-cli"
+                )
             if args.setup_action == "run":
                 return run_setup_wizard_cli(
                     home=args.home,
@@ -5682,6 +6025,12 @@ def main(argv: list[str] | None = None) -> int:
                 if args.home is None:
                     if args.client == "codex":
                         return run_setup_codex_status_cli(
+                            project_dir=args.project_dir,
+                            proxy_command=args.proxy_command,
+                            output_json=args.json_output,
+                        )
+                    if args.client in {"gemini-cli", "gemini_cli"}:
+                        return run_setup_gemini_status_cli(
                             project_dir=args.project_dir,
                             proxy_command=args.proxy_command,
                             output_json=args.json_output,
@@ -5730,8 +6079,18 @@ def main(argv: list[str] | None = None) -> int:
                     force=args.force,
                     output_json=args.json_output,
                 )
+            if args.setup_action == "gemini-cli":
+                return run_setup_gemini_cli(
+                    project_dir=args.project_dir,
+                    choose_folder=args.choose_folder,
+                    sandbox=args.sandbox,
+                    assume_yes=args.yes,
+                    passphrase_file=args.passphrase_file,
+                    force=args.force,
+                    output_json=args.json_output,
+                )
             raise ProxyCliError(
-                "setup action must be cursor, claude-code, codex, status, remove, run, or restore"
+                "setup action must be cursor, claude-code, codex, gemini-cli, status, remove, run, or restore"
             )
         if args.command == "install-claude-hook":
             return run_install_claude_hook_cli(

@@ -48,6 +48,7 @@ QUICKSTART_FILESYSTEM_TOOL_NAMES: tuple[str, ...] = (
     "read_file",
     "get_file_info",
     "instruction_surface_status",
+    "local_proof",
     "write_file",
     "delete_file",
     "rmdir_tree",
@@ -87,7 +88,7 @@ def test_product_route_catalog_matches_existing_pack_constants() -> None:
 
 def test_product_route_catalog_is_complete_and_deduplicated() -> None:
     assert len(PRODUCT_ROUTE_TOOL_CATALOG) == len(set(PRODUCT_ROUTE_TOOL_CATALOG))
-    assert len(PRODUCT_ROUTE_TOOL_CATALOG) == 70
+    assert len(PRODUCT_ROUTE_TOOL_CATALOG) == 71
     assert PRODUCT_ROUTE_TOOL_CATALOG.count("instruction_surface_status") == 1
     assert product_route_tool_pack("instruction_surface_status") == "filesystem"
 
@@ -115,6 +116,7 @@ def test_product_route_expectations_cover_full_catalog() -> None:
         ("list_issues", "github", PolicyDecision.ALLOW, "github-read"),
         ("list_files", "github", PolicyDecision.ALLOW, "github-read"),
         ("instruction_surface_status", "filesystem", PolicyDecision.ALLOW, "filesystem-read"),
+        ("local_proof", "filesystem", PolicyDecision.ALLOW, "filesystem-read"),
         ("get_repository", "github", PolicyDecision.ALLOW, "github-read"),
         ("get_ci_job", "github", PolicyDecision.ALLOW, "github-read"),
         ("get_secret", "github", PolicyDecision.BLOCK, "github-secrets-block"),
@@ -428,3 +430,61 @@ def test_product_route_unknown_tool_call_fails_closed(tmp_path, monkeypatch) -> 
     assert data["retry_after_approval"] is False
     assert data["reason_code"] == "unknown_tool"
     assert data["next_step"]
+
+
+def test_product_route_local_proof_succeeds_without_approval(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    profile_root = tmp_path / "profile"
+    _init_product_route_proxy(home, profile_root)
+    _block_avp_agent(monkeypatch)
+
+    pending_out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(
+            _tool_call("write_file", {"path": "proof.txt", "content": "x\n"}, call_id="write-1")
+        ),
+        out=pending_out,
+        approval_ui_mode="none",
+    ) == 0
+    pending_response = _responses(pending_out.getvalue())[0]
+    assert pending_response["error"]["data"]["status"] == "approval_required"
+
+    proof_out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(
+            _tool_call("local_proof", {"last": 5, "verify": True}, call_id="proof-1")
+        ),
+        out=proof_out,
+        approval_ui_mode="none",
+    ) == 0
+    proof_response = _responses(proof_out.getvalue())[0]
+    assert "error" not in proof_response
+    proof_text = proof_response["result"]["content"][0]["text"]
+    assert proof_text.startswith("AgentVeil proof")
+    assert "Verification:" in proof_text
+    assert "Result:" in proof_text
+    assert '"status"' not in proof_text
+
+    json_proof_out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(
+            _tool_call(
+                "local_proof",
+                {"last": 5, "verify": True, "format": "json"},
+                call_id="proof-json-1",
+            )
+        ),
+        out=json_proof_out,
+        approval_ui_mode="none",
+    ) == 0
+    json_proof_response = _responses(json_proof_out.getvalue())[0]
+    payload = json.loads(json_proof_response["result"]["content"][0]["text"])
+    assert payload["status"] == "ok"
+    assert payload["proof"]["events"]
+    assert payload["proof"]["events"][-1]["decision"] == "approval_required"
+    assert payload["proof"]["events"][-1]["tool"] == "write_file"
+    assert payload["proof"]["verify"]["status"] in {"not_available", "intact", "failed"}
+    assert "/Users/" not in json.dumps(payload)

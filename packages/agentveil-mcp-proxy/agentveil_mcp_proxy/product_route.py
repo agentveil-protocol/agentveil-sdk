@@ -41,6 +41,7 @@ SANDBOX_READ_ONLY_MCP_TOOLS: Final[frozenset[str]] = frozenset({
     "read_file",
     "get_file_info",
     "instruction_surface_status",
+    "local_proof",
 })
 
 PRODUCT_ROUTE_ACCEPTED_PACKS: Final[tuple[str, ...]] = (
@@ -55,6 +56,7 @@ FILESYSTEM_PRODUCT_TOOLS: Final[tuple[str, ...]] = (
     "read_file",
     "get_file_info",
     "instruction_surface_status",
+    "local_proof",
     "write_file",
     "delete_file",
     "rmdir_tree",

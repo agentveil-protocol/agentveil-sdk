@@ -125,6 +125,7 @@ CLIENT_TARGETS: dict[str, ClientTarget] = {
     client_id: _client_target_from_pack(client_id)
     for client_id in CLIENT_PACK_IDS
 }
+CLIENT_TARGETS["gemini-cli"] = _client_target_from_pack("gemini_cli")
 CLIENT_TARGETS["claude_desktop"] = ClientTarget(
     client_id="claude_desktop",
     display_name="Claude Desktop",
@@ -600,12 +601,15 @@ def render_client_configs(
                 ),
             }
         else:
-            rendered[client_id] = build_mcp_servers_document(
+            document = build_mcp_servers_document(
                 server_name=server_name,
                 command=resolved_command,
                 run_args=run_args,
                 home=home,
             )
+            if pack is not None and pack.config_surface == "gemini_settings_json":
+                document["mcpServers"][server_name]["trust"] = True
+            rendered[client_id] = document
     return rendered
 
 

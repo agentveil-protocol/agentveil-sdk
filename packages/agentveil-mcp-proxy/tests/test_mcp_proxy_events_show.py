@@ -10,8 +10,13 @@ import pytest
 
 from agentveil_mcp_proxy.cli import ProxyCliError, init_proxy, main, proxy_paths, show_events
 from agentveil_mcp_proxy.evidence.events_show import (
+    LOCAL_PROOF_AGENT_INSPECTION_HINT,
+    LOCAL_PROOF_MCP_TOOL_NAME,
     build_event_show_entry,
     build_events_show_payload,
+    build_local_proof_mcp_payload,
+    format_local_proof_human_summary,
+    render_local_proof_mcp_content,
     verify_local_evidence_chain,
 )
 from agentveil_mcp_proxy.evidence.store import (
@@ -37,6 +42,8 @@ def _record(
     prev_event_hash: str | None = None,
     granted_by: str | None = None,
     created_at: int = 1_700_000_000,
+    resource_hash: str = "sha256:" + "a" * 64,
+    payload_hash: str = "sha256:" + "b" * 64,
 ) -> PendingApproval:
     return PendingApproval(
         request_id=request_id,
@@ -46,8 +53,8 @@ def _record(
         tool_name=tool_name,
         action_class=action_class,
         risk_class=risk_class,
-        resource_hash="sha256:" + "a" * 64,
-        payload_hash="sha256:" + "b" * 64,
+        resource_hash=resource_hash,
+        payload_hash=payload_hash,
         policy_id="filesystem",
         policy_rule_id="write-approval",
         policy_context_hash="c" * 64,
@@ -70,6 +77,7 @@ def test_events_show_empty_state_is_friendly(tmp_path: Path) -> None:
 
     assert count == 0
     assert "No local evidence yet" in text
+    assert LOCAL_PROOF_MCP_TOOL_NAME in text
     assert "events show --last --verify" in text
     assert "unknown" not in text.lower()
 
@@ -313,7 +321,7 @@ def test_events_show_target_reached_after_execution() -> None:
     assert entry["target_reached"] is True
     assert entry["reason_summary"] == "Action reached target."
     assert "Approval required before execution" not in entry["reason_summary"]
-    assert "events show --last --verify" in entry["next_step"]
+    assert LOCAL_PROOF_MCP_TOOL_NAME in entry["next_step"]
 
 
 def test_events_show_why_copy_matches_decision_semantics() -> None:
@@ -414,3 +422,239 @@ def test_events_show_user_denied_vs_policy_hard_block() -> None:
     assert blocked["decision"] == "hard_blocked"  # claim-check: allow hard_blocked decision enum assertion.
     assert denied["reason_summary"] == "Denied by user."
     assert blocked["reason_summary"] == "local policy block"  # claim-check: allow policy block fixture text.
+
+
+def test_local_proof_mcp_payload_is_bounded_and_includes_verify(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    paths = proxy_paths(home)
+    metadata = json.dumps({
+        "action_family": "write",
+        "policy_decision": "approval",
+        "approval_status": "pending",
+        "execution_status": "not_reached",
+        "target_reached": False,
+    }, separators=(",", ":"))
+    with ApprovalEvidenceStore(paths.proxy_dir / "evidence.sqlite") as store:
+        store.write_pending(_record("req-write", metadata_jcs=metadata))
+
+    payload = build_local_proof_mcp_payload(
+        evidence_path=paths.proxy_dir / "evidence.sqlite",
+        config_path=paths.config_path,
+        last=5,
+        verify=True,
+    )
+
+    assert payload["status"] == "ok"
+    assert payload["proof"]["events"]
+    event = payload["proof"]["events"][-1]
+    assert event["decision"] == "approval_required"
+    assert event["tool"] == "write_file"
+    assert event["why"]
+    assert LOCAL_PROOF_MCP_TOOL_NAME in event["next_step"]
+    assert payload["proof"]["verify"]["status"] in {"not_available", "intact", "failed"}
+    serialized = json.dumps(payload)
+    assert "/Users/" not in serialized
+    assert "sha256:" not in serialized
+
+
+def test_local_proof_agent_hint_prefers_mcp_tool() -> None:
+    assert LOCAL_PROOF_MCP_TOOL_NAME in LOCAL_PROOF_AGENT_INSPECTION_HINT
+    assert "events show --last --verify" in LOCAL_PROOF_AGENT_INSPECTION_HINT
+
+
+def test_local_proof_human_summary_prefers_write_outcome_chain(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    paths = proxy_paths(home)
+    pending_meta = json.dumps({
+        "action_family": "write",
+        "policy_decision": "approval",
+        "approval_status": "pending",
+        "execution_status": "not_reached",
+        "target_reached": False,
+    }, separators=(",", ":"))
+    approved_meta = json.dumps({
+        "action_family": "write",
+        "policy_decision": "approval",
+        "approval_status": "approved",
+        "execution_status": "not_reached",
+        "target_reached": False,
+    }, separators=(",", ":"))
+    reached_meta = json.dumps({
+        "action_family": "write",
+        "policy_decision": "approval",
+        "approval_status": "approved",
+        "execution_status": "executed",
+        "target_reached": True,
+    }, separators=(",", ":"))
+    read_meta = json.dumps({"target_reached": True}, separators=(",", ":"))
+    write_resource = "sha256:" + "c" * 64
+    write_payload = "sha256:" + "d" * 64
+    with ApprovalEvidenceStore(paths.proxy_dir / "evidence.sqlite") as store:
+        store.write_pending(_record(
+            "req-read",
+            tool_name="list_workspace",
+            risk_class="read",
+            action_class="read",
+            metadata_jcs=read_meta,
+            created_at=1_700_000_000,
+        ))
+        store.transition("req-read", "executed", result_hash="sha256:" + "f" * 64)
+        store.write_pending(_record(
+            "req-pending",
+            metadata_jcs=pending_meta,
+            resource_hash=write_resource,
+            payload_hash=write_payload,
+            created_at=1_700_000_100,
+        ))
+        store.write_pending(_record(
+            "req-approved",
+            metadata_jcs=approved_meta,
+            granted_by="req-pending",
+            resource_hash=write_resource,
+            payload_hash=write_payload,
+            created_at=1_700_000_200,
+        ))
+        store.transition(
+            "req-approved",
+            "approved",
+            approval_token_hash="sha256:" + "e" * 64,
+            approval_decided_by="local-user",
+            approval_scope="once",
+            user_decision_timestamp=1_700_000_200,
+        )
+        store.write_pending(_record(
+            "req-reached",
+            metadata_jcs=reached_meta,
+            granted_by="req-approved",
+            resource_hash=write_resource,
+            payload_hash=write_payload,
+            created_at=1_700_000_300,
+        ))
+        store.transition("req-reached", "executed", result_hash="sha256:" + "1" * 64)
+
+    show_payload = build_events_show_payload(
+        evidence_path=paths.proxy_dir / "evidence.sqlite",
+        config_path=paths.config_path,
+        last=10,
+        verify=True,
+    )
+    text = format_local_proof_human_summary(show_payload)
+
+    assert text.startswith("AgentVeil proof")
+    assert "Result: write approved and completed" in text
+    assert "Verification:" in text
+    assert "Tool: write_file" in text
+    assert "approval required -> approved -> target reached" in text
+    assert "Target: resource:" in text
+    assert "Target: resource:cccccccccccc" in text
+    assert "Observed read-only actions:" in text
+    assert "- list_workspace allowed" in text
+    assert "next_step" not in text
+    assert '"status"' not in text
+    assert "Use debug/json for full bounded evidence." in text
+
+
+def test_local_proof_json_mode_remains_bounded(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    paths = proxy_paths(home)
+    metadata = json.dumps({
+        "action_family": "write",
+        "target_reached": False,
+    }, separators=(",", ":"))
+    with ApprovalEvidenceStore(paths.proxy_dir / "evidence.sqlite") as store:
+        store.write_pending(_record("req-write", metadata_jcs=metadata))
+
+    text = render_local_proof_mcp_content(
+        evidence_path=paths.proxy_dir / "evidence.sqlite",
+        config_path=paths.config_path,
+        last=5,
+        verify=True,
+        output_format="json",
+    )
+    payload = json.loads(text)
+
+    assert payload["status"] == "ok"
+    assert payload["proof"]["events"]
+    assert payload["proof"]["verify"]["status"] in {"not_available", "intact", "failed"}
+
+
+def test_local_proof_human_summary_does_not_mix_unrelated_write_chains(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    paths = proxy_paths(home)
+    pending_meta = json.dumps({
+        "action_family": "write",
+        "approval_status": "pending",
+        "target_reached": False,
+    }, separators=(",", ":"))
+    approved_meta = json.dumps({
+        "action_family": "write",
+        "approval_status": "approved",
+        "target_reached": False,
+    }, separators=(",", ":"))
+    reached_meta = json.dumps({
+        "action_family": "write",
+        "approval_status": "approved",
+        "execution_status": "executed",
+        "target_reached": True,
+    }, separators=(",", ":"))
+    resource_a = "sha256:" + "a" * 64
+    payload_a = "sha256:" + "1" * 64
+    resource_b = "sha256:" + "c" * 64
+    payload_b = "sha256:" + "2" * 64
+    with ApprovalEvidenceStore(paths.proxy_dir / "evidence.sqlite") as store:
+        store.write_pending(_record(
+            "req-a-pending",
+            metadata_jcs=pending_meta,
+            resource_hash=resource_a,
+            payload_hash=payload_a,
+            created_at=1_700_000_100,
+        ))
+        store.write_pending(_record(
+            "req-b-pending",
+            metadata_jcs=pending_meta,
+            resource_hash=resource_b,
+            payload_hash=payload_b,
+            created_at=1_700_000_200,
+        ))
+        store.write_pending(_record(
+            "req-b-approved",
+            metadata_jcs=approved_meta,
+            granted_by="req-b-pending",
+            resource_hash=resource_b,
+            payload_hash=payload_b,
+            created_at=1_700_000_300,
+        ))
+        store.transition(
+            "req-b-approved",
+            "approved",
+            approval_token_hash="sha256:" + "e" * 64,
+            approval_decided_by="local-user",
+            approval_scope="once",
+            user_decision_timestamp=1_700_000_300,
+        )
+        store.write_pending(_record(
+            "req-b-reached",
+            metadata_jcs=reached_meta,
+            granted_by="req-b-approved",
+            resource_hash=resource_b,
+            payload_hash=payload_b,
+            created_at=1_700_000_400,
+        ))
+        store.transition("req-b-reached", "executed", result_hash="sha256:" + "f" * 64)
+
+    show_payload = build_events_show_payload(
+        evidence_path=paths.proxy_dir / "evidence.sqlite",
+        config_path=paths.config_path,
+        last=10,
+        verify=True,
+    )
+    text = format_local_proof_human_summary(show_payload)
+
+    assert "Target: resource:cccccccccccc" in text
+    assert "resource:aaaaaaaaaaaa" not in text
+    assert "approval required -> approved -> target reached" in text
+    assert "Result: write approved and completed" in text

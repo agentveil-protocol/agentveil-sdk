@@ -54,6 +54,7 @@ from agentveil_mcp_proxy.evidence.observability import (
     execution_record_id_by_parent,
     format_event_record,
 )
+from agentveil_mcp_proxy.evidence.events_show import build_local_proof_mcp_payload
 from agentveil_mcp_proxy.evidence.approval_grant import (
     ApprovalGrantError,
     verify_approval_grant,
@@ -1761,6 +1762,8 @@ def _assert_approval_retry_contract(data: dict[str, Any]) -> None:
     assert data["approved_retry_requires_same_tool"] is True
     assert data["approved_retry_requires_same_resource"] is True
     assert data["approved_retry_requires_same_payload"] is True
+    assert data["agent_continue_after_approval"] == "retry_same_tool_call_immediately"
+    assert data["retry_requires_new_user_message"] is False
     assert "auto-resume" not in json.dumps(data).lower()
     assert "automatic rerouting" not in json.dumps(data).lower()
 
@@ -2364,6 +2367,81 @@ def test_payload_drift_after_approval_requires_new_prompt(tmp_path):
         assert drifted_payload[0]["error"]["data"]["status"] == "approval_required"
         assert len(server.pending_prompts()) == 1
         assert server.pending_prompts()[0].request_id != parent_id
+    finally:
+        passthrough.stop()
+        server.stop()
+        store.close()
+
+
+def test_approval_continue_user_path_local_proof_shows_target_reached(tmp_path):
+    """Deterministic user path: approve, identical retry succeeds, drift reprompts."""
+
+    config = _config(policy_rule=_fake_downstream_write_approval_rule())
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        wait_for_decision=False,
+    )
+    log_path = tmp_path / "downstream.log"
+    passthrough = McpPassthrough(
+        DownstreamConfig(
+            command=sys.executable,
+            args=("-u", str(_filesystem_write_downstream(tmp_path, log_path))),
+            name="fake-downstream",
+            env={"DOWNSTREAM_LOG": str(log_path)},
+        ),
+        classifier=ToolCallClassifier(config, server_name="fake-downstream"),
+        approval_manager=manager,
+    )
+    passthrough.start()
+    try:
+        first = passthrough.handle_client_line(
+            _write_file_call(call_id="call-1", path="proof-target.txt", content="proof-body\n")
+        )
+        assert first[0]["error"]["data"]["status"] == "approval_required"
+        _assert_approval_retry_contract(first[0]["error"]["data"])
+        assert "Do not ask the user for another message" in first[0]["error"]["message"]
+
+        deadline = time.monotonic() + 2
+        while not server.pending_prompts() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        parent_id = server.pending_prompts()[0].request_id
+        with httpx.Client() as client:
+            csrf = _get_csrf(client, server.approval_url(parent_id))
+            assert _post_decision(
+                client,
+                server.approval_url(parent_id),
+                decision="approve",
+                csrf=csrf,
+            ).status_code == 200
+
+        retry = passthrough.handle_client_line(
+            _write_file_call(call_id="call-2", path="proof-target.txt", content="proof-body\n")
+        )
+        assert "result" in retry[0]
+        assert server.pending_prompts() == []
+
+        drift = passthrough.handle_client_line(
+            _write_file_call(call_id="call-3", path="proof-target.txt", content="proof-body\n\n")
+        )
+        assert drift[0]["error"]["data"]["status"] == "approval_required"
+        assert len(server.pending_prompts()) == 1
+        assert server.pending_prompts()[0].request_id != parent_id
+
+        payload = build_local_proof_mcp_payload(
+            evidence_path=store.db_path,
+            config_path=None,
+            last=10,
+            verify=True,
+        )
+        assert payload["status"] == "ok"
+        write_events = [
+            event
+            for event in payload["proof"]["events"]
+            if event.get("tool") == "write_file"
+        ]
+        assert any(event.get("decision") == "target_reached" for event in write_events)
+        assert payload["proof"]["verify"]["status"] in {"not_available", "intact", "failed"}
     finally:
         passthrough.stop()
         server.stop()
@@ -3413,7 +3491,7 @@ def test_approval_security_headers_do_not_allow_unsafe_inline_scripts() -> None:
     assert "script-src 'self' 'nonce-test-nonce-value'" in nonce_csp
 
 
-def test_post_decision_page_instructs_retry():
+def test_post_decision_approve_page_is_human_without_agent_prompt():
     server = ApprovalServer()
     server.start()
     try:
@@ -3425,16 +3503,22 @@ def test_post_decision_page_instructs_retry():
         text = response.text
         csp = response.headers.get("content-security-policy", "")
         _assert_no_unsafe_inline_script_csp(csp)
-        nonce = _extract_script_nonce(csp)
-        assert f'<script nonce="{nonce}"' in text
-        assert "Decision recorded" in text
-        assert "Retry the same MCP tool call" in text
-        assert "without changing tool, target, or payload" in text
+        assert "nonce-" not in csp
+        assert "<script" not in text
+        assert "Approval recorded" in text
+        assert "Return to your agent" in text
+        assert "ready for the approved action to continue" in text
         assert "Local proof" in text
-        assert "approval-local-proof-command" in text
-        assert "agentveil-mcp-proxy events show --last --verify" in text
-        assert "Copy command" in text
-        assert "After the agent retries the same MCP call" in text
+        assert "To inspect what happened, ask your agent:" in text
+        assert "Show AgentVeil local proof for the last action." in text
+        assert "Retry the same MCP tool call" not in text
+        assert "Immediately retry the exact same AgentVeil MCP tool call" not in text
+        assert '<code class="approval-local-proof-command"' not in text
+        assert 'class="approval-copy-command"' not in text
+        assert "Copy prompt" not in text
+        assert "Copy command" not in text
+        assert "local_proof MCP tool" not in text
+        assert "agentveil-mcp-proxy events show" not in text
         assert "/proof" not in text
         assert "auto-resume" not in text.lower()
     finally:
@@ -3459,8 +3543,10 @@ def test_post_decision_deny_page_points_to_local_proof():
         assert "denied and will not run" in text
         assert "Local proof" in text
         assert "approval-local-proof-command" in text
-        assert "agentveil-mcp-proxy events show --last --verify" in text
-        assert "Copy command" in text
+        assert "Show AgentVeil local proof using the local_proof MCP tool" in text
+        assert "Do not run shell commands" in text
+        assert "agentveil-mcp-proxy events show --last --verify" not in text
+        assert "Copy prompt" in text
         assert "This denial was recorded" in text
         assert "Retry the same MCP tool call" not in text
         assert "agent retries the same MCP call" not in text
@@ -3485,6 +3571,7 @@ def test_pending_approval_page_shows_quiet_local_recording_note():
         assert "This decision will be recorded locally" in text
         assert "approval-local-proof-command" not in text
         assert "Copy command" not in text
+        assert "Copy prompt" not in text
         assert "agentveil-mcp-proxy events show --last --verify" not in text
         assert "Local proof" not in text
         assert "/proof" not in text

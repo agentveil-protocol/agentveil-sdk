@@ -18,7 +18,10 @@ import webbrowser
 import agentveil_mcp_proxy.cli as proxy_cli
 from agentveil_mcp_proxy.cli import init_proxy, run_proxy
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore, ApprovalStatus
-from agentveil_mcp_proxy.evidence.observability import parse_controlled_path_metadata
+from agentveil_mcp_proxy.evidence.observability import (
+    APPROVAL_REQUIRED_INSTRUCTIONS,
+    parse_controlled_path_metadata,
+)
 from agentveil_mcp_proxy.passthrough import GIT_INSTRUCTION_SURFACE_RISK_MESSAGE
 
 from mcp_fake_downstream import (
@@ -285,10 +288,7 @@ def test_git_add_write_gated_before_mutation(tmp_path, monkeypatch):
     assert "Approval required" in response["error"]["message"]
     assert "same MCP tool call" in response["error"]["message"]
     assert "without changing tool, target, or payload" in response["error"]["message"]
-    assert response["error"]["data"]["instructions"] == (
-        "Approval required. Open the approval page, approve or deny, then retry the same "
-        "MCP tool call without changing tool, target, or payload."
-    )
+    assert response["error"]["data"]["instructions"] == APPROVAL_REQUIRED_INSTRUCTIONS
     data = response["error"]["data"]
     assert data["retry_contract"] == "same_tool_call"
     assert data["retry_same_tool_call"] is True

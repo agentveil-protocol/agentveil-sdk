@@ -343,10 +343,23 @@ _DEDICATED_USER_MESSAGE_REASONS = frozenset({
 _DEFAULT_HARD_DENY_NEXT_STEP = (
     "This action cannot be approved. Adjust the tool call or local policy."
 )
-_APPROVAL_REQUIRED_NEXT_STEP = (
-    "Open the approval page, approve or deny, then retry the same MCP tool call "
-    "without changing tool, target, or payload."
+APPROVAL_REQUIRED_INSTRUCTIONS = (
+    "Approval required. Open the approval page and wait while the user approves or denies. "
+    "After approval, immediately retry this exact same AgentVeil MCP tool call yourself "
+    "without changing tool, target, or payload. Do not ask the user for another message."
 )
+APPROVAL_REQUIRED_USER_MESSAGE = APPROVAL_REQUIRED_INSTRUCTIONS
+_APPROVAL_REQUIRED_NEXT_STEP = (
+    "Wait for the user to approve or deny in the approval page. "
+    "After approval, immediately retry this exact same AgentVeil MCP tool call yourself "
+    "without changing tool, target, or payload. Do not ask the user for another message."
+)
+APPROVAL_CONTINUE_AGENT_PROMPT = (
+    "Immediately retry the exact same AgentVeil MCP tool call that required approval. "
+    "Do not ask the user for another message. "
+    "After retry, use the local_proof MCP tool to inspect outcome. Do not run shell commands."
+)
+_AGENT_CONTINUE_AFTER_APPROVAL = "retry_same_tool_call_immediately"
 _RETRY_CONTRACT_SAME_TOOL_CALL = "same_tool_call"
 _TOOL_NOT_AVAILABLE_NEXT_STEP = (
     "Configure or enable the MCP route that advertises this tool."
@@ -365,7 +378,19 @@ def approval_retry_contract_fields() -> dict[str, Any]:
         "approved_retry_requires_same_tool": True,
         "approved_retry_requires_same_resource": True,
         "approved_retry_requires_same_payload": True,
+        "agent_continue_after_approval": _AGENT_CONTINUE_AFTER_APPROVAL,
+        "retry_requires_new_user_message": False,
     }
+
+
+def approval_required_actionable_message(approval_url: str) -> str:
+    """Return approval-required MCP error text that includes the approval URL."""
+
+    return (
+        f"Approval required. Open {approval_url}, wait for user approval, "
+        "then immediately retry this exact same MCP tool call without changing "
+        "tool, target, or payload. Do not ask the user for another message."
+    )
 
 
 def mcp_error_reason_code(reason: str) -> str:
@@ -448,8 +473,9 @@ def mcp_error_user_message(data: Mapping[str, Any]) -> str:
     reason = str(data.get("reason", ""))
     if status == "approval_required":
         return (
-            "Approval required. Open the approval page, approve or deny, "
-            "then retry the same MCP tool call without changing tool, target, or payload."
+            "Approval required. Open the approval page and wait while the user approves or denies. "
+            "After approval, immediately retry this exact same AgentVeil MCP tool call yourself "
+            "without changing tool, target, or payload. Do not ask the user for another message."
         )
     if reason == "path_outside_workspace":
         return _PATH_OUTSIDE_SANDBOX_USER_MESSAGE
