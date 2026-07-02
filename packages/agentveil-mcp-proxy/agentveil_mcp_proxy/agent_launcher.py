@@ -623,6 +623,21 @@ def _proxy_cli_argv(proxy_command: str, subcommand: list[str]) -> list[str]:
     return [proxy_command, *subcommand]
 
 
+def _proxy_cli_child_env() -> dict[str, str]:
+    """Return an env that lets child interpreters import this package reliably."""
+
+    env = dict(os.environ)
+    package_root = str(Path(__file__).resolve().parents[1])
+    existing = env.get("PYTHONPATH")
+    if existing:
+        paths = existing.split(os.pathsep)
+        if package_root not in paths:
+            env["PYTHONPATH"] = os.pathsep.join([package_root, existing])
+    else:
+        env["PYTHONPATH"] = package_root
+    return env
+
+
 def _proxy_command_display(proxy_command: str) -> str:
     command_path = Path(proxy_command)
     name = _command_name(proxy_command)
@@ -709,12 +724,16 @@ def _spawn_approval_center(
     passphrase_file: Path | None = None,
 ) -> subprocess.Popen[bytes]:
     config_path = proxy_dir(home) / "config.json"
+    log_path = proxy_dir(home) / "approval-center.startup.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_handle = open(log_path, "ab")
     devnull = subprocess.DEVNULL
     kwargs: dict[str, Any] = {
         "stdin": devnull,
-        "stdout": devnull,
-        "stderr": devnull,
+        "stdout": log_handle,
+        "stderr": log_handle,
         "close_fds": True,
+        "env": _proxy_cli_child_env(),
     }
     if os.name == "posix":
         kwargs["start_new_session"] = True
@@ -730,10 +749,13 @@ def _spawn_approval_center(
     ]
     if passphrase_file is not None:
         subcommand.extend(["--passphrase-file", str(passphrase_file)])
-    return subprocess.Popen(  # noqa: S603
-        _proxy_cli_argv(proxy_command, subcommand),
-        **kwargs,
-    )
+    try:
+        return subprocess.Popen(  # noqa: S603
+            _proxy_cli_argv(proxy_command, subcommand),
+            **kwargs,
+        )
+    finally:
+        log_handle.close()
 
 
 def _wait_for_center(home: Path, *, deadline: float) -> CenterStatus:

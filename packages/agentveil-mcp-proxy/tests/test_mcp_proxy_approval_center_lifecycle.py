@@ -190,6 +190,49 @@ def test_proxy_cli_argv_treats_windows_python_exe_as_interpreter():
     assert "approval-center" in argv[2]
 
 
+def test_proxy_cli_child_env_includes_package_root(monkeypatch):
+    from agentveil_mcp_proxy import agent_launcher
+
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+
+    env = agent_launcher._proxy_cli_child_env()
+    package_root = str(Path(agent_launcher.__file__).resolve().parents[1])
+
+    assert env["PYTHONPATH"] == package_root
+
+
+def test_proxy_cli_child_env_preserves_existing_pythonpath(monkeypatch):
+    from agentveil_mcp_proxy import agent_launcher
+
+    monkeypatch.setenv("PYTHONPATH", "existing-path")
+
+    env = agent_launcher._proxy_cli_child_env()
+    package_root = str(Path(agent_launcher.__file__).resolve().parents[1])
+
+    assert env["PYTHONPATH"].split(os.pathsep) == [package_root, "existing-path"]
+
+
+def test_managed_center_cli_argv_treats_python_as_interpreter():
+    from agentveil_mcp_proxy.approval.server import _proxy_cli_argv
+
+    argv = _proxy_cli_argv(sys.executable, ["approval-center", "serve"])
+
+    assert argv[1] == "-c"
+    assert "agentveil_mcp_proxy.cli" in argv[2]
+    assert "approval-center" in argv[2]
+
+
+def test_managed_center_child_env_includes_package_root(monkeypatch):
+    from agentveil_mcp_proxy.approval import server
+
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+
+    env = server._proxy_cli_child_env()
+    package_root = str(Path(server.__file__).resolve().parents[1])
+
+    assert env["PYTHONPATH"] == package_root
+
+
 def test_stale_manifest_is_not_running(managed_project_home):
     _project, home, _tracker = managed_project_home
     status = inspect_managed_approval_center(home)
@@ -262,6 +305,7 @@ def test_managed_approval_center_subprocess_start_stop_reuse(managed_project_hom
     pid = center.pid
     assert pid is not None
     assert is_process_alive(pid)
+    assert not (home / "mcp-proxy" / "approval-center.startup.log").exists()
 
     center2, started2, _reason2 = ensure_approval_center_running(
         home=home,
