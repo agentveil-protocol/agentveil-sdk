@@ -23,14 +23,18 @@ from agentveil_mcp_proxy.agent_launcher import (
     bounded_command_metadata,
     build_hermes_config_document,
     build_launch_diagnostics,
+    build_launch_doctor_report,
     build_launch_result_payload,
     build_launch_status,
     build_launch_status_view,
     CenterStatus,
+    classify_approval_wait_mode,
     classify_evidence_state,
     classify_mcp_route_state,
+    classify_provider_prerequisite,
     derive_protection_mode,
     ensure_interactive_connector_defaults,
+    format_launch_doctor_human,
     format_launch_result_human,
     format_launch_status_human,
     hermes_config_path,
@@ -58,6 +62,7 @@ from agentveil_mcp_proxy.agent_launcher import (
 )
 from agentveil_mcp_proxy.agent_runtime_profiles import GENERIC_PROCESS_PROFILE, HERMES_CLI_PROFILE
 from agentveil_mcp_proxy.evidence.events_show import LOCAL_PROOF_LAUNCHER_HINT
+from agentveil_mcp_proxy.evidence.store import ApprovalEvidenceStore, ApprovalStatus, PendingApproval
 
 
 def test_normalize_child_command_strips_separator():
@@ -1273,3 +1278,144 @@ def test_launch_result_payload_includes_child_outcome(tmp_path):
     payload = build_launch_result_payload(result=result, view=view)
     assert payload["child_outcome"] == "finished"
     assert payload["proof_hint"] == ""
+
+
+def test_launch_doctor_empty_project_is_not_ready(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    report = build_launch_doctor_report(
+        home=project_avp_home(project),
+        profile=GENERIC_PROCESS_PROFILE,
+        project_dir=project,
+        parent_env={},
+    )
+    assert report.project_route == "missing"
+    assert report.local_proof == "not initialized"
+    assert report.ready is False
+    assert report.provider_key == "not applicable"
+    assert "project_route" in report.blocking
+
+
+def test_launch_doctor_configured_route_without_evidence(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir()
+    home = project_avp_home(project)
+    (home / "mcp-proxy").mkdir(parents=True)
+    (home / "mcp-proxy" / "config.json").write_text(
+        json.dumps({"approval": {"wait_for_decision": True}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.agent_launcher.check_approval_center_status",
+        lambda _home: _center_state("running"),
+    )
+    report = build_launch_doctor_report(
+        home=home,
+        profile=GENERIC_PROCESS_PROFILE,
+        project_dir=project,
+        parent_env={},
+    )
+    assert report.project_route == "ready"
+    assert report.local_proof == "empty"
+    assert report.approval_center == "running"
+    assert report.approval_wait == "not applicable"
+
+
+def test_launch_doctor_observed_proof(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir()
+    home = project_avp_home(project)
+    (home / "mcp-proxy").mkdir(parents=True)
+    (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+    now = 1_700_000_000
+    record = PendingApproval(
+        request_id="req-doctor-proof",
+        session_id="session-1",
+        client_id="cursor:session-7",
+        downstream_server="filesystem",
+        tool_name="filesystem.read",
+        action_class="read",
+        risk_class="read",
+        resource_hash="sha256:" + "b" * 64,
+        payload_hash="sha256:" + "a" * 64,
+        policy_id="filesystem-default",
+        policy_rule_id="rule-read",
+        policy_context_hash="c" * 64,
+        status=ApprovalStatus.PENDING.value,
+        created_at=now,
+        expires_at=now + 3600,
+    )
+    with ApprovalEvidenceStore(home / "mcp-proxy" / "evidence.sqlite") as store:
+        store.write_pending(record)
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.agent_launcher.check_approval_center_status",
+        lambda _home: _center_state("running"),
+    )
+    report = build_launch_doctor_report(
+        home=home,
+        profile=GENERIC_PROCESS_PROFILE,
+        project_dir=project,
+        parent_env={},
+    )
+    assert report.local_proof == "observed"
+    assert report.evidence_state == "observed"
+
+
+def test_launch_doctor_hermes_provider_present_without_leaking_secret(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir()
+    home = project_avp_home(project)
+    (home / "mcp-proxy").mkdir(parents=True)
+    (home / "mcp-proxy" / "config.json").write_text(
+        json.dumps({"approval": {"wait_for_decision": True}}),
+        encoding="utf-8",
+    )
+    secret = "sk-test-secret-doctor-1234567890"
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.agent_launcher.check_approval_center_status",
+        lambda _home: _center_state("running"),
+    )
+    report = build_launch_doctor_report(
+        home=home,
+        profile=HERMES_CLI_PROFILE,
+        project_dir=project,
+        parent_env={"OPENAI_API_KEY": secret},
+    )
+    text = "\n".join(format_launch_doctor_human(report))
+    assert report.provider_key == "present"
+    assert secret not in text
+    assert secret not in json.dumps(report.to_dict())
+
+
+def test_launch_doctor_hermes_provider_missing(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    home = project_avp_home(project)
+    (home / "mcp-proxy").mkdir(parents=True)
+    (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+    report = build_launch_doctor_report(
+        home=home,
+        profile=HERMES_CLI_PROFILE,
+        project_dir=project,
+        parent_env={},
+    )
+    assert report.provider_key == "missing"
+    assert report.approval_wait == "not configured"
+    assert "provider_key" in report.blocking
+
+
+def test_classify_approval_wait_mode_read_only(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    home = project_avp_home(project)
+    config_path = home / "mcp-proxy" / "config.json"
+    assert classify_approval_wait_mode(home, GENERIC_PROCESS_PROFILE) == "not applicable"
+    assert classify_approval_wait_mode(home, HERMES_CLI_PROFILE) == "not configured"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(json.dumps({"approval": {"wait_for_decision": False}}), encoding="utf-8")
+    assert classify_approval_wait_mode(home, HERMES_CLI_PROFILE) == "not configured"
+    before = config_path.read_text(encoding="utf-8")
+    config_path.write_text(json.dumps({"approval": {"wait_for_decision": True}}), encoding="utf-8")
+    assert classify_approval_wait_mode(home, HERMES_CLI_PROFILE) == "enabled"
+    ensure_interactive_connector_defaults(config_path)
+    assert config_path.read_text(encoding="utf-8") != before

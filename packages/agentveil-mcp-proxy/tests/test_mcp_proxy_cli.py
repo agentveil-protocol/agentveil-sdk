@@ -2504,6 +2504,68 @@ def test_cli_launch_status_bounded_without_paths(tmp_path, capsys):
     assert str(tmp_path) not in json.dumps(payload)
 
 
+def test_cli_launch_doctor_requires_profile(tmp_path, capsys):
+    rc = main(["launch", "doctor", "--project-dir", str(tmp_path)])
+    assert rc == 2
+    assert "profile" in capsys.readouterr().err.lower()
+
+
+def test_cli_launch_doctor_empty_project_json(tmp_path, capsys):
+    rc = main([
+        "launch",
+        "doctor",
+        "--profile",
+        "generic-process",
+        "--project-dir",
+        str(tmp_path),
+        "--json",
+    ])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["action"] == "launch-doctor"
+    assert payload["project_route"] == "missing"
+    assert payload["local_proof"] == "not initialized"
+    assert payload["ready"] is False
+    assert payload["provider_key"] == "not applicable"
+    assert str(tmp_path) not in json.dumps(payload)
+
+
+def test_cli_launch_doctor_is_read_only(tmp_path, monkeypatch, capsys):
+    from agentveil_mcp_proxy import agent_launcher
+
+    called = {"launch": False, "center": False, "init_defaults": False}
+
+    def fake_launch(**_kwargs):
+        called["launch"] = True
+        raise AssertionError("launch_managed_process must not run for doctor")
+
+    def fake_center(**_kwargs):
+        called["center"] = True
+        raise AssertionError("ensure_approval_center_running must not run for doctor")
+
+    def fake_defaults(_path):
+        called["init_defaults"] = True
+        raise AssertionError("ensure_interactive_connector_defaults must not run for doctor")
+
+    monkeypatch.setattr(agent_launcher, "launch_managed_process", fake_launch)
+    monkeypatch.setattr(agent_launcher, "ensure_approval_center_running", fake_center)
+    monkeypatch.setattr(agent_launcher, "ensure_interactive_connector_defaults", fake_defaults)
+
+    rc = main([
+        "launch",
+        "doctor",
+        "--profile",
+        "hermes-cli",
+        "--project-dir",
+        str(tmp_path),
+    ])
+    assert rc == 0
+    assert called == {"launch": False, "center": False, "init_defaults": False}
+    text = capsys.readouterr().out
+    assert "AgentVeil launcher doctor" in text
+    assert "Provider key:" in text
+
+
 def test_cli_launch_status_reports_hermes_cli_from_manifest(tmp_path, capsys, monkeypatch):
     from agentveil_mcp_proxy.agent_launcher import (
         LAUNCH_MANIFEST_SCHEMA_VERSION,

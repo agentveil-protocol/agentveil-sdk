@@ -1433,6 +1433,270 @@ def build_launch_result_payload(
     return payload
 
 
+ProjectRouteState = Literal["ready", "missing"]
+ApprovalWaitState = Literal["enabled", "not configured", "not applicable"]
+ProviderKeyState = Literal["present", "missing", "not applicable"]
+
+
+@dataclass(frozen=True)
+class LaunchDoctorReport:
+    """Read-only managed-runtime preflight report."""
+
+    profile_id: str
+    profile_label: str
+    project_dir_ref: str
+    project_route: ProjectRouteState
+    approval_center: str
+    approval_wait: ApprovalWaitState
+    local_proof: str
+    provider_key: ProviderKeyState
+    evidence_state: EvidenceObservationState
+    mcp_route_state: McpRouteState
+    ready: bool
+    blocking: tuple[str, ...]
+    next_step: str
+    diagnostics: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "action": "launch-doctor",
+            "ok": self.ready,
+            "profile_id": self.profile_id,
+            "profile_label": self.profile_label,
+            "project_dir_ref": self.project_dir_ref,
+            "project_route": self.project_route,
+            "approval_center": self.approval_center,
+            "approval_wait": self.approval_wait,
+            "local_proof": self.local_proof,
+            "provider_key": self.provider_key,
+            "evidence_state": self.evidence_state,
+            "mcp_route_state": self.mcp_route_state,
+            "ready": self.ready,
+            "blocking": list(self.blocking),
+            "next_step": self.next_step,
+            "diagnostics": list(self.diagnostics),
+        }
+
+
+def _doctor_local_proof_label(state: EvidenceObservationState) -> str:
+    if state == "observed":
+        return "observed"
+    if state == "ready_no_records":
+        return "empty"
+    return "not initialized"
+
+
+def classify_approval_wait_mode(
+    home: Path,
+    profile: RuntimeProfileSpec,
+) -> ApprovalWaitState:
+    if profile.profile_id != "hermes-cli":
+        return "not applicable"
+    config_path = proxy_dir(home) / "config.json"
+    if not config_path.is_file():
+        return "not configured"
+    try:
+        config_payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return "not configured"
+    if not isinstance(config_payload, dict):
+        return "not configured"
+    approval = config_payload.get("approval")
+    if isinstance(approval, Mapping) and approval.get("wait_for_decision") is True:
+        return "enabled"
+    return "not configured"
+
+
+def classify_provider_prerequisite(
+    profile: RuntimeProfileSpec,
+    parent_env: Mapping[str, str] | None = None,
+) -> ProviderKeyState:
+    if profile.profile_id != "hermes-cli":
+        return "not applicable"
+    source = dict(parent_env or os.environ)
+    for key in ("DEEPSEEK_API_KEY", "OPENAI_API_KEY"):
+        value = source.get(key)
+        if isinstance(value, str) and value.strip():
+            return "present"
+    return "missing"
+
+
+def _doctor_route_source_diagnostics(home: Path) -> tuple[str, ...]:
+    route_path = runtime_route_path(home)
+    if not route_path.is_file():
+        return ()
+    try:
+        route_payload = json.loads(route_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return ()
+    if not isinstance(route_payload, Mapping):
+        return ()
+    proxy_command = str(route_payload.get("proxy_command") or "").strip()
+    if proxy_command in {"python", "python3", "agentveil-mcp-proxy"}:
+        return (
+            "Proxy route uses a module/source launch path; verify PYTHONPATH before launch.",
+        )
+    run_args = route_payload.get("run_args")
+    if isinstance(run_args, list) and any(
+        str(item) == "agentveil_mcp_proxy.cli" for item in run_args
+    ):
+        return (
+            "Proxy route uses a module/source launch path; verify PYTHONPATH before launch.",
+        )
+    return ()
+
+
+def build_launch_doctor_blocking(
+    *,
+    project_route: ProjectRouteState,
+    approval_center: CenterStatus,
+    approval_wait: ApprovalWaitState,
+    provider_key: ProviderKeyState,
+) -> tuple[str, ...]:
+    blocking: list[str] = []
+    if project_route == "missing":
+        blocking.append("project_route")
+    if approval_center.state != "running":
+        blocking.append("approval_center")
+    if approval_wait == "not configured":
+        blocking.append("approval_wait")
+    if provider_key == "missing":
+        blocking.append("provider_key")
+    return tuple(blocking)
+
+
+def build_launch_doctor_next_step(
+    *,
+    profile: RuntimeProfileSpec,
+    blocking: tuple[str, ...],
+    ready: bool,
+) -> str:
+    if ready:
+        return "Next: run `agentveil-mcp-proxy launch` normally."
+    if "project_route" in blocking:
+        return (
+            f"Next: initialize the project route with "
+            f"`agentveil-mcp-proxy launch --profile {profile.profile_id} ...`."
+        )
+    if "approval_center" in blocking:
+        return "Next: start or restart the Approval Center, then rerun launch doctor."
+    if "approval_wait" in blocking:
+        return (
+            "Next: enable approval wait mode for this project route, then rerun "
+            "launch doctor."
+        )
+    if "provider_key" in blocking:
+        return (
+            "Next: set DEEPSEEK_API_KEY or OPENAI_API_KEY in your environment, "
+            "then rerun launch doctor."
+        )
+    return "Next: resolve the blocking items above before launching."
+
+
+def build_launch_doctor_diagnostics(
+    *,
+    approval_center: CenterStatus,
+    project_route: ProjectRouteState,
+    evidence_state: EvidenceObservationState,
+    profile_id: str,
+    home: Path,
+) -> tuple[str, ...]:
+    diagnostics: list[str] = []
+    if approval_center.state == "down":
+        diagnostics.append(
+            "Approval Center is down; controlled MCP writes may fail until it is running."
+        )
+    elif approval_center.state == "stale":
+        diagnostics.append(
+            "Approval Center looks stale; restart it before launching an interactive agent."
+        )
+    if project_route == "missing":
+        diagnostics.append("Project MCP route is not initialized for this folder.")
+    if evidence_state == "ready_no_records":
+        diagnostics.append("Local proof store is ready but no actions have been recorded yet.")
+    elif evidence_state == "not_initialized":
+        diagnostics.append("Local proof store is not initialized.")
+    if profile_id == "hermes-cli":
+        diagnostics.append(
+            "Hermes launches require --toolsets agentveil to stay on the MCP route."
+        )
+    diagnostics.extend(_doctor_route_source_diagnostics(home))
+    return tuple(diagnostics)
+
+
+def build_launch_doctor_report(
+    *,
+    home: Path,
+    profile: RuntimeProfileSpec,
+    project_dir: Path,
+    parent_env: Mapping[str, str] | None = None,
+) -> LaunchDoctorReport:
+    config_exists = (proxy_dir(home) / "config.json").is_file()
+    mcp_route_state = classify_mcp_route_state(home)
+    project_route: ProjectRouteState = (
+        "ready" if mcp_route_state == "configured" else "missing"
+    )
+    approval_center = check_approval_center_status(home)
+    evidence_state = classify_evidence_state(home=home, config_exists=config_exists)
+    approval_wait = classify_approval_wait_mode(home, profile)
+    provider_key = classify_provider_prerequisite(profile, parent_env=parent_env)
+    blocking = build_launch_doctor_blocking(
+        project_route=project_route,
+        approval_center=approval_center,
+        approval_wait=approval_wait,
+        provider_key=provider_key,
+    )
+    ready = not blocking
+    diagnostics = build_launch_doctor_diagnostics(
+        approval_center=approval_center,
+        project_route=project_route,
+        evidence_state=evidence_state,
+        profile_id=profile.profile_id,
+        home=home,
+    )
+    next_step = build_launch_doctor_next_step(
+        profile=profile,
+        blocking=blocking,
+        ready=ready,
+    )
+    return LaunchDoctorReport(
+        profile_id=profile.profile_id,
+        profile_label=profile.display_name,
+        project_dir_ref=bounded_path_ref(project_dir)["ref"] or "",
+        project_route=project_route,
+        approval_center=approval_center.state,
+        approval_wait=approval_wait,
+        local_proof=_doctor_local_proof_label(evidence_state),
+        provider_key=provider_key,
+        evidence_state=evidence_state,
+        mcp_route_state=mcp_route_state,
+        ready=ready,
+        blocking=blocking,
+        next_step=next_step,
+        diagnostics=diagnostics,
+    )
+
+
+def format_launch_doctor_human(report: LaunchDoctorReport) -> list[str]:
+    lines = [
+        "AgentVeil launcher doctor",
+        "",
+        f"Profile:          {report.profile_id}",
+        f"Project route:    {report.project_route}",
+        f"Approval Center:  {report.approval_center}",
+        f"Approval wait:    {report.approval_wait}",
+        f"Local proof:      {report.local_proof}",
+    ]
+    if report.provider_key != "not applicable":
+        lines.append(f"Provider key:     {report.provider_key}")
+    lines.append("")
+    lines.append(report.next_step)
+    if report.diagnostics:
+        lines.append("Notes:")
+        lines.extend(f"  - {item}" for item in report.diagnostics)
+    return lines
+
+
 __all__ = [
     "AGENTVEIL_AVP_HOME_ENV",
     "AGENTVEIL_MCP_PROXY_COMMAND_ENV",
@@ -1444,6 +1708,7 @@ __all__ = [
     "HERMES_HOME_ENV",
     "HERMES_MCP_SERVER_NAME",
     "HERMES_MCP_TOOLSET",
+    "LaunchDoctorReport",
     "LaunchManifest",
     "LaunchResult",
     "LaunchStatus",
@@ -1451,6 +1716,10 @@ __all__ = [
     "ProtectionMode",
     "bounded_command_metadata",
     "build_hermes_config_document",
+    "build_launch_doctor_blocking",
+    "build_launch_doctor_diagnostics",
+    "build_launch_doctor_next_step",
+    "build_launch_doctor_report",
     "build_launch_diagnostics",
     "build_launch_next_step",
     "build_launch_proof_hint",
@@ -1459,12 +1728,16 @@ __all__ = [
     "build_launch_status",
     "build_launch_status_view",
     "check_approval_center_status",
+    "classify_approval_wait_mode",
     "classify_evidence_state",
     "classify_mcp_route_state",
+    "classify_provider_prerequisite",
     "derive_protection_mode",
     "ensure_approval_center_running",
     "ensure_interactive_connector_defaults",
     "ensure_runtime_state_home",
+    "format_launch_doctor_human",
+    "format_launch_result_human",
     "format_launch_status_human",
     "hermes_config_path",
     "hermes_native_tool_containment_note",

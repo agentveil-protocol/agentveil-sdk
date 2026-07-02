@@ -3223,8 +3223,14 @@ def build_parser() -> argparse.ArgumentParser:
             "  agentveil-mcp-proxy launch --profile hermes-cli --project-dir . -- \\\n"
             "    hermes chat --toolsets agentveil -q \"…\"\n"
             "  agentveil-mcp-proxy launch status --project-dir .\n"
+            "  agentveil-mcp-proxy launch doctor --profile hermes-cli --project-dir .\n"
             "  agentveil-mcp-proxy launch stop --project-dir ."
         ),
+    )
+    launch.add_argument(
+        "--launch-doctor",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     launch.add_argument(
         "--launch-status",
@@ -4583,9 +4589,11 @@ def _normalize_launch_argv(argv: list[str]) -> list[str]:
         return argv
     if len(argv) >= 2 and argv[1] == "status":
         return ["launch", "--launch-status", *argv[2:]]
+    if len(argv) >= 2 and argv[1] == "doctor":
+        return ["launch", "--launch-doctor", *argv[2:]]
     if len(argv) >= 2 and argv[1] == "stop":
         return ["launch", "--launch-stop", *argv[2:]]
-    if "--launch-child" in argv or "--launch-status" in argv or "--launch-stop" in argv:
+    if "--launch-child" in argv or "--launch-status" in argv or "--launch-stop" in argv or "--launch-doctor" in argv:
         return argv
     rest = argv[1:]
     if "--" in rest:
@@ -4888,6 +4896,51 @@ def run_launch_status_cli(
         _print_operator_json({"ok": True, "action": "launch-status", **view.to_dict()})
     else:
         for line in format_launch_status_human(view):
+            print(line)
+    return 0
+
+
+def run_launch_doctor_cli(
+    *,
+    profile_id: str | None,
+    project_dir: Path | None,
+    output_json: bool,
+) -> int:
+    """Read-only preflight for a managed runtime launch."""
+
+    from agentveil_mcp_proxy.agent_launcher import (
+        AgentLauncherError,
+        build_launch_doctor_report,
+        format_launch_doctor_human,
+        project_avp_home,
+        resolve_project_dir,
+    )
+    from agentveil_mcp_proxy.agent_runtime_profiles import (
+        RuntimeProfileError,
+        resolve_runtime_profile,
+    )
+
+    if not profile_id:
+        raise ProxyCliError("--profile is required for launch doctor", exit_code=2)
+
+    try:
+        profile = resolve_runtime_profile(profile_id)
+        target = resolve_project_dir(project_dir)
+        home = project_avp_home(target)
+        report = build_launch_doctor_report(
+            home=home,
+            profile=profile,
+            project_dir=target,
+            parent_env=os.environ,
+        )
+    except (AgentLauncherError, RuntimeProfileError) as exc:
+        exit_code = exc.exit_code if isinstance(exc, AgentLauncherError) else 2
+        raise ProxyCliError(str(exc), exit_code=exit_code) from exc
+
+    if output_json:
+        _print_operator_json(report.to_dict())
+    else:
+        for line in format_launch_doctor_human(report):
             print(line)
     return 0
 
@@ -5957,10 +6010,18 @@ def main(argv: list[str] | None = None) -> int:
                 port=args.port,
             )
         if args.command == "launch":
-            if args.choose_folder and (args.launch_status or args.launch_stop):
+            if args.choose_folder and (
+                args.launch_status or args.launch_stop or args.launch_doctor
+            ):
                 raise ProxyCliError(
-                    "--choose-folder is only supported for launch, not launch status/stop",
+                    "--choose-folder is only supported for launch, not launch status/stop/doctor",
                     exit_code=2,
+                )
+            if args.launch_doctor:
+                return run_launch_doctor_cli(
+                    profile_id=args.profile,
+                    project_dir=args.project_dir,
+                    output_json=args.json_output,
                 )
             if args.launch_status:
                 return run_launch_status_cli(
