@@ -1589,7 +1589,12 @@ def _path_match_tokens(path: Path) -> tuple[str, ...]:
 
 
 def _cmdline_contains_path(cmd: str, path: Path) -> bool:
-    return any(token in cmd for token in _path_match_tokens(path))
+    cmd_variants = {cmd, cmd.replace("\\", "/"), cmd.replace("/", "\\")}
+    return any(
+        token in cmd_variant
+        for cmd_variant in cmd_variants
+        for token in _path_match_tokens(path)
+    )
 
 
 def _read_process_command(pid: int) -> str:
