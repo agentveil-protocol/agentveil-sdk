@@ -7,7 +7,11 @@ from html import escape
 import hashlib
 import json
 import hmac
+import os
+import signal
+import subprocess
 from http import HTTPStatus
+from pathlib import Path
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import secrets
@@ -1496,6 +1500,483 @@ details {{ margin: 8px 0 12px; }}
         self.close_connection = True
 
 
+_MANAGED_CENTER_START_TIMEOUT_SECONDS = 12.0
+_MANAGED_CENTER_POLL_INTERVAL_SECONDS = 0.2
+_MANAGED_CENTER_STOP_GRACE_SECONDS = 2.0
+
+
+@dataclass(frozen=True)
+class ManagedApprovalCenterStatus:
+    """Bounded managed Approval Center status for launcher/setup reporting."""
+
+    state: str  # running | stale | down
+    pid: int | None
+    port: int | None
+
+
+@dataclass(frozen=True)
+class ManagedApprovalCenterEnsureResult:
+    status: ManagedApprovalCenterStatus
+    started: bool
+    reused: bool
+    restarted: bool
+    reason: str
+
+
+def _managed_center_proxy_dir(home: Path) -> Path:
+    return Path(home) / "mcp-proxy"
+
+
+def inspect_managed_approval_center(home: Path) -> ManagedApprovalCenterStatus:
+    from agentveil_mcp_proxy.approval.persistent import (
+        load_manifest,
+        manifest_is_reachable,
+    )
+
+    manifest = load_manifest(_managed_center_proxy_dir(home))
+    if manifest is None:
+        return ManagedApprovalCenterStatus(state="down", pid=None, port=None)
+    if manifest_is_reachable(manifest):
+        return ManagedApprovalCenterStatus(
+            state="running",
+            pid=manifest.pid,
+            port=manifest.port,
+        )
+    return ManagedApprovalCenterStatus(
+        state="stale",
+        pid=manifest.pid,
+        port=manifest.port,
+    )
+
+
+def clear_managed_approval_center_manifest(home: Path) -> bool:
+    from agentveil_mcp_proxy.approval.persistent import manifest_path
+
+    path = manifest_path(_managed_center_proxy_dir(home))
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        return False
+    return True
+
+
+def _managed_center_config_path(home: Path) -> Path:
+    return _managed_center_proxy_dir(home) / "config.json"
+
+
+def _path_match_tokens(path: Path) -> tuple[str, ...]:
+    """Return path spellings that may appear in ``ps`` output on macOS."""
+
+    tokens: set[str] = set()
+    raw = Path(path)
+    tokens.add(str(raw))
+    try:
+        resolved = str(raw.resolve())
+        tokens.add(resolved)
+        real = os.path.realpath(str(raw))
+        tokens.add(real)
+    except OSError:
+        pass
+    for value in list(tokens):
+        if value.startswith("/private/"):
+            tokens.add(value[len("/private") :])
+        elif value.startswith("/"):
+            tokens.add(f"/private{value}")
+    return tuple(token for token in tokens if token)
+
+
+def _cmdline_contains_path(cmd: str, path: Path) -> bool:
+    return any(token in cmd for token in _path_match_tokens(path))
+
+
+def _read_process_command(pid: int) -> str:
+    """Return the best-effort full command line for a PID."""
+
+    if os.name != "posix":
+        return ""
+    for argv in (
+        ["ps", "-ww", "-p", str(pid), "-o", "args="],
+        ["ps", "-p", str(pid), "-o", "args="],
+        ["ps", "-p", str(pid), "-o", "command="],
+    ):
+        try:
+            result = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=2.0,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        cmd = result.stdout.strip()
+        if result.returncode == 0 and cmd:
+            return cmd
+    return ""
+
+
+def _process_cmdline_matches_managed_center(home: Path, pid: int) -> bool:
+    """Best-effort cmdline proof that pid is our approval-center serve process."""
+
+    cmd = _read_process_command(pid)
+    if not cmd:
+        return False
+    lowered = cmd.lower()
+    if "approval-center" not in lowered or "serve" not in lowered:
+        return False
+    if not _cmdline_contains_path(cmd, home):
+        return False
+    config = _managed_center_config_path(home)
+    if _cmdline_contains_path(cmd, config):
+        return True
+    config_suffix = "/mcp-proxy/config.json"
+    return any(f"{token}{config_suffix}" in cmd for token in _path_match_tokens(home))
+
+
+def scan_cmdline_proven_managed_center_pids(home: Path) -> tuple[int, ...]:
+    """Return PIDs whose cmdline proves they serve this project's Approval Center."""
+
+    if os.name != "posix":
+        return ()
+    try:
+        result = subprocess.run(
+            ["ps", "ax", "-o", "pid=,command="],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ()
+    if result.returncode != 0:
+        return ()
+    matched: set[int] = set()
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        pid_text, _, cmd = stripped.partition(" ")
+        if not pid_text.isdigit() or not cmd:
+            continue
+        pid = int(pid_text)
+        if _process_cmdline_matches_managed_center(home, pid):
+            matched.add(pid)
+    return tuple(sorted(matched))
+
+
+def managed_center_cmdline_owns_pid(home: Path, pid: int) -> bool:
+    return _managed_process_is_active(pid) and _process_cmdline_matches_managed_center(
+        home, pid
+    )
+
+
+def managed_center_owns_pid(home: Path, manifest: Any) -> bool:
+    """Return True only when pid is provably this project's managed Approval Center."""
+
+    from agentveil_mcp_proxy.approval.persistent import manifest_is_reachable
+
+    pid = manifest.pid
+    if pid is None or not _managed_process_is_active(pid):
+        return False
+    if manifest_is_reachable(manifest):
+        return True
+    return _process_cmdline_matches_managed_center(home, pid)
+
+
+def _managed_process_is_active(pid: int | None) -> bool:
+    """Return True when pid refers to a live, non-zombie process."""
+
+    from agentveil_mcp_proxy.approval.persistent import is_process_alive
+
+    if not is_process_alive(pid):
+        return False
+    if pid is None or os.name != "posix":
+        return True
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "stat="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return True
+    if result.returncode != 0:
+        return False
+    state = result.stdout.strip()
+    return bool(state) and "Z" not in state
+
+
+def terminate_managed_approval_center_pid(
+    pid: int,
+    *,
+    grace_seconds: float = _MANAGED_CENTER_STOP_GRACE_SECONDS,
+) -> bool:
+    if not _managed_process_is_active(pid):
+        return True
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        if not _managed_process_is_active(pid):
+            return True
+        time.sleep(0.05)
+
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+
+    kill_deadline = time.monotonic() + 1.0
+    while time.monotonic() < kill_deadline:
+        if not _managed_process_is_active(pid):
+            return True
+        time.sleep(0.05)
+    return not _managed_process_is_active(pid)
+
+
+def stop_managed_approval_center(
+    home: Path,
+    *,
+    require_healthy: bool = False,
+) -> dict[str, Any]:
+    """Stop only the Approval Center PID recorded in this project's manifest."""
+
+    from agentveil_mcp_proxy.approval.persistent import load_manifest, manifest_is_reachable
+
+    proxy_dir = _managed_center_proxy_dir(home)
+    manifest = load_manifest(proxy_dir)
+    if manifest is None or manifest.pid is None:
+        clear_managed_approval_center_manifest(home)
+        return {
+            "stopped": False,
+            "pid": None,
+            "reason": "no managed approval-center manifest",
+        }
+
+    pid = manifest.pid
+    healthy = manifest_is_reachable(manifest)
+    owns = managed_center_owns_pid(home, manifest)
+    unowned_reason = (
+        "manifest pid is not a proven AgentVeil Approval Center; "
+        "manifest cleared without kill"
+    )
+
+    if require_healthy:
+        if not healthy:
+            if _managed_process_is_active(pid):
+                if managed_center_cmdline_owns_pid(home, pid):
+                    stopped = terminate_managed_approval_center_pid(pid)
+                    clear_managed_approval_center_manifest(home)
+                    if stopped:
+                        reason = "managed approval-center stopped"
+                    else:
+                        reason = "managed approval-center stop did not confirm pid exit"
+                    return {"stopped": stopped, "pid": pid, "reason": reason}
+                return {
+                    "stopped": False,
+                    "pid": pid,
+                    "reason": (
+                        "manifest pid is not a healthy AgentVeil Approval Center; not stopped"
+                    ),
+                }
+            clear_managed_approval_center_manifest(home)
+            return {
+                "stopped": False,
+                "pid": pid,
+                "reason": "managed pid not alive; manifest cleared",
+            }
+        if not owns:
+            clear_managed_approval_center_manifest(home)
+            return {"stopped": False, "pid": pid, "reason": unowned_reason}
+    elif _managed_process_is_active(pid) and not owns:
+        clear_managed_approval_center_manifest(home)
+        return {"stopped": False, "pid": pid, "reason": unowned_reason}
+
+    stopped = False
+    if _managed_process_is_active(pid):
+        stopped = terminate_managed_approval_center_pid(pid)
+    clear_managed_approval_center_manifest(home)
+    if stopped:
+        reason = "managed approval-center stopped"
+    elif not _managed_process_is_active(pid):
+        reason = "managed pid already exited; manifest cleared"
+    else:
+        reason = "managed approval-center stop did not confirm pid exit"
+    return {"stopped": stopped, "pid": pid, "reason": reason}
+
+
+def prepare_stale_managed_approval_center(home: Path) -> dict[str, Any]:
+    """Remove a stale managed center before starting a replacement."""
+
+    from agentveil_mcp_proxy.approval.persistent import load_manifest
+
+    status = inspect_managed_approval_center(home)
+    if status.state != "stale":
+        return {"prepared": False, "reason": "approval center is not stale", "pid": status.pid}
+
+    manifest = load_manifest(_managed_center_proxy_dir(home))
+    if manifest is None or manifest.pid is None:
+        clear_managed_approval_center_manifest(home)
+        return {
+            "prepared": True,
+            "stopped": False,
+            "pid": None,
+            "reason": "stale manifest cleared",
+        }
+
+    pid = manifest.pid
+    if _managed_process_is_active(pid) and (
+        managed_center_cmdline_owns_pid(home, pid)
+        or managed_center_owns_pid(home, manifest)
+    ):
+        stopped = terminate_managed_approval_center_pid(pid)
+        if not stopped and managed_center_cmdline_owns_pid(home, pid):
+            stopped = terminate_managed_approval_center_pid(pid, grace_seconds=0.25)
+        clear_managed_approval_center_manifest(home)
+        if stopped:
+            reason = "stale managed approval-center stopped"
+        else:
+            reason = "stale manifest cleared; managed stop did not confirm pid exit"
+        return {"prepared": True, "stopped": stopped, "pid": pid, "reason": reason}
+
+    clear_managed_approval_center_manifest(home)
+    return {
+        "prepared": True,
+        "stopped": False,
+        "pid": pid,
+        "reason": "stale manifest cleared without killing unowned pid",
+    }
+
+
+def spawn_managed_approval_center_process(
+    *,
+    proxy_command: str,
+    home: Path,
+    passphrase_file: Path | None = None,
+) -> subprocess.Popen[bytes]:
+    """Spawn ``approval-center serve`` as a detached background process."""
+
+    config_path = _managed_center_config_path(home)
+    devnull = subprocess.DEVNULL
+    kwargs: dict[str, Any] = {
+        "stdin": devnull,
+        "stdout": devnull,
+        "stderr": devnull,
+        "close_fds": True,
+    }
+    if os.name == "posix":
+        kwargs["start_new_session"] = True
+    args = [
+        proxy_command,
+        "approval-center",
+        "serve",
+        "--home",
+        str(home),
+        "--config",
+        str(config_path),
+        "--port",
+        "0",
+    ]
+    if passphrase_file is not None:
+        args.extend(["--passphrase-file", str(passphrase_file)])
+    return subprocess.Popen(  # noqa: S603 - args constructed from validated paths
+        args,
+        **kwargs,
+    )
+
+
+def ensure_managed_approval_center_for_cli(
+    *,
+    home: Path,
+    proxy_command: str,
+    passphrase_file: Path | None = None,
+) -> ManagedApprovalCenterEnsureResult:
+    """Idempotently ensure a healthy project-local Approval Center for setup flows."""
+
+    def spawn() -> None:
+        spawn_managed_approval_center_process(
+            proxy_command=proxy_command,
+            home=home,
+            passphrase_file=passphrase_file,
+        )
+
+    return ensure_managed_approval_center_running(home=home, spawn=spawn)
+
+
+def ensure_managed_approval_center_running(
+    *,
+    home: Path,
+    spawn: Callable[[], Any],
+    wait_for_running: Callable[[Path, float], ManagedApprovalCenterStatus] | None = None,
+) -> ManagedApprovalCenterEnsureResult:
+    """Reuse a healthy managed center or replace stale state before spawning."""
+
+    initial = inspect_managed_approval_center(home)
+    if initial.state == "running":
+        return ManagedApprovalCenterEnsureResult(
+            status=initial,
+            started=False,
+            reused=True,
+            restarted=False,
+            reason="approval center already running",
+        )
+
+    restarted = initial.state == "stale"
+    if restarted:
+        prepare_stale_managed_approval_center(home)
+
+    try:
+        spawn()
+    except (OSError, ValueError) as exc:
+        return ManagedApprovalCenterEnsureResult(
+            status=initial,
+            started=False,
+            reused=False,
+            restarted=False,
+            reason=f"could not spawn approval center: {exc.__class__.__name__}",
+        )
+
+    waiter = wait_for_running or _default_wait_for_managed_center_running
+    deadline = time.monotonic() + _MANAGED_CENTER_START_TIMEOUT_SECONDS
+    final = waiter(home, deadline)
+    if final.state == "running":
+        return ManagedApprovalCenterEnsureResult(
+            status=final,
+            started=True,
+            reused=False,
+            restarted=restarted,
+            reason="approval center restarted" if restarted else "approval center started",
+        )
+    return ManagedApprovalCenterEnsureResult(
+        status=final,
+        started=False,
+        reused=False,
+        restarted=False,
+        reason="approval center did not become healthy within the start timeout",
+    )
+
+
+def _default_wait_for_managed_center_running(
+    home: Path,
+    deadline: float,
+) -> ManagedApprovalCenterStatus:
+    last = inspect_managed_approval_center(home)
+    while time.monotonic() < deadline:
+        last = inspect_managed_approval_center(home)
+        if last.state == "running":
+            return last
+        time.sleep(_MANAGED_CENTER_POLL_INTERVAL_SECONDS)
+    return last
+
+
 __all__ = [
     "APPROVAL_DECISION_DENIED_BODY",
     "APPROVAL_DECISION_RECORDED_BODY",
@@ -1504,7 +1985,8 @@ __all__ = [
     "APPROVAL_POST_APPROVE_PROOF_PROMPT",
     "APPROVAL_LOCAL_URL_WARNING",
     "INTERNAL_REGISTER_TOKEN_HEADER",
-    "ApprovalPrompt",
+    "ManagedApprovalCenterEnsureResult",
+    "ManagedApprovalCenterStatus",
     "ApprovalServer",
     "ApprovalServerDecision",
     "ApprovalServerError",
@@ -1512,9 +1994,19 @@ __all__ = [
     "SECURITY_HEADERS",
     "approval_content_security_policy",
     "approval_security_headers",
-    "generate_approval_script_nonce",
+    "clear_managed_approval_center_manifest",
+    "ensure_managed_approval_center_for_cli",
+    "ensure_managed_approval_center_running",
+    "inspect_managed_approval_center",
+    "managed_center_cmdline_owns_pid",
+    "managed_center_owns_pid",
+    "prepare_stale_managed_approval_center",
+    "scan_cmdline_proven_managed_center_pids",
+    "spawn_managed_approval_center_process",
     "render_local_proof_block",
     "render_local_proof_prompt_block",
+    "stop_managed_approval_center",
+    "terminate_managed_approval_center_pid",
     "TERMINAL_ALREADY_DECIDED",
     "TERMINAL_ALREADY_DECIDED_APPROVE",
     "TERMINAL_ALREADY_DECIDED_DENY",

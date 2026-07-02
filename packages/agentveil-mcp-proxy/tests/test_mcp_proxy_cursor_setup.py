@@ -330,13 +330,23 @@ def test_stop_does_not_kill_unhealthy_manifest(tmp_path: Path, monkeypatch) -> N
             started_at=1,
         ),
     )
-    monkeypatch.setattr(cursor_setup, "is_process_alive", lambda _pid: True)
-    monkeypatch.setattr(cursor_setup, "_center_health", lambda _manifest: False)
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.approval.server._managed_process_is_active",
+        lambda _pid: True,
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.approval.persistent.manifest_is_reachable",
+        lambda _manifest: False,
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.approval.server.managed_center_cmdline_owns_pid",
+        lambda _home, _pid: False,
+    )
 
     def fail_kill(_pid, _signal):
         raise AssertionError("must not kill an unhealthy/non-AgentVeil manifest pid")
 
-    monkeypatch.setattr("agentveil_mcp_proxy.cursor_setup.os.kill", fail_kill)
+    monkeypatch.setattr("agentveil_mcp_proxy.approval.server.os.kill", fail_kill)
     result = cursor_setup.stop_managed_approval_center(home)
     assert result["stopped"] is False
     assert "not a healthy AgentVeil Approval Center" in result["reason"]
@@ -353,10 +363,14 @@ def test_ensure_approval_center_spawn_failure_returns_without_long_wait(
     def fail_spawn(**_kwargs):
         raise OSError("spawn unavailable in unit test")
 
-    monkeypatch.setattr(cursor_setup, "_spawn_approval_center", fail_spawn)
-    monkeypatch.setattr(cursor_setup, "check_approval_center_status", lambda _home: cursor_setup.CenterStatus(
-        state="down", pid=None, port=None,
-    ))
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.approval.server.spawn_managed_approval_center_process",
+        fail_spawn,
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.approval.server.inspect_managed_approval_center",
+        lambda _home: SimpleNamespace(state="down", pid=None, port=None),
+    )
 
     result = cursor_setup.ensure_approval_center_running(
         home=home,

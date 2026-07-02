@@ -669,12 +669,14 @@ def _center_health(manifest: ApprovalCenterManifest) -> bool:
 
 
 def check_approval_center_status(home: Path) -> CenterStatus:
-    manifest = load_manifest(proxy_dir(home))
-    if manifest is None:
-        return CenterStatus(state="down", pid=None, port=None)
-    if _center_health(manifest):
-        return CenterStatus(state="running", pid=manifest.pid, port=manifest.port)
-    return CenterStatus(state="stale", pid=manifest.pid, port=manifest.port)
+    from agentveil_mcp_proxy.approval.server import inspect_managed_approval_center
+
+    managed = inspect_managed_approval_center(home)
+    return CenterStatus(
+        state=managed.state,
+        pid=managed.pid,
+        port=managed.port,
+    )
 
 
 def _spawn_approval_center(
@@ -727,25 +729,22 @@ def ensure_approval_center_running(
     proxy_command: str,
     passphrase_file: Path | None = None,
 ) -> tuple[CenterStatus, bool, str]:
-    initial = check_approval_center_status(home)
-    if initial.state == "running":
-        return initial, False, "approval center already running"
+    from agentveil_mcp_proxy.approval.server import ensure_managed_approval_center_running
 
-    try:
+    def spawn() -> None:
         _spawn_approval_center(
             proxy_command=proxy_command,
             home=home,
             passphrase_file=passphrase_file,
         )
-    except (OSError, ValueError) as exc:
-        return initial, False, f"could not spawn approval center: {exc.__class__.__name__}"
 
-    deadline = time.monotonic() + _CENTER_START_TIMEOUT_SECONDS
-    final = _wait_for_center(home, deadline=deadline)
-    if final.state == "running":
-        action = "restarted" if initial.state == "stale" else "started"
-        return final, True, f"approval center {action}"
-    return final, False, "approval center did not become healthy within the start timeout"
+    managed = ensure_managed_approval_center_running(home=home, spawn=spawn)
+    center = CenterStatus(
+        state=managed.status.state,
+        pid=managed.status.pid,
+        port=managed.status.port,
+    )
+    return center, managed.started, managed.reason
 
 
 def _bounded_child_env(
@@ -1071,34 +1070,12 @@ def stop_managed_launch(*, project_dir: Path) -> dict[str, Any]:
     else:
         reasons.append("no managed child manifest")
 
-    center_manifest = load_manifest(proxy_dir(home))
-    if center_manifest is not None and center_manifest.pid is not None:
-        if _center_health(center_manifest) and is_process_alive(center_manifest.pid):
-            try:
-                os.kill(center_manifest.pid, signal.SIGTERM)
-                stopped_center = True
-                reasons.append("managed approval center stopped")
-            except ProcessLookupError:
-                reasons.append("managed approval center already exited")
-            except PermissionError:
-                reasons.append("no permission to stop managed approval center")
-            else:
-                for _ in range(20):
-                    if not is_process_alive(center_manifest.pid):
-                        break
-                    time.sleep(0.1)
-            try:
-                approval_manifest_path(proxy_dir(home)).unlink(missing_ok=True)
-            except OSError:
-                pass
-        elif not is_process_alive(center_manifest.pid):
-            try:
-                approval_manifest_path(proxy_dir(home)).unlink(missing_ok=True)
-            except OSError:
-                pass
-            reasons.append("managed approval center manifest cleared")
-    else:
-        reasons.append("no managed approval center")
+    from agentveil_mcp_proxy.approval.server import stop_managed_approval_center
+
+    center_stop = stop_managed_approval_center(home, require_healthy=False)
+    stopped_center = bool(center_stop.get("stopped"))
+    center_reason = str(center_stop.get("reason") or "managed approval center stop attempted")
+    reasons.append(center_reason)
 
     return {
         "stopped_child": stopped_child,

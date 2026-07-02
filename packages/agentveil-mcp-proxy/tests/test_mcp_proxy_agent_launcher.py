@@ -423,18 +423,15 @@ def test_stop_managed_launch_only_stops_owned_processes(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         "agentveil_mcp_proxy.agent_launcher.is_process_alive",
-        lambda pid: pid in {9001, 9002},
+        lambda pid: pid == 9001,
     )
     monkeypatch.setattr(
-        "agentveil_mcp_proxy.agent_launcher.load_manifest",
-        lambda _proxy_dir: SimpleNamespace(
-            pid=9002,
-            approval_center_url=lambda: "http://127.0.0.1:8765/approval/token",
-        ),
-    )
-    monkeypatch.setattr(
-        "agentveil_mcp_proxy.agent_launcher._center_health",
-        lambda _manifest: True,
+        "agentveil_mcp_proxy.approval.server.stop_managed_approval_center",
+        lambda _home, **kwargs: {
+            "stopped": True,
+            "pid": 9002,
+            "reason": "managed approval-center stopped",
+        },
     )
 
     def fake_kill(pid, _sig):
@@ -445,7 +442,7 @@ def test_stop_managed_launch_only_stops_owned_processes(tmp_path, monkeypatch):
     outcome = stop_managed_launch(project_dir=project)
     assert outcome["stopped_child"] is True
     assert outcome["stopped_center"] is True
-    assert set(killed) == {9001, 9002}
+    assert set(killed) == {9001}
 
 
 # ----- P0.13b: hermes-cli profile ------------------------------------------------

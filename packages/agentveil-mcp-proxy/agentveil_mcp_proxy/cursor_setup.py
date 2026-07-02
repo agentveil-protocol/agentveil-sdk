@@ -13,22 +13,12 @@ import json
 import os
 import secrets
 import shlex
-import signal
 import stat
-import subprocess
 import sys
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from agentveil_mcp_proxy.approval.persistent import (
-    ApprovalCenterManifest,
-    is_process_alive,
-    load_manifest,
-    loopback_get_status,
-    manifest_path,
-)
 from agentveil_mcp_proxy.client_connect import resolve_cursor_global_mcp_json_path
 from agentveil_mcp_proxy.cursor_hooks import AGENTVEIL_MCP_SERVER_KEY
 from agentveil_mcp_proxy.cursor_user_mcp import (
@@ -664,14 +654,6 @@ def detect_competing_global_route() -> bool:
     return False
 
 
-def _center_health(manifest: ApprovalCenterManifest) -> bool:
-    url = f"{manifest.approval_center_url()}/api/approvals"
-    try:
-        return loopback_get_status(url, timeout=_HEALTH_TIMEOUT_SECONDS) == 200
-    except (OSError, TimeoutError, ValueError):
-        return False
-
-
 @dataclass(frozen=True)
 class CenterStatus:
     state: str
@@ -680,14 +662,10 @@ class CenterStatus:
 
 
 def check_approval_center_status(home: Path) -> CenterStatus:
-    manifest = load_manifest(_proxy_dir(home))
-    if manifest is None:
-        return CenterStatus(state="down", pid=None, port=None)
-    alive = is_process_alive(manifest.pid)
-    healthy = _center_health(manifest) if alive else False
-    if alive and healthy:
-        return CenterStatus(state="running", pid=manifest.pid, port=manifest.port)
-    return CenterStatus(state="stale", pid=manifest.pid, port=manifest.port)
+    from agentveil_mcp_proxy.approval.server import inspect_managed_approval_center
+
+    managed = inspect_managed_approval_center(home)
+    return CenterStatus(state=managed.state, pid=managed.pid, port=managed.port)
 
 
 @dataclass(frozen=True)
@@ -699,115 +677,37 @@ class EnsureCenterResult:
     reason: str
 
 
-def _spawn_approval_center(
-    *,
-    proxy_command: str,
-    home: Path,
-    passphrase_file: Path | None = None,
-) -> subprocess.Popen[bytes]:
-    config = proxy_config_path(home)
-    kwargs: dict[str, Any] = {
-        "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
-        "close_fds": True,
-    }
-    if os.name == "posix":
-        kwargs["start_new_session"] = True
-    args = [
-        proxy_command,
-        "approval-center",
-        "serve",
-        "--home", str(home),
-        "--config", str(config),
-        "--port", "0",
-    ]
-    if passphrase_file is not None:
-        args.extend(["--passphrase-file", str(passphrase_file)])
-    return subprocess.Popen(args, **kwargs)  # noqa: S603
-
-
-def _wait_for_center(home: Path, *, deadline: float) -> CenterStatus:
-    last = CenterStatus(state="down", pid=None, port=None)
-    while time.monotonic() < deadline:
-        last = check_approval_center_status(home)
-        if last.state == "running":
-            return last
-        time.sleep(_POLL_INTERVAL_SECONDS)
-    return last
-
-
 def ensure_approval_center_running(
     *,
     home: Path,
     proxy_command: str,
     passphrase_file: Path | None = None,
 ) -> EnsureCenterResult:
-    initial = check_approval_center_status(home)
-    if initial.state == "running":
-        return EnsureCenterResult(
-            status=initial, started=False, reused=True, restarted=False,
-            reason="center already running and healthy",
-        )
-    restarted = initial.state == "stale"
-    try:
-        _spawn_approval_center(
-            proxy_command=proxy_command,
-            home=home,
-            passphrase_file=passphrase_file,
-        )
-    except (OSError, ValueError) as exc:
-        return EnsureCenterResult(
-            status=initial, started=False, reused=False, restarted=False,
-            reason=f"could not spawn approval-center: {exc.__class__.__name__}",
-        )
-    final = _wait_for_center(home, deadline=time.monotonic() + _START_TIMEOUT_SECONDS)
-    if final.state == "running":
-        return EnsureCenterResult(
-            status=final, started=True, reused=False, restarted=restarted,
-            reason="center restarted" if restarted else "center started",
-        )
+    from agentveil_mcp_proxy.approval.server import ensure_managed_approval_center_for_cli
+
+    managed = ensure_managed_approval_center_for_cli(
+        home=home,
+        proxy_command=proxy_command,
+        passphrase_file=passphrase_file,
+    )
+    status = CenterStatus(
+        state=managed.status.state,
+        pid=managed.status.pid,
+        port=managed.status.port,
+    )
     return EnsureCenterResult(
-        status=final, started=False, reused=False, restarted=False,
-        reason="approval-center did not become healthy within the start timeout",
+        status=status,
+        started=managed.started,
+        reused=managed.reused,
+        restarted=managed.restarted,
+        reason=managed.reason,
     )
 
 
 def stop_managed_approval_center(home: Path) -> dict[str, Any]:
-    proxy_dir = _proxy_dir(home)
-    manifest = load_manifest(proxy_dir)
-    if manifest is None or manifest.pid is None:
-        return {"stopped": False, "reason": "no managed approval-center manifest"}
+    from agentveil_mcp_proxy.approval.server import stop_managed_approval_center as stop
 
-    if not is_process_alive(manifest.pid):
-        try:
-            manifest_path(proxy_dir).unlink(missing_ok=True)
-        except OSError:
-            pass
-        return {"stopped": False, "reason": "managed pid not alive; manifest cleared"}
-
-    if not _center_health(manifest):
-        return {
-            "stopped": False,
-            "reason": "manifest pid is not a healthy AgentVeil Approval Center; not stopped",
-        }
-
-    try:
-        os.kill(manifest.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return {"stopped": False, "reason": "managed pid already exited"}
-    except PermissionError:
-        return {"stopped": False, "reason": "no permission to stop managed pid"}
-
-    for _ in range(20):
-        if not is_process_alive(manifest.pid):
-            break
-        time.sleep(0.1)
-    try:
-        manifest_path(proxy_dir).unlink(missing_ok=True)
-    except OSError:
-        pass
-    return {"stopped": True, "reason": "managed approval-center stopped"}
+    return stop(home, require_healthy=True)
 
 
 def _hook_observation_state(workspace: Path, hooks_path: Path) -> tuple[bool, bool]:

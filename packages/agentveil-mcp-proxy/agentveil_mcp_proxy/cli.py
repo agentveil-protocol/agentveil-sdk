@@ -5141,7 +5141,7 @@ def run_setup_claude_code_cli(
     # 4. Approval Center: take ownership of lifecycle. Without a live center,
     # controlled MCP write approvals would surface URLs that the user cannot
     # open (ERR_CONNECTION_REFUSED). Setup must not claim ready in that case.
-    from agentveil_mcp_proxy import claude_center_lifecycle
+    from agentveil_mcp_proxy.approval.server import ensure_managed_approval_center_for_cli
 
     proxy_cmd_for_center = resolved_proxy_command
     if not proxy_cmd_for_center:
@@ -5149,7 +5149,7 @@ def run_setup_claude_code_cli(
             "agentveil-mcp-proxy console script not on PATH; cannot start Approval Center",
             exit_code=1,
         )
-    center_result = claude_center_lifecycle.ensure_running(
+    center_result = ensure_managed_approval_center_for_cli(
         home=home,
         proxy_command=proxy_cmd_for_center,
         passphrase_file=passphrase_file,
@@ -5334,9 +5334,9 @@ def run_setup_codex_cli(
             exit_code=1,
         )
 
-    from agentveil_mcp_proxy import claude_center_lifecycle
+    from agentveil_mcp_proxy.approval.server import ensure_managed_approval_center_for_cli
 
-    center_result = claude_center_lifecycle.ensure_running(
+    center_result = ensure_managed_approval_center_for_cli(
         home=home,
         proxy_command=proxy_cmd,
         passphrase_file=passphrase_file,
@@ -5426,11 +5426,15 @@ def run_setup_codex_status_cli(
     output_json: bool,
 ) -> int:
     """Project-local Codex connector status."""
-    from agentveil_mcp_proxy import claude_center_lifecycle, codex_setup
+    from agentveil_mcp_proxy import codex_setup
+    from agentveil_mcp_proxy.approval.server import (
+        inspect_managed_approval_center,
+        stop_managed_approval_center,
+    )
 
     target = (Path(project_dir) if project_dir is not None else Path.cwd()).resolve()
     home = codex_setup.setup_home(target)
-    center = claude_center_lifecycle.check_status(home)
+    center = inspect_managed_approval_center(home)
     status = codex_setup.connector_status(
         project_dir=target,
         center_state=center.state,
@@ -5456,7 +5460,8 @@ def run_setup_remove_codex_cli(
     *, project_dir: Path | None, assume_yes: bool, output_json: bool
 ) -> int:
     """Remove the one-command Codex connector — AgentVeil-managed entry only."""
-    from agentveil_mcp_proxy import claude_center_lifecycle, codex_setup
+    from agentveil_mcp_proxy import codex_setup
+    from agentveil_mcp_proxy.approval.server import stop_managed_approval_center
 
     target = (Path(project_dir) if project_dir is not None else Path.cwd()).resolve()
     home = codex_setup.setup_home(target)
@@ -5483,7 +5488,7 @@ def run_setup_remove_codex_cli(
         route_result = codex_setup.disconnect(project_dir=target, home=home, write=True)
     except (ClientConnectError, ClientConfigError, ClientPackError) as exc:
         raise ProxyCliError(str(exc), exit_code=2) from exc
-    center_stop = claude_center_lifecycle.stop_if_managed(home)
+    center_stop = stop_managed_approval_center(home, require_healthy=True)
     removed_any = (
         bool(hook_result.get("removed_entries"))
         or bool(route_result.get("removed_entry"))
@@ -5618,9 +5623,9 @@ def run_setup_gemini_cli(
             exit_code=1,
         )
 
-    from agentveil_mcp_proxy import claude_center_lifecycle
+    from agentveil_mcp_proxy.approval.server import ensure_managed_approval_center_for_cli
 
-    center_result = claude_center_lifecycle.ensure_running(
+    center_result = ensure_managed_approval_center_for_cli(
         home=home,
         proxy_command=proxy_cmd,
         passphrase_file=passphrase_file,
@@ -5713,11 +5718,12 @@ def run_setup_gemini_status_cli(
     output_json: bool,
 ) -> int:
     """Project-local Gemini CLI connector status."""
-    from agentveil_mcp_proxy import claude_center_lifecycle, gemini_setup
+    from agentveil_mcp_proxy import gemini_setup
+    from agentveil_mcp_proxy.approval.server import inspect_managed_approval_center
 
     target = (Path(project_dir) if project_dir is not None else Path.cwd()).resolve()
     home = gemini_setup.setup_home(target)
-    center = claude_center_lifecycle.check_status(home)
+    center = inspect_managed_approval_center(home)
     status = gemini_setup.connector_status(
         project_dir=target,
         center_state=center.state,
@@ -5743,7 +5749,8 @@ def run_setup_remove_gemini_cli(
     *, project_dir: Path | None, assume_yes: bool, output_json: bool
 ) -> int:
     """Remove the one-command Gemini CLI connector — AgentVeil-managed entries only."""
-    from agentveil_mcp_proxy import claude_center_lifecycle, gemini_setup
+    from agentveil_mcp_proxy import gemini_setup
+    from agentveil_mcp_proxy.approval.server import stop_managed_approval_center
 
     target = (Path(project_dir) if project_dir is not None else Path.cwd()).resolve()
     home = gemini_setup.setup_home(target)
@@ -5770,7 +5777,7 @@ def run_setup_remove_gemini_cli(
         route_result = gemini_setup.disconnect(project_dir=target, home=home, write=True)
     except (ClientConnectError, ClientConfigError, ClientPackError) as exc:
         raise ProxyCliError(str(exc), exit_code=2) from exc
-    center_stop = claude_center_lifecycle.stop_if_managed(home)
+    center_stop = stop_managed_approval_center(home, require_healthy=True)
     removed_any = (
         bool(hook_result.get("removed_entries"))
         or bool(route_result.get("removed_entry"))
@@ -5803,13 +5810,14 @@ def run_setup_remove_gemini_cli(
 
 def run_setup_connector_status_cli(*, project_dir: Path | None, output_json: bool) -> int:
     """Project-local Claude connector status (bare `setup status`)."""
-    from agentveil_mcp_proxy import claude_center_lifecycle, claude_hook_setup
+    from agentveil_mcp_proxy import claude_hook_setup
+    from agentveil_mcp_proxy.approval.server import inspect_managed_approval_center
 
     target = (Path(project_dir) if project_dir is not None else Path.cwd()).resolve()
     home = _setup_claude_code_home(target)
     config_path = home / "mcp-proxy" / "config.json"
     status = claude_hook_setup.connector_status(target, proxy_route_present=config_path.exists())
-    center = claude_center_lifecycle.check_status(home)
+    center = inspect_managed_approval_center(home)
     status["approval_center"] = center.state
     # Setup is not "ready" unless the center is running; downgrade product
     # status accordingly so we never say protected with a dead approval path.
@@ -5850,7 +5858,7 @@ def run_setup_remove_claude_code_cli(
             print(message)
         return 0
 
-    from agentveil_mcp_proxy import claude_center_lifecycle
+    from agentveil_mcp_proxy.approval.server import stop_managed_approval_center
 
     try:
         hook_result = claude_hook_setup.uninstall_hook(target)
@@ -5858,7 +5866,7 @@ def run_setup_remove_claude_code_cli(
     except claude_hook_setup.HookSetupError as exc:
         raise ProxyCliError(str(exc), exit_code=1) from exc
 
-    center_stop = claude_center_lifecycle.stop_if_managed(_setup_claude_code_home(target))
+    center_stop = stop_managed_approval_center(_setup_claude_code_home(target), require_healthy=True)
     removed_any = (
         hook_result.removed_entries > 0
         or route_result.removed
