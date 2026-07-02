@@ -161,6 +161,22 @@ def test_cmdline_match_accepts_mixed_separator_path_tokens(tmp_path):
     assert _cmdline_contains_path(cmd, config)
 
 
+def test_cmdline_match_accepts_windows_cmd_with_mixed_config_suffix():
+    from agentveil_mcp_proxy.approval.server import _cmdline_contains_path
+
+    config = Path(
+        r"C:\Users\runneradmin\AppData\Local\Temp\project\.avp\mcp-proxy\config.json"
+    )
+    cmd = (
+        "python -c main(['approval-center', 'serve', '--home', "
+        r"'C:\Users\runneradmin\AppData\Local\Temp\project\.avp', '--config', "
+        r"'C:\Users\runneradmin\AppData\Local\Temp\project\.avp/mcp-proxy/config.json', "
+        "'--port', '0'])"
+    )
+
+    assert _cmdline_contains_path(cmd, config)
+
+
 def test_proxy_cli_argv_treats_windows_python_exe_as_interpreter():
     from agentveil_mcp_proxy.agent_launcher import _proxy_cli_argv
 
