@@ -20,6 +20,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from pathlib import PurePosixPath
+from pathlib import PureWindowsPath
 from typing import Any, Callable, Literal, Mapping, Sequence
 
 from agentveil_mcp_proxy.agent_runtime_profiles import (
@@ -581,12 +582,34 @@ def ensure_runtime_state_home(path: Path) -> None:
     os.chmod(path, 0o700)
 
 
+def _command_name(proxy_command: str) -> str:
+    if "\\" in proxy_command:
+        return PureWindowsPath(proxy_command).name
+    return Path(proxy_command).name
+
+
+def _is_python_command_name(name: str) -> bool:
+    lowered = name.lower()
+    if lowered in {"python", "python.exe", "python3", "python3.exe"}:
+        return True
+    if not lowered.startswith("python3."):
+        return False
+    version = lowered[len("python3.") :]
+    if version.endswith(".exe"):
+        version = version[:-4]
+    if not version:
+        return False
+    for part in version.split("."):
+        if not part.isdigit():
+            return False
+    return True
+
+
 def _proxy_cli_argv(proxy_command: str, subcommand: list[str]) -> list[str]:
     """Build argv for a proxy CLI subcommand in a fresh interpreter when needed."""
 
     command_path = Path(proxy_command)
-    name = command_path.name
-    if name in {"python", "python3"} or name.startswith("python3."):
+    if _is_python_command_name(_command_name(proxy_command)):
         # Avoid `python -m agentveil_mcp_proxy.cli` from a parent that already
         # imported cli; spawn a clean interpreter with an inline entrypoint.
         script = (
@@ -602,10 +625,10 @@ def _proxy_cli_argv(proxy_command: str, subcommand: list[str]) -> list[str]:
 
 def _proxy_command_display(proxy_command: str) -> str:
     command_path = Path(proxy_command)
-    name = command_path.name
+    name = _command_name(proxy_command)
     if "/" in proxy_command:
         name = PurePosixPath(proxy_command).name
-    if name in {"python", "python3"} or name.startswith("python3."):
+    if _is_python_command_name(name):
         return "agentveil-mcp-proxy"
     if command_path.is_absolute() or "/" in proxy_command:
         return name
