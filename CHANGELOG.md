@@ -6,6 +6,32 @@ All notable changes to the `agentveil` SDK.
 
 No unreleased changes.
 
+## [0.7.28-mcp-proxy] - 2026-07-02
+
+Launcher lifecycle and status hardening release for `agentveil-mcp-proxy`.
+
+### MCP Proxy added
+- Added `launch doctor` as a read-only preflight for managed agent runtime
+  projects, showing route, Approval Center, approval wait-mode, provider, and
+  local proof readiness without spawning a child process.
+
+### MCP Proxy changed
+- Improved managed launcher status output so local proof hints appear only
+  when proof records exist, and empty projects get setup-oriented next steps.
+- Moved managed Approval Center start/status/stop paths onto shared lifecycle
+  helpers used by launcher and setup flows.
+- Reused healthy managed Approval Centers, replaced stale owned centers before
+  spawning new ones, and stopped managed centers by exact owned PID instead of
+  broad process-name matching.
+
+### MCP Proxy verification
+- Local public SDK PR gate passed before merge with `1527 passed, 1 skipped`.
+- GitHub Actions passed for PR #94 across macOS, Windows, and Ubuntu
+  compatibility checks before merge.
+- Post-merge Gemini CLI sanity confirmed trusted folder setup, routed MCP
+  `write_file`, local approval, target reach, and intact `local_proof` on the
+  merged `main` build.
+
 ## [0.7.27-mcp-proxy] - 2026-07-01
 
 Autonomous agent launcher and Hermes controlled MCP profile release for
