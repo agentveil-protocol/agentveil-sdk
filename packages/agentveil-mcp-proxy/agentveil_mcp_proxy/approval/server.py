@@ -8,6 +8,7 @@ import hashlib
 import json
 import hmac
 import os
+import shutil
 import signal
 import subprocess
 from http import HTTPStatus
@@ -1564,6 +1565,59 @@ def _managed_center_config_path(home: Path) -> Path:
     return _managed_center_proxy_dir(home) / "config.json"
 
 
+def _managed_center_startup_log_path(home: Path) -> Path:
+    return _managed_center_proxy_dir(home) / "approval-center.startup.log"
+
+
+def _command_name(command: str) -> str:
+    if "\\" in command:
+        return command.rsplit("\\", 1)[-1]
+    return Path(command).name
+
+
+def _is_python_command_name(name: str) -> bool:
+    lowered = name.lower()
+    if lowered in {"python", "python.exe", "python3", "python3.exe"}:
+        return True
+    if not lowered.startswith("python3."):
+        return False
+    version = lowered[len("python3.") :]
+    if version.endswith(".exe"):
+        version = version[:-4]
+    if not version:
+        return False
+    for part in version.split("."):
+        if not part.isdigit():
+            return False
+    return True
+
+
+def _proxy_cli_argv(proxy_command: str, subcommand: list[str]) -> list[str]:
+    if _is_python_command_name(_command_name(proxy_command)):
+        script = (
+            "from agentveil_mcp_proxy.cli import main; "
+            f"raise SystemExit(main({subcommand!r}))"
+        )
+        return [proxy_command, "-c", script]
+    resolved = shutil.which(proxy_command)
+    if resolved:
+        return [resolved, *subcommand]
+    return [proxy_command, *subcommand]
+
+
+def _proxy_cli_child_env() -> dict[str, str]:
+    env = dict(os.environ)
+    package_root = str(Path(__file__).resolve().parents[1])
+    existing = env.get("PYTHONPATH")
+    if existing:
+        paths = existing.split(os.pathsep)
+        if package_root not in paths:
+            env["PYTHONPATH"] = os.pathsep.join([package_root, existing])
+    else:
+        env["PYTHONPATH"] = package_root
+    return env
+
+
 def _path_match_tokens(path: Path) -> tuple[str, ...]:
     """Return path spellings that may appear in ``ps`` output on macOS."""
 
@@ -1873,17 +1927,20 @@ def spawn_managed_approval_center_process(
     """Spawn ``approval-center serve`` as a detached background process."""
 
     config_path = _managed_center_config_path(home)
+    startup_log = _managed_center_startup_log_path(home)
+    startup_log.parent.mkdir(parents=True, exist_ok=True)
+    log_handle = open(startup_log, "ab")
     devnull = subprocess.DEVNULL
     kwargs: dict[str, Any] = {
         "stdin": devnull,
-        "stdout": devnull,
-        "stderr": devnull,
+        "stdout": log_handle,
+        "stderr": log_handle,
         "close_fds": True,
+        "env": _proxy_cli_child_env(),
     }
     if os.name == "posix":
         kwargs["start_new_session"] = True
-    args = [
-        proxy_command,
+    subcommand = [
         "approval-center",
         "serve",
         "--home",
@@ -1894,11 +1951,14 @@ def spawn_managed_approval_center_process(
         "0",
     ]
     if passphrase_file is not None:
-        args.extend(["--passphrase-file", str(passphrase_file)])
-    return subprocess.Popen(  # noqa: S603 - args constructed from validated paths
-        args,
-        **kwargs,
-    )
+        subcommand.extend(["--passphrase-file", str(passphrase_file)])
+    try:
+        return subprocess.Popen(  # noqa: S603 - args constructed from validated paths
+            _proxy_cli_argv(proxy_command, subcommand),
+            **kwargs,
+        )
+    finally:
+        log_handle.close()
 
 
 def ensure_managed_approval_center_for_cli(
@@ -1956,6 +2016,10 @@ def ensure_managed_approval_center_running(
     deadline = time.monotonic() + _MANAGED_CENTER_START_TIMEOUT_SECONDS
     final = waiter(home, deadline)
     if final.state == "running":
+        try:
+            _managed_center_startup_log_path(home).unlink(missing_ok=True)
+        except OSError:
+            pass
         return ManagedApprovalCenterEnsureResult(
             status=final,
             started=True,
