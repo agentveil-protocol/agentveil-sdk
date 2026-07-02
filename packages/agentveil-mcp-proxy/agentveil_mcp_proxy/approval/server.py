@@ -1582,6 +1582,9 @@ def _path_match_tokens(path: Path) -> tuple[str, ...]:
             tokens.add(value[len("/private") :])
         elif value.startswith("/"):
             tokens.add(f"/private{value}")
+    for value in list(tokens):
+        tokens.add(value.replace("\\", "/"))
+        tokens.add(value.replace("/", "\\"))
     return tuple(token for token in tokens if token)
 
 

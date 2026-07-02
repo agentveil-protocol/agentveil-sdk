@@ -147,6 +147,33 @@ def test_cmdline_match_accepts_macos_private_path_variants(tmp_path):
     assert _cmdline_contains_path(cmd, config)
 
 
+def test_cmdline_match_accepts_mixed_separator_path_tokens(tmp_path):
+    home = tmp_path / "project" / ".avp"
+    config = home / "mcp-proxy" / "config.json"
+    mixed_config = str(config).replace("\\", "/")
+    cmd = (
+        "python -c main(['approval-center', 'serve', '--home', "
+        f"'{home}', '--config', '{mixed_config}', '--port', '0'])"
+    )
+
+    from agentveil_mcp_proxy.approval.server import _cmdline_contains_path
+
+    assert _cmdline_contains_path(cmd, config)
+
+
+def test_proxy_cli_argv_treats_windows_python_exe_as_interpreter():
+    from agentveil_mcp_proxy.agent_launcher import _proxy_cli_argv
+
+    argv = _proxy_cli_argv(
+        r"C:\hostedtoolcache\windows\Python\3.12.10\x64\python.exe",
+        ["approval-center", "serve"],
+    )
+
+    assert argv[1] == "-c"
+    assert "agentveil_mcp_proxy.cli" in argv[2]
+    assert "approval-center" in argv[2]
+
+
 def test_stale_manifest_is_not_running(managed_project_home):
     _project, home, _tracker = managed_project_home
     status = inspect_managed_approval_center(home)
