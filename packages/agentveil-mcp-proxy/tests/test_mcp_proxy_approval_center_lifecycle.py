@@ -305,7 +305,6 @@ def test_managed_approval_center_subprocess_start_stop_reuse(managed_project_hom
     pid = center.pid
     assert pid is not None
     assert is_process_alive(pid)
-    assert not (home / "mcp-proxy" / "approval-center.startup.log").exists()
 
     center2, started2, _reason2 = ensure_approval_center_running(
         home=home,
@@ -320,6 +319,7 @@ def test_managed_approval_center_subprocess_start_stop_reuse(managed_project_hom
     assert outcome["pid"] == pid
     assert not _managed_process_is_active(pid)
     assert load_manifest(home / "mcp-proxy") is None
+    assert not (home / "mcp-proxy" / "approval-center.startup.log").exists()
 
 
 def test_prepare_stale_replaces_before_new_start(managed_project_home, monkeypatch):

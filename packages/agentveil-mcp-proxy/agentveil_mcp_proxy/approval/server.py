@@ -1569,6 +1569,13 @@ def _managed_center_startup_log_path(home: Path) -> Path:
     return _managed_center_proxy_dir(home) / "approval-center.startup.log"
 
 
+def _clear_managed_center_startup_log(home: Path) -> None:
+    try:
+        _managed_center_startup_log_path(home).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _command_name(command: str) -> str:
     if "\\" in command:
         return command.rsplit("\\", 1)[-1]
@@ -1817,6 +1824,7 @@ def stop_managed_approval_center(
     manifest = load_manifest(proxy_dir)
     if manifest is None or manifest.pid is None:
         clear_managed_approval_center_manifest(home)
+        _clear_managed_center_startup_log(home)
         return {
             "stopped": False,
             "pid": None,
@@ -1837,6 +1845,7 @@ def stop_managed_approval_center(
                 if managed_center_cmdline_owns_pid(home, pid):
                     stopped = terminate_managed_approval_center_pid(pid)
                     clear_managed_approval_center_manifest(home)
+                    _clear_managed_center_startup_log(home)
                     if stopped:
                         reason = "managed approval-center stopped"
                     else:
@@ -1850,6 +1859,7 @@ def stop_managed_approval_center(
                     ),
                 }
             clear_managed_approval_center_manifest(home)
+            _clear_managed_center_startup_log(home)
             return {
                 "stopped": False,
                 "pid": pid,
@@ -1857,15 +1867,18 @@ def stop_managed_approval_center(
             }
         if not owns:
             clear_managed_approval_center_manifest(home)
+            _clear_managed_center_startup_log(home)
             return {"stopped": False, "pid": pid, "reason": unowned_reason}
     elif _managed_process_is_active(pid) and not owns:
         clear_managed_approval_center_manifest(home)
+        _clear_managed_center_startup_log(home)
         return {"stopped": False, "pid": pid, "reason": unowned_reason}
 
     stopped = False
     if _managed_process_is_active(pid):
         stopped = terminate_managed_approval_center_pid(pid)
     clear_managed_approval_center_manifest(home)
+    _clear_managed_center_startup_log(home)
     if stopped:
         reason = "managed approval-center stopped"
     elif not _managed_process_is_active(pid):
@@ -1887,6 +1900,7 @@ def prepare_stale_managed_approval_center(home: Path) -> dict[str, Any]:
     manifest = load_manifest(_managed_center_proxy_dir(home))
     if manifest is None or manifest.pid is None:
         clear_managed_approval_center_manifest(home)
+        _clear_managed_center_startup_log(home)
         return {
             "prepared": True,
             "stopped": False,
@@ -1903,6 +1917,7 @@ def prepare_stale_managed_approval_center(home: Path) -> dict[str, Any]:
         if not stopped and managed_center_cmdline_owns_pid(home, pid):
             stopped = terminate_managed_approval_center_pid(pid, grace_seconds=0.25)
         clear_managed_approval_center_manifest(home)
+        _clear_managed_center_startup_log(home)
         if stopped:
             reason = "stale managed approval-center stopped"
         else:
@@ -1910,6 +1925,7 @@ def prepare_stale_managed_approval_center(home: Path) -> dict[str, Any]:
         return {"prepared": True, "stopped": stopped, "pid": pid, "reason": reason}
 
     clear_managed_approval_center_manifest(home)
+    _clear_managed_center_startup_log(home)
     return {
         "prepared": True,
         "stopped": False,
@@ -2016,10 +2032,7 @@ def ensure_managed_approval_center_running(
     deadline = time.monotonic() + _MANAGED_CENTER_START_TIMEOUT_SECONDS
     final = waiter(home, deadline)
     if final.state == "running":
-        try:
-            _managed_center_startup_log_path(home).unlink(missing_ok=True)
-        except OSError:
-            pass
+        _clear_managed_center_startup_log(home)
         return ManagedApprovalCenterEnsureResult(
             status=final,
             started=True,
