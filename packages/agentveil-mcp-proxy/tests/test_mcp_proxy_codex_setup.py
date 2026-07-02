@@ -34,8 +34,6 @@ def _isolate_cli_home(monkeypatch, home: Path) -> None:
 
 
 def _install_fast_codex_setup_fakes(monkeypatch, *, proxy_command: str) -> None:
-    from agentveil_mcp_proxy import claude_center_lifecycle
-
     def fake_init_proxy(**kwargs):
         home = kwargs["home"]
         (home / "mcp-proxy").mkdir(parents=True, exist_ok=True)
@@ -44,8 +42,7 @@ def _install_fast_codex_setup_fakes(monkeypatch, *, proxy_command: str) -> None:
     monkeypatch.setattr(proxy_cli, "init_proxy", fake_init_proxy)
     monkeypatch.setattr(proxy_cli, "_resolve_setup_proxy_command", lambda: proxy_command)
     monkeypatch.setattr(
-        claude_center_lifecycle,
-        "ensure_running",
+        "agentveil_mcp_proxy.approval.server.ensure_managed_approval_center_for_cli",
         lambda **_kwargs: SimpleNamespace(
             status=SimpleNamespace(state="running", url="http://127.0.0.1/approval/SECRET"),
             started=True,
@@ -55,14 +52,12 @@ def _install_fast_codex_setup_fakes(monkeypatch, *, proxy_command: str) -> None:
         ),
     )
     monkeypatch.setattr(
-        claude_center_lifecycle,
-        "check_status",
+        "agentveil_mcp_proxy.approval.server.inspect_managed_approval_center",
         lambda _home: SimpleNamespace(state="running", url="http://127.0.0.1/approval/SECRET"),
     )
     monkeypatch.setattr(
-        claude_center_lifecycle,
-        "stop_if_managed",
-        lambda _home: {"stopped": True, "reason": "stopped"},
+        "agentveil_mcp_proxy.approval.server.stop_managed_approval_center",
+        lambda _home, **_kwargs: {"stopped": True, "reason": "stopped"},
     )
 
 

@@ -22,11 +22,26 @@ from agentveil_mcp_proxy.agent_launcher import (
     LAUNCH_MANIFEST_SCHEMA_VERSION,
     bounded_command_metadata,
     build_hermes_config_document,
+    build_launch_diagnostics,
+    build_launch_doctor_report,
+    build_launch_result_payload,
     build_launch_status,
+    build_launch_status_view,
+    CenterStatus,
+    classify_approval_wait_mode,
+    classify_evidence_state,
+    classify_mcp_route_state,
+    classify_provider_prerequisite,
+    derive_protection_mode,
     ensure_interactive_connector_defaults,
+    format_launch_doctor_human,
+    format_launch_result_human,
+    format_launch_status_human,
     hermes_config_path,
     hermes_runtime_home,
     launch_managed_process,
+    LaunchResult,
+    LaunchStatus,
     launch_manifest_path,
     load_launch_manifest,
     normalize_child_command,
@@ -46,6 +61,8 @@ from agentveil_mcp_proxy.agent_launcher import (
     write_runtime_route_config,
 )
 from agentveil_mcp_proxy.agent_runtime_profiles import GENERIC_PROCESS_PROFILE, HERMES_CLI_PROFILE
+from agentveil_mcp_proxy.evidence.events_show import LOCAL_PROOF_LAUNCHER_HINT
+from agentveil_mcp_proxy.evidence.store import ApprovalEvidenceStore, ApprovalStatus, PendingApproval
 
 
 def test_normalize_child_command_strips_separator():
@@ -406,18 +423,15 @@ def test_stop_managed_launch_only_stops_owned_processes(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         "agentveil_mcp_proxy.agent_launcher.is_process_alive",
-        lambda pid: pid in {9001, 9002},
+        lambda pid: pid == 9001,
     )
     monkeypatch.setattr(
-        "agentveil_mcp_proxy.agent_launcher.load_manifest",
-        lambda _proxy_dir: SimpleNamespace(
-            pid=9002,
-            approval_center_url=lambda: "http://127.0.0.1:8765/approval/token",
-        ),
-    )
-    monkeypatch.setattr(
-        "agentveil_mcp_proxy.agent_launcher._center_health",
-        lambda _manifest: True,
+        "agentveil_mcp_proxy.approval.server.stop_managed_approval_center",
+        lambda _home, **kwargs: {
+            "stopped": True,
+            "pid": 9002,
+            "reason": "managed approval-center stopped",
+        },
     )
 
     def fake_kill(pid, _sig):
@@ -428,7 +442,7 @@ def test_stop_managed_launch_only_stops_owned_processes(tmp_path, monkeypatch):
     outcome = stop_managed_launch(project_dir=project)
     assert outcome["stopped_child"] is True
     assert outcome["stopped_center"] is True
-    assert set(killed) == {9001, 9002}
+    assert set(killed) == {9001}
 
 
 # ----- P0.13b: hermes-cli profile ------------------------------------------------
@@ -1100,3 +1114,305 @@ def test_build_launch_status_prefers_manifest_profile_id(tmp_path, monkeypatch):
     )
     assert status.profile_id == "hermes-cli"
     assert status.profile_status == "stopped"
+
+
+def _center_state(state: str) -> CenterStatus:
+    return CenterStatus(state=state, pid=111 if state == "running" else None, port=8765)
+
+
+def test_launch_status_view_protection_mode_matrix():
+    assert derive_protection_mode(
+        mcp_route_state="missing",
+        center=_center_state("running"),
+        profile_id="generic-process",
+    ) == "not protected"
+    assert derive_protection_mode(
+        mcp_route_state="configured",
+        center=_center_state("running"),
+        profile_id="generic-process",
+    ) == "controlled MCP route"
+    assert derive_protection_mode(
+        mcp_route_state="configured",
+        center=_center_state("running"),
+        profile_id="hermes-cli",
+    ) == "advisory"
+
+
+def test_launch_status_view_json_fields(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    home = project_avp_home(project)
+    (home / "mcp-proxy").mkdir(parents=True)
+    (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+
+    view = build_launch_status_view(
+        home=home,
+        profile=GENERIC_PROCESS_PROFILE,
+        project_dir=project,
+    )
+    payload = view.to_dict()
+
+    assert payload["profile_label"] == GENERIC_PROCESS_PROFILE.display_name
+    assert payload["protection_mode"] == "advisory"
+    assert payload["mcp_route_state"] == "configured"
+    assert payload["proof_hint"] == ""
+    assert str(project) not in json.dumps(payload)
+
+
+def test_launch_status_human_prefers_agent_proof_hint_when_observed(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir()
+    home = project_avp_home(project)
+    (home / "mcp-proxy").mkdir(parents=True)
+    (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.agent_launcher._evidence_record_count",
+        lambda _home: 1,
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.agent_launcher.check_approval_center_status",
+        lambda _home: _center_state("running"),
+    )
+    view = build_launch_status_view(
+        home=home,
+        profile=GENERIC_PROCESS_PROFILE,
+        project_dir=project,
+    )
+    text = "\n".join(format_launch_status_human(view))
+
+    assert "AgentVeil managed runtime status" in text
+    assert LOCAL_PROOF_LAUNCHER_HINT in text
+    assert "Proof hint:" in text
+    assert "events show" not in text.lower()
+
+
+def test_launch_status_human_omits_proof_hint_when_unavailable(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    view = build_launch_status_view(
+        home=project_avp_home(project),
+        profile=GENERIC_PROCESS_PROFILE,
+        project_dir=project,
+    )
+    text = "\n".join(format_launch_status_human(view))
+
+    assert "Proof hint:" not in text
+    assert LOCAL_PROOF_LAUNCHER_HINT not in text
+    assert "Initialize the project proxy route" in text
+
+
+def test_launch_diagnostics_cover_stale_center_and_native_bypass():
+    status = LaunchStatus(
+        profile_id="hermes-cli",
+        profile_status="configured",
+        project_dir_ref="project",
+        session_id=None,
+        approval_center=_center_state("stale"),
+        child_running=False,
+        child_pid=None,
+        evidence_enabled=False,
+        scope="project",
+        host_wide_control_claim=False,
+    )
+    diagnostics = build_launch_diagnostics(
+        status=status,
+        mcp_route_state="configured",
+        evidence_state="ready_no_records",
+        profile_id="hermes-cli",
+        protection_mode="advisory",
+    )
+    joined = " ".join(diagnostics).lower()
+    assert "approval center" in joined
+    assert "native hermes" in joined
+
+
+def test_classify_launch_route_and_evidence_states(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    home = project_avp_home(project)
+    assert classify_mcp_route_state(home) == "missing"
+    assert classify_evidence_state(home=home, config_exists=False) == "not_initialized"
+
+    (home / "mcp-proxy").mkdir(parents=True)
+    (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+    assert classify_mcp_route_state(home) == "configured"
+    assert classify_evidence_state(home=home, config_exists=True) == "ready_no_records"
+
+
+def test_launch_result_payload_includes_child_outcome(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    home = project_avp_home(project)
+    (home / "mcp-proxy").mkdir(parents=True)
+    (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+
+    view = build_launch_status_view(
+        home=home,
+        profile=GENERIC_PROCESS_PROFILE,
+        project_dir=project,
+    )
+    status = LaunchStatus(
+        profile_id="generic-process",
+        profile_status="stopped",
+        project_dir_ref="project",
+        session_id="session-1",
+        approval_center=_center_state("running"),
+        child_running=False,
+        child_pid=None,
+        evidence_enabled=True,
+        scope="project",
+        host_wide_control_claim=False,
+    )
+    result = LaunchResult(
+        status=status,
+        child_started=True,
+        approval_center_started=True,
+        proxy_initialized=True,
+        reason="started",
+        child_exit_code=0,
+        child_foreground=True,
+    )
+    payload = build_launch_result_payload(result=result, view=view)
+    assert payload["child_outcome"] == "finished"
+    assert payload["proof_hint"] == ""
+
+
+def test_launch_doctor_empty_project_is_not_ready(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    report = build_launch_doctor_report(
+        home=project_avp_home(project),
+        profile=GENERIC_PROCESS_PROFILE,
+        project_dir=project,
+        parent_env={},
+    )
+    assert report.project_route == "missing"
+    assert report.local_proof == "not initialized"
+    assert report.ready is False
+    assert report.provider_key == "not applicable"
+    assert "project_route" in report.blocking
+
+
+def test_launch_doctor_configured_route_without_evidence(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir()
+    home = project_avp_home(project)
+    (home / "mcp-proxy").mkdir(parents=True)
+    (home / "mcp-proxy" / "config.json").write_text(
+        json.dumps({"approval": {"wait_for_decision": True}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.agent_launcher.check_approval_center_status",
+        lambda _home: _center_state("running"),
+    )
+    report = build_launch_doctor_report(
+        home=home,
+        profile=GENERIC_PROCESS_PROFILE,
+        project_dir=project,
+        parent_env={},
+    )
+    assert report.project_route == "ready"
+    assert report.local_proof == "empty"
+    assert report.approval_center == "running"
+    assert report.approval_wait == "not applicable"
+
+
+def test_launch_doctor_observed_proof(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir()
+    home = project_avp_home(project)
+    (home / "mcp-proxy").mkdir(parents=True)
+    (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+    now = 1_700_000_000
+    record = PendingApproval(
+        request_id="req-doctor-proof",
+        session_id="session-1",
+        client_id="cursor:session-7",
+        downstream_server="filesystem",
+        tool_name="filesystem.read",
+        action_class="read",
+        risk_class="read",
+        resource_hash="sha256:" + "b" * 64,
+        payload_hash="sha256:" + "a" * 64,
+        policy_id="filesystem-default",
+        policy_rule_id="rule-read",
+        policy_context_hash="c" * 64,
+        status=ApprovalStatus.PENDING.value,
+        created_at=now,
+        expires_at=now + 3600,
+    )
+    with ApprovalEvidenceStore(home / "mcp-proxy" / "evidence.sqlite") as store:
+        store.write_pending(record)
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.agent_launcher.check_approval_center_status",
+        lambda _home: _center_state("running"),
+    )
+    report = build_launch_doctor_report(
+        home=home,
+        profile=GENERIC_PROCESS_PROFILE,
+        project_dir=project,
+        parent_env={},
+    )
+    assert report.local_proof == "observed"
+    assert report.evidence_state == "observed"
+
+
+def test_launch_doctor_hermes_provider_present_without_leaking_secret(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir()
+    home = project_avp_home(project)
+    (home / "mcp-proxy").mkdir(parents=True)
+    (home / "mcp-proxy" / "config.json").write_text(
+        json.dumps({"approval": {"wait_for_decision": True}}),
+        encoding="utf-8",
+    )
+    secret = "sk-test-secret-doctor-1234567890"
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.agent_launcher.check_approval_center_status",
+        lambda _home: _center_state("running"),
+    )
+    report = build_launch_doctor_report(
+        home=home,
+        profile=HERMES_CLI_PROFILE,
+        project_dir=project,
+        parent_env={"OPENAI_API_KEY": secret},
+    )
+    text = "\n".join(format_launch_doctor_human(report))
+    assert report.provider_key == "present"
+    assert secret not in text
+    assert secret not in json.dumps(report.to_dict())
+
+
+def test_launch_doctor_hermes_provider_missing(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    home = project_avp_home(project)
+    (home / "mcp-proxy").mkdir(parents=True)
+    (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+    report = build_launch_doctor_report(
+        home=home,
+        profile=HERMES_CLI_PROFILE,
+        project_dir=project,
+        parent_env={},
+    )
+    assert report.provider_key == "missing"
+    assert report.approval_wait == "not configured"
+    assert "provider_key" in report.blocking
+
+
+def test_classify_approval_wait_mode_read_only(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    home = project_avp_home(project)
+    config_path = home / "mcp-proxy" / "config.json"
+    assert classify_approval_wait_mode(home, GENERIC_PROCESS_PROFILE) == "not applicable"
+    assert classify_approval_wait_mode(home, HERMES_CLI_PROFILE) == "not configured"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(json.dumps({"approval": {"wait_for_decision": False}}), encoding="utf-8")
+    assert classify_approval_wait_mode(home, HERMES_CLI_PROFILE) == "not configured"
+    before = config_path.read_text(encoding="utf-8")
+    config_path.write_text(json.dumps({"approval": {"wait_for_decision": True}}), encoding="utf-8")
+    assert classify_approval_wait_mode(home, HERMES_CLI_PROFILE) == "enabled"
+    ensure_interactive_connector_defaults(config_path)
+    assert config_path.read_text(encoding="utf-8") != before

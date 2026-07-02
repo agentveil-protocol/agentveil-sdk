@@ -3223,8 +3223,14 @@ def build_parser() -> argparse.ArgumentParser:
             "  agentveil-mcp-proxy launch --profile hermes-cli --project-dir . -- \\\n"
             "    hermes chat --toolsets agentveil -q \"…\"\n"
             "  agentveil-mcp-proxy launch status --project-dir .\n"
+            "  agentveil-mcp-proxy launch doctor --profile hermes-cli --project-dir .\n"
             "  agentveil-mcp-proxy launch stop --project-dir ."
         ),
+    )
+    launch.add_argument(
+        "--launch-doctor",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     launch.add_argument(
         "--launch-status",
@@ -4583,9 +4589,11 @@ def _normalize_launch_argv(argv: list[str]) -> list[str]:
         return argv
     if len(argv) >= 2 and argv[1] == "status":
         return ["launch", "--launch-status", *argv[2:]]
+    if len(argv) >= 2 and argv[1] == "doctor":
+        return ["launch", "--launch-doctor", *argv[2:]]
     if len(argv) >= 2 and argv[1] == "stop":
         return ["launch", "--launch-stop", *argv[2:]]
-    if "--launch-child" in argv or "--launch-status" in argv or "--launch-stop" in argv:
+    if "--launch-child" in argv or "--launch-status" in argv or "--launch-stop" in argv or "--launch-doctor" in argv:
         return argv
     rest = argv[1:]
     if "--" in rest:
@@ -4790,8 +4798,18 @@ def run_launch_cli(
 ) -> int:
     """Launch a child process under a managed AgentVeil runtime profile."""
 
-    from agentveil_mcp_proxy.agent_launcher import AgentLauncherError, launch_managed_process
-    from agentveil_mcp_proxy.agent_runtime_profiles import HERMES_CLI_PROFILE
+    from agentveil_mcp_proxy.agent_launcher import (
+        AgentLauncherError,
+        build_launch_result_payload,
+        build_launch_status_view,
+        format_launch_result_human,
+        launch_managed_process,
+        project_avp_home,
+    )
+    from agentveil_mcp_proxy.agent_runtime_profiles import (
+        HERMES_CLI_PROFILE,
+        resolve_runtime_profile,
+    )
 
     if not profile_id:
         raise ProxyCliError("--profile is required for launch", exit_code=2)
@@ -4812,30 +4830,17 @@ def run_launch_cli(
     except AgentLauncherError as exc:
         raise ProxyCliError(str(exc), exit_code=exc.exit_code) from exc
 
-    status = result.status
+    profile = resolve_runtime_profile(profile_id)
+    view = build_launch_status_view(
+        home=project_avp_home(target),
+        profile=profile,
+        project_dir=target,
+    )
     if output_json:
-        payload = {
-            "ok": result.child_exit_code in (None, 0),
-            "action": "launch",
-            "profile_id": status.profile_id,
-            "profile_status": status.profile_status,
-            "project_dir_ref": status.project_dir_ref,
-            "session_id": status.session_id,
-            "approval_center": status.approval_center.state,
-            "child_started": result.child_started,
-            "child_running": status.child_running,
-            "child_foreground": result.child_foreground,
-            "child_exit_code": result.child_exit_code,
-            "proxy_initialized": result.proxy_initialized,
-            "evidence_enabled": status.evidence_enabled,
-            "scope": status.scope,
-            "host_wide_control_claim": status.host_wide_control_claim,
-            "reason": result.reason,
-        }
+        payload = build_launch_result_payload(result=result, view=view)
         if profile_id == HERMES_CLI_PROFILE.profile_id:
             from agentveil_mcp_proxy.agent_launcher import (
                 hermes_native_tool_containment_note,
-                project_avp_home,
                 runtime_route_path,
             )
 
@@ -4850,24 +4855,8 @@ def run_launch_cli(
             payload["native_tool_containment"] = hermes_native_tool_containment_note()
         _print_operator_json(payload)
     else:
-        print("Managed runtime launch:")
-        print(f"  profile:          {status.profile_id} ({status.profile_status})")
-        print(f"  scope:            {status.scope} (no host-wide control claim)")
-        print(f"  approval_center:  {status.approval_center.state}")
-        print(f"  evidence/proof:   {'enabled' if status.evidence_enabled else 'not initialized'}")
-        if result.child_foreground:
-            exit_code = result.child_exit_code if result.child_exit_code is not None else "unknown"
-            label = "finished" if result.child_exit_code == 0 else "failed"
-            print(f"  child:            {label} (exit {exit_code})")
-        else:
-            print(f"  child:            {'started' if result.child_started else 'not started'}")
-        if result.proxy_initialized:
-            print("  proxy route:      initialized for this project")
-        if profile_id == HERMES_CLI_PROFILE.profile_id:
-            print(
-                "  hermes note:      AgentVeil MCP route only; native Hermes tools are "
-                "limited, not host-wide. Use --toolsets agentveil."
-            )
+        for line in format_launch_result_human(result=result, view=view):
+            print(line)
     if result.child_exit_code is not None and result.child_exit_code != 0:
         return int(result.child_exit_code)
     return 0
@@ -4883,7 +4872,8 @@ def run_launch_status_cli(
 
     from agentveil_mcp_proxy.agent_launcher import (
         AgentLauncherError,
-        build_launch_status,
+        build_launch_status_view,
+        format_launch_status_human,
         project_avp_home,
         resolve_project_dir,
     )
@@ -4897,20 +4887,61 @@ def run_launch_status_cli(
         profile = resolve_runtime_profile(resolved_profile)
         target = resolve_project_dir(project_dir)
         home = project_avp_home(target)
-        status = build_launch_status(home=home, profile=profile, project_dir=target)
+        view = build_launch_status_view(home=home, profile=profile, project_dir=target)
     except (AgentLauncherError, RuntimeProfileError) as exc:
         exit_code = exc.exit_code if isinstance(exc, AgentLauncherError) else 2
         raise ProxyCliError(str(exc), exit_code=exit_code) from exc
 
     if output_json:
-        _print_operator_json({"ok": True, "action": "launch-status", **status.to_dict()})
+        _print_operator_json({"ok": True, "action": "launch-status", **view.to_dict()})
     else:
-        print("Managed runtime status:")
-        print(f"  profile:          {status.profile_id} ({status.profile_status})")
-        print(f"  scope:            {status.scope} (no host-wide control claim)")
-        print(f"  approval_center:  {status.approval_center.state}")
-        print(f"  child_running:    {status.child_running}")
-        print(f"  evidence/proof:   {'enabled' if status.evidence_enabled else 'not initialized'}")
+        for line in format_launch_status_human(view):
+            print(line)
+    return 0
+
+
+def run_launch_doctor_cli(
+    *,
+    profile_id: str | None,
+    project_dir: Path | None,
+    output_json: bool,
+) -> int:
+    """Read-only preflight for a managed runtime launch."""
+
+    from agentveil_mcp_proxy.agent_launcher import (
+        AgentLauncherError,
+        build_launch_doctor_report,
+        format_launch_doctor_human,
+        project_avp_home,
+        resolve_project_dir,
+    )
+    from agentveil_mcp_proxy.agent_runtime_profiles import (
+        RuntimeProfileError,
+        resolve_runtime_profile,
+    )
+
+    if not profile_id:
+        raise ProxyCliError("--profile is required for launch doctor", exit_code=2)
+
+    try:
+        profile = resolve_runtime_profile(profile_id)
+        target = resolve_project_dir(project_dir)
+        home = project_avp_home(target)
+        report = build_launch_doctor_report(
+            home=home,
+            profile=profile,
+            project_dir=target,
+            parent_env=os.environ,
+        )
+    except (AgentLauncherError, RuntimeProfileError) as exc:
+        exit_code = exc.exit_code if isinstance(exc, AgentLauncherError) else 2
+        raise ProxyCliError(str(exc), exit_code=exit_code) from exc
+
+    if output_json:
+        _print_operator_json(report.to_dict())
+    else:
+        for line in format_launch_doctor_human(report):
+            print(line)
     return 0
 
 
@@ -5110,7 +5141,7 @@ def run_setup_claude_code_cli(
     # 4. Approval Center: take ownership of lifecycle. Without a live center,
     # controlled MCP write approvals would surface URLs that the user cannot
     # open (ERR_CONNECTION_REFUSED). Setup must not claim ready in that case.
-    from agentveil_mcp_proxy import claude_center_lifecycle
+    from agentveil_mcp_proxy.approval.server import ensure_managed_approval_center_for_cli
 
     proxy_cmd_for_center = resolved_proxy_command
     if not proxy_cmd_for_center:
@@ -5118,7 +5149,7 @@ def run_setup_claude_code_cli(
             "agentveil-mcp-proxy console script not on PATH; cannot start Approval Center",
             exit_code=1,
         )
-    center_result = claude_center_lifecycle.ensure_running(
+    center_result = ensure_managed_approval_center_for_cli(
         home=home,
         proxy_command=proxy_cmd_for_center,
         passphrase_file=passphrase_file,
@@ -5303,9 +5334,9 @@ def run_setup_codex_cli(
             exit_code=1,
         )
 
-    from agentveil_mcp_proxy import claude_center_lifecycle
+    from agentveil_mcp_proxy.approval.server import ensure_managed_approval_center_for_cli
 
-    center_result = claude_center_lifecycle.ensure_running(
+    center_result = ensure_managed_approval_center_for_cli(
         home=home,
         proxy_command=proxy_cmd,
         passphrase_file=passphrase_file,
@@ -5395,11 +5426,15 @@ def run_setup_codex_status_cli(
     output_json: bool,
 ) -> int:
     """Project-local Codex connector status."""
-    from agentveil_mcp_proxy import claude_center_lifecycle, codex_setup
+    from agentveil_mcp_proxy import codex_setup
+    from agentveil_mcp_proxy.approval.server import (
+        inspect_managed_approval_center,
+        stop_managed_approval_center,
+    )
 
     target = (Path(project_dir) if project_dir is not None else Path.cwd()).resolve()
     home = codex_setup.setup_home(target)
-    center = claude_center_lifecycle.check_status(home)
+    center = inspect_managed_approval_center(home)
     status = codex_setup.connector_status(
         project_dir=target,
         center_state=center.state,
@@ -5425,7 +5460,8 @@ def run_setup_remove_codex_cli(
     *, project_dir: Path | None, assume_yes: bool, output_json: bool
 ) -> int:
     """Remove the one-command Codex connector — AgentVeil-managed entry only."""
-    from agentveil_mcp_proxy import claude_center_lifecycle, codex_setup
+    from agentveil_mcp_proxy import codex_setup
+    from agentveil_mcp_proxy.approval.server import stop_managed_approval_center
 
     target = (Path(project_dir) if project_dir is not None else Path.cwd()).resolve()
     home = codex_setup.setup_home(target)
@@ -5452,7 +5488,7 @@ def run_setup_remove_codex_cli(
         route_result = codex_setup.disconnect(project_dir=target, home=home, write=True)
     except (ClientConnectError, ClientConfigError, ClientPackError) as exc:
         raise ProxyCliError(str(exc), exit_code=2) from exc
-    center_stop = claude_center_lifecycle.stop_if_managed(home)
+    center_stop = stop_managed_approval_center(home, require_healthy=True)
     removed_any = (
         bool(hook_result.get("removed_entries"))
         or bool(route_result.get("removed_entry"))
@@ -5587,9 +5623,9 @@ def run_setup_gemini_cli(
             exit_code=1,
         )
 
-    from agentveil_mcp_proxy import claude_center_lifecycle
+    from agentveil_mcp_proxy.approval.server import ensure_managed_approval_center_for_cli
 
-    center_result = claude_center_lifecycle.ensure_running(
+    center_result = ensure_managed_approval_center_for_cli(
         home=home,
         proxy_command=proxy_cmd,
         passphrase_file=passphrase_file,
@@ -5682,11 +5718,12 @@ def run_setup_gemini_status_cli(
     output_json: bool,
 ) -> int:
     """Project-local Gemini CLI connector status."""
-    from agentveil_mcp_proxy import claude_center_lifecycle, gemini_setup
+    from agentveil_mcp_proxy import gemini_setup
+    from agentveil_mcp_proxy.approval.server import inspect_managed_approval_center
 
     target = (Path(project_dir) if project_dir is not None else Path.cwd()).resolve()
     home = gemini_setup.setup_home(target)
-    center = claude_center_lifecycle.check_status(home)
+    center = inspect_managed_approval_center(home)
     status = gemini_setup.connector_status(
         project_dir=target,
         center_state=center.state,
@@ -5712,7 +5749,8 @@ def run_setup_remove_gemini_cli(
     *, project_dir: Path | None, assume_yes: bool, output_json: bool
 ) -> int:
     """Remove the one-command Gemini CLI connector — AgentVeil-managed entries only."""
-    from agentveil_mcp_proxy import claude_center_lifecycle, gemini_setup
+    from agentveil_mcp_proxy import gemini_setup
+    from agentveil_mcp_proxy.approval.server import stop_managed_approval_center
 
     target = (Path(project_dir) if project_dir is not None else Path.cwd()).resolve()
     home = gemini_setup.setup_home(target)
@@ -5739,7 +5777,7 @@ def run_setup_remove_gemini_cli(
         route_result = gemini_setup.disconnect(project_dir=target, home=home, write=True)
     except (ClientConnectError, ClientConfigError, ClientPackError) as exc:
         raise ProxyCliError(str(exc), exit_code=2) from exc
-    center_stop = claude_center_lifecycle.stop_if_managed(home)
+    center_stop = stop_managed_approval_center(home, require_healthy=True)
     removed_any = (
         bool(hook_result.get("removed_entries"))
         or bool(route_result.get("removed_entry"))
@@ -5772,13 +5810,14 @@ def run_setup_remove_gemini_cli(
 
 def run_setup_connector_status_cli(*, project_dir: Path | None, output_json: bool) -> int:
     """Project-local Claude connector status (bare `setup status`)."""
-    from agentveil_mcp_proxy import claude_center_lifecycle, claude_hook_setup
+    from agentveil_mcp_proxy import claude_hook_setup
+    from agentveil_mcp_proxy.approval.server import inspect_managed_approval_center
 
     target = (Path(project_dir) if project_dir is not None else Path.cwd()).resolve()
     home = _setup_claude_code_home(target)
     config_path = home / "mcp-proxy" / "config.json"
     status = claude_hook_setup.connector_status(target, proxy_route_present=config_path.exists())
-    center = claude_center_lifecycle.check_status(home)
+    center = inspect_managed_approval_center(home)
     status["approval_center"] = center.state
     # Setup is not "ready" unless the center is running; downgrade product
     # status accordingly so we never say protected with a dead approval path.
@@ -5819,7 +5858,7 @@ def run_setup_remove_claude_code_cli(
             print(message)
         return 0
 
-    from agentveil_mcp_proxy import claude_center_lifecycle
+    from agentveil_mcp_proxy.approval.server import stop_managed_approval_center
 
     try:
         hook_result = claude_hook_setup.uninstall_hook(target)
@@ -5827,7 +5866,7 @@ def run_setup_remove_claude_code_cli(
     except claude_hook_setup.HookSetupError as exc:
         raise ProxyCliError(str(exc), exit_code=1) from exc
 
-    center_stop = claude_center_lifecycle.stop_if_managed(_setup_claude_code_home(target))
+    center_stop = stop_managed_approval_center(_setup_claude_code_home(target), require_healthy=True)
     removed_any = (
         hook_result.removed_entries > 0
         or route_result.removed
@@ -5979,10 +6018,18 @@ def main(argv: list[str] | None = None) -> int:
                 port=args.port,
             )
         if args.command == "launch":
-            if args.choose_folder and (args.launch_status or args.launch_stop):
+            if args.choose_folder and (
+                args.launch_status or args.launch_stop or args.launch_doctor
+            ):
                 raise ProxyCliError(
-                    "--choose-folder is only supported for launch, not launch status/stop",
+                    "--choose-folder is only supported for launch, not launch status/stop/doctor",
                     exit_code=2,
+                )
+            if args.launch_doctor:
+                return run_launch_doctor_cli(
+                    profile_id=args.profile,
+                    project_dir=args.project_dir,
+                    output_json=args.json_output,
                 )
             if args.launch_status:
                 return run_launch_status_cli(

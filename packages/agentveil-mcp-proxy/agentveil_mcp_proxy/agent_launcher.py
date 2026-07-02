@@ -20,7 +20,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from pathlib import PurePosixPath
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Literal, Mapping, Sequence
 
 from agentveil_mcp_proxy.agent_runtime_profiles import (
     RuntimeProfileError,
@@ -40,6 +40,8 @@ from agentveil_mcp_proxy.client_config import (
     format_bounded_run_args,
     resolve_proxy_command,
 )
+from agentveil_mcp_proxy.evidence.events_show import LOCAL_PROOF_LAUNCHER_HINT
+from agentveil_mcp_proxy.evidence.store import ApprovalEvidenceStore
 
 
 LAUNCH_MANIFEST_FILENAME = "runtime-launch.manifest.json"
@@ -667,12 +669,14 @@ def _center_health(manifest: ApprovalCenterManifest) -> bool:
 
 
 def check_approval_center_status(home: Path) -> CenterStatus:
-    manifest = load_manifest(proxy_dir(home))
-    if manifest is None:
-        return CenterStatus(state="down", pid=None, port=None)
-    if _center_health(manifest):
-        return CenterStatus(state="running", pid=manifest.pid, port=manifest.port)
-    return CenterStatus(state="stale", pid=manifest.pid, port=manifest.port)
+    from agentveil_mcp_proxy.approval.server import inspect_managed_approval_center
+
+    managed = inspect_managed_approval_center(home)
+    return CenterStatus(
+        state=managed.state,
+        pid=managed.pid,
+        port=managed.port,
+    )
 
 
 def _spawn_approval_center(
@@ -725,25 +729,22 @@ def ensure_approval_center_running(
     proxy_command: str,
     passphrase_file: Path | None = None,
 ) -> tuple[CenterStatus, bool, str]:
-    initial = check_approval_center_status(home)
-    if initial.state == "running":
-        return initial, False, "approval center already running"
+    from agentveil_mcp_proxy.approval.server import ensure_managed_approval_center_running
 
-    try:
+    def spawn() -> None:
         _spawn_approval_center(
             proxy_command=proxy_command,
             home=home,
             passphrase_file=passphrase_file,
         )
-    except (OSError, ValueError) as exc:
-        return initial, False, f"could not spawn approval center: {exc.__class__.__name__}"
 
-    deadline = time.monotonic() + _CENTER_START_TIMEOUT_SECONDS
-    final = _wait_for_center(home, deadline=deadline)
-    if final.state == "running":
-        action = "restarted" if initial.state == "stale" else "started"
-        return final, True, f"approval center {action}"
-    return final, False, "approval center did not become healthy within the start timeout"
+    managed = ensure_managed_approval_center_running(home=home, spawn=spawn)
+    center = CenterStatus(
+        state=managed.status.state,
+        pid=managed.status.pid,
+        port=managed.status.port,
+    )
+    return center, managed.started, managed.reason
 
 
 def _bounded_child_env(
@@ -1069,40 +1070,608 @@ def stop_managed_launch(*, project_dir: Path) -> dict[str, Any]:
     else:
         reasons.append("no managed child manifest")
 
-    center_manifest = load_manifest(proxy_dir(home))
-    if center_manifest is not None and center_manifest.pid is not None:
-        if _center_health(center_manifest) and is_process_alive(center_manifest.pid):
-            try:
-                os.kill(center_manifest.pid, signal.SIGTERM)
-                stopped_center = True
-                reasons.append("managed approval center stopped")
-            except ProcessLookupError:
-                reasons.append("managed approval center already exited")
-            except PermissionError:
-                reasons.append("no permission to stop managed approval center")
-            else:
-                for _ in range(20):
-                    if not is_process_alive(center_manifest.pid):
-                        break
-                    time.sleep(0.1)
-            try:
-                approval_manifest_path(proxy_dir(home)).unlink(missing_ok=True)
-            except OSError:
-                pass
-        elif not is_process_alive(center_manifest.pid):
-            try:
-                approval_manifest_path(proxy_dir(home)).unlink(missing_ok=True)
-            except OSError:
-                pass
-            reasons.append("managed approval center manifest cleared")
-    else:
-        reasons.append("no managed approval center")
+    from agentveil_mcp_proxy.approval.server import stop_managed_approval_center
+
+    center_stop = stop_managed_approval_center(home, require_healthy=False)
+    stopped_center = bool(center_stop.get("stopped"))
+    center_reason = str(center_stop.get("reason") or "managed approval center stop attempted")
+    reasons.append(center_reason)
 
     return {
         "stopped_child": stopped_child,
         "stopped_center": stopped_center,
         "reasons": reasons,
     }
+
+
+ProtectionMode = Literal["controlled MCP route", "advisory", "not protected"]
+McpRouteState = Literal["configured", "missing"]
+EvidenceObservationState = Literal["observed", "ready_no_records", "not_initialized"]
+
+
+@dataclass(frozen=True)
+class LaunchStatusView:
+    """Shared human/JSON launcher status view derived from runtime facts."""
+
+    status: LaunchStatus
+    profile: RuntimeProfileSpec
+    mcp_route_state: McpRouteState
+    evidence_state: EvidenceObservationState
+    protection_mode: ProtectionMode
+    proof_hint: str
+    next_step: str
+    diagnostics: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = self.status.to_dict()
+        payload.update(
+            {
+                "profile_label": self.profile.display_name,
+                "control_surface": self.profile.control_surface,
+                "known_limitations": self.profile.known_limitations,
+                "mcp_route_state": self.mcp_route_state,
+                "evidence_state": self.evidence_state,
+                "protection_mode": self.protection_mode,
+                "proof_hint": self.proof_hint,
+                "next_step": self.next_step,
+                "diagnostics": list(self.diagnostics),
+            }
+        )
+        return payload
+
+
+def _evidence_record_count(home: Path) -> int:
+    evidence_path = proxy_dir(home) / "evidence.sqlite"
+    if not evidence_path.is_file():
+        return 0
+    try:
+        with ApprovalEvidenceStore(evidence_path) as store:
+            return len(store.list_records())
+    except (OSError, ValueError, RuntimeError):
+        return 0
+
+
+def classify_mcp_route_state(home: Path) -> McpRouteState:
+    if (proxy_dir(home) / "config.json").is_file():
+        return "configured"
+    return "missing"
+
+
+def classify_evidence_state(*, home: Path, config_exists: bool) -> EvidenceObservationState:
+    if not config_exists:
+        return "not_initialized"
+    if _evidence_record_count(home) > 0:
+        return "observed"
+    return "ready_no_records"
+
+
+def derive_protection_mode(
+    *,
+    mcp_route_state: McpRouteState,
+    center: CenterStatus,
+    profile_id: str,
+) -> ProtectionMode:
+    if mcp_route_state == "missing":
+        return "not protected"
+    if center.state != "running":
+        return "advisory"
+    if profile_id == "hermes-cli":
+        return "advisory"
+    return "controlled MCP route"
+
+
+def _profile_activity_label(profile_status: str) -> str:
+    if profile_status == "running":
+        return "running"
+    if profile_status == "stopped":
+        return "stopped"
+    if profile_status == "verify_only":
+        return "not launched yet"
+    return "ready"
+
+
+def _child_outcome_label(
+    *,
+    child_foreground: bool,
+    child_started: bool,
+    child_running: bool,
+    child_exit_code: int | None,
+) -> str:
+    if child_foreground:
+        if child_exit_code == 0:
+            return "finished"
+        if child_exit_code is not None:
+            return "failed"
+        return "running"
+    if child_running:
+        return "running"
+    if child_started:
+        return "started"
+    return "not started"
+
+
+def build_launch_diagnostics(
+    *,
+    status: LaunchStatus,
+    mcp_route_state: McpRouteState,
+    evidence_state: EvidenceObservationState,
+    profile_id: str,
+    protection_mode: ProtectionMode,
+) -> tuple[str, ...]:
+    diagnostics: list[str] = []
+    center_state = status.approval_center.state
+    if center_state == "down":
+        diagnostics.append(
+            "Approval center is down; pre-approval and controlled MCP writes may fail."
+        )
+    elif center_state == "stale":
+        diagnostics.append(
+            "Approval center looks stale; restart launch or run approval-center serve."
+        )
+    if mcp_route_state == "missing":
+        diagnostics.append("MCP route is not configured for this project.")
+    if evidence_state == "ready_no_records":
+        diagnostics.append("No local proof recorded yet; run a routed MCP action first.")
+    elif evidence_state == "not_initialized":
+        diagnostics.append("Local proof store is not initialized.")
+    if profile_id == "hermes-cli" and protection_mode == "advisory":
+        diagnostics.append(
+            "Native Hermes tools may bypass the MCP route; use --toolsets agentveil."
+        )
+    return tuple(diagnostics)
+
+
+def build_launch_proof_hint(*, evidence_state: EvidenceObservationState) -> str:
+    if evidence_state == "observed":
+        return LOCAL_PROOF_LAUNCHER_HINT
+    return ""
+
+
+def build_launch_next_step(
+    *,
+    protection_mode: ProtectionMode,
+    mcp_route_state: McpRouteState,
+    center: CenterStatus,
+    profile_status: str,
+    child_running: bool,
+    evidence_state: EvidenceObservationState,
+) -> str:
+    if mcp_route_state == "missing":
+        return (
+            "Initialize the project proxy route, then run "
+            "`agentveil-mcp-proxy launch` again."
+        )
+    if evidence_state == "not_initialized":
+        return (
+            "Initialize the project proxy route, then run "
+            "`agentveil-mcp-proxy launch` again."
+        )
+    if center.state != "running":
+        return (
+            "Start or restart the Approval Center, then retry a routed MCP action."
+        )
+    if profile_status == "verify_only":
+        return (
+            "Run `agentveil-mcp-proxy launch --profile <profile> --project-dir . -- <command>` "
+            "to start a managed child."
+        )
+    if evidence_state == "ready_no_records":
+        return (
+            "Run a routed MCP action first; local proof will be recorded after "
+            "the first action."
+        )
+    if evidence_state == "observed":
+        return LOCAL_PROOF_LAUNCHER_HINT
+    if child_running:
+        return (
+            "Let the managed child run routed MCP actions, then inspect local proof "
+            "through your agent."
+        )
+    if protection_mode == "advisory":
+        return (
+            "Keep the child on the AgentVeil MCP route, then run a routed MCP action."
+        )
+    return (
+        "Run a routed MCP action first; local proof will be recorded after "
+        "the first action."
+    )
+
+
+def build_launch_status_view(
+    *,
+    home: Path,
+    profile: RuntimeProfileSpec,
+    project_dir: Path,
+) -> LaunchStatusView:
+    status = build_launch_status(home=home, profile=profile, project_dir=project_dir)
+    config_exists = (proxy_dir(home) / "config.json").is_file()
+    mcp_route_state = classify_mcp_route_state(home)
+    evidence_state = classify_evidence_state(home=home, config_exists=config_exists)
+    protection_mode = derive_protection_mode(
+        mcp_route_state=mcp_route_state,
+        center=status.approval_center,
+        profile_id=profile.profile_id,
+    )
+    diagnostics = build_launch_diagnostics(
+        status=status,
+        mcp_route_state=mcp_route_state,
+        evidence_state=evidence_state,
+        profile_id=profile.profile_id,
+        protection_mode=protection_mode,
+    )
+    proof_hint = build_launch_proof_hint(evidence_state=evidence_state)
+    next_step = build_launch_next_step(
+        protection_mode=protection_mode,
+        mcp_route_state=mcp_route_state,
+        center=status.approval_center,
+        profile_status=status.profile_status,
+        child_running=status.child_running,
+        evidence_state=evidence_state,
+    )
+    return LaunchStatusView(
+        status=status,
+        profile=profile,
+        mcp_route_state=mcp_route_state,
+        evidence_state=evidence_state,
+        protection_mode=protection_mode,
+        proof_hint=proof_hint,
+        next_step=next_step,
+        diagnostics=diagnostics,
+    )
+
+
+def format_launch_status_human(view: LaunchStatusView) -> list[str]:
+    status = view.status
+    activity = _profile_activity_label(status.profile_status)
+    lines = [
+        "AgentVeil managed runtime status",
+        f"Profile:         {view.profile.display_name} ({status.profile_id}) — {activity}",
+        f"Protection:      {view.protection_mode}",
+        f"Controls:        {view.profile.control_surface}",
+        f"Limitation:      {view.profile.known_limitations}",
+        f"Approval center: {status.approval_center.state}",
+        f"MCP route:       {view.mcp_route_state}",
+        f"Local proof:     {view.evidence_state.replace('_', ' ')}",
+    ]
+    if status.child_running:
+        lines.append(f"Managed child:   running (pid {status.child_pid})")
+    elif status.profile_status == "stopped":
+        lines.append("Managed child:   stopped")
+    lines.append(f"Next:            {view.next_step}")
+    if view.diagnostics:
+        lines.append("Notes:")
+        lines.extend(f"  - {item}" for item in view.diagnostics)
+    if view.proof_hint:
+        lines.append(f"Proof hint:      {view.proof_hint}")
+    return lines
+
+
+def format_launch_result_human(
+    *,
+    result: LaunchResult,
+    view: LaunchStatusView,
+) -> list[str]:
+    status = view.status
+    child_label = _child_outcome_label(
+        child_foreground=result.child_foreground,
+        child_started=result.child_started,
+        child_running=status.child_running,
+        child_exit_code=result.child_exit_code,
+    )
+    lines = [
+        "AgentVeil managed runtime launch",
+        f"Profile:         {view.profile.display_name} ({status.profile_id})",
+        f"Protection:      {view.protection_mode}",
+        f"Controls:        {view.profile.control_surface}",
+        f"Limitation:      {view.profile.known_limitations}",
+        f"Managed child:   {child_label}",
+        f"Approval center: {status.approval_center.state}",
+        f"MCP route:       {view.mcp_route_state}",
+        f"Local proof:     {view.evidence_state.replace('_', ' ')}",
+    ]
+    if result.proxy_initialized:
+        lines.append("Proxy route:     initialized for this project")
+    if result.child_foreground and result.child_exit_code is not None:
+        lines.append(f"Exit code:       {result.child_exit_code}")
+    lines.append(f"Next:            {view.next_step}")
+    if view.diagnostics:
+        lines.append("Notes:")
+        lines.extend(f"  - {item}" for item in view.diagnostics)
+    if view.proof_hint:
+        lines.append(f"Proof hint:      {view.proof_hint}")
+    return lines
+
+
+def build_launch_result_payload(
+    *,
+    result: LaunchResult,
+    view: LaunchStatusView,
+) -> dict[str, Any]:
+    status = view.status
+    payload = view.to_dict()
+    payload.update(
+        {
+            "ok": result.child_exit_code in (None, 0),
+            "action": "launch",
+            "child_started": result.child_started,
+            "child_running": status.child_running,
+            "child_foreground": result.child_foreground,
+            "child_exit_code": result.child_exit_code,
+            "child_outcome": _child_outcome_label(
+                child_foreground=result.child_foreground,
+                child_started=result.child_started,
+                child_running=status.child_running,
+                child_exit_code=result.child_exit_code,
+            ),
+            "proxy_initialized": result.proxy_initialized,
+            "reason": result.reason,
+        }
+    )
+    return payload
+
+
+ProjectRouteState = Literal["ready", "missing"]
+ApprovalWaitState = Literal["enabled", "not configured", "not applicable"]
+ProviderKeyState = Literal["present", "missing", "not applicable"]
+
+
+@dataclass(frozen=True)
+class LaunchDoctorReport:
+    """Read-only managed-runtime preflight report."""
+
+    profile_id: str
+    profile_label: str
+    project_dir_ref: str
+    project_route: ProjectRouteState
+    approval_center: str
+    approval_wait: ApprovalWaitState
+    local_proof: str
+    provider_key: ProviderKeyState
+    evidence_state: EvidenceObservationState
+    mcp_route_state: McpRouteState
+    ready: bool
+    blocking: tuple[str, ...]
+    next_step: str
+    diagnostics: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "action": "launch-doctor",
+            "ok": self.ready,
+            "profile_id": self.profile_id,
+            "profile_label": self.profile_label,
+            "project_dir_ref": self.project_dir_ref,
+            "project_route": self.project_route,
+            "approval_center": self.approval_center,
+            "approval_wait": self.approval_wait,
+            "local_proof": self.local_proof,
+            "provider_key": self.provider_key,
+            "evidence_state": self.evidence_state,
+            "mcp_route_state": self.mcp_route_state,
+            "ready": self.ready,
+            "blocking": list(self.blocking),
+            "next_step": self.next_step,
+            "diagnostics": list(self.diagnostics),
+        }
+
+
+def _doctor_local_proof_label(state: EvidenceObservationState) -> str:
+    if state == "observed":
+        return "observed"
+    if state == "ready_no_records":
+        return "empty"
+    return "not initialized"
+
+
+def classify_approval_wait_mode(
+    home: Path,
+    profile: RuntimeProfileSpec,
+) -> ApprovalWaitState:
+    if profile.profile_id != "hermes-cli":
+        return "not applicable"
+    config_path = proxy_dir(home) / "config.json"
+    if not config_path.is_file():
+        return "not configured"
+    try:
+        config_payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return "not configured"
+    if not isinstance(config_payload, dict):
+        return "not configured"
+    approval = config_payload.get("approval")
+    if isinstance(approval, Mapping) and approval.get("wait_for_decision") is True:
+        return "enabled"
+    return "not configured"
+
+
+def classify_provider_prerequisite(
+    profile: RuntimeProfileSpec,
+    parent_env: Mapping[str, str] | None = None,
+) -> ProviderKeyState:
+    if profile.profile_id != "hermes-cli":
+        return "not applicable"
+    source = dict(parent_env or os.environ)
+    for key in ("DEEPSEEK_API_KEY", "OPENAI_API_KEY"):
+        value = source.get(key)
+        if isinstance(value, str) and value.strip():
+            return "present"
+    return "missing"
+
+
+def _doctor_route_source_diagnostics(home: Path) -> tuple[str, ...]:
+    route_path = runtime_route_path(home)
+    if not route_path.is_file():
+        return ()
+    try:
+        route_payload = json.loads(route_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return ()
+    if not isinstance(route_payload, Mapping):
+        return ()
+    proxy_command = str(route_payload.get("proxy_command") or "").strip()
+    if proxy_command in {"python", "python3", "agentveil-mcp-proxy"}:
+        return (
+            "Proxy route uses a module/source launch path; verify PYTHONPATH before launch.",
+        )
+    run_args = route_payload.get("run_args")
+    if isinstance(run_args, list) and any(
+        str(item) == "agentveil_mcp_proxy.cli" for item in run_args
+    ):
+        return (
+            "Proxy route uses a module/source launch path; verify PYTHONPATH before launch.",
+        )
+    return ()
+
+
+def build_launch_doctor_blocking(
+    *,
+    project_route: ProjectRouteState,
+    approval_center: CenterStatus,
+    approval_wait: ApprovalWaitState,
+    provider_key: ProviderKeyState,
+) -> tuple[str, ...]:
+    blocking: list[str] = []
+    if project_route == "missing":
+        blocking.append("project_route")
+    if approval_center.state != "running":
+        blocking.append("approval_center")
+    if approval_wait == "not configured":
+        blocking.append("approval_wait")
+    if provider_key == "missing":
+        blocking.append("provider_key")
+    return tuple(blocking)
+
+
+def build_launch_doctor_next_step(
+    *,
+    profile: RuntimeProfileSpec,
+    blocking: tuple[str, ...],
+    ready: bool,
+) -> str:
+    if ready:
+        return "Next: run `agentveil-mcp-proxy launch` normally."
+    if "project_route" in blocking:
+        return (
+            f"Next: initialize the project route with "
+            f"`agentveil-mcp-proxy launch --profile {profile.profile_id} ...`."
+        )
+    if "approval_center" in blocking:
+        return "Next: start or restart the Approval Center, then rerun launch doctor."
+    if "approval_wait" in blocking:
+        return (
+            "Next: enable approval wait mode for this project route, then rerun "
+            "launch doctor."
+        )
+    if "provider_key" in blocking:
+        return (
+            "Next: set DEEPSEEK_API_KEY or OPENAI_API_KEY in your environment, "
+            "then rerun launch doctor."
+        )
+    return "Next: resolve the blocking items above before launching."
+
+
+def build_launch_doctor_diagnostics(
+    *,
+    approval_center: CenterStatus,
+    project_route: ProjectRouteState,
+    evidence_state: EvidenceObservationState,
+    profile_id: str,
+    home: Path,
+) -> tuple[str, ...]:
+    diagnostics: list[str] = []
+    if approval_center.state == "down":
+        diagnostics.append(
+            "Approval Center is down; controlled MCP writes may fail until it is running."
+        )
+    elif approval_center.state == "stale":
+        diagnostics.append(
+            "Approval Center looks stale; restart it before launching an interactive agent."
+        )
+    if project_route == "missing":
+        diagnostics.append("Project MCP route is not initialized for this folder.")
+    if evidence_state == "ready_no_records":
+        diagnostics.append("Local proof store is ready but no actions have been recorded yet.")
+    elif evidence_state == "not_initialized":
+        diagnostics.append("Local proof store is not initialized.")
+    if profile_id == "hermes-cli":
+        diagnostics.append(
+            "Hermes launches require --toolsets agentveil to stay on the MCP route."
+        )
+    diagnostics.extend(_doctor_route_source_diagnostics(home))
+    return tuple(diagnostics)
+
+
+def build_launch_doctor_report(
+    *,
+    home: Path,
+    profile: RuntimeProfileSpec,
+    project_dir: Path,
+    parent_env: Mapping[str, str] | None = None,
+) -> LaunchDoctorReport:
+    config_exists = (proxy_dir(home) / "config.json").is_file()
+    mcp_route_state = classify_mcp_route_state(home)
+    project_route: ProjectRouteState = (
+        "ready" if mcp_route_state == "configured" else "missing"
+    )
+    approval_center = check_approval_center_status(home)
+    evidence_state = classify_evidence_state(home=home, config_exists=config_exists)
+    approval_wait = classify_approval_wait_mode(home, profile)
+    provider_key = classify_provider_prerequisite(profile, parent_env=parent_env)
+    blocking = build_launch_doctor_blocking(
+        project_route=project_route,
+        approval_center=approval_center,
+        approval_wait=approval_wait,
+        provider_key=provider_key,
+    )
+    ready = not blocking
+    diagnostics = build_launch_doctor_diagnostics(
+        approval_center=approval_center,
+        project_route=project_route,
+        evidence_state=evidence_state,
+        profile_id=profile.profile_id,
+        home=home,
+    )
+    next_step = build_launch_doctor_next_step(
+        profile=profile,
+        blocking=blocking,
+        ready=ready,
+    )
+    return LaunchDoctorReport(
+        profile_id=profile.profile_id,
+        profile_label=profile.display_name,
+        project_dir_ref=bounded_path_ref(project_dir)["ref"] or "",
+        project_route=project_route,
+        approval_center=approval_center.state,
+        approval_wait=approval_wait,
+        local_proof=_doctor_local_proof_label(evidence_state),
+        provider_key=provider_key,
+        evidence_state=evidence_state,
+        mcp_route_state=mcp_route_state,
+        ready=ready,
+        blocking=blocking,
+        next_step=next_step,
+        diagnostics=diagnostics,
+    )
+
+
+def format_launch_doctor_human(report: LaunchDoctorReport) -> list[str]:
+    lines = [
+        "AgentVeil launcher doctor",
+        "",
+        f"Profile:          {report.profile_id}",
+        f"Project route:    {report.project_route}",
+        f"Approval Center:  {report.approval_center}",
+        f"Approval wait:    {report.approval_wait}",
+        f"Local proof:      {report.local_proof}",
+    ]
+    if report.provider_key != "not applicable":
+        lines.append(f"Provider key:     {report.provider_key}")
+    lines.append("")
+    lines.append(report.next_step)
+    if report.diagnostics:
+        lines.append("Notes:")
+        lines.extend(f"  - {item}" for item in report.diagnostics)
+    return lines
 
 
 __all__ = [
@@ -1116,16 +1685,37 @@ __all__ = [
     "HERMES_HOME_ENV",
     "HERMES_MCP_SERVER_NAME",
     "HERMES_MCP_TOOLSET",
+    "LaunchDoctorReport",
     "LaunchManifest",
     "LaunchResult",
     "LaunchStatus",
+    "LaunchStatusView",
+    "ProtectionMode",
     "bounded_command_metadata",
     "build_hermes_config_document",
+    "build_launch_doctor_blocking",
+    "build_launch_doctor_diagnostics",
+    "build_launch_doctor_next_step",
+    "build_launch_doctor_report",
+    "build_launch_diagnostics",
+    "build_launch_next_step",
+    "build_launch_proof_hint",
+    "build_launch_result_human",
+    "build_launch_result_payload",
     "build_launch_status",
+    "build_launch_status_view",
     "check_approval_center_status",
+    "classify_approval_wait_mode",
+    "classify_evidence_state",
+    "classify_mcp_route_state",
+    "classify_provider_prerequisite",
+    "derive_protection_mode",
     "ensure_approval_center_running",
     "ensure_interactive_connector_defaults",
     "ensure_runtime_state_home",
+    "format_launch_doctor_human",
+    "format_launch_result_human",
+    "format_launch_status_human",
     "hermes_config_path",
     "hermes_native_tool_containment_note",
     "hermes_runtime_home",

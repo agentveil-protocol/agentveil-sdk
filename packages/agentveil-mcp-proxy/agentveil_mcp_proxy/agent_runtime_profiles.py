@@ -23,6 +23,8 @@ class RuntimeProfileSpec:
     default_status: str  # configured | verify_only
     child_detach: bool
     requires_child_command: bool
+    control_surface: str
+    known_limitations: str
 
     def summary(self) -> dict[str, str | bool]:
         return {
@@ -30,6 +32,8 @@ class RuntimeProfileSpec:
             "display_name": self.display_name,
             "default_status": self.default_status,
             "child_detach": self.child_detach,
+            "control_surface": self.control_surface,
+            "known_limitations": self.known_limitations,
         }
 
 
@@ -39,6 +43,12 @@ GENERIC_PROCESS_PROFILE = RuntimeProfileSpec(
     default_status="configured",
     child_detach=True,
     requires_child_command=True,
+    control_surface=(
+        "Routed MCP tool calls through AgentVeil approval and local proof"
+    ),
+    known_limitations=(
+        "Does not control the host, shell, or tools outside the MCP route"
+    ),
 )
 
 HERMES_CLI_PROFILE = RuntimeProfileSpec(
@@ -47,6 +57,13 @@ HERMES_CLI_PROFILE = RuntimeProfileSpec(
     default_status="configured",
     child_detach=False,
     requires_child_command=True,
+    control_surface=(
+        "Hermes chat through the AgentVeil MCP route (--toolsets agentveil)"
+    ),
+    known_limitations=(
+        "Native Hermes toolsets are limited, not host-wide; "
+        "full containment is not claimed"
+    ),
 )
 
 _KNOWN_PROFILES: dict[str, RuntimeProfileSpec] = {
