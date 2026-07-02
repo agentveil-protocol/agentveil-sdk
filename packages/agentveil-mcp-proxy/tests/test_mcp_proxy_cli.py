@@ -2498,6 +2498,9 @@ def test_cli_launch_status_bounded_without_paths(tmp_path, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["profile_id"] == "generic-process"
     assert payload["host_wide_control_claim"] is False
+    assert payload["protection_mode"] == "not protected"
+    assert payload["mcp_route_state"] == "missing"
+    assert payload["proof_hint"] == ""
     assert str(tmp_path) not in json.dumps(payload)
 
 

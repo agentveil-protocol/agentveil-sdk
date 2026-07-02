@@ -4790,8 +4790,18 @@ def run_launch_cli(
 ) -> int:
     """Launch a child process under a managed AgentVeil runtime profile."""
 
-    from agentveil_mcp_proxy.agent_launcher import AgentLauncherError, launch_managed_process
-    from agentveil_mcp_proxy.agent_runtime_profiles import HERMES_CLI_PROFILE
+    from agentveil_mcp_proxy.agent_launcher import (
+        AgentLauncherError,
+        build_launch_result_payload,
+        build_launch_status_view,
+        format_launch_result_human,
+        launch_managed_process,
+        project_avp_home,
+    )
+    from agentveil_mcp_proxy.agent_runtime_profiles import (
+        HERMES_CLI_PROFILE,
+        resolve_runtime_profile,
+    )
 
     if not profile_id:
         raise ProxyCliError("--profile is required for launch", exit_code=2)
@@ -4812,30 +4822,17 @@ def run_launch_cli(
     except AgentLauncherError as exc:
         raise ProxyCliError(str(exc), exit_code=exc.exit_code) from exc
 
-    status = result.status
+    profile = resolve_runtime_profile(profile_id)
+    view = build_launch_status_view(
+        home=project_avp_home(target),
+        profile=profile,
+        project_dir=target,
+    )
     if output_json:
-        payload = {
-            "ok": result.child_exit_code in (None, 0),
-            "action": "launch",
-            "profile_id": status.profile_id,
-            "profile_status": status.profile_status,
-            "project_dir_ref": status.project_dir_ref,
-            "session_id": status.session_id,
-            "approval_center": status.approval_center.state,
-            "child_started": result.child_started,
-            "child_running": status.child_running,
-            "child_foreground": result.child_foreground,
-            "child_exit_code": result.child_exit_code,
-            "proxy_initialized": result.proxy_initialized,
-            "evidence_enabled": status.evidence_enabled,
-            "scope": status.scope,
-            "host_wide_control_claim": status.host_wide_control_claim,
-            "reason": result.reason,
-        }
+        payload = build_launch_result_payload(result=result, view=view)
         if profile_id == HERMES_CLI_PROFILE.profile_id:
             from agentveil_mcp_proxy.agent_launcher import (
                 hermes_native_tool_containment_note,
-                project_avp_home,
                 runtime_route_path,
             )
 
@@ -4850,24 +4847,8 @@ def run_launch_cli(
             payload["native_tool_containment"] = hermes_native_tool_containment_note()
         _print_operator_json(payload)
     else:
-        print("Managed runtime launch:")
-        print(f"  profile:          {status.profile_id} ({status.profile_status})")
-        print(f"  scope:            {status.scope} (no host-wide control claim)")
-        print(f"  approval_center:  {status.approval_center.state}")
-        print(f"  evidence/proof:   {'enabled' if status.evidence_enabled else 'not initialized'}")
-        if result.child_foreground:
-            exit_code = result.child_exit_code if result.child_exit_code is not None else "unknown"
-            label = "finished" if result.child_exit_code == 0 else "failed"
-            print(f"  child:            {label} (exit {exit_code})")
-        else:
-            print(f"  child:            {'started' if result.child_started else 'not started'}")
-        if result.proxy_initialized:
-            print("  proxy route:      initialized for this project")
-        if profile_id == HERMES_CLI_PROFILE.profile_id:
-            print(
-                "  hermes note:      AgentVeil MCP route only; native Hermes tools are "
-                "limited, not host-wide. Use --toolsets agentveil."
-            )
+        for line in format_launch_result_human(result=result, view=view):
+            print(line)
     if result.child_exit_code is not None and result.child_exit_code != 0:
         return int(result.child_exit_code)
     return 0
@@ -4883,7 +4864,8 @@ def run_launch_status_cli(
 
     from agentveil_mcp_proxy.agent_launcher import (
         AgentLauncherError,
-        build_launch_status,
+        build_launch_status_view,
+        format_launch_status_human,
         project_avp_home,
         resolve_project_dir,
     )
@@ -4897,20 +4879,16 @@ def run_launch_status_cli(
         profile = resolve_runtime_profile(resolved_profile)
         target = resolve_project_dir(project_dir)
         home = project_avp_home(target)
-        status = build_launch_status(home=home, profile=profile, project_dir=target)
+        view = build_launch_status_view(home=home, profile=profile, project_dir=target)
     except (AgentLauncherError, RuntimeProfileError) as exc:
         exit_code = exc.exit_code if isinstance(exc, AgentLauncherError) else 2
         raise ProxyCliError(str(exc), exit_code=exit_code) from exc
 
     if output_json:
-        _print_operator_json({"ok": True, "action": "launch-status", **status.to_dict()})
+        _print_operator_json({"ok": True, "action": "launch-status", **view.to_dict()})
     else:
-        print("Managed runtime status:")
-        print(f"  profile:          {status.profile_id} ({status.profile_status})")
-        print(f"  scope:            {status.scope} (no host-wide control claim)")
-        print(f"  approval_center:  {status.approval_center.state}")
-        print(f"  child_running:    {status.child_running}")
-        print(f"  evidence/proof:   {'enabled' if status.evidence_enabled else 'not initialized'}")
+        for line in format_launch_status_human(view):
+            print(line)
     return 0
 
 

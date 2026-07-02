@@ -54,3 +54,12 @@ def test_generic_process_summary():
 def test_hermes_cli_summary():
     summary = HERMES_CLI_PROFILE.summary()
     assert summary["profile_id"] == "hermes-cli"
+
+
+def test_runtime_profiles_expose_shared_control_metadata():
+    for profile in (GENERIC_PROCESS_PROFILE, HERMES_CLI_PROFILE):
+        assert profile.control_surface
+        assert profile.known_limitations
+        summary = profile.summary()
+        assert summary["control_surface"] == profile.control_surface
+        assert summary["known_limitations"] == profile.known_limitations

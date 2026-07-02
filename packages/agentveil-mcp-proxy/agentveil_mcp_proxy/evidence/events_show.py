@@ -26,6 +26,8 @@ from agentveil_mcp_proxy.evidence.store import (
 DEFAULT_SHOW_LAST = 10
 LOCAL_PROOF_MCP_TOOL_NAME = "local_proof"
 LOCAL_PROOF_INSPECTION_COMMAND = "agentveil-mcp-proxy events show --last --verify"
+LOCAL_PROOF_USER_REQUEST = "Show AgentVeil local proof for the last action."
+LOCAL_PROOF_LAUNCHER_HINT = f'Ask your agent: "{LOCAL_PROOF_USER_REQUEST}"'
 LOCAL_PROOF_AGENT_PROMPT = (
     "Show AgentVeil local proof using the local_proof MCP tool. "
     "Do not run shell commands."
