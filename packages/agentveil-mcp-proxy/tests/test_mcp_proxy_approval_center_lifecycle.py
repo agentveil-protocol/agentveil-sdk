@@ -49,6 +49,14 @@ class ManagedCenterPidTracker:
         return set(self._pids_by_home.get(str(Path(home).resolve()), set()))
 
 
+def _expected_child_pythonpath_roots(package_root: Path) -> list[str]:
+    roots = [str(package_root)]
+    repo_root = package_root.parents[1]
+    if (repo_root / "agentveil").is_dir():
+        roots.append(str(repo_root))
+    return roots
+
+
 def _force_cleanup_managed_centers_for_home(
     home: Path,
     *,
@@ -198,7 +206,10 @@ def test_proxy_cli_child_env_includes_package_root(monkeypatch):
     env = agent_launcher._proxy_cli_child_env()
     package_root = str(Path(agent_launcher.__file__).resolve().parents[1])
 
-    assert env["PYTHONPATH"] == package_root
+    assert env["PYTHONPATH"].split(os.pathsep) == _expected_child_pythonpath_roots(
+        Path(package_root)
+    )
+    assert (Path(package_root) / "agentveil_mcp_proxy").is_dir()
 
 
 def test_proxy_cli_child_env_preserves_existing_pythonpath(monkeypatch):
@@ -208,8 +219,9 @@ def test_proxy_cli_child_env_preserves_existing_pythonpath(monkeypatch):
 
     env = agent_launcher._proxy_cli_child_env()
     package_root = str(Path(agent_launcher.__file__).resolve().parents[1])
+    expected_prefix = _expected_child_pythonpath_roots(Path(package_root))
 
-    assert env["PYTHONPATH"].split(os.pathsep) == [package_root, "existing-path"]
+    assert env["PYTHONPATH"].split(os.pathsep) == [*expected_prefix, "existing-path"]
 
 
 def test_managed_center_cli_argv_treats_python_as_interpreter():
@@ -228,9 +240,12 @@ def test_managed_center_child_env_includes_package_root(monkeypatch):
     monkeypatch.delenv("PYTHONPATH", raising=False)
 
     env = server._proxy_cli_child_env()
-    package_root = str(Path(server.__file__).resolve().parents[1])
+    package_root = str(Path(server.__file__).resolve().parents[2])
 
-    assert env["PYTHONPATH"] == package_root
+    assert env["PYTHONPATH"].split(os.pathsep) == _expected_child_pythonpath_roots(
+        Path(package_root)
+    )
+    assert (Path(package_root) / "agentveil_mcp_proxy").is_dir()
 
 
 def test_stale_manifest_is_not_running(managed_project_home):
@@ -296,11 +311,13 @@ def test_managed_approval_center_subprocess_start_stop_reuse(managed_project_hom
     project, home, _tracker = managed_project_home
     proxy_command = sys.executable
 
-    center, started, _reason = ensure_approval_center_running(
+    center, started, reason = ensure_approval_center_running(
         home=home,
         proxy_command=proxy_command,
     )
-    assert started is True
+    startup_log = home / "mcp-proxy" / "approval-center.startup.log"
+    log_tail = startup_log.read_text(errors="replace")[-1000:] if startup_log.exists() else ""
+    assert started is True, {"center": center, "reason": reason, "log_tail": log_tail}
     assert center.state == "running"
     pid = center.pid
     assert pid is not None
@@ -326,12 +343,14 @@ def test_prepare_stale_replaces_before_new_start(managed_project_home, monkeypat
     _project, home, tracker = managed_project_home
     proxy_command = sys.executable
 
-    center, _started, _ = ensure_approval_center_running(
+    center, _started, reason = ensure_approval_center_running(
         home=home,
         proxy_command=proxy_command,
     )
     pid = center.pid
-    assert pid is not None
+    startup_log = home / "mcp-proxy" / "approval-center.startup.log"
+    log_tail = startup_log.read_text(errors="replace")[-1000:] if startup_log.exists() else ""
+    assert pid is not None, {"center": center, "reason": reason, "log_tail": log_tail}
     tracker.track(home, pid)
 
     proxy_dir = home / "mcp-proxy"
@@ -384,12 +403,14 @@ def test_prepare_stale_replaces_before_new_start(managed_project_home, monkeypat
 def test_launch_stop_uses_managed_center_stop(managed_project_home):
     project, home, _tracker = managed_project_home
     proxy_command = sys.executable
-    center, _, _ = ensure_approval_center_running(
+    center, _, reason = ensure_approval_center_running(
         home=home,
         proxy_command=proxy_command,
     )
     pid = center.pid
-    assert pid is not None
+    startup_log = home / "mcp-proxy" / "approval-center.startup.log"
+    log_tail = startup_log.read_text(errors="replace")[-1000:] if startup_log.exists() else ""
+    assert pid is not None, {"center": center, "reason": reason, "log_tail": log_tail}
 
     outcome = stop_managed_launch(project_dir=project)
     assert outcome["stopped_center"] is True
