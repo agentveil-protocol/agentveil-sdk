@@ -1614,14 +1614,19 @@ def _proxy_cli_argv(proxy_command: str, subcommand: list[str]) -> list[str]:
 
 def _proxy_cli_child_env() -> dict[str, str]:
     env = dict(os.environ)
-    package_root = str(Path(__file__).resolve().parents[1])
+    package_root_path = Path(__file__).resolve().parents[2]
+    source_roots = [str(package_root_path)]
+    repo_root = package_root_path.parents[1]
+    if (repo_root / "agentveil").is_dir():
+        source_roots.append(str(repo_root))
     existing = env.get("PYTHONPATH")
     if existing:
         paths = existing.split(os.pathsep)
-        if package_root not in paths:
-            env["PYTHONPATH"] = os.pathsep.join([package_root, existing])
+        prefix = [path for path in source_roots if path not in paths]
+        if prefix:
+            env["PYTHONPATH"] = os.pathsep.join([*prefix, existing])
     else:
-        env["PYTHONPATH"] = package_root
+        env["PYTHONPATH"] = os.pathsep.join(source_roots)
     return env
 
 
