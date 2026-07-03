@@ -781,8 +781,8 @@ def ensure_approval_center_running(
 ) -> tuple[CenterStatus, bool, str]:
     from agentveil_mcp_proxy.approval.server import ensure_managed_approval_center_running
 
-    def spawn() -> None:
-        _spawn_approval_center(
+    def spawn() -> subprocess.Popen[bytes]:
+        return _spawn_approval_center(
             proxy_command=proxy_command,
             home=home,
             passphrase_file=passphrase_file,
