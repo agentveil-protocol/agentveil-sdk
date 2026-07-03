@@ -1062,7 +1062,7 @@ def launch_managed_process(
         schema_version=LAUNCH_MANIFEST_SCHEMA_VERSION,
         profile_id=profile.profile_id,
         session_id=session_id,
-        child_pid=process.pid,
+        child_pid=None if child_foreground else process.pid,
         child_argv0=command_meta["child_argv0"],
         child_command_ref=command_meta["child_command_ref"],
         started_at=int(time.time()),
