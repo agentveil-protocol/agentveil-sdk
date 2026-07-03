@@ -11,11 +11,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Any, Literal, Mapping
 
 from agentveil_mcp_proxy.classification import ClassifiedToolCall
 from agentveil_mcp_proxy.policy import RiskClass
-from agentveil_mcp_proxy.product_route import PRODUCT_ROUTE_POLICY_ID, PRODUCT_ROUTE_TOOL_CATALOG
+from agentveil_mcp_proxy.product_route import (
+    PRODUCT_ROUTE_POLICY_ID,
+    PRODUCT_ROUTE_TOOL_CATALOG,
+    SANDBOX_READ_ONLY_MCP_TOOLS,
+)
 
 
 class RiskFamily(str, Enum):
@@ -210,6 +215,47 @@ for tool, family in _READ_TOOL_FALLBACK.items():
 for tool in PRODUCT_ROUTE_TOOL_CATALOG:
     _TOOL_RISK_FAMILIES.setdefault(tool, RiskFamily.UNKNOWN)
 
+_SENSITIVE_PATH_MARKERS: tuple[str, ...] = (
+    ".git/",
+    ".env",
+    ".ssh/",
+    ".avp/",
+    ".agentveil/",
+)
+
+_DEFAULT_REDIRECT_TOOLS: frozenset[str] = frozenset({
+    "list_workspace",
+    "read_file",
+    "get_file_info",
+    "instruction_surface_status",
+    "git_status",
+    "git_diff",
+    "git_diff_staged",
+    "git_diff_unstaged",
+    "git_log",
+    "git_show",
+    "git_branch",
+    "package_inspect_state",
+    "package_list_manifest",
+    "package_risk_status",
+}) | SANDBOX_READ_ONLY_MCP_TOOLS
+
+_PLAYBOOK_PRIMARY_TOOLS: dict[str, str] = {
+    RedirectPlaybook.INSPECT_BEFORE_WRITE.value: "read_file",
+    RedirectPlaybook.INSPECT_BEFORE_DELETE.value: "read_file",
+    RedirectPlaybook.SHOW_GIT_STATUS_AND_DIFF.value: "git_status",
+    RedirectPlaybook.INSPECT_PACKAGE_RISK.value: "package_inspect_state",
+    RedirectPlaybook.SECRET_POSTURE_ONLY.value: "instruction_surface_status",
+    RedirectPlaybook.RELEASE_READINESS_CHECK.value: "list_workspace",
+    RedirectPlaybook.REPO_CHANGE_REVIEW.value: "list_workspace",
+    RedirectPlaybook.UNTRUSTED_TEXT_REVIEW.value: "instruction_surface_status",
+    RedirectPlaybook.WORKFLOW_REVIEW.value: "list_workspace",
+    RedirectPlaybook.REMOTE_COMMAND_REVIEW.value: "list_workspace",
+    RedirectPlaybook.STOP_AND_CLASSIFY_UNKNOWN.value: "list_workspace",
+}
+
+RedirectOutcome = Literal["approval_required", "hard_blocked"]
+
 
 @dataclass(frozen=True)
 class PlaybookSpec:
@@ -389,19 +435,187 @@ def build_risk_family_guidance(
     )
 
 
-def redirect_fields_from_guidance(guidance: RiskFamilyRedirectGuidance) -> dict[str, Any]:
+def redirect_fields_from_guidance(
+    guidance: RiskFamilyRedirectGuidance,
+    *,
+    classification: ClassifiedToolCall | None = None,
+    request_id: str | None = None,
+    available_tools: frozenset[str] | None = None,
+) -> dict[str, Any]:
     """Return bounded redirect keys for JSON-RPC error data."""
 
-    return {
+    redirect_outcome: RedirectOutcome = (
+        "approval_required" if guidance.approval_required else "hard_blocked"
+    )
+    fields: dict[str, Any] = {
         "risk_family": guidance.risk_family,
         "redirect_playbook": guidance.redirect_playbook,
         "requested_action": guidance.requested_action,
         "risk_reason": guidance.risk_reason,
         "safe_first_step_id": guidance.safe_first_step_id,
         "approval_required": guidance.approval_required,
+        "redirect_outcome": redirect_outcome,
         "target_outcome": guidance.target_outcome,
         "target_reached": False,
         "redirect_playbook_id": guidance.redirect_playbook_id,
+    }
+    if classification is not None:
+        fields["redirect"] = build_structured_redirect_contract(
+            classification,
+            guidance,
+            redirect_outcome=redirect_outcome,
+            available_tools=available_tools,
+        )
+        if request_id is not None:
+            fields["original_request_fingerprint"] = build_original_request_fingerprint(
+                classification,
+                request_id,
+            )
+    return fields
+
+
+def _path_is_sensitive(resource_plain: str | None) -> bool:
+    if resource_plain is None:
+        return False
+    normalized = resource_plain.replace("\\", "/").lower().strip()
+    if not normalized:
+        return False
+    if normalized.startswith("/") or normalized.startswith("~"):
+        return True
+    if any(marker in normalized for marker in _SENSITIVE_PATH_MARKERS):
+        return True
+    return any(part.startswith(".") for part in Path(normalized).parts)
+
+
+def _bounded_relative_path(resource_plain: str | None) -> str | None:
+    if resource_plain is None:
+        return None
+    text = resource_plain.strip()
+    if not text or text.startswith("/") or text.startswith("~"):
+        return None
+    if ".." in Path(text).parts:
+        return None
+    if _path_is_sensitive(text):
+        return None
+    return text
+
+
+def _redirect_tool_available(tool: str, available_tools: frozenset[str]) -> bool:
+    return tool in available_tools
+
+
+def _next_action_for_tool(
+    tool: str,
+    classification: ClassifiedToolCall,
+    *,
+    available_tools: frozenset[str],
+) -> dict[str, Any] | None:
+    if not _redirect_tool_available(tool, available_tools):
+        return None
+    args: dict[str, Any] = {}
+    if tool in {"read_file", "get_file_info"}:
+        path = _bounded_relative_path(classification.resource_plain)
+        if path is None:
+            return None
+        args = {"path": path}
+    return {"tool": tool, "args": args}
+
+
+_FALLBACK_TOOL_CANDIDATES: tuple[str, ...] = (
+    "list_workspace",
+    "instruction_surface_status",
+    "git_status",
+    "package_inspect_state",
+)
+
+
+def _first_available_tool(
+    candidates: tuple[str, ...],
+    available_tools: frozenset[str],
+) -> str | None:
+    for tool in candidates:
+        if tool in available_tools:
+            return tool
+    return None
+
+
+def build_structured_redirect_contract(
+    classification: ClassifiedToolCall,
+    guidance: RiskFamilyRedirectGuidance,
+    *,
+    redirect_outcome: RedirectOutcome,
+    available_tools: frozenset[str] | None = None,
+) -> dict[str, Any]:
+    """Return bounded machine-readable redirect next action for agents."""
+
+    tools = _DEFAULT_REDIRECT_TOOLS if available_tools is None else available_tools
+    then_retry_original = redirect_outcome == "approval_required"
+    playbook_id = guidance.redirect_playbook_id
+    primary_tool = _PLAYBOOK_PRIMARY_TOOLS.get(playbook_id, "list_workspace")
+    fallback_tool = _first_available_tool(_FALLBACK_TOOL_CANDIDATES, tools)
+
+    if guidance.risk_family == RiskFamily.SECRET_ACCESS.value:
+        primary_tool = "instruction_surface_status"
+    elif _path_is_sensitive(classification.resource_plain):
+        primary_tool = fallback_tool or primary_tool
+    if redirect_outcome == "hard_blocked" and guidance.risk_family in {
+        RiskFamily.FILE_DELETE.value,
+        RiskFamily.SECRET_ACCESS.value,
+    }:
+        primary_tool = fallback_tool or primary_tool
+
+    next_action = _next_action_for_tool(
+        primary_tool,
+        classification,
+        available_tools=tools,
+    )
+    fallback_next_action = None
+    if fallback_tool is not None:
+        fallback_next_action = _next_action_for_tool(
+            fallback_tool,
+            classification,
+            available_tools=tools,
+        )
+        if fallback_next_action is None and _redirect_tool_available(fallback_tool, tools):
+            fallback_next_action = {"tool": fallback_tool, "args": {}}
+    if next_action is None and fallback_next_action is not None:
+        next_action = fallback_next_action
+
+    kind = playbook_id
+    if redirect_outcome == "hard_blocked" and guidance.risk_family == RiskFamily.SECRET_ACCESS.value:
+        kind = "sensitive_path_blocked"
+
+    contract: dict[str, Any] = {
+        "kind": kind,
+        "target_changed": False,
+        "then_retry_original": then_retry_original,
+        "next_action": next_action,
+        "fallback_next_action": fallback_next_action,
+    }
+    if next_action is None:
+        contract["next_action_unavailable_reason"] = (
+            "no advertised read-only tool is available for this redirect"
+        )
+    return contract
+
+
+def build_original_request_fingerprint(
+    classification: ClassifiedToolCall,
+    request_id: str,
+) -> dict[str, str]:
+    """Return bounded original-request identity without raw payload content."""
+
+    if classification.resource_hash:
+        target_ref = f"resource:{classification.resource_hash}"
+    elif classification.resource:
+        target_ref = f"resource:{classification.resource}"
+    else:
+        target_ref = "target:unknown"
+    return {
+        "tool": classification.tool,
+        "target_ref": target_ref,
+        "payload_hash": classification.payload_hash,
+        "request_id": request_id,
     }
 
 
@@ -417,6 +631,7 @@ def message_visible_approval_redirect(
         f"Approval required for {guidance.risk_family}.\n"
         f"Redirect playbook: {guidance.redirect_playbook}.\n"
         f"Safe first step: {spec.safe_first_step}\n"  # claim-check: allow bounded playbook UI string.
+        f"Approval can allow the exact same MCP tool call after review.\n"
         f"Open {approval_url}, approve or deny, then retry the same request."
     )
 
@@ -431,12 +646,21 @@ def message_visible_blocked_redirect(
         return (
             "Secret access blocked.\n"  # claim-check: allow blocked as JSON-RPC status vocabulary.
             f"Redirect playbook: {guidance.redirect_playbook}.\n"
-            f"Safe first step: {spec.safe_first_step}"  # claim-check: allow bounded playbook UI string.
+            f"Safe first step: {spec.safe_first_step}\n"  # claim-check: allow bounded playbook UI string.
+            "The original secret access will not be allowed; inspect posture only."
+        )
+    if guidance.risk_family == RiskFamily.FILE_DELETE.value:
+        return (
+            f"Action blocked for {guidance.risk_family}.\n"  # claim-check: allow blocked as JSON-RPC status vocabulary.
+            f"Redirect playbook: {guidance.redirect_playbook}.\n"
+            f"Safe first step: {spec.safe_first_step}\n"  # claim-check: allow bounded playbook UI string.
+            "The original delete will not be allowed; confirm target identity with read-only inspection only."
         )
     return (
         f"Action blocked for {guidance.risk_family}.\n"  # claim-check: allow blocked as JSON-RPC status vocabulary.
         f"Redirect playbook: {guidance.redirect_playbook}.\n"
-        f"Safe first step: {spec.safe_first_step}"  # claim-check: allow bounded playbook UI string.
+        f"Safe first step: {spec.safe_first_step}\n"  # claim-check: allow bounded playbook UI string.
+        "The original action will not be allowed; use the safe inspection step only."
     )
 
 
@@ -491,7 +715,13 @@ def enrich_risk_family_error_data(
     """Attach risk-family redirect metadata to JSON-RPC error data."""
 
     guidance = build_risk_family_guidance(classification, outcome=outcome)
-    data.update(redirect_fields_from_guidance(guidance))
+    data.update(
+        redirect_fields_from_guidance(
+            guidance,
+            classification=classification,
+            request_id=original_request_id,
+        )
+    )
     if original_request_id is not None:
         data["original_request_id"] = original_request_id
         data["redirect_context"] = redirect_context_stub(
@@ -651,7 +881,9 @@ __all__ = [
     "RiskFamilyRedirectGuidance",
     "attach_redirect_playbook_fields",
     "attach_redirect_playbook_fields_for_evidence_record",
+    "build_original_request_fingerprint",
     "build_risk_family_guidance",
+    "build_structured_redirect_contract",
     "enrich_risk_family_error_data",
     "message_visible_approval_redirect",
     "message_visible_blocked_redirect",

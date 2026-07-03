@@ -1978,6 +1978,8 @@ def test_cli_setup_status_bare_is_connector(tmp_path, capsys):
     assert payload["hook"] == "missing"
     assert payload["mcp_route"] == "missing"
     assert "next_step" in payload
+    assert payload["trust_boundary"]["host_wide_control_claim"] is False
+    assert payload["trust_boundary"]["hook_coverage"] == "missing"
 
 
 def test_cli_setup_status_home_routes_to_wizard(tmp_path, capsys):
@@ -1990,6 +1992,45 @@ def test_cli_setup_status_home_routes_to_wizard(tmp_path, capsys):
     # wizard output must not carry the connector-only keys
     assert "mcp_route" not in payload
     assert "hook" not in payload or "next_step" not in payload
+    assert payload["trust_boundary"]["hook_coverage"] == "not reported"
+
+
+def test_cli_setup_status_client_codex_includes_trust_boundary(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from agentveil_mcp_proxy import codex_setup
+
+    monkeypatch.setattr(
+        codex_setup,
+        "connector_status",
+        lambda **_kwargs: {
+            "status": "advisory",
+            "hook": "installed",
+            "hook_state": "installed",
+            "mcp_route": "present",
+            "proxy_route": "present",
+            "approval_center": "running",
+        },
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.approval.server.inspect_managed_approval_center",
+        lambda _home: SimpleNamespace(state="running", pid=123, port=8765),
+    )
+
+    assert main([
+        "setup",
+        "status",
+        "--client",
+        "codex",
+        "--project-dir",
+        str(tmp_path),
+        "--json",
+    ]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["trust_boundary"]["host_wide_control_claim"] is False
+    assert payload["trust_boundary"]["hook_coverage"] == "installed"
 
 
 def test_cli_setup_claude_code_preview_does_not_write(tmp_path, capsys):
@@ -2512,7 +2553,17 @@ def test_cli_launch_status_bounded_without_paths(tmp_path, capsys):
     assert payload["protection_mode"] == "not protected"
     assert payload["mcp_route_state"] == "missing"
     assert payload["proof_hint"] == ""
+    assert payload["trust_boundary"]["host_wide_control_claim"] is False
+    assert "Protection scope: project MCP route, not host-wide" not in json.dumps(payload)
     assert str(tmp_path) not in json.dumps(payload)
+
+
+def test_cli_launch_status_human_includes_trust_boundary_scope_line(tmp_path, capsys):
+    rc = main(["launch", "status", "--project-dir", str(tmp_path)])
+    assert rc == 0
+    text = capsys.readouterr().out
+    assert "Protection scope: project MCP route, not host-wide" in text
+    assert text.count("Protection scope: project MCP route, not host-wide") == 1
 
 
 def test_cli_launch_doctor_requires_profile(tmp_path, capsys):
@@ -2538,6 +2589,7 @@ def test_cli_launch_doctor_empty_project_json(tmp_path, capsys):
     assert payload["local_proof"] == "not initialized"
     assert payload["ready"] is False
     assert payload["provider_key"] == "not applicable"
+    assert payload["trust_boundary"]["host_wide_control_claim"] is False
     assert str(tmp_path) not in json.dumps(payload)
 
 
@@ -2575,6 +2627,7 @@ def test_cli_launch_doctor_is_read_only(tmp_path, monkeypatch, capsys):
     text = capsys.readouterr().out
     assert "AgentVeil launcher doctor" in text
     assert "Provider key:" in text
+    assert "Protection scope: project MCP route, not host-wide" in text
 
 
 def test_cli_launch_status_reports_hermes_cli_from_manifest(tmp_path, capsys, monkeypatch):

@@ -43,6 +43,7 @@ from agentveil_mcp_proxy.agent_launcher import (
     LaunchResult,
     LaunchStatus,
     launch_manifest_path,
+    TRUST_BOUNDARY_HUMAN_LINE,
     load_launch_manifest,
     normalize_child_command,
     parse_hermes_agentveil_stdio_config,
@@ -1156,6 +1157,8 @@ def test_launch_status_view_json_fields(tmp_path):
     assert payload["protection_mode"] == "advisory"
     assert payload["mcp_route_state"] == "configured"
     assert payload["proof_hint"] == ""
+    assert payload["trust_boundary"]["host_wide_control_claim"] is False
+    assert payload["trust_boundary"]["proxy_route_state"] == "configured"
     assert str(project) not in json.dumps(payload)
 
 
@@ -1199,6 +1202,43 @@ def test_launch_status_human_omits_proof_hint_when_unavailable(tmp_path):
     assert "Proof hint:" not in text
     assert LOCAL_PROOF_LAUNCHER_HINT not in text
     assert "Initialize the project proxy route" in text
+
+
+def test_launch_status_human_includes_trust_boundary_scope_line(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    view = build_launch_status_view(
+        home=project_avp_home(project),
+        profile=GENERIC_PROCESS_PROFILE,
+        project_dir=project,
+    )
+    text = "\n".join(format_launch_status_human(view))
+    payload = view.to_dict()
+
+    assert TRUST_BOUNDARY_HUMAN_LINE in text
+    assert text.count(TRUST_BOUNDARY_HUMAN_LINE) == 1
+    assert "protected host-wide" not in text.lower()
+    assert "trust_boundary" in payload
+    assert TRUST_BOUNDARY_HUMAN_LINE not in json.dumps(payload)
+
+
+def test_launch_doctor_human_includes_trust_boundary_scope_line(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    report = build_launch_doctor_report(
+        home=project_avp_home(project),
+        profile=GENERIC_PROCESS_PROFILE,
+        project_dir=project,
+        parent_env={},
+    )
+    text = "\n".join(format_launch_doctor_human(report))
+    payload = report.to_dict()
+
+    assert TRUST_BOUNDARY_HUMAN_LINE in text
+    assert text.count(TRUST_BOUNDARY_HUMAN_LINE) == 1
+    assert "protected host-wide" not in text.lower()
+    assert "trust_boundary" in payload
+    assert TRUST_BOUNDARY_HUMAN_LINE not in json.dumps(payload)
 
 
 def test_launch_diagnostics_cover_stale_center_and_native_bypass():
@@ -1291,6 +1331,18 @@ def test_launch_doctor_empty_project_is_not_ready(tmp_path):
     assert report.ready is False
     assert report.provider_key == "not applicable"
     assert "project_route" in report.blocking
+    assert report.trust_boundary["host_wide_control_claim"] is False
+    assert report.trust_boundary["proxy_route_state"] == "missing"
+    assert report.trust_boundary["hook_coverage"] == "not reported"
+
+
+def test_derive_hook_coverage_from_connector_status() -> None:
+    from agentveil_mcp_proxy.agent_launcher import derive_hook_coverage_from_connector_status
+
+    assert derive_hook_coverage_from_connector_status({"hook": "missing"}) == "missing"
+    assert derive_hook_coverage_from_connector_status({"hook_evidence_observed": True}) == "observed"
+    assert derive_hook_coverage_from_connector_status({"hook_state": "fired"}) == "observed"
+    assert derive_hook_coverage_from_connector_status({"hook": "installed"}) == "installed"
 
 
 def test_launch_doctor_configured_route_without_evidence(tmp_path, monkeypatch):

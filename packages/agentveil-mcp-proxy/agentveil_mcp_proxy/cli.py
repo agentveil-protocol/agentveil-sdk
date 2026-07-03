@@ -1560,6 +1560,34 @@ def run_setup_wizard_cli(
     return 0 if result.ok or result.setup_status == "incomplete" else 2
 
 
+def _attach_connector_trust_boundary(
+    status: dict[str, Any],
+    *,
+    home: Path,
+    project_dir: Path,
+) -> dict[str, Any]:
+    from agentveil_mcp_proxy.agent_launcher import (
+        CenterStatus,
+        build_trust_boundary,
+        derive_hook_coverage_from_connector_status,
+    )
+    from agentveil_mcp_proxy.approval.server import inspect_managed_approval_center
+
+    enriched = dict(status)
+    center = inspect_managed_approval_center(home)
+    enriched["trust_boundary"] = build_trust_boundary(
+        home=home,
+        project_dir=project_dir,
+        approval_center=CenterStatus(
+            state=center.state,
+            pid=getattr(center, "pid", None),
+            port=getattr(center, "port", None),
+        ),
+        hook_coverage=derive_hook_coverage_from_connector_status(enriched),
+    )
+    return enriched
+
+
 def print_setup_status_cli(
     *,
     home: Path | None = None,
@@ -1584,6 +1612,14 @@ def print_setup_status_cli(
         proxy_config_path=config_path,
     )
     payload = setup_status_to_dict(status)
+    project_dir = home.parent if home.name == ".avp" else home
+    from agentveil_mcp_proxy.agent_launcher import build_trust_boundary
+
+    payload["trust_boundary"] = build_trust_boundary(
+        home=home,
+        project_dir=project_dir,
+        hook_coverage="not reported",
+    )
     assert_setup_output_is_privacy_safe(payload)
     if output_json:
         _print_json(payload, sink)
@@ -4497,6 +4533,7 @@ def run_setup_cursor_status_cli(*, workspace: Path | None, output_json: bool) ->
     status = cursor_setup.connector_status(target, home=home)
     if status["approval_center"] != "running" and status["status"] != "unsafe":
         status["status"] = "advisory"
+    status = _attach_connector_trust_boundary(status, home=home, project_dir=target)
     if output_json:
         _print_operator_json(status)
     else:
@@ -5440,6 +5477,7 @@ def run_setup_codex_status_cli(
         center_state=center.state,
         proxy_command=proxy_command or _resolve_setup_proxy_command(),
     )
+    status = _attach_connector_trust_boundary(status, home=home, project_dir=target)
     if output_json:
         _print_operator_json(status)
     else:
@@ -5729,6 +5767,7 @@ def run_setup_gemini_status_cli(
         center_state=center.state,
         proxy_command=proxy_command or _resolve_setup_proxy_command(),
     )
+    status = _attach_connector_trust_boundary(status, home=home, project_dir=target)
     if output_json:
         _print_operator_json(status)
     else:
@@ -5823,6 +5862,7 @@ def run_setup_connector_status_cli(*, project_dir: Path | None, output_json: boo
     # status accordingly so we never say protected with a dead approval path.
     if center.state != "running" and status["status"] != "unsafe":
         status["status"] = "unsafe" if status["mcp_route"] == "missing" else "advisory"
+    status = _attach_connector_trust_boundary(status, home=home, project_dir=target)
     if output_json:
         _print_operator_json(status)
     else:
