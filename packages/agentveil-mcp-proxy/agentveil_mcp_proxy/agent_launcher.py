@@ -1137,6 +1137,97 @@ def stop_managed_launch(*, project_dir: Path) -> dict[str, Any]:
 ProtectionMode = Literal["controlled MCP route", "advisory", "not protected"]
 McpRouteState = Literal["configured", "missing"]
 EvidenceObservationState = Literal["observed", "ready_no_records", "not_initialized"]
+HookCoverageState = Literal["not reported", "missing", "installed", "observed", "stale"]
+TRUST_BOUNDARY_HUMAN_LINE = "Protection scope: project MCP route, not host-wide"
+
+
+def build_trust_boundary(
+    *,
+    home: Path,
+    project_dir: Path,
+    profile: RuntimeProfileSpec | None = None,
+    approval_center: CenterStatus | None = None,
+    mcp_route_state: McpRouteState | None = None,
+    evidence_state: EvidenceObservationState | None = None,
+    protection_mode: ProtectionMode | None = None,
+    hook_coverage: HookCoverageState = "not reported",
+) -> dict[str, Any]:
+    """Return bounded local trust-boundary facts for status/doctor surfaces."""
+
+    config_exists = (proxy_dir(home) / "config.json").is_file()
+    resolved_route = mcp_route_state or classify_mcp_route_state(home)
+    resolved_evidence = evidence_state or classify_evidence_state(
+        home=home,
+        config_exists=config_exists,
+    )
+    center = approval_center or check_approval_center_status(home)
+    resolved_protection = protection_mode
+    if resolved_protection is None and profile is not None:
+        resolved_protection = derive_protection_mode(
+            mcp_route_state=resolved_route,
+            center=center,
+            profile_id=profile.profile_id,
+        )
+    approval_wait: ApprovalWaitState = "not applicable"
+    if profile is not None:
+        approval_wait = classify_approval_wait_mode(home, profile)
+    else:
+        approval_wait = classify_setup_approval_wait_mode(home)
+    return {
+        "scope": "project",
+        "host_wide_control_claim": False,
+        "proxy_route_state": resolved_route,
+        "approval_center_state": center.state,
+        "approval_wait_mode": approval_wait,
+        "local_proof_state": resolved_evidence,
+        "workspace_root_ref": bounded_path_ref(project_dir)["ref"] or "",
+        "hook_coverage": hook_coverage,
+        "protection_mode": resolved_protection or "not protected",
+        "boundary_note": (
+            "AgentVeil trust applies to routed MCP actions in this project. "
+            "Native host tools outside the MCP route are not host-wide contained."
+        ),
+    }
+
+
+def classify_setup_approval_wait_mode(home: Path) -> ApprovalWaitState:
+    """Return approval wait-mode state from project proxy config when known."""
+
+    config_path = proxy_dir(home) / "config.json"
+    if not config_path.is_file():
+        return "not configured"
+    try:
+        config_payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return "not configured"
+    if not isinstance(config_payload, dict):
+        return "not configured"
+    approval = config_payload.get("approval")
+    if isinstance(approval, Mapping) and approval.get("wait_for_decision") is True:
+        return "enabled"
+    return "not configured"
+
+
+def derive_hook_coverage_from_connector_status(
+    status: Mapping[str, Any],
+) -> HookCoverageState:
+    """Map existing connector status hook fields to bounded hook coverage."""
+
+    if status.get("hook_evidence_observed") is True:
+        return "observed"
+    if status.get("mcp_route_observed") is True:
+        return "observed"
+    hook = str(status.get("hook") or "")
+    hook_state = str(status.get("hook_state") or "")
+    if hook in {"missing"} or hook_state in {"missing"}:
+        return "missing"
+    if hook in {"stale"} or hook_state in {"stale", "invalid-json"}:
+        return "stale"
+    if hook_state in {"fired", "protected"} or status.get("status") == "protected":
+        return "observed"
+    if hook in {"installed", "present", "fired"} or hook_state in {"installed", "fired"}:
+        return "installed"
+    return "missing"
 
 
 @dataclass(frozen=True)
@@ -1151,6 +1242,7 @@ class LaunchStatusView:
     proof_hint: str
     next_step: str
     diagnostics: tuple[str, ...]
+    trust_boundary: dict[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
         payload = self.status.to_dict()
@@ -1165,6 +1257,7 @@ class LaunchStatusView:
                 "proof_hint": self.proof_hint,
                 "next_step": self.next_step,
                 "diagnostics": list(self.diagnostics),
+                "trust_boundary": self.trust_boundary,
             }
         )
         return payload
@@ -1358,6 +1451,15 @@ def build_launch_status_view(
         child_running=status.child_running,
         evidence_state=evidence_state,
     )
+    trust_boundary = build_trust_boundary(
+        home=home,
+        project_dir=project_dir,
+        profile=profile,
+        approval_center=status.approval_center,
+        mcp_route_state=mcp_route_state,
+        evidence_state=evidence_state,
+        protection_mode=protection_mode,
+    )
     return LaunchStatusView(
         status=status,
         profile=profile,
@@ -1367,6 +1469,7 @@ def build_launch_status_view(
         proof_hint=proof_hint,
         next_step=next_step,
         diagnostics=diagnostics,
+        trust_boundary=trust_boundary,
     )
 
 
@@ -1377,6 +1480,7 @@ def format_launch_status_human(view: LaunchStatusView) -> list[str]:
         "AgentVeil managed runtime status",
         f"Profile:         {view.profile.display_name} ({status.profile_id}) — {activity}",
         f"Protection:      {view.protection_mode}",
+        TRUST_BOUNDARY_HUMAN_LINE,
         f"Controls:        {view.profile.control_surface}",
         f"Limitation:      {view.profile.known_limitations}",
         f"Approval center: {status.approval_center.state}",
@@ -1483,6 +1587,7 @@ class LaunchDoctorReport:
     blocking: tuple[str, ...]
     next_step: str
     diagnostics: tuple[str, ...]
+    trust_boundary: dict[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1502,6 +1607,7 @@ class LaunchDoctorReport:
             "blocking": list(self.blocking),
             "next_step": self.next_step,
             "diagnostics": list(self.diagnostics),
+            "trust_boundary": self.trust_boundary,
         }
 
 
@@ -1686,6 +1792,20 @@ def build_launch_doctor_report(
         blocking=blocking,
         ready=ready,
     )
+    protection_mode = derive_protection_mode(
+        mcp_route_state=mcp_route_state,
+        center=approval_center,
+        profile_id=profile.profile_id,
+    )
+    trust_boundary = build_trust_boundary(
+        home=home,
+        project_dir=project_dir,
+        profile=profile,
+        approval_center=approval_center,
+        mcp_route_state=mcp_route_state,
+        evidence_state=evidence_state,
+        protection_mode=protection_mode,
+    )
     return LaunchDoctorReport(
         profile_id=profile.profile_id,
         profile_label=profile.display_name,
@@ -1701,6 +1821,7 @@ def build_launch_doctor_report(
         blocking=blocking,
         next_step=next_step,
         diagnostics=diagnostics,
+        trust_boundary=trust_boundary,
     )
 
 
@@ -1713,6 +1834,7 @@ def format_launch_doctor_human(report: LaunchDoctorReport) -> list[str]:
         f"Approval Center:  {report.approval_center}",
         f"Approval wait:    {report.approval_wait}",
         f"Local proof:      {report.local_proof}",
+        TRUST_BOUNDARY_HUMAN_LINE,
     ]
     if report.provider_key != "not applicable":
         lines.append(f"Provider key:     {report.provider_key}")
@@ -1747,6 +1869,9 @@ __all__ = [
     "build_launch_doctor_diagnostics",
     "build_launch_doctor_next_step",
     "build_launch_doctor_report",
+    "build_trust_boundary",
+    "classify_setup_approval_wait_mode",
+    "derive_hook_coverage_from_connector_status",
     "build_launch_diagnostics",
     "build_launch_next_step",
     "build_launch_proof_hint",
