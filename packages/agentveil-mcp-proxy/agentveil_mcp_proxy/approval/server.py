@@ -1501,7 +1501,7 @@ details {{ margin: 8px 0 12px; }}
         self.close_connection = True
 
 
-_MANAGED_CENTER_START_TIMEOUT_SECONDS = 12.0
+_MANAGED_CENTER_START_TIMEOUT_SECONDS = 30.0
 _MANAGED_CENTER_POLL_INTERVAL_SECONDS = 0.2
 _MANAGED_CENTER_STOP_GRACE_SECONDS = 2.0
 
@@ -1990,8 +1990,8 @@ def ensure_managed_approval_center_for_cli(
 ) -> ManagedApprovalCenterEnsureResult:
     """Idempotently ensure a healthy project-local Approval Center for setup flows."""
 
-    def spawn() -> None:
-        spawn_managed_approval_center_process(
+    def spawn() -> subprocess.Popen[bytes]:
+        return spawn_managed_approval_center_process(
             proxy_command=proxy_command,
             home=home,
             passphrase_file=passphrase_file,
@@ -2023,7 +2023,7 @@ def ensure_managed_approval_center_running(
         prepare_stale_managed_approval_center(home)
 
     try:
-        spawn()
+        spawned = spawn()
     except (OSError, ValueError) as exc:
         return ManagedApprovalCenterEnsureResult(
             status=initial,
@@ -2045,6 +2045,19 @@ def ensure_managed_approval_center_running(
             restarted=restarted,
             reason="approval center restarted" if restarted else "approval center started",
         )
+    if isinstance(spawned, subprocess.Popen):
+        returncode = spawned.poll()
+        if returncode is not None:
+            return ManagedApprovalCenterEnsureResult(
+                status=final,
+                started=False,
+                reused=False,
+                restarted=False,
+                reason=(
+                    "approval center process exited before becoming healthy "
+                    f"(exit {returncode})"
+                ),
+            )
     return ManagedApprovalCenterEnsureResult(
         status=final,
         started=False,
