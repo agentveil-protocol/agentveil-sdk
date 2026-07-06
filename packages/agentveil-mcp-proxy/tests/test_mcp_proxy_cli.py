@@ -2931,3 +2931,79 @@ def test_cli_launch_hermes_cli_choose_folder_routes_to_launch(tmp_path, monkeypa
     err = capsys.readouterr()
     assert str(selected) not in err.out
     assert str(selected) not in err.err
+
+
+def test_root_help_surfaces_grouped_onboarding_sections(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["--help"])
+    assert exc.value.code == 0
+    text = capsys.readouterr().out
+    assert "Getting started:" in text
+    assert "init, doctor, run, setup, launch" in text
+    assert "Evidence and proof:" in text
+    assert "events, export-evidence, verify" in text
+    assert "Advanced:" in text
+    assert "Typical first-run path:" in text
+    assert "Commands:" in text
+    assert "protected machine" not in text.lower()
+    assert "host-wide" not in text.lower()
+
+
+def test_root_help_still_lists_all_commands():
+    help_text = proxy_cli.build_parser().format_help()
+    for command in (
+        "init",
+        "doctor",
+        "run",
+        "setup",
+        "launch",
+        "export-evidence",
+        "verify",
+        "events",
+        "approval-center",
+        "wizard",
+        "install-claude-hook",
+    ):
+        assert command in help_text
+
+
+def test_init_help_retains_next_steps_guidance(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["init", "--help"])
+    assert exc.value.code == 0
+    text = capsys.readouterr().out
+    assert "agentveil-mcp-proxy init --quickstart-filesystem" in text
+    assert "client-config print" in text
+
+
+def test_init_next_steps_include_home_when_custom_home(tmp_path, capsys):
+    home = tmp_path / "custom-avp-home"
+    rc = main([
+        "init",
+        "--home",
+        str(home),
+        "--plaintext",
+        "--force",
+    ])
+    assert rc == 0
+    text = capsys.readouterr().out
+    assert f"doctor --home {home}" in text
+    assert f"client-config print --home {home}" in text
+
+
+def test_init_next_steps_include_config_when_custom_config(tmp_path, capsys):
+    home = tmp_path / "custom-avp-home"
+    config = home / "custom-config.json"
+    rc = main([
+        "init",
+        "--home",
+        str(home),
+        "--config",
+        str(config),
+        "--plaintext",
+        "--force",
+    ])
+    assert rc == 0
+    text = capsys.readouterr().out
+    assert f"doctor --home {home} --config {config}" in text
+    assert f"client-config print --home {home} --config {config}" in text

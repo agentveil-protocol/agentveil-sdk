@@ -2774,6 +2774,23 @@ def _add_common_path_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", type=Path, default=None, help="Proxy config JSON path")
 
 
+def _format_init_next_step_commands(
+    *,
+    home: Path | None,
+    config_path: Path | None,
+) -> tuple[str, str]:
+    def _with_path_args(parts: list[str]) -> str:
+        if home is not None:
+            parts.extend(["--home", str(home)])
+        if config_path is not None:
+            parts.extend(["--config", str(config_path)])
+        return " ".join(parts)
+
+    doctor_cmd = _with_path_args(["agentveil-mcp-proxy", "doctor"])
+    client_cmd = _with_path_args(["agentveil-mcp-proxy", "client-config", "print"])
+    return doctor_cmd, client_cmd
+
+
 def _add_passphrase_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--passphrase", default=None, help="MCP proxy identity passphrase")
     parser.add_argument("--passphrase-file", type=Path, default=None, help="Read passphrase from file")
@@ -3135,16 +3152,51 @@ def run_connect_status_cli(
     return 0
 
 
+_ROOT_CLI_DESCRIPTION = (
+    "Project-scoped MCP proxy for local approval routing, evidence export, and verification.\n"
+    "New here? Use the grouped sections below, then run COMMAND --help for details."
+)
+
+_ROOT_CLI_EPILOG = (
+    "Getting started:\n"
+    "  init, doctor, run, setup, launch\n"
+    "\n"
+    "Evidence and proof:\n"
+    "  events, export-evidence, verify\n"
+    "\n"
+    "Advanced:\n"
+    "  approval-center, client-config, client-doctor, client-run, configure-downstream,\n"
+    "  connect, control, disconnect, downstream, evidence-summary, explain, hook,\n"
+    "  install-claude-hook, permission-doctor, reissue-grant, register, smoke,\n"
+    "  status-claude-hook, templates, uninstall-claude-hook, wizard\n"
+    "\n"
+    "Typical first-run path:\n"
+    "  agentveil-mcp-proxy init --quickstart-filesystem ./sandbox\n"
+    "  agentveil-mcp-proxy doctor\n"
+    "  agentveil-mcp-proxy client-config print\n"
+)
+
+
 def build_parser() -> argparse.ArgumentParser:
     from agentveil_mcp_proxy import __version__ as package_version
 
-    parser = argparse.ArgumentParser(prog="agentveil-mcp-proxy")
+    parser = argparse.ArgumentParser(
+        prog="agentveil-mcp-proxy",
+        description=_ROOT_CLI_DESCRIPTION,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=_ROOT_CLI_EPILOG,
+    )
     parser.add_argument(
         "--version",
         action="version",
         version=f"%(prog)s {package_version}",
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(
+        dest="command",
+        required=True,
+        title="Commands",
+        metavar="command",
+    )
 
     init = subparsers.add_parser(
         "init",
@@ -6036,6 +6088,12 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Config file: {result.config_path.name}")
                 print(f"Control grant file: {result.control_grant_path.name}")
                 print(f"Control grant expires: {result.control_grant_expires_at}")
+                doctor_cmd, client_cmd = _format_init_next_step_commands(
+                    home=args.home,
+                    config_path=args.config,
+                )
+                print(f"Next: {doctor_cmd}")
+                print(f"      {client_cmd}")
             return 0
         if args.command == "doctor":
             return doctor_proxy(
