@@ -6,6 +6,7 @@ import os
 import signal
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -246,6 +247,112 @@ def test_managed_center_child_env_includes_package_root(monkeypatch):
         Path(package_root)
     )
     assert (Path(package_root) / "agentveil_mcp_proxy").is_dir()
+
+
+def test_managed_center_child_env_excludes_provider_and_generic_secrets():
+    from agentveil_mcp_proxy.approval import server
+    from agentveil_mcp_proxy.identity import PASSPHRASE_ENV
+
+    parent_env = {
+        "PATH": "/usr/bin",
+        "LANG": "C",
+        "OPENAI_API_KEY": "sk-test",
+        "DEEPSEEK_API_KEY": "sk-test",
+        "AWS_SECRET_ACCESS_KEY": "secret",
+        "SECRET_TOKEN": "secret",
+        PASSPHRASE_ENV: "pass",
+    }
+    env = server._proxy_cli_child_env(parent_env=parent_env)
+
+    assert env["PATH"] == "/usr/bin"
+    assert env["LANG"] == "C"
+    assert "OPENAI_API_KEY" not in env
+    assert "DEEPSEEK_API_KEY" not in env
+    assert "AWS_SECRET_ACCESS_KEY" not in env
+    assert "SECRET_TOKEN" not in env
+    assert env[PASSPHRASE_ENV] == "pass"
+    package_root = Path(server.__file__).resolve().parents[2]
+    assert env["PYTHONPATH"].split(os.pathsep) == _expected_child_pythonpath_roots(
+        package_root
+    )
+
+
+def test_managed_center_child_env_omits_passphrase_when_passphrase_file_used():
+    from agentveil_mcp_proxy.approval import server
+    from agentveil_mcp_proxy.identity import PASSPHRASE_ENV
+
+    parent_env = {
+        "PATH": "/usr/bin",
+        PASSPHRASE_ENV: "pass",
+        "OPENAI_API_KEY": "sk-test",
+    }
+    env = server._proxy_cli_child_env(
+        parent_env=parent_env,
+        passphrase_file=Path("/tmp/demo.passphrase"),
+    )
+
+    assert PASSPHRASE_ENV not in env
+    assert "OPENAI_API_KEY" not in env
+
+
+def test_managed_center_child_env_preserves_existing_pythonpath(monkeypatch):
+    from agentveil_mcp_proxy.approval import server
+
+    env = server._proxy_cli_child_env(
+        parent_env={"PATH": "/usr/bin", "PYTHONPATH": "existing-path"},
+    )
+    package_root = Path(server.__file__).resolve().parents[2]
+    expected_prefix = _expected_child_pythonpath_roots(package_root)
+
+    assert env["PYTHONPATH"].split(os.pathsep) == [*expected_prefix, "existing-path"]
+
+
+def test_managed_center_child_env_empty_parent_does_not_read_os_environ(monkeypatch):
+    from agentveil_mcp_proxy.approval import server
+
+    monkeypatch.setenv("PATH", "/must-not-leak")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+
+    env = server._proxy_cli_child_env(parent_env={})
+
+    assert "PATH" not in env
+    assert "OPENAI_API_KEY" not in env
+    assert env["PYTHONPATH"].split(os.pathsep) == _expected_child_pythonpath_roots(
+        Path(server.__file__).resolve().parents[2]
+    )
+
+
+def test_claude_center_spawn_uses_bounded_env(tmp_path, monkeypatch):
+    from agentveil_mcp_proxy import claude_center_lifecycle
+    from agentveil_mcp_proxy.identity import PASSPHRASE_ENV
+
+    captured: dict[str, dict[str, str]] = {}
+
+    def fake_popen(argv, **kwargs):
+        captured["env"] = kwargs["env"]
+        return SimpleNamespace(pid=999999, poll=lambda: 0)
+
+    monkeypatch.setattr(claude_center_lifecycle.subprocess, "Popen", fake_popen)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv(PASSPHRASE_ENV, "pass")
+
+    home = tmp_path / "project" / ".avp"
+    home.mkdir(parents=True)
+    (home / "mcp-proxy").mkdir()
+    (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+    passphrase_file = tmp_path / "demo.passphrase"
+    passphrase_file.write_text("secret\n", encoding="utf-8")
+
+    claude_center_lifecycle._spawn_center(
+        proxy_command=sys.executable,
+        home=home,
+        passphrase_file=passphrase_file,
+    )
+
+    env = captured["env"]
+    assert "OPENAI_API_KEY" not in env
+    assert PASSPHRASE_ENV not in env
+    assert "PATH" in env
 
 
 def test_stale_manifest_is_not_running(managed_project_home):

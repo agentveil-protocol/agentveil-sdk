@@ -143,6 +143,9 @@ def _spawn_center(
     ]
     if passphrase_file is not None:
         args.extend(["--passphrase-file", str(passphrase_file)])
+    from agentveil_mcp_proxy.approval.server import _proxy_cli_child_env
+
+    kwargs["env"] = _proxy_cli_child_env(passphrase_file=passphrase_file)
     return subprocess.Popen(  # noqa: S603 - args constructed from validated paths
         args,
         **kwargs,

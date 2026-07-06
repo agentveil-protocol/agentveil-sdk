@@ -1612,21 +1612,85 @@ def _proxy_cli_argv(proxy_command: str, subcommand: list[str]) -> list[str]:
     return [proxy_command, *subcommand]
 
 
-def _proxy_cli_child_env() -> dict[str, str]:
-    env = dict(os.environ)
+_MANAGED_CENTER_ENV_KEYS = (
+    "PATH",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "TZ",
+    "TERM",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "PYTHONHOME",
+    "VIRTUAL_ENV",
+)
+
+_BLOCKED_MANAGED_CENTER_ENV_KEYS = frozenset({
+    "OPENAI_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "AWS_SECRET_ACCESS_KEY",
+})
+
+_BLOCKED_MANAGED_CENTER_ENV_SUFFIXES = ("_TOKEN", "_SECRET", "_PASSWORD")
+
+
+def _managed_center_env_key_is_blocked(key: str) -> bool:
+    upper = key.upper()
+    if upper in _BLOCKED_MANAGED_CENTER_ENV_KEYS:
+        return True
+    return any(upper.endswith(suffix) for suffix in _BLOCKED_MANAGED_CENTER_ENV_SUFFIXES)
+
+
+def _managed_center_pythonpath(*, parent_env: Mapping[str, str]) -> str:
     package_root_path = Path(__file__).resolve().parents[2]
     source_roots = [str(package_root_path)]
     repo_root = package_root_path.parents[1]
     if (repo_root / "agentveil").is_dir():
         source_roots.append(str(repo_root))
-    existing = env.get("PYTHONPATH")
+    existing = parent_env.get("PYTHONPATH")
     if existing:
         paths = existing.split(os.pathsep)
         prefix = [path for path in source_roots if path not in paths]
         if prefix:
-            env["PYTHONPATH"] = os.pathsep.join([*prefix, existing])
-    else:
-        env["PYTHONPATH"] = os.pathsep.join(source_roots)
+            return os.pathsep.join([*prefix, existing])
+        return existing
+    return os.pathsep.join(source_roots)
+
+
+def _proxy_cli_child_env(
+    *,
+    passphrase_file: Path | None = None,
+    parent_env: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Return a bounded env for managed Approval Center child processes."""
+
+    from agentveil_mcp_proxy.identity import PASSPHRASE_ENV
+
+    source = dict(os.environ if parent_env is None else parent_env)
+    env: dict[str, str] = {}
+    for key in _MANAGED_CENTER_ENV_KEYS:
+        if _managed_center_env_key_is_blocked(key):
+            continue
+        value = source.get(key)
+        if isinstance(value, str) and value:
+            env[key] = value
+    env["PYTHONPATH"] = _managed_center_pythonpath(parent_env=source)
+    if passphrase_file is None:
+        passphrase = source.get(PASSPHRASE_ENV)
+        if isinstance(passphrase, str) and passphrase:
+            env[PASSPHRASE_ENV] = passphrase
     return env
 
 
@@ -1957,7 +2021,7 @@ def spawn_managed_approval_center_process(
         "stdout": log_handle,
         "stderr": log_handle,
         "close_fds": True,
-        "env": _proxy_cli_child_env(),
+        "env": _proxy_cli_child_env(passphrase_file=passphrase_file),
     }
     if os.name == "posix":
         kwargs["start_new_session"] = True
