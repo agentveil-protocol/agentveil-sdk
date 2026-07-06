@@ -6,6 +6,31 @@ All notable changes to the `agentveil` SDK.
 
 No unreleased changes.
 
+## [0.7.29-mcp-proxy] - 2026-07-06
+
+Public trust and approval environment hardening release for
+`agentveil-mcp-proxy`.
+
+### MCP Proxy added
+- Added `agentveil-mcp-proxy demo`, a local guided flow that shows the generic
+  routed MCP redirect shape, browser approval, retry, and bounded local proof
+  without exposing policy catalogs or private playbook depth.
+
+### MCP Proxy changed
+- Updated the public README PyPI badge and package version signal to `0.7.29`.
+- Improved root CLI help around the first-run path and kept `init` next-step
+  guidance privacy-bounded when custom home/config paths are used.
+- Qualified evidence verification output so empty bundles and chain-only
+  bundles no longer render as bare `VERIFY: passed`.
+- Started managed Approval Center child processes with a bounded environment
+  instead of inheriting the full parent shell environment across shared,
+  launcher, and legacy Claude lifecycle paths.
+
+### MCP Proxy verification
+- Local public SDK PR gate passed on PR #104 head with `1566 passed, 1 skipped`.
+- GitHub Actions passed for PR #104 across macOS, Windows, and Ubuntu
+  compatibility checks before merge.
+
 ## [0.7.28-mcp-proxy] - 2026-07-02
 
 Launcher lifecycle and status hardening release for `agentveil-mcp-proxy`.
