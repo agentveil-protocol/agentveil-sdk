@@ -18,7 +18,9 @@ from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore, ApprovalStatus, 
 from agentveil_mcp_proxy.evidence.approval_grant import APPROVAL_GRANT_SCHEMA, build_approval_grant
 from agentveil_mcp_proxy.evidence.proof import build_evidence_bundle
 from agentveil_mcp_proxy.evidence.verify_output import (
+    VERIFY_CHAIN_ONLY,
     VERIFY_FAILED_UNEXPECTED,
+    VERIFY_NO_SIGNED_EVIDENCE,
     VERIFY_PASSED,
     VERIFY_REQUIRES_TRUST_ROOTS,
     classify_verify_payload,
@@ -238,10 +240,74 @@ def test_verify_unexpected_failure_is_classified(tmp_path: Path) -> None:
 
 def test_verify_contract_lib_classifies_verify_contracts() -> None:
     assert classify_verify_payload({"contract": VERIFY_PASSED}) == VERIFY_PASSED
+    assert classify_verify_payload({"contract": VERIFY_NO_SIGNED_EVIDENCE}) == VERIFY_NO_SIGNED_EVIDENCE
+    assert classify_verify_payload({"contract": VERIFY_CHAIN_ONLY}) == VERIFY_CHAIN_ONLY
     assert classify_verify_payload({"contract": VERIFY_REQUIRES_TRUST_ROOTS}) == VERIFY_REQUIRES_TRUST_ROOTS
     assert classify_verify_payload({"contract": VERIFY_FAILED_UNEXPECTED}) == VERIFY_FAILED_UNEXPECTED
     assert classify_verify_payload({"status": "ok"}) == VERIFY_PASSED
+    assert classify_verify_payload({"status": "no_signed_evidence"}) == VERIFY_NO_SIGNED_EVIDENCE
+    assert classify_verify_payload({"status": "chain_only"}) == VERIFY_CHAIN_ONLY
     assert classify_verify_payload({"status": "requires_trust_roots"}) == VERIFY_REQUIRES_TRUST_ROOTS
+
+
+def test_verify_empty_bundle_is_honest_human_and_json(tmp_path: Path) -> None:
+    with _store(tmp_path) as store:
+        bundle = build_evidence_bundle(
+            store,
+            proxy_identity_did=None,
+            trusted_signer_dids=[],
+        )
+    bundle_path = tmp_path / "empty.json"
+    bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
+
+    human = io.StringIO()
+    assert verify_evidence(bundle_path=bundle_path, out=human) == 0
+    human_text = human.getvalue()
+    _assert_verify_privacy(human_text)
+    assert "VERIFY: no_signed_evidence" in human_text
+    assert "VERIFY: passed" not in human_text
+    assert "Records: 0; signed_receipt_count: 0" in human_text
+    assert "Nothing to prove." in human_text
+
+    json_out = io.StringIO()
+    assert verify_evidence(bundle_path=bundle_path, output_format="json", out=json_out) == 0
+    payload = json.loads(json_out.getvalue())
+    _assert_verify_privacy(json_out.getvalue())
+    assert payload["contract"] == VERIFY_NO_SIGNED_EVIDENCE
+    assert payload["status"] == "no_signed_evidence"
+    assert payload["proof_grade"] == "none"
+    assert payload["trust_verification_completed"] is False
+
+
+def test_verify_chain_only_bundle_is_qualified_human_and_json(tmp_path: Path) -> None:
+    with _store(tmp_path) as store:
+        store.write_pending(_record("req-chain-only"))
+        bundle = build_evidence_bundle(
+            store,
+            proxy_identity_did=GRANT_DID,
+            trusted_signer_dids=[],
+        )
+    bundle_path = tmp_path / "chain-only.json"
+    bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
+
+    human = io.StringIO()
+    assert verify_evidence(bundle_path=bundle_path, out=human) == 0
+    human_text = human.getvalue()
+    _assert_verify_privacy(human_text)
+    assert "VERIFY: chain_only" in human_text
+    assert "VERIFY: passed" not in human_text
+    assert "signed_receipt_count: 0" in human_text
+    assert "chain-only, not third-party signed proof" in human_text
+
+    json_out = io.StringIO()
+    assert verify_evidence(bundle_path=bundle_path, output_format="json", out=json_out) == 0
+    payload = json.loads(json_out.getvalue())
+    assert payload["contract"] == VERIFY_CHAIN_ONLY
+    assert payload["status"] == "chain_only"
+    assert payload["proof_grade"] == "chain_only"
+    assert payload["record_count"] == 1
+    assert payload["signed_receipt_count"] == 0
+    assert payload["trust_verification_completed"] is False
 
 
 def test_wheel_installed_verify_cli_probe(tmp_path: Path) -> None:
