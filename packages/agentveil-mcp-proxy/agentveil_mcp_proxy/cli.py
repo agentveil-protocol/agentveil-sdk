@@ -19,12 +19,19 @@ import json
 import math
 import os
 from pathlib import Path
+import queue
+import re
+import secrets
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Any, Iterable, Mapping, TextIO
+from urllib.parse import urlencode
+from urllib.request import HTTPCookieProcessor, Request, build_opener
 
 from nacl.signing import SigningKey
 
@@ -3152,6 +3159,371 @@ def run_connect_status_cli(
     return 0
 
 
+_DEMO_JSONRPC_APPROVAL_REQUIRED = -32011
+_DEMO_CSRF_RE = re.compile(r'name="csrf_token" value="([^"]+)"')
+_DEMO_BOUNDARY_LINE = (
+    "This demonstrates the routed MCP redirect + approval loop, not host-wide control."
+)
+_DEMO_REDIRECT_LINE = (
+    "Demo redirect: use the AgentVeil controlled MCP tool for this operation."
+)
+_DEMO_WRITE_NAME = "agentveil-demo.txt"
+_DEMO_WRITE_CONTENT = "AgentVeil demo write\n"
+_DEMO_TIMELINE_LINE = "Demo timeline: redirect -> approval -> proof"
+
+
+class _DemoJsonRpcClient:
+    """Minimal JSON-RPC client for the isolated demo proxy subprocess."""
+
+    def __init__(self, command: list[str], *, env: dict[str, str], cwd: Path) -> None:
+        self.process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            env=env,
+            cwd=str(cwd),
+        )
+        self.stdout_queue: queue.Queue[str] = queue.Queue()
+        self.stderr_lines: list[str] = []
+        self._stdout_thread = threading.Thread(target=self._read_stdout, daemon=True)
+        self._stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
+        self._stdout_thread.start()
+        self._stderr_thread.start()
+
+    def _read_stdout(self) -> None:
+        assert self.process.stdout is not None
+        for line in self.process.stdout:
+            self.stdout_queue.put(line)
+
+    def _read_stderr(self) -> None:
+        assert self.process.stderr is not None
+        for line in self.process.stderr:
+            self.stderr_lines.append(line.rstrip("\n"))
+
+    def call(self, request_id: str, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        assert self.process.stdin is not None
+        message: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id, "method": method}
+        if params is not None:
+            message["params"] = params
+        self.process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+        self.process.stdin.flush()
+        return self._read_response(request_id)
+
+    def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
+        assert self.process.stdin is not None
+        message: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            message["params"] = params
+        self.process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+        self.process.stdin.flush()
+
+    def _read_response(self, request_id: str, timeout: float = 30.0) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                raw = self.stdout_queue.get(timeout=0.2)
+            except queue.Empty:
+                if self.process.poll() is not None:
+                    raise ProxyCliError(
+                        "demo proxy exited early: "
+                        + "; ".join(self.stderr_lines[-3:]),
+                        exit_code=1,
+                    )
+                continue
+            response = json.loads(raw)
+            if response.get("id") == request_id:
+                return response
+        raise ProxyCliError(f"demo timed out waiting for JSON-RPC response id={request_id}", exit_code=1)
+
+    def close(self) -> None:
+        if self.process.stdin is not None:
+            self.process.stdin.close()
+        try:
+            self.process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=5)
+
+
+def _demo_runtime_env(*, from_console_script: bool) -> dict[str, str]:
+    env = dict(os.environ)
+    if not from_console_script:
+        package_root = Path(__file__).resolve().parents[1]
+        repo_root = Path(__file__).resolve().parents[3]
+        pythonpath_parts = [str(repo_root), str(package_root)]
+        existing = env.get("PYTHONPATH")
+        if existing:
+            pythonpath_parts.append(existing)
+        env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
+    else:
+        env.pop("PYTHONPATH", None)
+    env["BROWSER"] = "/bin/true"
+    return env
+
+
+def _demo_proxy_command_base() -> tuple[str, bool]:
+    """Return the demo proxy executable and whether the CLI was invoked as a console script."""
+    invoked = Path(sys.argv[0])
+    from_console_script = invoked.name == "agentveil-mcp-proxy" and invoked.exists()
+    if from_console_script:
+        return str(invoked.resolve()), True
+    return sys.executable, False
+
+
+def _demo_proxy_command_for_center() -> str:
+    """Resolve the proxy executable used to spawn the demo's managed Approval Center."""
+    proxy_command, _from_console_script = _demo_proxy_command_base()
+    return proxy_command
+
+
+def _demo_proxy_command_argv(*, home: Path, passphrase_file: Path) -> tuple[list[str], bool]:
+    proxy_command, from_console_script = _demo_proxy_command_base()
+    if from_console_script:
+        base = [proxy_command]
+    else:
+        base = [proxy_command, "-m", "agentveil_mcp_proxy.cli"]
+    return [
+        *base,
+        "run",
+        "--home",
+        str(home),
+        "--passphrase-file",
+        str(passphrase_file),
+        "--approval-ui-mode",
+        "none",
+    ], from_console_script
+
+
+def _demo_http_approve(approval_url: str) -> None:
+    opener = build_opener(HTTPCookieProcessor())
+    with opener.open(approval_url, timeout=10) as response:
+        page = response.read().decode("utf-8")
+    match = _DEMO_CSRF_RE.search(page)
+    if match is None:
+        raise ProxyCliError("demo approval page did not contain a CSRF token", exit_code=1)
+    body = urlencode({
+        "decision": "approve",
+        "approval_scope": "exact",
+        "csrf_token": match.group(1),
+    }).encode("utf-8")
+    request = Request(
+        approval_url,
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    with opener.open(request, timeout=10) as response:
+        if response.status != 200:
+            raise ProxyCliError(
+                f"demo approval POST returned HTTP {response.status}",
+                exit_code=1,
+            )
+
+
+def _demo_tool_call_success(response: dict[str, Any], *, request_id: str) -> dict[str, Any]:
+    if response.get("id") != request_id or "result" not in response:
+        raise ProxyCliError(f"demo expected success for {request_id}", exit_code=1)
+    result = response["result"]
+    if not isinstance(result, dict):
+        raise ProxyCliError(f"demo tool result for {request_id} was not an object", exit_code=1)
+    return result
+
+
+def _demo_approval_error_data(response: dict[str, Any]) -> dict[str, Any]:
+    error = response.get("error")
+    if not isinstance(error, dict) or error.get("code") != _DEMO_JSONRPC_APPROVAL_REQUIRED:
+        raise ProxyCliError("demo expected approval_required on first routed write", exit_code=1)
+    data = error.get("data")
+    if not isinstance(data, dict) or data.get("status") != "approval_required":
+        raise ProxyCliError("demo approval_required payload missing", exit_code=1)
+    approval_url = data.get("approval_url")
+    if not isinstance(approval_url, str) or not approval_url:
+        raise ProxyCliError("demo approval_required missing approval_url", exit_code=1)
+    return data
+
+
+def _demo_local_proof_line(home: Path, *, observed_approval_required: bool) -> str:
+    from agentveil_mcp_proxy.evidence.events_show import (
+        build_events_show_payload,
+        format_local_proof_human_summary,
+    )
+
+    if not observed_approval_required:
+        raise ProxyCliError("demo did not observe approval_required", exit_code=1)
+
+    paths = proxy_paths(home, None)
+    show_payload = build_events_show_payload(
+        evidence_path=paths.proxy_dir / "evidence.sqlite",
+        config_path=paths.config_path,
+        last=20,
+        verify=False,
+    )
+    summary = format_local_proof_human_summary(show_payload)
+    evidence_path = ""
+    for line in summary.splitlines():
+        if line.startswith("Decision path: "):
+            evidence_path = line.removeprefix("Decision path: ")
+            break
+    if not evidence_path:
+        raise ProxyCliError("demo local proof decision path missing", exit_code=1)
+    if "redirected" in evidence_path:
+        raise ProxyCliError("demo proof must not claim redirect in evidence", exit_code=1)
+    if "target reached" not in evidence_path:
+        raise ProxyCliError("demo local proof missing target reached", exit_code=1)
+    path_labels = {part.strip() for part in evidence_path.split("->")}
+    if path_labels == {"approved", "target reached"}:
+        return "approval required -> approved -> target reached"
+    if evidence_path == "approval required -> approved -> target reached":
+        return evidence_path
+    raise ProxyCliError(f"demo local proof unexpected: {evidence_path}", exit_code=1)
+
+
+def run_redirect_approval_demo_cli(
+    *,
+    work_dir: Path | None = None,
+    demo_auto_approve: bool = False,
+    output_json: bool = False,
+    out: TextIO | None = None,
+) -> int:
+    """Run an isolated guided demo of redirect shape, approval, and local proof."""
+
+    from agentveil_mcp_proxy.approval.server import (
+        ensure_managed_approval_center_for_cli,
+        stop_managed_approval_center,
+    )
+
+    sink = out or sys.stdout
+    owns_work_dir = work_dir is None
+    work_root = (work_dir or Path(tempfile.mkdtemp(prefix="agentveil-demo-"))).resolve()
+    work_root.mkdir(parents=True, exist_ok=True)
+    home = work_root / "avp-home"
+    sandbox = work_root / "sandbox"
+    sandbox.mkdir(parents=True, exist_ok=True)
+    passphrase_file = work_root / "demo.passphrase"
+    passphrase_secret = secrets.token_urlsafe(32)
+    passphrase_file.write_text(passphrase_secret + "\n", encoding="utf-8")
+    passphrase_file.chmod(0o600)
+    target_file = sandbox / _DEMO_WRITE_NAME
+
+    try:
+        role_preset, explicit_role = resolve_init_role_preset(None)
+        setup_profile = init_setup_profile(explicit_role=explicit_role)
+        init_proxy(
+            home=home,
+            agent_name=DEFAULT_AGENT_NAME,
+            trusted_signer_dids=trusted_signers_for_base_url(DEFAULT_BASE_URL),
+            policy_pack="filesystem",
+            role_preset=role_preset,
+            setup_profile=setup_profile,
+            downstream_config=quickstart_filesystem_downstream(sandbox),
+            passphrase_file=passphrase_file,
+            force=True,
+        )
+        center = ensure_managed_approval_center_for_cli(
+            home=home,
+            proxy_command=_demo_proxy_command_for_center(),
+            passphrase_file=passphrase_file,
+        )
+        if center.status.state != "running":
+            raise ProxyCliError("Approval Center did not start for demo", exit_code=1)
+
+        if not output_json:
+            print("AgentVeil redirect + approval demo", file=sink)
+            print(f"Sandbox: {work_root}", file=sink)
+            print(_DEMO_BOUNDARY_LINE, file=sink)
+            print("", file=sink)
+            print(_DEMO_REDIRECT_LINE, file=sink)
+            print("", file=sink)
+
+        write_call = {
+            "name": "write_file",
+            "arguments": {"path": _DEMO_WRITE_NAME, "content": _DEMO_WRITE_CONTENT},
+        }
+        run_argv, from_console_script = _demo_proxy_command_argv(
+            home=home,
+            passphrase_file=passphrase_file,
+        )
+        client = _DemoJsonRpcClient(
+            run_argv,
+            env=_demo_runtime_env(from_console_script=from_console_script),
+            cwd=work_root,
+        )
+        try:
+            _demo_tool_call_success(
+                client.call(
+                    "demo-init",
+                    "initialize",
+                    {"clientInfo": {"name": "agentveil-demo"}},
+                ),
+                request_id="demo-init",
+            )
+            client.notify("notifications/initialized", {})
+            pending = client.call("demo-write-1", "tools/call", write_call)
+            approval_data = _demo_approval_error_data(pending)
+            if target_file.exists():
+                raise ProxyCliError("demo target file existed before approval", exit_code=1)
+
+            if not output_json:
+                print("Approval required.", file=sink)
+                if demo_auto_approve:
+                    _demo_http_approve(str(approval_data["approval_url"]))
+                else:
+                    print(f"Approval Center URL: {approval_data['approval_url']}", file=sink)
+                    print(
+                        "Open the URL, approve the request, then press Enter here to continue.",
+                        file=sink,
+                    )
+                    input()
+            elif demo_auto_approve:
+                _demo_http_approve(str(approval_data["approval_url"]))
+            else:
+                raise ProxyCliError(
+                    "demo JSON output requires --demo-auto-approve for non-interactive runs",
+                    exit_code=2,
+                )
+
+            retry = client.call("demo-write-2", "tools/call", write_call)
+            _demo_tool_call_success(retry, request_id="demo-write-2")
+        finally:
+            client.close()
+
+        if not target_file.exists():
+            raise ProxyCliError("demo write did not create the target file", exit_code=1)
+        if target_file.read_text(encoding="utf-8") != _DEMO_WRITE_CONTENT:
+            raise ProxyCliError("demo write content mismatch", exit_code=1)
+
+        proof_summary = _demo_local_proof_line(home, observed_approval_required=True)
+        if output_json:
+            _print_operator_json({
+                "ok": True,
+                "errors": [],
+                "warnings": [],
+                "demo_timeline": "redirect -> approval -> proof",
+                "local_proof": proof_summary,
+                "target_reached": True,
+            }, out=sink)
+        else:
+            print("Action continued: demo file written.", file=sink)
+            print(_DEMO_TIMELINE_LINE, file=sink)
+            print(f"Local proof: {proof_summary}", file=sink)
+        return 0
+    except ProxyCliError:
+        raise
+    except Exception as exc:
+        raise ProxyCliError(f"demo failed: {exc}", exit_code=1) from exc
+    finally:
+        stop_managed_approval_center(home, require_healthy=False)
+        if owns_work_dir:
+            shutil.rmtree(work_root, ignore_errors=True)
+
+
 _ROOT_CLI_DESCRIPTION = (
     "Project-scoped MCP proxy for local approval routing, evidence export, and verification.\n"
     "New here? Use the grouped sections below, then run COMMAND --help for details."
@@ -3159,7 +3531,7 @@ _ROOT_CLI_DESCRIPTION = (
 
 _ROOT_CLI_EPILOG = (
     "Getting started:\n"
-    "  init, doctor, run, setup, launch\n"
+    "  init, doctor, run, setup, launch, demo\n"
     "\n"
     "Evidence and proof:\n"
     "  events, export-evidence, verify\n"
@@ -3424,6 +3796,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common_path_args(smoke)
     _add_json_arg(smoke)
+
+    demo = subparsers.add_parser(
+        "demo",
+        help="Guided local demo of redirect, approval, and proof",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Uses an isolated temporary sandbox and the real local approval flow.\n"
+            "Shows product shape only; it is not a coverage or policy catalog."
+        ),
+    )
+    demo.add_argument("--work-dir", type=Path, default=None, help=argparse.SUPPRESS)
+    demo.add_argument("--demo-auto-approve", action="store_true", help=argparse.SUPPRESS)
+    _add_json_arg(demo)
 
     reissue = subparsers.add_parser("reissue-grant", help="Issue a fresh local control grant")
     _add_common_path_args(reissue)
@@ -6191,6 +6576,12 @@ def main(argv: list[str] | None = None) -> int:
                 output_json=args.json_output,
             )
             return 0
+        if args.command == "demo":
+            return run_redirect_approval_demo_cli(
+                work_dir=args.work_dir,
+                demo_auto_approve=args.demo_auto_approve,
+                output_json=args.json_output,
+            )
         if args.command == "reissue-grant":
             reissue_grant(
                 home=args.home,

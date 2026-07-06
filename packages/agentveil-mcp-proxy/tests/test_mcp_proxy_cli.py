@@ -3007,3 +3007,102 @@ def test_init_next_steps_include_config_when_custom_config(tmp_path, capsys):
     text = capsys.readouterr().out
     assert f"doctor --home {home} --config {config}" in text
     assert f"client-config print --home {home} --config {config}" in text
+
+
+def _assert_demo_managed_approval_center_stopped(home: Path) -> None:
+    from agentveil_mcp_proxy.approval.server import (
+        inspect_managed_approval_center,
+        scan_cmdline_proven_managed_center_pids,
+    )
+
+    status = inspect_managed_approval_center(home)
+    assert status.state != "running"
+    assert scan_cmdline_proven_managed_center_pids(home) == ()
+
+
+def test_demo_help_exists_without_hidden_flags(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["demo", "--help"])
+    assert exc.value.code == 0
+    text = capsys.readouterr().out
+    assert "demo" in text
+    assert "product shape only" in text
+    assert "--demo-auto-approve" not in text
+    assert "--work-dir" not in text
+
+
+def test_root_help_lists_demo_in_getting_started(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["--help"])
+    assert exc.value.code == 0
+    text = capsys.readouterr().out
+    getting_started = text.split("Getting started:", 1)[1].split("Evidence and proof:", 1)[0]
+    assert "demo" in getting_started
+    assert "  demo" in text or ", demo" in getting_started
+
+
+def test_demo_auto_approve_runs_real_flow(tmp_path, capsys):
+    work_dir = tmp_path / "demo-work"
+    rc = main([
+        "demo",
+        "--work-dir",
+        str(work_dir),
+        "--demo-auto-approve",
+        "--json",
+    ])
+    assert rc == 0
+    text = capsys.readouterr().out
+    payload = json.loads(text)
+    assert payload["ok"] is True
+    assert payload["demo_timeline"] == "redirect -> approval -> proof"
+    assert payload["local_proof"] == "approval required -> approved -> target reached"
+    assert payload["target_reached"] is True
+    assert "redirect_playbook" not in text
+    assert "risk_family" not in text
+    assert "host-wide" not in text.lower()
+    _assert_demo_managed_approval_center_stopped(work_dir / "avp-home")
+
+
+def test_demo_human_output_is_bounded_without_secrets(tmp_path, capsys):
+    work_dir = tmp_path / "demo-human"
+    rc = main([
+        "demo",
+        "--work-dir",
+        str(work_dir),
+        "--demo-auto-approve",
+    ])
+    assert rc == 0
+    text = capsys.readouterr().out
+    assert proxy_cli._DEMO_BOUNDARY_LINE in text
+    assert proxy_cli._DEMO_REDIRECT_LINE in text
+    assert "Action continued: demo file written." in text
+    assert "Local proof: approval required -> approved -> target reached" in text
+    assert "redirect_playbook" not in text
+    assert "risk_family" not in text
+    assert "/approval/" not in text
+    _assert_demo_managed_approval_center_stopped(work_dir / "avp-home")
+
+
+def test_demo_uses_source_aware_proxy_command_for_approval_center(tmp_path, monkeypatch):
+    from agentveil_mcp_proxy.approval.server import ensure_managed_approval_center_for_cli
+
+    captured: dict[str, str] = {}
+
+    def capture_center_start(**kwargs):
+        captured["proxy_command"] = kwargs["proxy_command"]
+        return ensure_managed_approval_center_for_cli(**kwargs)
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.approval.server.ensure_managed_approval_center_for_cli",
+        capture_center_start,
+    )
+    rc = main([
+        "demo",
+        "--work-dir",
+        str(tmp_path / "demo-source-route"),
+        "--demo-auto-approve",
+        "--json",
+    ])
+    assert rc == 0
+    assert captured["proxy_command"] == sys.executable
+    _assert_demo_managed_approval_center_stopped(tmp_path / "demo-source-route" / "avp-home")
