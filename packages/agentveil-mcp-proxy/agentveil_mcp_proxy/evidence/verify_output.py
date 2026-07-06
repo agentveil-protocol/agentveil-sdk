@@ -11,6 +11,8 @@ from typing import Any
 from agentveil_mcp_proxy.evidence.proof import EvidenceVerificationError
 
 VERIFY_PASSED = "verify_passed"
+VERIFY_NO_SIGNED_EVIDENCE = "verify_no_signed_evidence"
+VERIFY_CHAIN_ONLY = "verify_chain_only"
 VERIFY_REQUIRES_TRUST_ROOTS = "verify_requires_trust_roots"
 VERIFY_FAILED_UNEXPECTED = "verify_failed_unexpected"
 
@@ -51,11 +53,21 @@ def classify_verify_payload(payload: dict[str, Any]) -> str:
     """Map verify JSON output to a bounded contract state."""
 
     contract = payload.get("contract")
-    if contract in {VERIFY_PASSED, VERIFY_REQUIRES_TRUST_ROOTS, VERIFY_FAILED_UNEXPECTED}:
+    if contract in {
+        VERIFY_PASSED,
+        VERIFY_NO_SIGNED_EVIDENCE,
+        VERIFY_CHAIN_ONLY,
+        VERIFY_REQUIRES_TRUST_ROOTS,
+        VERIFY_FAILED_UNEXPECTED,
+    }:
         return str(contract)
     status = payload.get("status")
     if status == "ok":
         return VERIFY_PASSED
+    if status == "no_signed_evidence":
+        return VERIFY_NO_SIGNED_EVIDENCE
+    if status == "chain_only":
+        return VERIFY_CHAIN_ONLY
     if status == "requires_trust_roots":
         return VERIFY_REQUIRES_TRUST_ROOTS
     return VERIFY_FAILED_UNEXPECTED
@@ -103,16 +115,46 @@ def bounded_trust_summary(trusted_signer_dids: tuple[str, ...]) -> dict[str, Any
     }
 
 
+def classify_verify_success_contract(*, result: Any) -> str:
+    """Classify structurally valid bundles by verify contract."""
+
+    record_count = int(result.record_count)
+    signed_receipt_count = int(result.signed_receipt_count)
+    verified_grant_count = int(result.verified_approval_grant_count)
+    if record_count == 0:
+        return VERIFY_NO_SIGNED_EVIDENCE
+    if signed_receipt_count == 0 and verified_grant_count == 0:
+        return VERIFY_CHAIN_ONLY
+    return VERIFY_PASSED
+
+
+def proof_grade_for_contract(contract: str) -> str:
+    if contract == VERIFY_PASSED:
+        return "signed"
+    if contract == VERIFY_CHAIN_ONLY:
+        return "chain_only"
+    return "none"
+
+
 def build_verify_success_payload(
     *,
     result: Any,
     parse_summary: dict[str, Any],
     trusted_signer_dids: tuple[str, ...],
 ) -> dict[str, Any]:
+    contract = classify_verify_success_contract(result=result)
+    proof_grade = proof_grade_for_contract(contract)
+    if contract == VERIFY_PASSED:
+        status = "ok"
+    elif contract == VERIFY_NO_SIGNED_EVIDENCE:
+        status = "no_signed_evidence"
+    else:
+        status = "chain_only"
     return {
-        "status": "ok",
-        "contract": VERIFY_PASSED,
+        "status": status,
+        "contract": contract,
         "ok": True,
+        "proof_grade": proof_grade,
         "privacy_bounded": True,
         "bundle_parsed": parse_summary["bundle_parsed"],
         "record_count": result.record_count,
@@ -120,7 +162,7 @@ def build_verify_success_payload(
         "unverified_receipt_count": result.unverified_receipt_count,
         "verified_approval_grant_count": result.verified_approval_grant_count,
         "approval_grant_count": parse_summary["approval_grant_count"],
-        "trust_verification_completed": True,
+        "trust_verification_completed": contract == VERIFY_PASSED,
         "chain_root_ref": _hash_ref(result.chain_root_hash),
         "warnings": list(result.warnings),
         **bounded_trust_summary(trusted_signer_dids),
@@ -165,6 +207,30 @@ def build_verify_failure_payload(
 
 def render_verify_human(payload: dict[str, Any]) -> str:
     contract = payload.get("contract")
+    if contract == VERIFY_NO_SIGNED_EVIDENCE:
+        lines = [
+            "VERIFY: no_signed_evidence",
+            (
+                f"Records: {payload.get('record_count', 0)}; "
+                f"signed_receipt_count: {payload.get('signed_receipt_count', 0)}"
+            ),
+            "Nothing to prove.",
+        ]
+        for warning in payload.get("warnings") or []:
+            lines.append(f"WARN: {warning}")
+        return "\n".join(lines)
+    if contract == VERIFY_CHAIN_ONLY:
+        lines = [
+            "VERIFY: chain_only",
+            (
+                f"Records: {payload.get('record_count', 0)}; "
+                f"signed_receipt_count: {payload.get('signed_receipt_count', 0)}"
+            ),
+            "chain-only, not third-party signed proof",
+        ]
+        for warning in payload.get("warnings") or []:
+            lines.append(f"WARN: {warning}")
+        return "\n".join(lines)
     if contract == VERIFY_PASSED:
         lines = [
             "VERIFY: passed",

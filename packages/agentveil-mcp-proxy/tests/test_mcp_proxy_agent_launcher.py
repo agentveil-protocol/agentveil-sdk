@@ -218,6 +218,42 @@ def test_launch_child_gets_project_local_home_not_host_home(tmp_path, monkeypatc
     assert Path(child_home).name == "home"
 
 
+def test_launcher_approval_center_spawn_uses_bounded_env(tmp_path, monkeypatch):
+    from agentveil_mcp_proxy import agent_launcher
+    from agentveil_mcp_proxy.identity import PASSPHRASE_ENV
+
+    captured: dict[str, dict[str, str]] = {}
+
+    def fake_popen(_args, **kwargs):
+        captured["env"] = kwargs["env"]
+        return SimpleNamespace(pid=7171)
+
+    monkeypatch.setenv("OPENAI_API_KEY", PROVIDER_API_KEY)
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "aws-secret")
+    monkeypatch.setenv("SECRET_TOKEN", "token-secret")
+    monkeypatch.setenv(PASSPHRASE_ENV, "passphrase-secret")
+    monkeypatch.setattr(agent_launcher.subprocess, "Popen", fake_popen)
+
+    home = tmp_path / "project" / ".avp"
+    (home / "mcp-proxy").mkdir(parents=True)
+    (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+    passphrase_file = tmp_path / "passphrase.txt"
+    passphrase_file.write_text("passphrase-secret\n", encoding="utf-8")
+
+    agent_launcher._spawn_approval_center(
+        proxy_command="agentveil-mcp-proxy",
+        home=home,
+        passphrase_file=passphrase_file,
+    )
+
+    env = captured["env"]
+    assert "OPENAI_API_KEY" not in env
+    assert "AWS_SECRET_ACCESS_KEY" not in env
+    assert "SECRET_TOKEN" not in env
+    assert PASSPHRASE_ENV not in env
+    assert "PYTHONPATH" in env
+
+
 SECRET_COMMAND_TOKEN = "SECRET_TOKEN_DO_NOT_PERSIST_IN_MANIFEST"
 PROVIDER_API_KEY = "sk-FAKE_PROVIDER_KEY_DO_NOT_PERSIST"
 

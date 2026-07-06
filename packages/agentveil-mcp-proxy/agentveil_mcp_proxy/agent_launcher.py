@@ -623,24 +623,12 @@ def _proxy_cli_argv(proxy_command: str, subcommand: list[str]) -> list[str]:
     return [proxy_command, *subcommand]
 
 
-def _proxy_cli_child_env() -> dict[str, str]:
+def _proxy_cli_child_env(*, passphrase_file: Path | None = None) -> dict[str, str]:
     """Return an env that lets child interpreters import this package reliably."""
 
-    env = dict(os.environ)
-    package_root_path = Path(__file__).resolve().parents[1]
-    source_roots = [str(package_root_path)]
-    repo_root = package_root_path.parents[1]
-    if (repo_root / "agentveil").is_dir():
-        source_roots.append(str(repo_root))
-    existing = env.get("PYTHONPATH")
-    if existing:
-        paths = existing.split(os.pathsep)
-        prefix = [path for path in source_roots if path not in paths]
-        if prefix:
-            env["PYTHONPATH"] = os.pathsep.join([*prefix, existing])
-    else:
-        env["PYTHONPATH"] = os.pathsep.join(source_roots)
-    return env
+    from agentveil_mcp_proxy.approval.server import _proxy_cli_child_env as _center_child_env
+
+    return _center_child_env(passphrase_file=passphrase_file)
 
 
 def _proxy_command_display(proxy_command: str) -> str:
@@ -738,7 +726,7 @@ def _spawn_approval_center(
         "stdout": log_handle,
         "stderr": log_handle,
         "close_fds": True,
-        "env": _proxy_cli_child_env(),
+        "env": _proxy_cli_child_env(passphrase_file=passphrase_file),
     }
     if os.name == "posix":
         kwargs["start_new_session"] = True

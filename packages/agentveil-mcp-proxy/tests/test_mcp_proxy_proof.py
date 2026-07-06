@@ -31,9 +31,15 @@ from agentveil_mcp_proxy.evidence import (
 )
 from agentveil_mcp_proxy.evidence.proof import _bundle_records, verify_evidence_bundle_file
 from agentveil_mcp_proxy.evidence.verify_output import (
+    VERIFY_CHAIN_ONLY,
     VERIFY_FAILED_UNEXPECTED,
+    VERIFY_NO_SIGNED_EVIDENCE,
     VERIFY_PASSED,
     VERIFY_REQUIRES_TRUST_ROOTS,
+    build_verify_success_payload,
+    bundle_parse_summary,
+    classify_verify_success_contract,
+    render_verify_human,
 )
 
 
@@ -962,6 +968,138 @@ def test_verify_human_and_json_output_formats(tmp_path):
         bundle_path=bundle_path, trusted_signer_dids=[BACKEND_DID], out=warn
     ) == 0
     assert "WARN: unverified_receipt_count mismatch: bundle claims 1, computed 0" in warn.getvalue()
+
+
+def test_verify_empty_bundle_does_not_claim_passed(tmp_path):
+    from agentveil_mcp_proxy.cli import verify_evidence
+    import io
+
+    with _store(tmp_path) as store:
+        bundle = build_evidence_bundle(
+            store,
+            proxy_identity_did=None,
+            trusted_signer_dids=[],
+        )
+    bundle_path = tmp_path / "empty.json"
+    bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
+
+    out = io.StringIO()
+    assert verify_evidence(bundle_path=bundle_path, out=out) == 0
+    text = out.getvalue()
+    assert "VERIFY: no_signed_evidence" in text
+    assert "VERIFY: passed" not in text
+    assert "Nothing to prove." in text
+
+
+def test_verify_chain_only_bundle_is_not_proof_grade_passed(tmp_path):
+    from agentveil_mcp_proxy.cli import verify_evidence
+    import io
+
+    with _store(tmp_path) as store:
+        store.write_pending(_record("req-chain-only"))
+        bundle = build_evidence_bundle(
+            store,
+            proxy_identity_did="did:key:z6Mkproxy",
+            trusted_signer_dids=[],
+        )
+    bundle_path = tmp_path / "chain-only.json"
+    bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
+
+    out = io.StringIO()
+    assert verify_evidence(bundle_path=bundle_path, out=out) == 0
+    text = out.getvalue()
+    assert "VERIFY: chain_only" in text
+    assert "VERIFY: passed" not in text
+    assert "chain-only, not third-party signed proof" in text
+
+    structured = io.StringIO()
+    assert verify_evidence(
+        bundle_path=bundle_path,
+        output_format="json",
+        out=structured,
+    ) == 0
+    payload = json.loads(structured.getvalue())
+    assert payload["contract"] == VERIFY_CHAIN_ONLY
+    assert payload["proof_grade"] == "chain_only"
+
+
+def test_verify_empty_records_with_orphan_receipt_is_not_proof_grade(tmp_path):
+    from agentveil_mcp_proxy.cli import verify_evidence
+    import io
+
+    receipt_jcs = _decision_receipt()
+    digest = hashlib.sha256(receipt_jcs.encode("utf-8")).hexdigest()
+    with _store(tmp_path) as store:
+        bundle = build_evidence_bundle(
+            store,
+            proxy_identity_did=None,
+            trusted_signer_dids=[BACKEND_DID],
+        )
+    bundle["signed_receipts"] = {digest: receipt_jcs}
+    bundle_path = tmp_path / "orphan-empty.json"
+    bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
+
+    out = io.StringIO()
+    assert verify_evidence(
+        bundle_path=bundle_path,
+        trusted_signer_dids=[BACKEND_DID],
+        out=out,
+    ) == 0
+    text = out.getvalue()
+    assert "VERIFY: no_signed_evidence" in text
+    assert "VERIFY: passed" not in text
+    assert digest[:16] in text
+    assert "not referenced by any record" in text
+
+    structured = io.StringIO()
+    assert verify_evidence(
+        bundle_path=bundle_path,
+        output_format="json",
+        trusted_signer_dids=[BACKEND_DID],
+        out=structured,
+    ) == 0
+    payload = json.loads(structured.getvalue())
+    assert payload["contract"] == VERIFY_NO_SIGNED_EVIDENCE
+    assert payload["proof_grade"] == "none"
+    assert payload["record_count"] == 0
+    assert payload["signed_receipt_count"] == 1
+    assert payload["trust_verification_completed"] is False
+
+
+def test_classify_verify_success_contract_distinguishes_proof_grades(tmp_path):
+    with _store(tmp_path) as store:
+        empty = build_evidence_bundle(
+            store,
+            proxy_identity_did=None,
+            trusted_signer_dids=[],
+        )
+        store.write_pending(_record("req-chain-only"))
+        chain_only = build_evidence_bundle(
+            store,
+            proxy_identity_did="did:key:z6Mkproxy",
+            trusted_signer_dids=[],
+        )
+    signed = _bundle_with_receipt(tmp_path)
+
+    empty_result = verify_evidence_bundle(empty, trusted_signer_dids=[])
+    chain_result = verify_evidence_bundle(chain_only, trusted_signer_dids=[])
+    signed_result = verify_evidence_bundle(signed, trusted_signer_dids=[BACKEND_DID])
+
+    assert classify_verify_success_contract(result=empty_result) == VERIFY_NO_SIGNED_EVIDENCE
+    assert classify_verify_success_contract(result=chain_result) == VERIFY_CHAIN_ONLY
+    assert classify_verify_success_contract(result=signed_result) == VERIFY_PASSED
+
+    empty_payload = build_verify_success_payload(
+        result=empty_result,
+        parse_summary={
+            "bundle_parsed": True,
+            "record_count": 0,
+            "approval_grant_count": 0,
+            "signed_receipt_count": 0,
+        },
+        trusted_signer_dids=(),
+    )
+    assert render_verify_human(empty_payload).startswith("VERIFY: no_signed_evidence")
 
 
 def test_verify_cli_fails_closed_when_trusted_signer_did_absent_human(tmp_path):

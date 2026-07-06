@@ -2931,3 +2931,181 @@ def test_cli_launch_hermes_cli_choose_folder_routes_to_launch(tmp_path, monkeypa
     err = capsys.readouterr()
     assert str(selected) not in err.out
     assert str(selected) not in err.err
+
+
+def test_root_help_surfaces_grouped_onboarding_sections(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["--help"])
+    assert exc.value.code == 0
+    text = capsys.readouterr().out
+    assert "Getting started:" in text
+    assert "init, doctor, run, setup, launch" in text
+    assert "Evidence and proof:" in text
+    assert "events, export-evidence, verify" in text
+    assert "Advanced:" in text
+    assert "Typical first-run path:" in text
+    assert "Commands:" in text
+    assert "protected machine" not in text.lower()
+    assert "host-wide" not in text.lower()
+
+
+def test_root_help_still_lists_all_commands():
+    help_text = proxy_cli.build_parser().format_help()
+    for command in (
+        "init",
+        "doctor",
+        "run",
+        "setup",
+        "launch",
+        "export-evidence",
+        "verify",
+        "events",
+        "approval-center",
+        "wizard",
+        "install-claude-hook",
+    ):
+        assert command in help_text
+
+
+def test_init_help_retains_next_steps_guidance(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["init", "--help"])
+    assert exc.value.code == 0
+    text = capsys.readouterr().out
+    assert "agentveil-mcp-proxy init --quickstart-filesystem" in text
+    assert "client-config print" in text
+
+
+def test_init_next_steps_include_home_when_custom_home(tmp_path, capsys):
+    home = tmp_path / "custom-avp-home"
+    rc = main([
+        "init",
+        "--home",
+        str(home),
+        "--plaintext",
+        "--force",
+    ])
+    assert rc == 0
+    text = capsys.readouterr().out
+    assert "doctor --home <same AVP home>" in text
+    assert "client-config print --home <same AVP home>" in text
+    assert str(home) not in text
+
+
+def test_init_next_steps_include_config_when_custom_config(tmp_path, capsys):
+    home = tmp_path / "custom-avp-home"
+    config = home / "custom-config.json"
+    rc = main([
+        "init",
+        "--home",
+        str(home),
+        "--config",
+        str(config),
+        "--plaintext",
+        "--force",
+    ])
+    assert rc == 0
+    text = capsys.readouterr().out
+    assert "doctor --home <same AVP home> --config <same config>" in text
+    assert "client-config print --home <same AVP home> --config <same config>" in text
+    assert str(home) not in text
+    assert str(config) not in text
+
+
+def _assert_demo_managed_approval_center_stopped(home: Path) -> None:
+    from agentveil_mcp_proxy.approval.server import (
+        inspect_managed_approval_center,
+        scan_cmdline_proven_managed_center_pids,
+    )
+
+    status = inspect_managed_approval_center(home)
+    assert status.state != "running"
+    assert scan_cmdline_proven_managed_center_pids(home) == ()
+
+
+def test_demo_help_exists_without_hidden_flags(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["demo", "--help"])
+    assert exc.value.code == 0
+    text = capsys.readouterr().out
+    assert "demo" in text
+    assert "product shape only" in text
+    assert "--demo-auto-approve" not in text
+    assert "--work-dir" not in text
+
+
+def test_root_help_lists_demo_in_getting_started(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["--help"])
+    assert exc.value.code == 0
+    text = capsys.readouterr().out
+    getting_started = text.split("Getting started:", 1)[1].split("Evidence and proof:", 1)[0]
+    assert "demo" in getting_started
+    assert "  demo" in text or ", demo" in getting_started
+
+
+def test_demo_auto_approve_runs_real_flow(tmp_path, capsys):
+    work_dir = tmp_path / "demo-work"
+    rc = main([
+        "demo",
+        "--work-dir",
+        str(work_dir),
+        "--demo-auto-approve",
+        "--json",
+    ])
+    assert rc == 0
+    text = capsys.readouterr().out
+    payload = json.loads(text)
+    assert payload["ok"] is True
+    assert payload["demo_timeline"] == "redirect -> approval -> proof"
+    assert payload["local_proof"] == "approval required -> approved -> target reached"
+    assert payload["target_reached"] is True
+    assert "redirect_playbook" not in text
+    assert "risk_family" not in text
+    assert "host-wide" not in text.lower()
+    _assert_demo_managed_approval_center_stopped(work_dir / "avp-home")
+
+
+def test_demo_human_output_is_bounded_without_secrets(tmp_path, capsys):
+    work_dir = tmp_path / "demo-human"
+    rc = main([
+        "demo",
+        "--work-dir",
+        str(work_dir),
+        "--demo-auto-approve",
+    ])
+    assert rc == 0
+    text = capsys.readouterr().out
+    assert proxy_cli._DEMO_BOUNDARY_LINE in text
+    assert proxy_cli._DEMO_REDIRECT_LINE in text
+    assert "Action continued: demo file written." in text
+    assert "Local proof: approval required -> approved -> target reached" in text
+    assert "redirect_playbook" not in text
+    assert "risk_family" not in text
+    assert "/approval/" not in text
+    _assert_demo_managed_approval_center_stopped(work_dir / "avp-home")
+
+
+def test_demo_uses_source_aware_proxy_command_for_approval_center(tmp_path, monkeypatch):
+    from agentveil_mcp_proxy.approval.server import ensure_managed_approval_center_for_cli
+
+    captured: dict[str, str] = {}
+
+    def capture_center_start(**kwargs):
+        captured["proxy_command"] = kwargs["proxy_command"]
+        return ensure_managed_approval_center_for_cli(**kwargs)
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.approval.server.ensure_managed_approval_center_for_cli",
+        capture_center_start,
+    )
+    rc = main([
+        "demo",
+        "--work-dir",
+        str(tmp_path / "demo-source-route"),
+        "--demo-auto-approve",
+        "--json",
+    ])
+    assert rc == 0
+    assert captured["proxy_command"] == sys.executable
+    _assert_demo_managed_approval_center_stopped(tmp_path / "demo-source-route" / "avp-home")
