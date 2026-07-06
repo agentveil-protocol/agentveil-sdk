@@ -2987,8 +2987,9 @@ def test_init_next_steps_include_home_when_custom_home(tmp_path, capsys):
     ])
     assert rc == 0
     text = capsys.readouterr().out
-    assert f"doctor --home {home}" in text
-    assert f"client-config print --home {home}" in text
+    assert "doctor --home <same AVP home>" in text
+    assert "client-config print --home <same AVP home>" in text
+    assert str(home) not in text
 
 
 def test_init_next_steps_include_config_when_custom_config(tmp_path, capsys):
@@ -3005,8 +3006,10 @@ def test_init_next_steps_include_config_when_custom_config(tmp_path, capsys):
     ])
     assert rc == 0
     text = capsys.readouterr().out
-    assert f"doctor --home {home} --config {config}" in text
-    assert f"client-config print --home {home} --config {config}" in text
+    assert "doctor --home <same AVP home> --config <same config>" in text
+    assert "client-config print --home <same AVP home> --config <same config>" in text
+    assert str(home) not in text
+    assert str(config) not in text
 
 
 def _assert_demo_managed_approval_center_stopped(home: Path) -> None:

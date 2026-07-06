@@ -2788,9 +2788,9 @@ def _format_init_next_step_commands(
 ) -> tuple[str, str]:
     def _with_path_args(parts: list[str]) -> str:
         if home is not None:
-            parts.extend(["--home", str(home)])
+            parts.extend(["--home", "<same AVP home>"])
         if config_path is not None:
-            parts.extend(["--config", str(config_path)])
+            parts.extend(["--config", "<same config>"])
         return " ".join(parts)
 
     doctor_cmd = _with_path_args(["agentveil-mcp-proxy", "doctor"])
