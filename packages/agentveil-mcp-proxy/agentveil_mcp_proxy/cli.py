@@ -135,6 +135,12 @@ from agentveil_mcp_proxy.client_connect import (
     is_connect_all_target,
 )
 from agentveil_mcp_proxy.passthrough import DownstreamConfig, McpPassthrough, PassthroughError
+from agentveil_mcp_proxy.paid_activation import (
+    PaidActivationError,
+    run_paid_activate_cli,
+    run_paid_deactivate_cli,
+    run_paid_status_cli,
+)
 from agentveil_mcp_proxy.agent_templates import (
     AGENT_TEMPLATE_NAMES,
     AgentTemplateError,
@@ -3549,7 +3555,7 @@ _ROOT_CLI_EPILOG = (
     "\n"
     "Advanced:\n"
     "  approval-center, client-config, client-doctor, client-run, configure-downstream,\n"
-    "  connect, control, disconnect, downstream, evidence-summary, explain, hook, role,\n"
+    "  connect, control, disconnect, downstream, evidence-summary, explain, hook, paid, role,\n"
     "  install-claude-hook, permission-doctor, reissue-grant, register, smoke,\n"
     "  status-claude-hook, templates, uninstall-claude-hook, wizard\n"
     "\n"
@@ -3919,6 +3925,43 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_path_args(control_timeline)
     control_timeline.add_argument("--limit", type=int, default=20)
     _add_json_arg(control_timeline)
+
+    paid = subparsers.add_parser(
+        "paid",
+        help="Paid activation, package install, and bounded local status",
+    )
+    paid_subparsers = paid.add_subparsers(dest="paid_action", required=True)
+    paid_activate = paid_subparsers.add_parser(
+        "activate",
+        help="Activate paid preview access and install the private provider package",
+    )
+    paid_activate.add_argument(
+        "license_key",
+        nargs="?",
+        default=None,
+        help="License key (raw value is not persisted; a bounded reference may be persisted)",
+    )
+    paid_activate.add_argument(
+        "--license-key-stdin",
+        action="store_true",
+        help="Read license key from stdin instead of argv (avoids shell history)",
+    )
+    _add_common_path_args(paid_activate)
+    _add_json_arg(paid_activate)
+
+    paid_status = paid_subparsers.add_parser(
+        "status",
+        help="Show bounded paid activation and install status",
+    )
+    _add_common_path_args(paid_status)
+    _add_json_arg(paid_status)
+
+    paid_deactivate = paid_subparsers.add_parser(
+        "deactivate",
+        help="Clear local paid activation metadata",
+    )
+    _add_common_path_args(paid_deactivate)
+    _add_json_arg(paid_deactivate)
 
     permission_doctor = subparsers.add_parser(
         "permission-doctor",
@@ -6727,6 +6770,25 @@ def main(argv: list[str] | None = None) -> int:
                     output_json=args.json_output,
                 )
             raise ProxyCliError("control action must be status or timeline")
+        if args.command == "paid":
+            if args.paid_action == "activate":
+                return run_paid_activate_cli(
+                    license_key=args.license_key,
+                    license_key_stdin=args.license_key_stdin,
+                    home=args.home,
+                    output_json=args.json_output,
+                )
+            if args.paid_action == "status":
+                return run_paid_status_cli(
+                    home=args.home,
+                    output_json=args.json_output,
+                )
+            if args.paid_action == "deactivate":
+                return run_paid_deactivate_cli(
+                    home=args.home,
+                    output_json=args.json_output,
+                )
+            raise ProxyCliError("paid action must be activate, status, or deactivate")
         if args.command == "permission-doctor":
             return print_permission_doctor_cli(
                 home=args.home,
@@ -7011,6 +7073,7 @@ def main(argv: list[str] | None = None) -> int:
             )
     except (
         ProxyCliError,
+        PaidActivationError,
         ApprovalEvidenceError,
         EvidenceExportError,
         EvidenceVerificationError,
@@ -7036,7 +7099,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 error_message = str(exc)
             print(f"ERROR: {error_message}", file=sys.stderr)
-        return exc.exit_code if isinstance(exc, ProxyCliError) else 1
+        return exc.exit_code if isinstance(exc, (ProxyCliError, PaidActivationError)) else 1
     raise AssertionError(f"unhandled command: {args.command}")
 
 
