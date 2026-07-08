@@ -1394,6 +1394,7 @@ def doctor_proxy(
                 )
             for warning in warnings:
                 print(f"WARN: {warning}", file=out)
+            _print_role_presets_discoverability_hint(out)
         return 0
     except ProxyCliError as exc:
         if output_json:
@@ -2796,6 +2797,16 @@ def _format_init_next_step_commands(
     doctor_cmd = _with_path_args(["agentveil-mcp-proxy", "doctor"])
     client_cmd = _with_path_args(["agentveil-mcp-proxy", "client-config", "print"])
     return doctor_cmd, client_cmd
+
+
+_ROLE_PRESETS_DISCOVERABILITY_HINT = (
+    "Role presets: available. Inspect with "
+    "`agentveil-mcp-proxy role doctor --preset reviewer`."
+)
+
+
+def _print_role_presets_discoverability_hint(out: TextIO) -> None:
+    print(_ROLE_PRESETS_DISCOVERABILITY_HINT, file=out)
 
 
 def _add_passphrase_args(parser: argparse.ArgumentParser) -> None:
@@ -6508,6 +6519,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 print(f"Next: {doctor_cmd}")
                 print(f"      {client_cmd}")
+                _print_role_presets_discoverability_hint(sys.stdout)
             return 0
         if args.command == "doctor":
             return doctor_proxy(
