@@ -3109,3 +3109,106 @@ def test_demo_uses_source_aware_proxy_command_for_approval_center(tmp_path, monk
     assert rc == 0
     assert captured["proxy_command"] == sys.executable
     _assert_demo_managed_approval_center_stopped(tmp_path / "demo-source-route" / "avp-home")
+
+
+_ROLE_DOCTOR_FORBIDDEN_WORDING = (
+    "AgentVeil learned",
+    "inferred role",
+)
+
+
+def _assert_role_doctor_reviewer_output(output: str) -> None:
+    assert "Preset: reviewer" in output
+    assert "Allowed action families" in output
+    assert "Blocked action families" in output
+    assert "Action boundary:" in output
+    assert "Implementer" in output
+    assert "Build agent" in output
+    lowered = output.lower()
+    for forbidden in _ROLE_DOCTOR_FORBIDDEN_WORDING:
+        assert forbidden.lower() not in lowered
+    assert "adaptive recommendation" not in lowered
+    assert "before local policy" not in lowered
+
+
+def test_role_doctor_reviewer_preset_shows_action_boundary(capsys):
+    assert main(["role", "doctor", "--preset", "reviewer"]) == 0
+    _assert_role_doctor_reviewer_output(capsys.readouterr().out)
+
+
+def test_explain_role_reviewer_still_works(capsys):
+    assert main(["explain", "role", "--preset", "reviewer"]) == 0
+    _assert_role_doctor_reviewer_output(capsys.readouterr().out)
+
+
+def test_role_doctor_and_explain_role_reviewer_match(capsys):
+    assert main(["role", "doctor", "--preset", "reviewer"]) == 0
+    role_output = capsys.readouterr().out
+    assert main(["explain", "role", "--preset", "reviewer"]) == 0
+    explain_output = capsys.readouterr().out
+    assert role_output == explain_output
+
+
+def test_role_doctor_help_is_discoverable(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["role", "doctor", "--help"])
+    assert exc.value.code == 0
+    text = capsys.readouterr().out
+    assert "--preset" in text
+    assert "reviewer" in text
+
+
+def test_root_help_lists_role_doctor(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["--help"])
+    assert exc.value.code == 0
+    text = capsys.readouterr().out
+    advanced = text.split("Advanced:", 1)[1].split("Typical first-run path:", 1)[0]
+    assert "role" in advanced
+
+
+def test_doctor_human_output_includes_role_presets_hint(tmp_path):
+    home = tmp_path / "avp-home"
+    init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    out = io.StringIO()
+    assert doctor_proxy(home=home, passphrase=TEST_PASSPHRASE, out=out) == 0
+    text = out.getvalue()
+    assert proxy_cli._ROLE_PRESETS_DISCOVERABILITY_HINT in text
+    assert "inferred" not in text.lower()
+    assert "adaptive" not in text.lower()
+
+
+def test_doctor_json_output_omits_role_presets_hint(tmp_path):
+    home = tmp_path / "avp-home"
+    init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    out = io.StringIO()
+    assert doctor_proxy(
+        home=home,
+        passphrase=TEST_PASSPHRASE,
+        output_json=True,
+        out=out,
+    ) == 0
+    payload = json.loads(out.getvalue())
+    serialized = json.dumps(payload)
+    assert proxy_cli._ROLE_PRESETS_DISCOVERABILITY_HINT not in serialized
+    assert "role doctor" not in serialized
+
+
+def test_init_human_output_includes_role_presets_hint(tmp_path, capsys):
+    home = tmp_path / "avp-home"
+    assert main(["init", "--home", str(home), "--plaintext", "--force"]) == 0
+    text = capsys.readouterr().out
+    assert proxy_cli._ROLE_PRESETS_DISCOVERABILITY_HINT in text
+    assert "Next:" in text
+
+
+def test_demo_human_output_omits_role_presets_hint(tmp_path, capsys):
+    work_dir = tmp_path / "demo-no-role-hint"
+    assert main([
+        "demo",
+        "--work-dir",
+        str(work_dir),
+        "--demo-auto-approve",
+    ]) == 0
+    text = capsys.readouterr().out
+    assert proxy_cli._ROLE_PRESETS_DISCOVERABILITY_HINT not in text
