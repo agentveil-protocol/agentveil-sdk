@@ -3538,7 +3538,7 @@ _ROOT_CLI_EPILOG = (
     "\n"
     "Advanced:\n"
     "  approval-center, client-config, client-doctor, client-run, configure-downstream,\n"
-    "  connect, control, disconnect, downstream, evidence-summary, explain, hook,\n"
+    "  connect, control, disconnect, downstream, evidence-summary, explain, hook, role,\n"
     "  install-claude-hook, permission-doctor, reissue-grant, register, smoke,\n"
     "  status-claude-hook, templates, uninstall-claude-hook, wizard\n"
     "\n"
@@ -4186,6 +4186,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explain one preset; default reads role_preset from config or the preset set",
     )
     _add_json_arg(explain_role)
+
+    role = subparsers.add_parser(
+        "role",
+        help="Inspect static role preset action-boundary behavior",
+        description=(
+            "Inspect what a role preset may read, block, or require approval for. "
+            "Roles map to action-boundary decisions; they are not inferred policy."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  agentveil-mcp-proxy role doctor --preset reviewer\n"
+            "  agentveil-mcp-proxy explain role --preset reviewer"
+        ),
+    )
+    role_subparsers = role.add_subparsers(dest="role_action", required=True)
+    role_doctor = role_subparsers.add_parser(
+        "doctor",
+        # claim-check: allow "blocked" is bounded role-doctor action-family status text.
+        help="Show allowed, blocked, and approval-required action families by role preset",
+    )
+    _add_common_path_args(role_doctor)
+    role_doctor.add_argument(
+        "--preset",
+        choices=list(ROLE_PRESET_NAMES),
+        default=None,
+        help="Inspect one preset; default reads role_preset from config or the preset set",
+    )
+    _add_json_arg(role_doctor)
 
     templates = subparsers.add_parser(
         "templates",
@@ -6778,6 +6807,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "explain":
             if args.explain_action != "role":
                 raise ProxyCliError("explain action must be role")
+            return explain_role_proxy(
+                home=args.home,
+                config_path=args.config,
+                preset=args.preset,
+                output_json=args.json_output,
+            )
+        if args.command == "role":
+            if args.role_action != "doctor":
+                raise ProxyCliError("role action must be doctor")
             return explain_role_proxy(
                 home=args.home,
                 config_path=args.config,
