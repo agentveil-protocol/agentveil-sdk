@@ -403,9 +403,10 @@ def build_role_preset_guide(preset_name: str) -> RolePresetGuide:
             approval_required_action_families=POLICY_APPROVAL_ACTION_FAMILIES,
             blocked_action_families=MUTATION_ACTION_FAMILIES,
             summary=(
-                f"{_preset_label(preset.name)} may read and inspect tools; "
+                f"{_preset_label(preset.name)} may read and inspect; "
                 # claim-check: allow "blocked" is bounded role-doctor status text.
-                "mutation and command actions are blocked by role authority."
+                "file changes and shell commands are blocked at the action boundary. "
+                "Hand implementation work to an Implementer or Build agent."
             ),
         )
     return RolePresetGuide(
@@ -453,7 +454,11 @@ def format_role_doctor_report(report: Mapping[str, Any]) -> str:
     """Render human-readable role doctor output."""
 
     if "presets" in report:
-        lines = ["Role doctor: preset capabilities", ""]
+        lines = [
+            "Role doctor: static action-boundary map for role presets.",
+            "Roles provide context for allow, approval, and deny decisions.",
+            "",
+        ]
         for preset_report in report["presets"]:
             lines.append(format_role_doctor_report(preset_report))
             lines.append("")
@@ -471,6 +476,10 @@ def format_role_doctor_report(report: Mapping[str, Any]) -> str:
         # claim-check: allow "Blocked" is the literal bounded role-doctor label.
         f"Blocked action families: {', '.join(report['blocked_action_families']) or 'none'}",
         f"Summary: {report['summary']}",
+        (
+            "Action boundary: role authority helps decide whether each tool call "
+            "is allowed, needs approval, or is blocked."
+        ),
     ]
     return "\n".join(lines)
 

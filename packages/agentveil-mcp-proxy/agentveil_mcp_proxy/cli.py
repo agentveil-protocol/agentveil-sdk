@@ -1400,6 +1400,7 @@ def doctor_proxy(
                 )
             for warning in warnings:
                 print(f"WARN: {warning}", file=out)
+            _print_role_presets_discoverability_hint(out)
         return 0
     except ProxyCliError as exc:
         if output_json:
@@ -2804,6 +2805,16 @@ def _format_init_next_step_commands(
     return doctor_cmd, client_cmd
 
 
+_ROLE_PRESETS_DISCOVERABILITY_HINT = (
+    "Role presets: available. Inspect with "
+    "`agentveil-mcp-proxy role doctor --preset reviewer`."
+)
+
+
+def _print_role_presets_discoverability_hint(out: TextIO) -> None:
+    print(_ROLE_PRESETS_DISCOVERABILITY_HINT, file=out)
+
+
 def _add_passphrase_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--passphrase", default=None, help="MCP proxy identity passphrase")
     parser.add_argument("--passphrase-file", type=Path, default=None, help="Read passphrase from file")
@@ -3544,7 +3555,7 @@ _ROOT_CLI_EPILOG = (
     "\n"
     "Advanced:\n"
     "  approval-center, client-config, client-doctor, client-run, configure-downstream,\n"
-    "  connect, control, disconnect, downstream, evidence-summary, explain, hook, paid,\n"
+    "  connect, control, disconnect, downstream, evidence-summary, explain, hook, paid, role,\n"
     "  install-claude-hook, permission-doctor, reissue-grant, register, smoke,\n"
     "  status-claude-hook, templates, uninstall-claude-hook, wizard\n"
     "\n"
@@ -4229,6 +4240,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explain one preset; default reads role_preset from config or the preset set",
     )
     _add_json_arg(explain_role)
+
+    role = subparsers.add_parser(
+        "role",
+        help="Inspect static role preset action-boundary behavior",
+        description=(
+            "Inspect what a role preset may read, block, or require approval for. "
+            "Roles map to action-boundary decisions; they are not inferred policy."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  agentveil-mcp-proxy role doctor --preset reviewer\n"
+            "  agentveil-mcp-proxy explain role --preset reviewer"
+        ),
+    )
+    role_subparsers = role.add_subparsers(dest="role_action", required=True)
+    role_doctor = role_subparsers.add_parser(
+        "doctor",
+        # claim-check: allow "blocked" is bounded role-doctor action-family status text.
+        help="Show allowed, blocked, and approval-required action families by role preset",
+    )
+    _add_common_path_args(role_doctor)
+    role_doctor.add_argument(
+        "--preset",
+        choices=list(ROLE_PRESET_NAMES),
+        default=None,
+        help="Inspect one preset; default reads role_preset from config or the preset set",
+    )
+    _add_json_arg(role_doctor)
 
     templates = subparsers.add_parser(
         "templates",
@@ -6522,6 +6562,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 print(f"Next: {doctor_cmd}")
                 print(f"      {client_cmd}")
+                _print_role_presets_discoverability_hint(sys.stdout)
             return 0
         if args.command == "doctor":
             return doctor_proxy(
@@ -6840,6 +6881,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "explain":
             if args.explain_action != "role":
                 raise ProxyCliError("explain action must be role")
+            return explain_role_proxy(
+                home=args.home,
+                config_path=args.config,
+                preset=args.preset,
+                output_json=args.json_output,
+            )
+        if args.command == "role":
+            if args.role_action != "doctor":
+                raise ProxyCliError("role action must be doctor")
             return explain_role_proxy(
                 home=args.home,
                 config_path=args.config,
