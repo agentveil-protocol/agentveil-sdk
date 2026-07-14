@@ -20,7 +20,9 @@ from typing import Any, Callable, Mapping
 from agentveil.agent import AVPAgent
 from agentveil.data_integrity import DataIntegrityError, verify_eddsa_jcs_2022
 from agentveil.delegation import DelegationInvalid, verify_delegation
+from agentveil.exceptions import AVPValidationError
 from agentveil.proof import ProofVerificationError, verify_signed_jcs
+from agentveil.runtime_install_clone import validate_install_clone_context
 from agentveil_mcp_proxy.circuit_breaker import (
     CircuitBreaker,
     CircuitBreakerOpenError,
@@ -88,6 +90,7 @@ class _RuntimeGateRequest:
     payload_hash: str
     risk_class: str
     policy_context_hash: str
+    install_clone_context: Mapping[str, Any] | None = None
 
 
 class RuntimeGateClient:
@@ -191,15 +194,20 @@ class RuntimeGateClient:
             raise RuntimeGateUnavailableError("runtime gate circuit breaker open") from exc
         try:
             try:
-                response = self.agent.runtime_evaluate(
-                    action=request.action,
-                    resource=request.resource,
-                    environment=request.environment,
-                    delegation_receipt=self.control_grant,
-                    payload_hash=request.payload_hash,
-                    risk_class=request.risk_class,
-                    policy_context_hash=request.policy_context_hash,
-                )
+                evaluate_kwargs: dict[str, Any] = {
+                    "action": request.action,
+                    "resource": request.resource,
+                    "environment": request.environment,
+                    "delegation_receipt": self.control_grant,
+                    "payload_hash": request.payload_hash,
+                    "risk_class": request.risk_class,
+                    "policy_context_hash": request.policy_context_hash,
+                }
+                if request.install_clone_context is not None:
+                    evaluate_kwargs["install_clone_context"] = dict(
+                        request.install_clone_context
+                    )
+                response = self.agent.runtime_evaluate(**evaluate_kwargs)
             except Exception as exc:
                 raise RuntimeGateUnavailableError("runtime gate request failed") from exc
             if not isinstance(response, Mapping):
@@ -243,6 +251,14 @@ class RuntimeGateClient:
 
     def _build_request(self, classification: ClassifiedToolCall) -> _RuntimeGateRequest:
         metadata = classification.backend_metadata()
+        install_clone_context = metadata.get("install_clone_context")
+        if install_clone_context is not None:
+            if not isinstance(install_clone_context, Mapping):
+                raise RuntimeGateUnavailableError("install_clone_context invalid")
+            try:
+                install_clone_context = validate_install_clone_context(install_clone_context)
+            except AVPValidationError as exc:
+                raise RuntimeGateUnavailableError("install_clone_context invalid") from exc
         return _RuntimeGateRequest(
             action=_runtime_field(metadata.get("action")),
             resource=_runtime_field(metadata.get("resource")),
@@ -253,6 +269,7 @@ class RuntimeGateClient:
                 metadata.get("policy_context_hash"),
                 "policy_context_hash",
             ),
+            install_clone_context=install_clone_context,
         )
 
     def _decision_receipt_jcs(self, response: Mapping[str, Any]) -> str:

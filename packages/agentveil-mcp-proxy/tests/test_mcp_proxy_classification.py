@@ -322,6 +322,57 @@ def test_infer_risk_class_recognizes_pip_run_script_as_destructive():
     assert infer_risk_class("package.pip_run_script", tool="pip_run_script") is RiskClass.DESTRUCTIVE
 
 
+def test_build_install_clone_context_for_package_mutation_tools_only():
+    from agentveil_mcp_proxy.classification import (
+        INSTALL_CLONE_PACKAGE_REF,
+        INSTALL_CLONE_SOURCE_REF,
+        build_install_clone_context,
+    )
+
+    for tool in ("pip_install", "pip_uninstall", "pip_update", "pip_run_script"):
+        context = build_install_clone_context(tool)
+        assert context is not None
+        assert context["operation"] == "install"
+        assert context["source_ref"] == INSTALL_CLONE_SOURCE_REF
+        assert context["source_ref_kind"] == "workspace_registry"
+        assert context["user_pinned_source"] is False
+        assert context["intent_source"] == "user_direct"
+        assert context["target_source"] == "workspace_registry"
+        assert context["tool_source"] == "approved_registry"
+        assert context["metadata_influence"] == "none"
+        assert context["requested_package"] == INSTALL_CLONE_PACKAGE_REF
+        assert context["expected_package"] == INSTALL_CLONE_PACKAGE_REF
+        text = json.dumps(context, sort_keys=True)
+        assert "/Users/" not in text
+        assert "http" not in text
+        assert "secret" not in text.lower()
+
+    for tool in ("package_list_manifest", "create_issue", "read_file", "git_status"):
+        assert build_install_clone_context(tool) is None
+
+
+def test_package_tool_backend_metadata_includes_install_clone_context():
+    from agentveil_mcp_proxy.classification import INSTALL_CLONE_SOURCE_REF
+
+    classified = ToolCallClassifier(_config(), server_name="package").classify(
+        tool="pip_install",
+        arguments={"package_name": "raw-secret-package-name", "project_path": "/Users/secret/proj"},
+    )
+    metadata = classified.backend_metadata()
+    assert "install_clone_context" in metadata
+    context = metadata["install_clone_context"]
+    assert context["source_ref"] == INSTALL_CLONE_SOURCE_REF
+    text = json.dumps(metadata, sort_keys=True)
+    assert "raw-secret-package-name" not in text
+    assert "/Users/secret" not in text
+
+    non_package = ToolCallClassifier(_config(), server_name="github").classify(
+        tool="create_issue",
+        arguments={"title": "x"},
+    )
+    assert "install_clone_context" not in non_package.backend_metadata()
+
+
 def test_no_official_mcp_git_tool_falls_back_to_unknown():
     # Tool list from https://github.com/modelcontextprotocol/servers/tree/main/src/git
     official_git_tools = (
