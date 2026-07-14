@@ -41,6 +41,46 @@ BOUNDED_INSTALL_KEYS = frozenset(
         "public_fallback_available",
         "error_code",
         "last_installed_at",
+        "install_safety_state",
+        "install_safety_reason",
+    }
+)
+
+INSTALL_SAFETY_OPERATION = "install"
+INSTALL_SAFETY_SOURCE_REF = "src_private_policy_artifact"
+INSTALL_SAFETY_SOURCE_REF_KIND = "workspace_registry"
+INSTALL_SAFETY_REQUESTED_PACKAGE = "pkg_agentveil_private_policy"
+INSTALL_SAFETY_EXPECTED_PACKAGE = "pkg_agentveil_private_policy"
+PROVENANCE_INTENT_SOURCE_USER_DIRECT = "user_direct"
+PROVENANCE_TARGET_SOURCE_WORKSPACE_REGISTRY = "workspace_registry"
+PROVENANCE_TOOL_SOURCE_APPROVED_REGISTRY = "approved_registry"
+PROVENANCE_METADATA_INFLUENCE_NONE = "none"
+INSTALL_SAFETY_STATE_VERIFIED = "verified"
+INSTALL_SAFETY_STATE_REVIEW_RECOMMENDED = "review_recommended"
+# claim-check: allow "blocked" is a bounded backend response state label.
+INSTALL_SAFETY_STATE_BLOCKED = "blocked"
+INSTALL_SAFETY_STATE_MALFORMED = "malformed"
+INSTALL_SAFETY_DECISION_ALLOW = "allow"
+INSTALL_SAFETY_DECISION_REDIRECT = "redirect"
+INSTALL_SAFETY_DECISION_BLOCK = "block"
+INSTALL_SAFETY_LIVE_ENFORCEMENT_HOLD = "HOLD"
+INSTALL_SAFETY_ALLOWED_REQUEST_KEYS = frozenset(
+    {
+        "entitlement_token",
+        "operation",
+        "source_ref",
+        "source_ref_kind",
+        "user_pinned_source",
+        "intent_source",
+        "target_source",
+        "tool_source",
+        "metadata_influence",
+        "requested_package",
+        "expected_package",
+        "package_namespace",
+        "expected_hash",
+        "resource_hash",
+        "payload_hash",
     }
 )
 
@@ -67,6 +107,8 @@ ERROR_HASH_MISMATCH = "artifact_hash_mismatch"
 ERROR_PACKAGE_NAME_MISMATCH = "package_name_mismatch"
 ERROR_VERSION_MISMATCH = "package_version_mismatch"
 ERROR_INSTALL_FAILED = "install_failed"
+ERROR_INSTALL_SAFETY_BLOCKED = "install_safety_blocked"
+ERROR_INSTALL_SAFETY_MALFORMED = "install_safety_malformed"
 
 
 class PaidInstallError(ValueError):
@@ -97,6 +139,17 @@ class EntitlementResult:
 
 
 @dataclass(frozen=True)
+class InstallSafetyResult:
+    ok: bool
+    decision: str | None
+    reason_code: str | None
+    install_safety_state: str | None
+    live_enforcement: str | None
+    public_warning: str | None
+    error_code: str | None
+
+
+@dataclass(frozen=True)
 class PackageAuthorizeResult:
     download_authorized: bool
     artifact_id: str | None
@@ -122,6 +175,7 @@ class PaidActivateInstallResult:
     install_state: dict[str, Any]
     public_fallback_available: bool
     license_id: str
+    install_safety_advisory: str | None = None
 
 
 class PaidBackendClient(Protocol):
@@ -135,6 +189,12 @@ class PaidBackendClient(Protocol):
         license_key: str,
         validation: ActivationValidateResult,
     ) -> EntitlementResult:
+        ...
+
+    def check_install_safety(
+        self,
+        entitlement_token: str,
+    ) -> InstallSafetyResult:
         ...
 
     def authorize_package(
@@ -191,6 +251,81 @@ def current_platform_name() -> str:
 
 def current_python_version() -> str:
     return f"{sys.version_info.major}.{sys.version_info.minor}"
+
+
+def format_install_safety_advisory_line(reason_code: str | None) -> str:
+    code = (reason_code or "unknown").strip() or "unknown"
+    return f"Install check: review recommended ({code})"
+
+
+def format_install_safety_blocked_message(reason_code: str | None) -> str:
+    # claim-check: allow "blocked" is user-facing bounded status from backend.
+    code = (reason_code or "blocked").strip() or "blocked"
+    # claim-check: allow "blocked" is a bounded backend response state label.
+    return f"install check blocked ({code})"
+
+
+def build_install_safety_check_request(entitlement_token: str) -> dict[str, Any]:
+    """Bounded request body aligned with private InstallSafetyCheckRequestSchema."""
+
+    return {
+        "entitlement_token": entitlement_token,
+        "operation": INSTALL_SAFETY_OPERATION,
+        "source_ref": INSTALL_SAFETY_SOURCE_REF,
+        "source_ref_kind": INSTALL_SAFETY_SOURCE_REF_KIND,
+        "user_pinned_source": False,
+        "intent_source": PROVENANCE_INTENT_SOURCE_USER_DIRECT,
+        "target_source": PROVENANCE_TARGET_SOURCE_WORKSPACE_REGISTRY,
+        "tool_source": PROVENANCE_TOOL_SOURCE_APPROVED_REGISTRY,
+        "metadata_influence": PROVENANCE_METADATA_INFLUENCE_NONE,
+        "requested_package": INSTALL_SAFETY_REQUESTED_PACKAGE,
+        "expected_package": INSTALL_SAFETY_EXPECTED_PACKAGE,
+    }
+
+
+def parse_install_safety_result(payload: Mapping[str, Any]) -> InstallSafetyResult:
+    if not isinstance(payload, Mapping):
+        raise PaidInstallError(ERROR_INSTALL_SAFETY_MALFORMED, exit_code=1)
+    decision = _optional_str(payload.get("decision"))
+    install_safety_state = _optional_str(payload.get("install_safety_state"))
+    reason_code = _optional_str(payload.get("reason_code"))
+    if not decision or not install_safety_state or not reason_code:
+        raise PaidInstallError(ERROR_INSTALL_SAFETY_MALFORMED, exit_code=1)
+    return InstallSafetyResult(
+        ok=bool(payload.get("ok", True)),
+        decision=decision,
+        reason_code=reason_code,
+        install_safety_state=install_safety_state,
+        live_enforcement=_optional_str(payload.get("live_enforcement")),
+        public_warning=_optional_str(payload.get("public_warning")),
+        error_code=_optional_str(payload.get("error_code")),
+    )
+
+
+def evaluate_install_safety(result: InstallSafetyResult) -> tuple[str | None, str | None, str | None]:
+    """Return advisory line, persisted state, persisted reason; or raise on deny."""
+
+    state = (result.install_safety_state or "").strip().lower()
+    decision = (result.decision or "").strip().lower()
+    if not state:
+        raise PaidInstallError(ERROR_INSTALL_SAFETY_MALFORMED, exit_code=1)
+
+    if state in {INSTALL_SAFETY_STATE_BLOCKED, INSTALL_SAFETY_STATE_MALFORMED}:
+        reason = result.reason_code or result.error_code or state
+        raise PaidInstallError(format_install_safety_blocked_message(reason), exit_code=1)
+    if decision == INSTALL_SAFETY_DECISION_BLOCK:
+        # claim-check: allow "blocked" is a bounded fallback reason label.
+        reason = result.reason_code or result.error_code or "blocked"
+        raise PaidInstallError(format_install_safety_blocked_message(reason), exit_code=1)
+
+    if state == INSTALL_SAFETY_STATE_REVIEW_RECOMMENDED:
+        advisory = result.public_warning or format_install_safety_advisory_line(result.reason_code)
+        return advisory, state, result.reason_code
+
+    if state == INSTALL_SAFETY_STATE_VERIFIED:
+        return None, state, result.reason_code
+
+    raise PaidInstallError(ERROR_INSTALL_SAFETY_MALFORMED, exit_code=1)
 
 
 def assert_install_metadata_bounded(data: Mapping[str, Any]) -> None:
@@ -381,8 +516,12 @@ class HttpPaidBackendClient:
             with urllib.request.urlopen(request, timeout=self._timeout) as response:
                 raw = response.read()
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            scan_paid_output_for_leaks(detail)
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")
+            except OSError:
+                detail = ""
+            if detail:
+                scan_paid_output_for_leaks(detail)
             raise PaidInstallError(ERROR_BACKEND_UNAVAILABLE, exit_code=1) from exc
         except urllib.error.URLError as exc:
             raise PaidInstallError(ERROR_BACKEND_UNAVAILABLE, exit_code=1) from exc
@@ -411,6 +550,54 @@ class HttpPaidBackendClient:
             raise PaidInstallError(ERROR_DOWNLOAD_DENIED, exit_code=1) from exc
         except urllib.error.URLError as exc:
             raise PaidInstallError(ERROR_BACKEND_UNAVAILABLE, exit_code=1) from exc
+
+    def _post_install_safety_json(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        entitlement_token: str,
+    ) -> dict[str, Any]:
+        body = json.dumps(dict(payload)).encode("utf-8")
+        request = urllib.request.Request(
+            # claim-check: allow "safety" is the private advisory endpoint name.
+            f"{self._base_url}/v1/paid/install/safety-check",
+            data=body,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout) as response:
+                raw = response.read()
+        except urllib.error.HTTPError as exc:
+            raw = b""
+            try:
+                raw = exc.read()
+            except OSError:
+                raw = b""
+            if raw and exc.code in {403, 422}:
+                try:
+                    parsed = json.loads(raw.decode("utf-8"))
+                except json.JSONDecodeError as decode_exc:
+                    raise PaidInstallError(ERROR_BACKEND_UNAVAILABLE, exit_code=1) from decode_exc
+                if isinstance(parsed, dict):
+                    scan_paid_output_for_leaks(json.dumps(parsed), secrets=(entitlement_token,))
+                    return parsed
+            if exc.code in {403, 422}:
+                raise PaidInstallError(ERROR_INSTALL_SAFETY_BLOCKED, exit_code=1) from exc
+            detail = raw.decode("utf-8", errors="replace") if raw else ""
+            if detail:
+                scan_paid_output_for_leaks(detail)
+            raise PaidInstallError(ERROR_BACKEND_UNAVAILABLE, exit_code=1) from exc
+        except urllib.error.URLError as exc:
+            raise PaidInstallError(ERROR_BACKEND_UNAVAILABLE, exit_code=1) from exc
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise PaidInstallError(ERROR_BACKEND_UNAVAILABLE, exit_code=1) from exc
+        if not isinstance(parsed, dict):
+            raise PaidInstallError(ERROR_BACKEND_UNAVAILABLE, exit_code=1)
+        scan_paid_output_for_leaks(json.dumps(parsed), secrets=(entitlement_token,))
+        return parsed
 
     def validate_activation(self, license_key: str) -> ActivationValidateResult:
         payload = self._post_json("/v1/paid/activate/validate", {"license_key": license_key})
@@ -444,6 +631,17 @@ class HttpPaidBackendClient:
             entitlement_id=entitlement_id,
             expires_at=_optional_str(payload.get("expires_at")),
         )
+
+    def check_install_safety(
+        self,
+        entitlement_token: str,
+    ) -> InstallSafetyResult:
+        request_payload = build_install_safety_check_request(entitlement_token)
+        response_payload = self._post_install_safety_json(
+            request_payload,
+            entitlement_token=entitlement_token,
+        )
+        return parse_install_safety_result(response_payload)
 
     def authorize_package(
         self,
@@ -517,9 +715,15 @@ def run_paid_activate_install_flow(
         )
 
     entitlement = backend.issue_entitlement(license_key, validation)
+    resolved_artifact_id = artifact_id or os.environ.get("AVP_PAID_ARTIFACT_ID", DEFAULT_ARTIFACT_ID)
+    # claim-check: allow "safety" is advisory-only; install still verifies hash/metadata.
+    install_check = backend.check_install_safety(entitlement.entitlement_token)
+    install_safety_advisory, install_safety_state, install_safety_reason = evaluate_install_safety(
+        install_check,
+    )
     authorization = backend.authorize_package(
         entitlement.entitlement_token,
-        artifact_id=artifact_id or os.environ.get("AVP_PAID_ARTIFACT_ID", DEFAULT_ARTIFACT_ID),
+        artifact_id=resolved_artifact_id,
         platform_name=current_platform_name(),
         python_version=current_python_version(),
     )
@@ -567,6 +771,8 @@ def run_paid_activate_install_flow(
         "public_fallback_available": authorization.public_fallback_available,
         "error_code": None,
         "last_installed_at": utc_now_iso(),
+        "install_safety_state": install_safety_state,
+        "install_safety_reason": install_safety_reason,
     }
     write_install_state(install_state_path(home), install_state)
 
@@ -589,6 +795,7 @@ def run_paid_activate_install_flow(
         install_state=install_state,
         public_fallback_available=authorization.public_fallback_available,
         license_id=synthetic_license_id(license_key),
+        install_safety_advisory=install_safety_advisory,
     )
 
 
