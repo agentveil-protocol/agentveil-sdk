@@ -171,6 +171,17 @@ _PACKAGE_TOOL_RISK_CLASSES: Mapping[str, RiskClass] = {
     "pip_run_script": RiskClass.DESTRUCTIVE,
 }
 
+# Package install/clone-relevant tools that may attach bounded Runtime Gate
+# advisory context. Read-only package status tools are intentionally excluded.
+_PACKAGE_INSTALL_CLONE_CONTEXT_TOOLS = frozenset({
+    "pip_install",
+    "pip_uninstall",
+    "pip_update",
+    "pip_run_script",
+})
+INSTALL_CLONE_SOURCE_REF = "src_package_route_builtin"
+INSTALL_CLONE_PACKAGE_REF = "pkg_package_route_builtin"
+
 # Fetch/network MCP tools (e.g. the official MCP "fetch" server's `fetch` tool)
 # take a URL argument. The tool name `fetch` matches the generic _READ prefix,
 # so a benign public fetch already infers READ. The risk that this prefix misses
@@ -277,7 +288,7 @@ class ClassifiedToolCall:
     def backend_metadata(self) -> dict[str, Any]:
         """Return privacy-filtered metadata intended for later backend calls."""
 
-        return {
+        metadata = {
             "action": self.action,
             "action_hash": self.action_hash if self.action == self.action_hash else None,
             "resource": self.resource,
@@ -291,6 +302,10 @@ class ClassifiedToolCall:
                 else self.policy_evaluation.would_decision.value
             ),
         }
+        install_clone_context = build_install_clone_context(self.tool)
+        if install_clone_context is not None:
+            metadata["install_clone_context"] = install_clone_context
+        return metadata
 
     def local_evidence_metadata(self) -> dict[str, Any]:
         """Return local-only metadata for future evidence slices."""
@@ -397,6 +412,29 @@ def extract_resource(arguments: Mapping[str, Any]) -> str | None:
         if isinstance(value, int) and not isinstance(value, bool):
             return f"{key}:{value}"
     return None
+
+
+def build_install_clone_context(tool: str) -> dict[str, Any] | None:
+    """Return bounded install/clone advisory context for package mutation tools.
+
+    Returns ``None`` for non-package tools. Includes only stable bounded refs,
+    without raw package names, paths, URLs, prompts, source, or secrets.
+    """
+
+    if tool not in _PACKAGE_INSTALL_CLONE_CONTEXT_TOOLS:
+        return None
+    return {
+        "operation": "install",
+        "source_ref": INSTALL_CLONE_SOURCE_REF,
+        "source_ref_kind": "workspace_registry",
+        "user_pinned_source": False,
+        "intent_source": "user_direct",
+        "target_source": "workspace_registry",
+        "tool_source": "approved_registry",
+        "metadata_influence": "none",
+        "requested_package": INSTALL_CLONE_PACKAGE_REF,
+        "expected_package": INSTALL_CLONE_PACKAGE_REF,
+    }
 
 
 def infer_action_family(tool: str) -> str:
@@ -515,8 +553,11 @@ def _normalize_json(value: Any) -> Any:
 __all__ = [
     "ClassifiedToolCall",
     "HASH_PREFIX",
+    "INSTALL_CLONE_PACKAGE_REF",
+    "INSTALL_CLONE_SOURCE_REF",
     "REDACTED",
     "ToolCallClassifier",
+    "build_install_clone_context",
     "extract_resource",
     "infer_action_family",
     "infer_risk_class",

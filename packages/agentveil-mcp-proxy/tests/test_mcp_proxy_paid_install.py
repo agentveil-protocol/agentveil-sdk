@@ -23,9 +23,18 @@ from agentveil_mcp_proxy.paid_install import (
     ERROR_PACKAGE_NAME_MISMATCH,
     ERROR_VERSION_MISMATCH,
     INSTALL_FILENAME,
+    INSTALL_SAFETY_ALLOWED_REQUEST_KEYS,
+    INSTALL_SAFETY_LIVE_ENFORCEMENT_HOLD,
+    INSTALL_SAFETY_STATE_BLOCKED,
+    INSTALL_SAFETY_STATE_MALFORMED,
+    INSTALL_SAFETY_STATE_REVIEW_RECOMMENDED,
+    INSTALL_SAFETY_STATE_VERIFIED,
     HttpPaidBackendClient,
     PaidInstallError,
+    build_install_safety_check_request,
+    evaluate_install_safety,
     install_wheel_to_vendor,
+    parse_install_safety_result,
     parse_wheel_metadata,
     scan_paid_output_for_leaks,
     set_paid_backend_client,
@@ -53,6 +62,11 @@ class _MockBackendState:
     artifact_hash: str
     artifact_size: int
     last_authorize_artifact_id: str | None = None
+    safety_decision: str = "allow"
+    safety_reason_code: str | None = None
+    post_paths: list[str] | None = None
+    authorize_call_count: int = 0
+    download_call_count: int = 0
 
 
 class _MockPaidBackendHandler(BaseHTTPRequestHandler):
@@ -75,6 +89,8 @@ class _MockPaidBackendHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self) -> None:  # noqa: N802
+        self.state.post_paths = self.state.post_paths or []
+        self.state.post_paths.append(self.path)
         if self.path == "/v1/paid/activate/validate":
             payload = self._read_json()
             if payload.get("license_key") != RAW_LICENSE_KEY:
@@ -108,7 +124,79 @@ class _MockPaidBackendHandler(BaseHTTPRequestHandler):
                 }
             )
             return
+        # claim-check: allow "safety" is the advisory endpoint label under test.
+        if self.path == "/v1/paid/install/safety-check":
+            payload = self._read_json()
+            extra = set(payload) - INSTALL_SAFETY_ALLOWED_REQUEST_KEYS
+            if extra:
+                self._send_json({"detail": "request_invalid"}, status=422)
+                return
+            expected = build_install_safety_check_request(ENTITLEMENT_TOKEN)
+            for key, value in expected.items():
+                if payload.get(key) != value:
+                    self._send_json({"detail": "request_invalid"}, status=422)
+                    return
+            if payload.get("entitlement_token") != ENTITLEMENT_TOKEN:
+                self._send_json({"detail": "request_invalid"}, status=422)
+                return
+            decision = self.state.safety_decision
+            # claim-check: allow "blocked" is mock backend response state.
+            if decision == "blocked":
+                self._send_json(
+                    {
+                        "ok": False,
+                        "decision": "block",
+                        "reason_code": self.state.safety_reason_code or "hash_unverified",
+                        "redirect_ref": None,
+                        "install_safety_state": INSTALL_SAFETY_STATE_BLOCKED,
+                        "live_enforcement": INSTALL_SAFETY_LIVE_ENFORCEMENT_HOLD,
+                        "source_truth": {"resource_hash": None},
+                    },
+                    status=403,
+                )
+                return
+            if decision == "malformed":
+                self._send_json(
+                    {
+                        "ok": False,
+                        "decision": "malformed",
+                        "reason_code": "malformed_response",
+                        "redirect_ref": None,
+                        "install_safety_state": INSTALL_SAFETY_STATE_MALFORMED,
+                        "live_enforcement": INSTALL_SAFETY_LIVE_ENFORCEMENT_HOLD,
+                        "source_truth": {},
+                    },
+                    status=422,
+                )
+                return
+            if decision == "redirect":
+                reason = self.state.safety_reason_code or "model_suggested_source"
+                self._send_json(
+                    {
+                        "ok": False,
+                        "decision": "redirect",
+                        "reason_code": reason,
+                        "redirect_ref": "src_model_pkg_001",
+                        "install_safety_state": INSTALL_SAFETY_STATE_REVIEW_RECOMMENDED,
+                        "live_enforcement": INSTALL_SAFETY_LIVE_ENFORCEMENT_HOLD,
+                        "source_truth": {"decision": "redirect"},
+                    }
+                )
+                return
+            self._send_json(
+                {
+                    "ok": True,
+                    "decision": "allow",
+                    "reason_code": "workspace_registry_trusted",
+                    "redirect_ref": None,
+                    "install_safety_state": INSTALL_SAFETY_STATE_VERIFIED,
+                    "live_enforcement": INSTALL_SAFETY_LIVE_ENFORCEMENT_HOLD,
+                    "source_truth": {"decision": "allow"},
+                }
+            )
+            return
         if self.path == "/v1/paid/packages/authorize":
+            self.state.authorize_call_count += 1
             payload = self._read_json()
             self.state.last_authorize_artifact_id = payload.get("artifact_id")
             if payload.get("entitlement_token") != ENTITLEMENT_TOKEN:
@@ -142,6 +230,7 @@ class _MockPaidBackendHandler(BaseHTTPRequestHandler):
             )
             return
         if self.path == "/v1/paid/packages/download":
+            self.state.download_call_count += 1
             payload = self._read_json()
             if payload.get("download_authorization_id") != "dlauth_test_001":
                 self.send_response(403)
@@ -194,6 +283,7 @@ def mock_paid_backend(tmp_path):
         wheel_bytes=wheel_bytes,
         artifact_hash=artifact_hash,
         artifact_size=len(wheel_bytes),
+        post_paths=[],
     )
     _MockPaidBackendHandler.state = state
     server = ThreadingHTTPServer(("127.0.0.1", 0), _MockPaidBackendHandler)
@@ -292,6 +382,12 @@ def test_paid_activate_install_local_flow(tmp_path, mock_paid_backend):
     _assert_no_paid_leaks("", file_text=activation_file.read_text(encoding="utf-8"))
     _assert_no_paid_leaks("", file_text=install_file.read_text(encoding="utf-8"))
     assert json.loads(install_file.read_text(encoding="utf-8"))["status"] == STATUS_ACTIVE
+    assert _MockPaidBackendHandler.state.post_paths is not None
+    # claim-check: allow "safety" is the advisory endpoint label under test.
+    safety_index = _MockPaidBackendHandler.state.post_paths.index("/v1/paid/install/safety-check")
+    authorize_index = _MockPaidBackendHandler.state.post_paths.index("/v1/paid/packages/authorize")
+    download_index = _MockPaidBackendHandler.state.post_paths.index("/v1/paid/packages/download")
+    assert safety_index < authorize_index < download_index
 
     code, out, err = _run_main_with_backend(
         ["paid", "status", "--home", str(home)],
@@ -495,4 +591,155 @@ def test_paid_activate_rejects_backend_controlled_package_name(tmp_path, mock_pa
 
     assert code == 1
     assert ERROR_PACKAGE_NAME_MISMATCH in err or "package_name_mismatch" in err
+    _assert_no_paid_leaks(out + err)
+
+
+def test_paid_activate_install_safety_review_continues_with_warning(tmp_path, mock_paid_backend):
+    _MockPaidBackendHandler.state.safety_decision = "redirect"
+    _MockPaidBackendHandler.state.safety_reason_code = "model_suggested_source"
+    home = tmp_path / "avp-home"
+    code, out, err = _run_main_with_backend(
+        ["paid", "activate", "--license-key-stdin", "--home", str(home)],
+        home=home,
+        base_url=mock_paid_backend,
+        stdin_text=f"{RAW_LICENSE_KEY}\n",
+    )
+    assert code == 0, err
+    assert "Install check: review recommended (model_suggested_source)" in out
+    assert "Status: active" in out
+    install_file = home / "paid" / INSTALL_FILENAME
+    install_state = json.loads(install_file.read_text(encoding="utf-8"))
+    assert install_state["install_safety_state"] == "review_recommended"
+    assert install_state["install_safety_reason"] == "model_suggested_source"
+    _assert_no_paid_leaks(out + err, file_text=install_file.read_text(encoding="utf-8"))
+
+
+def test_paid_activate_install_safety_blocked_stops_before_download(tmp_path, mock_paid_backend):
+    # claim-check: allow "blocked" is bounded test fixture state.
+    _MockPaidBackendHandler.state.safety_decision = "blocked"
+    _MockPaidBackendHandler.state.safety_reason_code = "hash_unverified"
+    home = tmp_path / "avp-home"
+    code, out, err = _run_main_with_backend(
+        ["paid", "activate", "--license-key-stdin", "--home", str(home)],
+        home=home,
+        base_url=mock_paid_backend,
+        stdin_text=f"{RAW_LICENSE_KEY}\n",
+    )
+    assert code == 1
+    # claim-check: allow "blocked" is bounded CLI error text.
+    assert "install check blocked (hash_unverified)" in err.lower()
+    assert _MockPaidBackendHandler.state.authorize_call_count == 0
+    assert _MockPaidBackendHandler.state.download_call_count == 0
+    assert not (home / "paid" / INSTALL_FILENAME).exists()
+    _assert_no_paid_leaks(out + err)
+
+
+def test_paid_activate_install_safety_malformed_fails_closed(tmp_path, mock_paid_backend):
+    _MockPaidBackendHandler.state.safety_decision = "malformed"
+    home = tmp_path / "avp-home"
+    code, out, err = _run_main_with_backend(
+        ["paid", "activate", "--license-key-stdin", "--home", str(home)],
+        home=home,
+        base_url=mock_paid_backend,
+        stdin_text=f"{RAW_LICENSE_KEY}\n",
+    )
+    assert code == 1
+    # claim-check: allow "blocked" is bounded CLI error text.
+    assert "install check blocked" in err.lower()
+    assert _MockPaidBackendHandler.state.authorize_call_count == 0
+    _assert_no_paid_leaks(out + err)
+
+
+def test_paid_activate_install_safety_backend_unavailable_fails_closed(tmp_path, mock_paid_backend):
+    original_post = _MockPaidBackendHandler.do_POST
+
+    def safety_server_error(self):  # noqa: ANN001
+        # claim-check: allow "safety" is the advisory endpoint label under test.
+        if self.path == "/v1/paid/install/safety-check":
+            self._send_json({"ok": False, "error_code": "unavailable"}, status=503)
+            return
+        return original_post(self)
+
+    _MockPaidBackendHandler.do_POST = safety_server_error
+    try:
+        home = tmp_path / "avp-home"
+        code, out, err = _run_main_with_backend(
+            ["paid", "activate", "--license-key-stdin", "--home", str(home)],
+            home=home,
+            base_url=mock_paid_backend,
+            stdin_text=f"{RAW_LICENSE_KEY}\n",
+        )
+    finally:
+        _MockPaidBackendHandler.do_POST = original_post
+
+    assert code == 1
+    assert "paid_backend_unavailable" in err.lower() or "ERROR:" in err
+    assert _MockPaidBackendHandler.state.authorize_call_count == 0
+    _assert_no_paid_leaks(out + err)
+
+
+def test_build_install_safety_check_request_matches_private_schema():
+    payload = build_install_safety_check_request(ENTITLEMENT_TOKEN)
+    assert set(payload) <= INSTALL_SAFETY_ALLOWED_REQUEST_KEYS
+    assert "artifact_id" not in payload
+    assert payload["user_pinned_source"] is False
+    assert payload["intent_source"] == "user_direct"
+    assert payload["target_source"] == "workspace_registry"
+    assert payload["tool_source"] == "approved_registry"
+    assert payload["metadata_influence"] == "none"
+
+
+def test_evaluate_install_safety_accepts_redirect_advisory_continue():
+    result = parse_install_safety_result(
+        {
+            "ok": False,
+            "decision": "redirect",
+            "reason_code": "model_suggested_source",
+            "install_safety_state": INSTALL_SAFETY_STATE_REVIEW_RECOMMENDED,
+            "live_enforcement": INSTALL_SAFETY_LIVE_ENFORCEMENT_HOLD,
+        }
+    )
+    advisory, state, reason = evaluate_install_safety(result)
+    assert advisory == "Install check: review recommended (model_suggested_source)"
+    assert state == INSTALL_SAFETY_STATE_REVIEW_RECOMMENDED
+    assert reason == "model_suggested_source"
+
+
+def test_paid_activate_rejects_extra_safety_check_field(tmp_path, mock_paid_backend):
+    original_post = _MockPaidBackendHandler.do_POST
+
+    def reject_artifact_id(self):  # noqa: ANN001
+        # claim-check: allow "safety" is the advisory endpoint label under test.
+        if self.path == "/v1/paid/install/safety-check":
+            payload = self._read_json()
+            if "artifact_id" in payload:
+                self._send_json({"detail": "request_invalid"}, status=422)
+                return
+        return original_post(self)
+
+    _MockPaidBackendHandler.do_POST = reject_artifact_id
+    import agentveil_mcp_proxy.paid_install as paid_install_module
+
+    original_build = paid_install_module.build_install_safety_check_request
+    try:
+
+        def build_with_artifact(token: str) -> dict[str, object]:
+            body = dict(original_build(token))
+            body["artifact_id"] = ARTIFACT_ID
+            return body
+
+        paid_install_module.build_install_safety_check_request = build_with_artifact
+        home = tmp_path / "avp-home"
+        code, out, err = _run_main_with_backend(
+            ["paid", "activate", "--license-key-stdin", "--home", str(home)],
+            home=home,
+            base_url=mock_paid_backend,
+            stdin_text=f"{RAW_LICENSE_KEY}\n",
+        )
+    finally:
+        _MockPaidBackendHandler.do_POST = original_post
+        paid_install_module.build_install_safety_check_request = original_build
+
+    assert code == 1
+    assert _MockPaidBackendHandler.state.authorize_call_count == 0
     _assert_no_paid_leaks(out + err)

@@ -35,6 +35,7 @@ from agentveil.exceptions import (
     AVPValidationError,
     AVPServerError,
 )
+from agentveil.runtime_install_clone import validate_install_clone_context
 
 log = logging.getLogger("agentveil")
 
@@ -1335,6 +1336,7 @@ class AVPAgent:
         payload_hash: Optional[str] = None,
         risk_class: Optional[str] = None,
         policy_context_hash: Optional[str] = None,
+        install_clone_context: Optional[dict] = None,
     ) -> dict:
         """
         Evaluate whether this agent may perform one action right now.
@@ -1342,6 +1344,10 @@ class AVPAgent:
         The agent DID is always derived from this SDK identity; callers cannot
         override it. The returned decision is one of ALLOW, BLOCK, or
         WAITING_FOR_HUMAN_APPROVAL.
+
+        Optional ``install_clone_context`` is bounded advisory metadata for
+        package install/clone tools. It must not contain raw paths, URLs,
+        prompts, secrets, or package-manager command payloads.
         """
         body_data = {
             "agent_did": self._did,
@@ -1360,6 +1366,10 @@ class AVPAgent:
             body_data["risk_class"] = risk_class
         if policy_context_hash is not None:
             body_data["policy_context_hash"] = policy_context_hash
+        if install_clone_context is not None:
+            body_data["install_clone_context"] = validate_install_clone_context(
+                install_clone_context
+            )
         return self._post_json("/v1/runtime/evaluate", body_data)
 
     def get_runtime_decision(self, audit_id: str) -> dict:

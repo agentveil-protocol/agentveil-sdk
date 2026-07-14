@@ -103,6 +103,7 @@ def _config(*, privacy: dict | None = None, fallback: dict | None = None) -> Pro
             "read": "allow",
             "write": "approval",
             "destructive": "block",
+            # claim-check: allow "production" is a fallback risk-class key in test config.
             "production": "block",
             "financial": "block",
             "unknown": "approval",
@@ -596,6 +597,293 @@ def test_runtime_evaluate_wire_body_excludes_raw_mcp_args_and_secrets():
         "create_issue",
     ):
         assert forbidden not in body_text
+
+
+def _package_classification(config: ProxyConfig):
+    return ToolCallClassifier(config, server_name="package").classify(
+        tool="pip_install",
+        arguments={
+            "package_name": "raw-secret-package-name",
+            "project_path": "/Users/secret/proj",
+            "url": "https://evil.example/pkg.whl",
+            "token": "sk_live_do_not_leak",
+        },
+    )
+
+
+def _package_ask_backend_config() -> ProxyConfig:
+    return ProxyConfig.from_dict({
+        "proxy_config_schema_version": 1,
+        "avp": {
+            "base_url": "https://agentveil.dev",
+            "agent_name": "agentveil-mcp-proxy",
+            "trusted_signer_dids": [BACKEND_DID],
+        },
+        "mode": "protect",
+        "privacy": {
+            "action": "redacted",
+            "resource": "hash",
+            "payload": "hash_only",
+            "evidence_upload": False,
+        },
+        "fallback": {
+            "read": "allow",
+            "write": "approval",
+            "destructive": "block",
+            # claim-check: allow "production" is a fallback risk-class key in test config.
+            "production": "block",
+            "financial": "block",
+            "unknown": "approval",
+        },
+        "approval": {},
+        "policy": {
+            "id": "runtime-gate-package-test",
+            "policy_schema_version": 1,
+            "default_decision": "ask_backend",
+            "default_risk_class": "write",
+            "rules": [
+                {
+                    "id": "ask-runtime-gate-pip-install",
+                    "source": "user",
+                    "decision": "ask_backend",
+                    "match": {"server": ["package"], "tool": ["pip_install"]},
+                    "risk_class": "write",
+                }
+            ],
+        },
+        "downstream": {},
+    })
+
+
+def test_package_install_runtime_request_includes_bounded_install_clone_context():
+    config = _package_ask_backend_config()
+    agent = RecordingAgent()
+    client = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+
+    result = client.evaluate(_package_classification(config))
+
+    assert result.decision == "ALLOW"
+    call = agent.calls[0]
+    assert "install_clone_context" in call
+    context = call["install_clone_context"]
+    assert context["operation"] == "install"
+    assert context["source_ref"] == "src_package_route_builtin"
+    assert context["source_ref_kind"] == "workspace_registry"
+    assert context["tool_source"] == "approved_registry"
+    assert context["requested_package"] == "pkg_package_route_builtin"
+    body_text = json.dumps(call, sort_keys=True)
+    for forbidden in (
+        "raw-secret-package-name",
+        "/Users/secret",
+        "evil.example",
+        "sk_live_do_not_leak",
+    ):
+        assert forbidden not in body_text
+
+
+def test_non_package_runtime_request_omits_install_clone_context():
+    config = _config()
+    agent = RecordingAgent()
+    client = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+    client.evaluate(_classification(config))
+    assert "install_clone_context" not in agent.calls[0]
+
+
+def test_package_install_wire_body_includes_install_clone_context_without_raw_args():
+    config = _package_ask_backend_config()
+    agent = AVPAgent("https://agentveil.dev", AGENT_SEED, name="wire-package", timeout=2.0)
+    client = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+    captured: dict[str, object] = {}
+
+    def mock_post(url, **kwargs):
+        body = json.loads(kwargs["content"])
+        captured["url"] = url
+        captured["body"] = body
+        # Receipt verifies core fields only; advisory may be present in response.
+        receipt_request = {
+            key: body[key]
+            for key in (
+                "action",
+                "resource",
+                "environment",
+                "payload_hash",
+                "risk_class",
+                "policy_context_hash",
+            )
+        }
+        receipt_jcs = _decision_receipt(receipt_request, decision="ALLOW")
+        response = MagicMock(spec=httpx.Response)
+        response.status_code = 200
+        response.json.return_value = {
+            "audit_id": AUDIT_ID,
+            "decision": "ALLOW",
+            "decision_receipt_jcs": receipt_jcs,
+            "install_clone_advisory": {
+                "ok": True,
+                "decision": "allow",
+                "reason_code": "workspace_registry_trusted",
+                "advisory_state": "verified",
+                "live_enforcement": "HOLD",
+                "source_truth": {"decision": "allow"},
+            },
+        }
+        return response
+
+    with patch.object(httpx.Client, "post", side_effect=mock_post):
+        result = client.evaluate(_package_classification(config))
+
+    assert result.decision == "ALLOW"
+    body = captured["body"]
+    assert body["install_clone_context"]["source_ref"] == "src_package_route_builtin"
+    assert set(body) >= {
+        "agent_did",
+        "action",
+        "resource",
+        "environment",
+        "receipt",
+        "payload_hash",
+        "risk_class",
+        "policy_context_hash",
+        "install_clone_context",
+    }
+    body_text = json.dumps(body, sort_keys=True)
+    for forbidden in ("raw-secret-package-name", "/Users/secret", "sk_live_do_not_leak"):
+        assert forbidden not in body_text
+
+
+def test_receipt_with_install_clone_advisory_still_verifies():
+    config = _package_ask_backend_config()
+
+    class AdvisoryReceiptAgent(RecordingAgent):
+        def runtime_evaluate(self, **kwargs):
+            self.calls.append(kwargs)
+            receipt_request = {
+                key: kwargs[key]
+                for key in (
+                    "action",
+                    "resource",
+                    "environment",
+                    "payload_hash",
+                    "risk_class",
+                    "policy_context_hash",
+                )
+            }
+            receipt_jcs = _decision_receipt(receipt_request, decision="ALLOW")
+            # Inject advisory into signed body after signing would break verification;
+            # advisory is response-level, receipt core fields unchanged.
+            return {
+                "audit_id": AUDIT_ID,
+                "decision": "ALLOW",
+                "decision_receipt_jcs": receipt_jcs,
+                "install_clone_advisory": {
+                    "ok": False,
+                    "decision": "redirect",
+                    "reason_code": "model_suggested_source",
+                    "advisory_state": "review_recommended",
+                    "live_enforcement": "HOLD",
+                    "source_truth": {"decision": "redirect"},
+                },
+            }
+
+    agent = AdvisoryReceiptAgent()
+    client = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+    result = client.evaluate(_package_classification(config))
+    assert result.decision == "ALLOW"
+    assert "install_clone_context" in agent.calls[0]
+
+
+def test_signed_receipt_body_with_install_clone_advisory_still_verifies():
+    """P2: advisory may also appear inside signed DecisionReceipt body."""
+
+    config = _package_ask_backend_config()
+
+    class SignedAdvisoryReceiptAgent(RecordingAgent):
+        def runtime_evaluate(self, **kwargs):
+            self.calls.append(kwargs)
+            receipt_request = {
+                key: kwargs[key]
+                for key in (
+                    "action",
+                    "resource",
+                    "environment",
+                    "payload_hash",
+                    "risk_class",
+                    "policy_context_hash",
+                )
+            }
+            body = {
+                "schema_version": "decision_receipt/2",
+                "audit_id": AUDIT_ID,
+                "agent_did": AGENT_DID,
+                "action": receipt_request["action"],
+                "resource": receipt_request["resource"],
+                "environment": receipt_request["environment"],
+                "decision": "ALLOW",
+                "payload_hash": receipt_request["payload_hash"],
+                "risk_class": "unknown",
+                "policy_context_hash": "b" * 64,
+                "client_risk_class": receipt_request["risk_class"],
+                "client_policy_context_hash": receipt_request["policy_context_hash"],
+                "install_clone_advisory": {
+                    "ok": False,
+                    "decision": "redirect",
+                    "reason_code": "model_suggested_source",
+                    "advisory_state": "review_recommended",
+                    "live_enforcement": "HOLD",
+                    "source_truth": {"decision": "redirect"},
+                },
+            }
+            return {
+                "audit_id": AUDIT_ID,
+                "decision": "ALLOW",
+                "decision_receipt_jcs": _sign_jcs(body),
+            }
+
+    agent = SignedAdvisoryReceiptAgent()
+    client = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+    result = client.evaluate(_package_classification(config))
+    assert result.decision == "ALLOW"
+    assert result.receipt_body["install_clone_advisory"]["advisory_state"] == "review_recommended"
+
+
+def test_avp_agent_rejects_raw_install_clone_context_before_post():
+    config = _package_ask_backend_config()
+    agent = AVPAgent("https://agentveil.dev", AGENT_SEED, name="raw-context", timeout=2.0)
+    client = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+    from agentveil.exceptions import AVPValidationError
+
+    posted = {"called": False}
+
+    def mock_post(*_args, **_kwargs):
+        posted["called"] = True
+        raise AssertionError("must not post raw install_clone_context")
+
+    # Bypass RuntimeGateClient validation by calling agent directly.
+    with patch.object(httpx.Client, "post", side_effect=mock_post):
+        with pytest.raises(AVPValidationError):
+            agent.runtime_evaluate(
+                action="redacted",
+                resource="sha256:" + ("a" * 64),
+                environment="mcp_proxy",
+                delegation_receipt={"id": "grant"},
+                payload_hash="sha256:" + ("c" * 64),
+                risk_class="write",
+                policy_context_hash="sha256:" + ("d" * 64),
+                install_clone_context={
+                    "operation": "install",
+                    "source_ref": "https://evil.example/pkg.whl",
+                    "source_ref_kind": "workspace_registry",
+                    "user_pinned_source": False,
+                    "intent_source": "user_direct",
+                    "target_source": "workspace_registry",
+                    "tool_source": "approved_registry",
+                    "metadata_influence": "none",
+                    "requested_package": "/Users/secret/proj",
+                },
+            )
+    assert posted["called"] is False
+    # Keep client path green for valid package classification.
+    assert client is not None
 
 
 def test_verified_allow_forwards_downstream(tmp_path):

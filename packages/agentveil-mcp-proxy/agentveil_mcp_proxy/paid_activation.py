@@ -204,6 +204,7 @@ def _envelope(
     activation: Mapping[str, Any],
     provider: PaidProviderSnapshot,
     install_state: Mapping[str, Any] | None = None,
+    install_safety_advisory: str | None = None,
 ) -> dict[str, Any]:
     payload = {
         "ok": True,
@@ -223,7 +224,11 @@ def _envelope(
             "public_fallback_available": install_state.get("public_fallback_available"),
             "error_code": install_state.get("error_code"),
             "last_installed_at": install_state.get("last_installed_at"),
+            "install_safety_state": install_state.get("install_safety_state"),
+            "install_safety_reason": install_state.get("install_safety_reason"),
         }
+    if install_safety_advisory:
+        payload["install_safety_advisory"] = install_safety_advisory
     return payload
 
 
@@ -233,15 +238,17 @@ def format_paid_human_output(payload: Mapping[str, Any]) -> str:
     install = payload.get("install") or {}
     if activation.get("status") == STATUS_ACTIVE and install:
         fallback = "available" if activation.get("public_fallback_available") else "unavailable"
-        return "\n".join(
-            [
-                f"Status: {activation['status']}",
-                f"Provider: {install.get('provider_id') or provider.get('provider_id') or 'private_v1'}",
-                f"Installed package: {install.get('package_name')}",
-                f"Installed version: {install.get('package_version')}",
-                f"Public fallback: {fallback}",
-            ]
-        )
+        lines = [
+            f"Status: {activation['status']}",
+            f"Provider: {install.get('provider_id') or provider.get('provider_id') or 'private_v1'}",
+            f"Installed package: {install.get('package_name')}",
+            f"Installed version: {install.get('package_version')}",
+            f"Public fallback: {fallback}",
+        ]
+        advisory = payload.get("install_safety_advisory")
+        if advisory:
+            lines.insert(0, str(advisory))
+        return "\n".join(lines)
 
     lines = [
         f"Paid provider: {'present' if payload['paid_provider_present'] else 'absent'}",
@@ -317,6 +324,7 @@ def build_paid_activate_payload(*, license_key: str, home: Path | None) -> dict[
             activation=activation,
             provider=result.provider,
             install_state=result.install_state,
+            install_safety_advisory=result.install_safety_advisory,
         )
 
     provider = activate_with_paid_provider(license_key=license_key.strip())
