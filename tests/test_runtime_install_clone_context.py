@@ -11,9 +11,13 @@ from nacl.signing import SigningKey
 
 from agentveil.agent import AVPAgent, _public_key_to_did
 from agentveil.exceptions import AVPValidationError
-from agentveil.runtime_install_clone import validate_install_clone_context
+from agentveil.runtime_install_clone import (
+    validate_install_clone_context,
+    validate_metadata_evidence_slot,
+)
 
 AGENT_SEED = bytes.fromhex("44" * 32)
+VALID_HASH = "sha256:" + ("ab" * 32)
 
 
 def _bounded_context(**overrides):
@@ -39,9 +43,78 @@ def test_validate_install_clone_context_accepts_bounded_payload():
     assert "artifact_id" not in bounded
 
 
+def test_validate_install_clone_context_accepts_bounded_metadata_evidence():
+    bounded = validate_install_clone_context(
+        _bounded_context(
+            readme={
+                "signal_code": "install_hint",
+                "evidence_ref": "ev_readme_001",
+                "content_hash": VALID_HASH,
+            },
+            tool_output={"signal_code": "package_reference"},
+            mcp_schema={
+                "signal_code": "tool_declares_install",
+                "evidence_ref": "ev_mcp_schema_package_route",
+            },
+            file_metadata={"signal_code": "config_package_ref"},
+        )
+    )
+    assert bounded["readme"]["signal_code"] == "install_hint"
+    assert bounded["tool_output"]["signal_code"] == "package_reference"
+    assert bounded["mcp_schema"]["evidence_ref"] == "ev_mcp_schema_package_route"
+    assert bounded["file_metadata"]["signal_code"] == "config_package_ref"
+    text = json.dumps(bounded, sort_keys=True)
+    assert "raw_readme" not in text
+    assert "https://" not in text
+
+
 def test_validate_install_clone_context_rejects_extra_keys():
     with pytest.raises(AVPValidationError, match="forbidden keys"):
         validate_install_clone_context(_bounded_context(artifact_id="art_x"))
+
+
+def test_validate_install_clone_context_rejects_unknown_evidence_slot_fields():
+    with pytest.raises(AVPValidationError, match="forbidden keys"):
+        validate_install_clone_context(
+            _bounded_context(
+                readme={
+                    "signal_code": "install_hint",
+                    "raw_readme": "pip install evil",
+                }
+            )
+        )
+
+
+def test_validate_install_clone_context_rejects_wrong_channel_signal_code():
+    with pytest.raises(AVPValidationError, match="signal_code"):
+        validate_install_clone_context(
+            _bounded_context(readme={"signal_code": "package_reference"})
+        )
+
+
+def test_validate_install_clone_context_rejects_raw_url_in_content_hash():
+    with pytest.raises(AVPValidationError):
+        validate_install_clone_context(
+            _bounded_context(
+                readme={
+                    "signal_code": "install_hint",
+                    "content_hash": "https://evil.example/readme.md",
+                }
+            )
+        )
+
+
+def test_validate_metadata_evidence_slot_rejects_without_echoing_raw_input():
+    with pytest.raises(AVPValidationError) as exc_info:
+        validate_metadata_evidence_slot(
+            "readme",
+            {
+                "signal_code": "install_hint",
+                "content_hash": "https://evil.example/secret-readme",
+            },
+        )
+    assert "evil.example" not in str(exc_info.value)
+    assert "secret-readme" not in str(exc_info.value)
 
 
 @pytest.mark.parametrize(
@@ -52,11 +125,19 @@ def test_validate_install_clone_context_rejects_extra_keys():
         {"requested_package": "raw-secret-package-name"},
         {"intent_source": "not_a_real_intent"},
         {"operation": "download"},
+        {"readme_signal": {"signal_code": "install_hint"}},
     ],
 )
 def test_validate_install_clone_context_rejects_raw_or_invalid(overrides):
     with pytest.raises(AVPValidationError):
         validate_install_clone_context(_bounded_context(**overrides))
+
+
+def test_validate_install_clone_context_does_not_echo_unknown_key():
+    marker = "sk_live_should_not_echo"
+    with pytest.raises(AVPValidationError) as exc_info:
+        validate_install_clone_context(_bounded_context(**{marker: "x"}))
+    assert marker not in str(exc_info.value)
 
 
 def test_avp_agent_runtime_evaluate_rejects_raw_context_before_http_post():
@@ -107,13 +188,26 @@ def test_avp_agent_runtime_evaluate_posts_only_bounded_context():
             payload_hash="sha256:" + ("a" * 64),
             risk_class="write",
             policy_context_hash="sha256:" + ("b" * 64),
-            install_clone_context=_bounded_context(),
+            install_clone_context=_bounded_context(
+                mcp_schema={
+                    "signal_code": "tool_declares_install",
+                    "evidence_ref": "ev_mcp_schema_package_route",
+                },
+                readme={
+                    "signal_code": "install_hint",
+                    "evidence_ref": "ev_readme_001",
+                    "content_hash": VALID_HASH,
+                },
+            ),
         )
 
     body = captured["body"]
     assert captured["url"] == "/v1/runtime/evaluate"
     assert body["install_clone_context"]["source_ref"] == "src_package_route_builtin"
+    assert body["install_clone_context"]["mcp_schema"]["signal_code"] == "tool_declares_install"
+    assert body["install_clone_context"]["readme"]["signal_code"] == "install_hint"
     body_text = json.dumps(body, sort_keys=True)
     assert "https://" not in body_text
     assert "/Users/" not in body_text
+    assert "pip install" not in body_text
     assert _public_key_to_did(bytes(SigningKey(AGENT_SEED).verify_key)) == body["agent_did"]

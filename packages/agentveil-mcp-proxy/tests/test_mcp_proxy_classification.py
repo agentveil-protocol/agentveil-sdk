@@ -324,6 +324,7 @@ def test_infer_risk_class_recognizes_pip_run_script_as_destructive():
 
 def test_build_install_clone_context_for_package_mutation_tools_only():
     from agentveil_mcp_proxy.classification import (
+        INSTALL_CLONE_MCP_SCHEMA_EVIDENCE_REF,
         INSTALL_CLONE_PACKAGE_REF,
         INSTALL_CLONE_SOURCE_REF,
         build_install_clone_context,
@@ -342,6 +343,13 @@ def test_build_install_clone_context_for_package_mutation_tools_only():
         assert context["metadata_influence"] == "none"
         assert context["requested_package"] == INSTALL_CLONE_PACKAGE_REF
         assert context["expected_package"] == INSTALL_CLONE_PACKAGE_REF
+        assert context["mcp_schema"] == {
+            "signal_code": "tool_declares_install",
+            "evidence_ref": INSTALL_CLONE_MCP_SCHEMA_EVIDENCE_REF,
+        }
+        assert "readme" not in context
+        assert "tool_output" not in context
+        assert "file_metadata" not in context
         text = json.dumps(context, sort_keys=True)
         assert "/Users/" not in text
         assert "http" not in text
@@ -349,6 +357,57 @@ def test_build_install_clone_context_for_package_mutation_tools_only():
 
     for tool in ("package_list_manifest", "create_issue", "read_file", "git_status"):
         assert build_install_clone_context(tool) is None
+
+
+def test_build_install_clone_context_accepts_bounded_metadata_evidence():
+    from agentveil_mcp_proxy.classification import build_install_clone_context
+
+    content_hash = "sha256:" + ("ab" * 32)
+    context = build_install_clone_context(
+        "pip_install",
+        metadata_evidence={
+            "readme": {
+                "signal_code": "install_hint",
+                "evidence_ref": "ev_readme_001",
+                "content_hash": content_hash,
+            },
+            "tool_output": {"signal_code": "package_reference", "evidence_ref": "ev_toolout_001"},
+            "file_metadata": {"signal_code": "config_package_ref"},
+        },
+    )
+    assert context is not None
+    assert context["readme"]["signal_code"] == "install_hint"
+    assert context["tool_output"]["signal_code"] == "package_reference"
+    assert context["file_metadata"]["signal_code"] == "config_package_ref"
+    assert context["mcp_schema"]["signal_code"] == "tool_declares_install"
+    text = json.dumps(context, sort_keys=True)
+    assert "Install me via pip" not in text
+    assert "https://" not in text
+    assert "/Users/" not in text
+
+
+def test_build_install_clone_context_drops_unsafe_metadata_evidence():
+    from agentveil_mcp_proxy.classification import build_install_clone_context
+
+    context = build_install_clone_context(
+        "pip_install",
+        metadata_evidence={
+            "readme": {
+                "signal_code": "install_hint",
+                "content_hash": "https://evil.example/readme.md",
+                "raw_readme": "pip install evil",
+            },
+            "tool_output": {"signal_code": "install_command"},
+        },
+    )
+    assert context is not None
+    assert "readme" not in context
+    assert context["tool_output"]["signal_code"] == "install_command"
+    assert context["mcp_schema"]["signal_code"] == "tool_declares_install"
+    text = json.dumps(context, sort_keys=True)
+    assert "evil.example" not in text
+    assert "pip install evil" not in text
+    assert "raw_readme" not in text
 
 
 def test_package_tool_backend_metadata_includes_install_clone_context():
@@ -362,6 +421,7 @@ def test_package_tool_backend_metadata_includes_install_clone_context():
     assert "install_clone_context" in metadata
     context = metadata["install_clone_context"]
     assert context["source_ref"] == INSTALL_CLONE_SOURCE_REF
+    assert context["mcp_schema"]["signal_code"] == "tool_declares_install"
     text = json.dumps(metadata, sort_keys=True)
     assert "raw-secret-package-name" not in text
     assert "/Users/secret" not in text
