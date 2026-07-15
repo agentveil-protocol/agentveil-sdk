@@ -671,14 +671,45 @@ def test_package_install_runtime_request_includes_bounded_install_clone_context(
     assert context["source_ref_kind"] == "workspace_registry"
     assert context["tool_source"] == "approved_registry"
     assert context["requested_package"] == "pkg_package_route_builtin"
+    assert context["mcp_schema"] == {
+        "signal_code": "tool_declares_install",
+        "evidence_ref": "ev_mcp_schema_package_route",
+    }
+    assert "readme" not in context
     body_text = json.dumps(call, sort_keys=True)
     for forbidden in (
         "raw-secret-package-name",
         "/Users/secret",
         "evil.example",
         "sk_live_do_not_leak",
+        "readme_signal",
+        "tool_output_signal",
     ):
         assert forbidden not in body_text
+
+
+def test_package_install_runtime_request_rejects_unknown_evidence_fields_before_post():
+    config = _package_ask_backend_config()
+    agent = RecordingAgent()
+    client = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+    classification = _package_classification(config)
+    metadata = classification.backend_metadata()
+    context = dict(metadata["install_clone_context"])
+    context["readme"] = {
+        "signal_code": "install_hint",
+        "raw_readme": "pip install evil from https://evil.example",
+    }
+
+    class _MutableClassification:
+        def backend_metadata(self):
+            return {
+                **metadata,
+                "install_clone_context": context,
+            }
+
+    with pytest.raises(RuntimeGateUnavailableError, match="install_clone_context invalid"):
+        client.evaluate(_MutableClassification())  # type: ignore[arg-type]
+    assert agent.calls == []
 
 
 def test_non_package_runtime_request_omits_install_clone_context():

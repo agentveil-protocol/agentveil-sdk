@@ -17,6 +17,14 @@ from urllib.parse import urlsplit
 
 import jcs
 
+from agentveil.exceptions import AVPValidationError
+from agentveil.runtime_install_clone import (
+    EVIDENCE_CHANNEL_FILE_METADATA,
+    EVIDENCE_CHANNEL_MCP_SCHEMA,
+    EVIDENCE_CHANNEL_README,
+    EVIDENCE_CHANNEL_TOOL_OUTPUT,
+    validate_metadata_evidence_slot,
+)
 from agentveil_mcp_proxy.policy import (
     PolicyEngine,
     PolicyEvaluation,
@@ -181,6 +189,7 @@ _PACKAGE_INSTALL_CLONE_CONTEXT_TOOLS = frozenset({
 })
 INSTALL_CLONE_SOURCE_REF = "src_package_route_builtin"
 INSTALL_CLONE_PACKAGE_REF = "pkg_package_route_builtin"
+INSTALL_CLONE_MCP_SCHEMA_EVIDENCE_REF = "ev_mcp_schema_package_route"
 
 # Fetch/network MCP tools (e.g. the official MCP "fetch" server's `fetch` tool)
 # take a URL argument. The tool name `fetch` matches the generic _READ prefix,
@@ -414,16 +423,28 @@ def extract_resource(arguments: Mapping[str, Any]) -> str | None:
     return None
 
 
-def build_install_clone_context(tool: str) -> dict[str, Any] | None:
+def build_install_clone_context(
+    tool: str,
+    *,
+    metadata_evidence: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
     """Return bounded install/clone advisory context for package mutation tools.
 
-    Returns ``None`` for non-package tools. Includes only stable bounded refs,
-    without raw package names, paths, URLs, prompts, source, or secrets.
+    Returns ``None`` for non-package tools. Includes only stable bounded refs
+    and optional private-schema evidence slots (``readme``, ``tool_output``,
+    ``mcp_schema``, ``file_metadata``), without raw package names, paths, URLs,
+    prompts, source, or secrets.
+
+    When ``metadata_evidence`` is omitted, the package-route sensor still emits
+    a bounded ``mcp_schema`` slot (``tool_declares_install``). Other channels
+    are omitted until callers supply bounded evidence. Unsafe channel payloads
+    are dropped without echoing raw input.
     """
 
     if tool not in _PACKAGE_INSTALL_CLONE_CONTEXT_TOOLS:
         return None
-    return {
+
+    context: dict[str, Any] = {
         "operation": "install",
         "source_ref": INSTALL_CLONE_SOURCE_REF,
         "source_ref_kind": "workspace_registry",
@@ -435,6 +456,33 @@ def build_install_clone_context(tool: str) -> dict[str, Any] | None:
         "requested_package": INSTALL_CLONE_PACKAGE_REF,
         "expected_package": INSTALL_CLONE_PACKAGE_REF,
     }
+
+    slots: dict[str, Any] = {
+        EVIDENCE_CHANNEL_MCP_SCHEMA: {
+            "signal_code": "tool_declares_install",
+            "evidence_ref": INSTALL_CLONE_MCP_SCHEMA_EVIDENCE_REF,
+        },
+    }
+    if metadata_evidence is not None:
+        if not isinstance(metadata_evidence, Mapping):
+            metadata_evidence = {}
+        for channel in (
+            EVIDENCE_CHANNEL_README,
+            EVIDENCE_CHANNEL_TOOL_OUTPUT,
+            EVIDENCE_CHANNEL_MCP_SCHEMA,
+            EVIDENCE_CHANNEL_FILE_METADATA,
+        ):
+            if channel in metadata_evidence and metadata_evidence[channel] is not None:
+                slots[channel] = metadata_evidence[channel]
+
+    for channel, payload in slots.items():
+        try:
+            bounded_slot = validate_metadata_evidence_slot(channel, payload)
+        except AVPValidationError:
+            continue
+        if bounded_slot is not None:
+            context[channel] = bounded_slot
+    return context
 
 
 def infer_action_family(tool: str) -> str:
@@ -553,6 +601,7 @@ def _normalize_json(value: Any) -> Any:
 __all__ = [
     "ClassifiedToolCall",
     "HASH_PREFIX",
+    "INSTALL_CLONE_MCP_SCHEMA_EVIDENCE_REF",
     "INSTALL_CLONE_PACKAGE_REF",
     "INSTALL_CLONE_SOURCE_REF",
     "REDACTED",
