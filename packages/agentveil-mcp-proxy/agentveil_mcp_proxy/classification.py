@@ -25,6 +25,9 @@ from agentveil.runtime_install_clone import (
     EVIDENCE_CHANNEL_TOOL_OUTPUT,
     validate_metadata_evidence_slot,
 )
+from agentveil_mcp_proxy.metadata_evidence_collectors import (
+    collect_install_metadata_evidence,
+)
 from agentveil_mcp_proxy.policy import (
     PolicyEngine,
     PolicyEvaluation,
@@ -293,6 +296,7 @@ class ClassifiedToolCall:
     action_family: str
     role: str | None = None
     authority: str | None = None
+    metadata_evidence: Mapping[str, Any] | None = None
 
     def backend_metadata(self) -> dict[str, Any]:
         """Return privacy-filtered metadata intended for later backend calls."""
@@ -311,7 +315,10 @@ class ClassifiedToolCall:
                 else self.policy_evaluation.would_decision.value
             ),
         }
-        install_clone_context = build_install_clone_context(self.tool)
+        install_clone_context = build_install_clone_context(
+            self.tool,
+            metadata_evidence=self.metadata_evidence,
+        )
         if install_clone_context is not None:
             metadata["install_clone_context"] = install_clone_context
         return metadata
@@ -383,6 +390,10 @@ class ToolCallClassifier:
         evaluation = self.engine.evaluate(context)
         action_hash = sha256_text(action_plain)
         resource_hash = None if resource_plain is None else sha256_text(resource_plain)
+        metadata_evidence = None
+        if tool in _PACKAGE_INSTALL_CLONE_CONTEXT_TOOLS:
+            collected = collect_install_metadata_evidence(tool=tool, arguments=args)
+            metadata_evidence = collected or None
         return ClassifiedToolCall(
             server=self.server_name,
             tool=tool,
@@ -398,6 +409,7 @@ class ToolCallClassifier:
             action_family=action_family,
             role=context.role,
             authority=context.authority,
+            metadata_evidence=metadata_evidence,
         )
 
 
@@ -435,10 +447,11 @@ def build_install_clone_context(
     ``mcp_schema``, ``file_metadata``), without raw package names, paths, URLs,
     prompts, source, or secrets.
 
-    When ``metadata_evidence`` is omitted, the package-route sensor still emits
-    a bounded ``mcp_schema`` slot (``tool_declares_install``). Other channels
-    are omitted until callers supply bounded evidence. Unsafe channel payloads
-    are dropped without echoing raw input.
+    When ``metadata_evidence`` is omitted, collectors may still supply slots from
+    tool arguments during classification. If no collector evidence is available,
+    the package-route sensor emits a bounded ``mcp_schema`` slot
+    (``tool_declares_install``). Unsafe channel payloads are dropped without
+    echoing raw input.
     """
 
     if tool not in _PACKAGE_INSTALL_CLONE_CONTEXT_TOOLS:

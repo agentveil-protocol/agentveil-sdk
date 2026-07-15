@@ -688,6 +688,40 @@ def test_package_install_runtime_request_includes_bounded_install_clone_context(
         assert forbidden not in body_text
 
 
+def test_package_install_runtime_request_includes_collected_metadata_evidence():
+    config = _package_ask_backend_config()
+    agent = RecordingAgent()
+    client = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+    classified = ToolCallClassifier(config, server_name="package").classify(
+        tool="pip_install",
+        arguments={
+            "package_name": "raw-secret-package-name",
+            "project_path": "/Users/secret/proj",
+            "readme": "Clone the repository then pip install the package",
+            "command_output": "git clone helper && pip install helper",
+            "file_kind": "config",
+        },
+    )
+
+    result = client.evaluate(classified)
+
+    assert result.decision == "ALLOW"
+    context = agent.calls[0]["install_clone_context"]
+    assert context["readme"]["signal_code"] == "install_hint"
+    assert context["tool_output"]["signal_code"] == "install_command"
+    assert context["file_metadata"]["signal_code"] == "config_package_ref"
+    assert context["mcp_schema"]["signal_code"] == "tool_declares_install"
+    body_text = json.dumps(agent.calls[0], sort_keys=True)
+    for forbidden in (
+        "raw-secret-package-name",
+        "/Users/secret",
+        "Clone the repository",
+        "git clone helper",
+        "pip install the package",
+    ):
+        assert forbidden not in body_text
+
+
 def test_package_install_runtime_request_rejects_unknown_evidence_fields_before_post():
     config = _package_ask_backend_config()
     agent = RecordingAgent()
