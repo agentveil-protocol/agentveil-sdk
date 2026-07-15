@@ -133,6 +133,13 @@ def test_validate_install_clone_context_rejects_raw_or_invalid(overrides):
         validate_install_clone_context(_bounded_context(**overrides))
 
 
+def test_validate_install_clone_context_does_not_echo_unknown_key():
+    marker = "sk_live_should_not_echo"
+    with pytest.raises(AVPValidationError) as exc_info:
+        validate_install_clone_context(_bounded_context(**{marker: "x"}))
+    assert marker not in str(exc_info.value)
+
+
 def test_avp_agent_runtime_evaluate_rejects_raw_context_before_http_post():
     agent = AVPAgent("https://agentveil.dev", AGENT_SEED, name="privacy-probe", timeout=2.0)
     posted = {"called": False}

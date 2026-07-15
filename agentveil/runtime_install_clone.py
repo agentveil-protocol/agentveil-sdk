@@ -218,9 +218,7 @@ def validate_install_clone_context(context: Mapping[str, Any]) -> dict[str, Any]
     keys = set(context)
     extra = keys - _ALLOWED_KEYS
     if extra:
-        raise AVPValidationError(
-            f"install_clone_context contains forbidden keys: {sorted(extra)}"
-        )
+        raise AVPValidationError("install_clone_context contains forbidden keys")
     missing = _REQUIRED_KEYS - keys
     if missing:
         raise AVPValidationError(
