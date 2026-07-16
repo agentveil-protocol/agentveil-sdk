@@ -6,6 +6,38 @@ All notable changes to the `agentveil` SDK.
 
 No unreleased changes.
 
+## [0.7.30-mcp-proxy] / [0.7.21-sdk] - 2026-07-16
+
+Paired public SDK and MCP Proxy release candidate. The paired versions keep
+the proxy's runtime install-clone integration aligned with the SDK module it
+imports.
+
+### Public SDK added
+- Added bounded runtime install-clone context validation and agent integration.
+
+### Public SDK changed
+- Kept invalid install-clone metadata keys out of emitted evidence.
+
+### MCP Proxy added
+- Added role-aware doctor and status visibility for managed agent runtime
+  projects.
+- Added public paid-activation, install, and provider-configuration command
+  surfaces.
+- Added bounded install-clone advisory and metadata evidence collection.
+
+### MCP Proxy changed
+- Reframed legacy entry-point documentation around routed action control.
+- Denied generic quickstart filesystem enumeration and reads of local
+  `.avp/mcp-proxy/**` control artifacts, including resolved directory and file
+  symlink aliases, while preserving ordinary workspace reads and the existing
+  Approval Center and redirect paths.
+- Raised the public SDK dependency floor to `agentveil>=0.7.21,<0.8` so the
+  proxy cannot install against an SDK that lacks `runtime_install_clone`.
+
+### Boundary
+- The control-artifact containment applies to filesystem operations routed
+  through the MCP Proxy; it is not host-wide filesystem interception.
+
 ## [0.7.29-mcp-proxy] - 2026-07-06
 
 Public trust and approval environment hardening release for

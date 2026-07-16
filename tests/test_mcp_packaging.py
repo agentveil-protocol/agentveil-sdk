@@ -14,6 +14,7 @@ installed, tests that need to import the server module are skipped.
 
 from __future__ import annotations
 
+import ast
 import importlib
 import pathlib
 import sys
@@ -36,6 +37,23 @@ MCP_SERVER = REPO_ROOT / "agentveil_mcp" / "server.py"
 INTEGRATIONS_DOC = REPO_ROOT / "docs" / "INTEGRATIONS.md"
 CLAUDE_MCP_EXAMPLE = REPO_ROOT / "examples" / "claude_mcp_example.py"
 LEGACY_CLAUDE_MCP_MODULE = REPO_ROOT / "agentveil" / "tools" / "claude_mcp.py"
+SDK_INIT = REPO_ROOT / "agentveil" / "__init__.py"
+
+
+def test_sdk_release_version_is_synchronized():
+    with PYPROJECT.open("rb") as f:
+        pyproject = tomllib.load(f)
+
+    init_tree = ast.parse(SDK_INIT.read_text(encoding="utf-8"))
+    version_node = next(
+        node.value
+        for node in init_tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "__version__" for target in node.targets)
+    )
+
+    assert pyproject["project"]["version"] == "0.7.21"
+    assert ast.literal_eval(version_node) == pyproject["project"]["version"]
 
 
 def _mcp_runtime_available() -> bool:
