@@ -1421,6 +1421,60 @@ def test_secret_read_file_path_fails_before_downstream_read(tmp_path, monkeypatc
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
 
 
+def test_agentveil_control_manifest_read_blocked_before_downstream(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    sandbox = tmp_path / "sandbox"
+    init = init_proxy(
+        home=home,
+        agent_name="proxy",
+        plaintext=True,
+        policy_pack="filesystem",
+        downstream_config=proxy_cli.quickstart_filesystem_downstream(sandbox),
+    )
+    manifest_dir = sandbox / ".avp" / "mcp-proxy"
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    fixture_token = "FIXTURE_SESSION_TOKEN_DO_NOT_LEAK_001"
+    (manifest_dir / "approval-center.manifest.json").write_text(
+        json.dumps({"session_token": fixture_token}),
+        encoding="utf-8",
+    )
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("control path policy must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line({
+            "jsonrpc": "2.0",
+            "id": "call-control-manifest",
+            "method": "tools/call",
+            "params": {
+                "name": "read_file",
+                "arguments": {"path": ".avp/mcp-proxy/approval-center.manifest.json"},
+            },
+        })),
+        out=client_out,
+    ) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    assert response["error"]["code"] == JSONRPC_POLICY_BLOCKED
+    _assert_policy_denied_contract(
+        response["error"]["data"],
+        reason="agentveil_control_path_blocked",
+    )
+    assert fixture_token not in client_out.getvalue()
+    records = _evidence_records(home)
+    assert len(records) == 1
+    record = records[0]
+    assert record["status"] == "blocked"  # claim-check: allow "blocked" is terminal evidence asserted by this negative control-path read test.    assert record["error_class"] == "agentveil_control_path_blocked"
+    assert record["tool_name"] == "read_file"
+    assert fixture_token not in json.dumps(record)
+
+
 def test_secret_path_in_paths_list_blocks_broadened_tool(tmp_path):
     # read_multiple_files carries paths in a list arg key; a secret entry must be
     # denied before downstream, and the value must not appear in proxy output.
