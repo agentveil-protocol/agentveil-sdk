@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -107,6 +108,35 @@ def _executed_metadata_for_tool(home: Path, tool: str) -> dict:
             if metadata is not None and metadata.get("tool") == tool:
                 return metadata
     raise AssertionError(f"expected executed metadata row for {tool!r}")
+
+
+def _evidence_records(home: Path) -> list[dict]:
+    evidence_path = home / "mcp-proxy" / "evidence.sqlite"
+    if not evidence_path.exists():
+        return []
+    with sqlite3.connect(evidence_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM pending_approvals ORDER BY created_at, request_id"
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _assert_terminal_deny_record(
+    home: Path,
+    *,
+    tool: str,
+    reason: str,
+    forbidden: str,
+) -> None:
+    records = _evidence_records(home)
+    assert len(records) == 1
+    record = records[0]
+    assert record["status"] == "blocked"
+    assert record["error_class"] == reason
+    assert record["result_status"] == "blocked"
+    assert record["tool_name"] == tool
+    assert forbidden not in json.dumps(record)
 
 
 def _assert_no_local_path_leaks(*parts: str) -> None:
@@ -506,3 +536,213 @@ def test_instruction_file_write_requires_approval_before_mutation(tmp_path, monk
     assert "instruction body must not leak" not in out.getvalue()
     metadata = _metadata_for_tool(home, tool="write_file")
     assert metadata["target_reached"] is False
+
+
+FIXTURE_SESSION_TOKEN = "FIXTURE_SESSION_TOKEN_DO_NOT_LEAK_001"
+FIXTURE_REGISTER_TOKEN = "FIXTURE_REGISTER_TOKEN_DO_NOT_LEAK_002"
+MANIFEST_REL = ".avp/mcp-proxy/approval-center.manifest.json"
+NESTED_CONTROL_REL = ".avp/mcp-proxy/nested/evidence.sqlite"
+
+
+def _seed_agentveil_control_artifacts(sandbox: Path) -> None:
+    manifest_dir = sandbox / ".avp" / "mcp-proxy"
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    (manifest_dir / "approval-center.manifest.json").write_text(
+        json.dumps(
+            {
+                "session_token": FIXTURE_SESSION_TOKEN,
+                "internal_register_token": FIXTURE_REGISTER_TOKEN,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    nested = manifest_dir / "nested"
+    nested.mkdir(parents=True, exist_ok=True)
+    (nested / "evidence.sqlite").write_bytes(b"fixture-evidence-db")
+
+
+def test_list_workspace_excludes_agentveil_control_artifacts(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    sandbox = tmp_path / "sandbox"
+    _init_quickstart(home, sandbox)
+    _seed_sandbox_file(sandbox, "ordinary.txt", "visible")
+    _seed_agentveil_control_artifacts(sandbox)
+    _block_avp_agent(monkeypatch)
+
+    out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_tool_call("list_workspace", {}, call_id="list-control-1")),
+        out=out,
+        approval_ui_mode="none",
+    ) == 0
+
+    response = _responses(out.getvalue())[0]
+    listing = response["result"]["content"][0]["text"]
+    assert "ordinary.txt" in listing
+    assert MANIFEST_REL not in listing
+    assert NESTED_CONTROL_REL not in listing
+    assert ".avp/mcp-proxy" not in listing
+    assert FIXTURE_SESSION_TOKEN not in out.getvalue()
+    assert FIXTURE_REGISTER_TOKEN not in out.getvalue()
+
+    metadata = _metadata_for_tool(home, tool="list_workspace")
+    assert metadata["target_reached"] is True
+    _assert_no_local_path_leaks(out.getvalue(), json.dumps(metadata))
+
+
+@pytest.mark.parametrize(
+    "manifest_path",
+    [
+        MANIFEST_REL,
+        ".AVP/MCP-PROXY/approval-center.manifest.json",
+        "./.avp/mcp-proxy/approval-center.manifest.json",
+        ".avp//mcp-proxy/approval-center.manifest.json",
+        NESTED_CONTROL_REL,
+    ],
+)
+def test_read_file_rejects_agentveil_control_paths(
+    tmp_path,
+    monkeypatch,
+    manifest_path: str,
+):
+    home = tmp_path / "home"
+    sandbox = tmp_path / "sandbox"
+    _init_quickstart(home, sandbox)
+    _seed_agentveil_control_artifacts(sandbox)
+    _block_avp_agent(monkeypatch)
+
+    out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_tool_call(
+            "read_file",
+            {"path": manifest_path},
+            call_id=f"read-control-{manifest_path}",
+        )),
+        out=out,
+        approval_ui_mode="none",
+    ) == 0
+
+    response = _responses(out.getvalue())[0]
+    assert response["error"]["code"] == -32010
+    assert response["error"]["data"]["status"] == "policy_denied"
+    assert response["error"]["data"]["reason"] == "agentveil_control_path_blocked"
+    assert response["error"]["data"]["approval_possible"] is False
+    assert FIXTURE_SESSION_TOKEN not in out.getvalue()
+    assert FIXTURE_REGISTER_TOKEN not in out.getvalue()
+
+    _assert_terminal_deny_record(
+        home,
+        tool="read_file",
+        reason="agentveil_control_path_blocked",
+        forbidden=FIXTURE_SESSION_TOKEN,
+    )
+
+
+def test_similarly_named_user_manifest_outside_control_dir_still_readable(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    sandbox = tmp_path / "sandbox"
+    _init_quickstart(home, sandbox)
+    user_manifest = "docs/approval-center.manifest.json"
+    _seed_sandbox_file(
+        sandbox,
+        user_manifest,
+        json.dumps({"note": "user-owned manifest copy", "session_token": "user-copy-not-control"}),
+    )
+    _seed_agentveil_control_artifacts(sandbox)
+    _block_avp_agent(monkeypatch)
+
+    out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_tool_call(
+            "read_file",
+            {"path": user_manifest},
+            call_id="read-user-manifest",
+        )),
+        out=out,
+        approval_ui_mode="none",
+    ) == 0
+
+    response = _responses(out.getvalue())[0]
+    assert "result" in response
+    assert FIXTURE_SESSION_TOKEN not in response["result"]["content"][0]["text"]
+    assert "user-owned manifest copy" in response["result"]["content"][0]["text"]
+
+
+def _seed_control_symlink_aliases(sandbox: Path) -> tuple[str, str]:
+    _seed_agentveil_control_artifacts(sandbox)
+    alias_dir = sandbox / "alias"
+    alias_dir.symlink_to(sandbox / ".avp" / "mcp-proxy", target_is_directory=True)
+    alias_file = sandbox / "alias-manifest.json"
+    alias_file.symlink_to(sandbox / ".avp" / "mcp-proxy" / "approval-center.manifest.json")
+    return "alias/approval-center.manifest.json", "alias-manifest.json"
+
+
+def test_list_workspace_excludes_symlink_aliases_to_control_directory(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    sandbox = tmp_path / "sandbox"
+    _init_quickstart(home, sandbox)
+    _seed_sandbox_file(sandbox, "ordinary.txt", "visible")
+    manifest_alias, file_alias = _seed_control_symlink_aliases(sandbox)
+    _block_avp_agent(monkeypatch)
+
+    out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_tool_call("list_workspace", {}, call_id="list-symlink-alias")),
+        out=out,
+        approval_ui_mode="none",
+    ) == 0
+
+    listing = _responses(out.getvalue())[0]["result"]["content"][0]["text"]
+    assert "ordinary.txt" in listing
+    assert MANIFEST_REL not in listing
+    assert manifest_alias not in listing
+    assert file_alias not in listing
+    assert FIXTURE_SESSION_TOKEN not in out.getvalue()
+
+
+@pytest.mark.parametrize(
+    "alias_path",
+    [
+        "alias/approval-center.manifest.json",
+        "alias-manifest.json",
+    ],
+)
+def test_read_file_rejects_symlink_aliases_to_control_artifacts(
+    tmp_path,
+    monkeypatch,
+    alias_path: str,
+):
+    home = tmp_path / "home"
+    sandbox = tmp_path / "sandbox"
+    _init_quickstart(home, sandbox)
+    _seed_control_symlink_aliases(sandbox)
+    _block_avp_agent(monkeypatch)
+
+    out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_tool_call(
+            "read_file",
+            {"path": alias_path},
+            call_id=f"read-symlink-{alias_path}",
+        )),
+        out=out,
+        approval_ui_mode="none",
+    ) == 0
+
+    response = _responses(out.getvalue())[0]
+    assert response["error"]["code"] == -32010
+    assert response["error"]["data"]["reason"] == "agentveil_control_path_blocked"
+    assert FIXTURE_SESSION_TOKEN not in out.getvalue()
+    assert FIXTURE_REGISTER_TOKEN not in out.getvalue()
+    _assert_terminal_deny_record(
+        home,
+        tool="read_file",
+        reason="agentveil_control_path_blocked",
+        forbidden=FIXTURE_SESSION_TOKEN,
+    )

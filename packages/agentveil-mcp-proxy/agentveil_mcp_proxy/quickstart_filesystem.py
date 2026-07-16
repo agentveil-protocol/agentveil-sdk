@@ -10,12 +10,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import posixpath
 import shutil
 import sys
 from pathlib import Path
 from typing import Any, Mapping
 
 HASH_PREFIX = "sha256:"
+AGENTVEIL_CONTROL_PATH_DENIED = "agentveil control path access denied"
 INSTRUCTION_SURFACE_RISK_MESSAGE = (
     "Repo instruction files detected; risky changes need approval."
 )
@@ -26,6 +28,69 @@ _INSTRUCTION_SURFACE_BASENAMES = frozenset({
     ".cursorrules",
 })
 _COPILOT_INSTRUCTIONS_PATH = (".github", "copilot-instructions.md")
+
+
+def normalized_relative_path_segments(path: str) -> list[str]:
+    """Return normalized relative path segments without ``.`` entries."""
+
+    normalized = path.replace("\\", "/")
+    resolved = posixpath.normpath(normalized)
+    return [segment for segment in resolved.split("/") if segment and segment != "."]
+
+
+def is_agentveil_control_relative_path(path: str) -> bool:
+    """Return True when ``path`` lexically appears under ``.avp/mcp-proxy/``."""
+
+    lowered = [segment.lower() for segment in normalized_relative_path_segments(path)]
+    for index, segment in enumerate(lowered):
+        if (
+            segment == ".avp"
+            and index + 1 < len(lowered)
+            and lowered[index + 1] == "mcp-proxy"
+        ):
+            return True
+    return False
+
+
+def _root_resolved(root: Path) -> Path:
+    return root.expanduser().resolve()
+
+
+def agentveil_control_root(root: Path) -> Path:
+    """Return the resolved AgentVeil control directory under ``root``."""
+
+    return (_root_resolved(root) / ".avp" / "mcp-proxy").resolve()
+
+
+def is_resolved_path_under_agentveil_control(root: Path, resolved: Path) -> bool:
+    """Return True when a resolved filesystem target is inside the control root."""
+
+    control_root = agentveil_control_root(root)
+    try:
+        target = resolved.resolve()
+    except OSError:
+        return False
+    if target == control_root:
+        return True
+    try:
+        target.relative_to(control_root)
+    except ValueError:
+        return False
+    return True
+
+
+def quickstart_sandbox_root_from_downstream_args(args: list[str]) -> Path | None:
+    """Extract the quickstart sandbox root from downstream launch args."""
+
+    if len(args) < 2:
+        return None
+    server_script = str(args[0])
+    if "quickstart_filesystem" not in server_script:
+        return None
+    try:
+        return Path(args[1]).expanduser().resolve()
+    except OSError:
+        return None
 
 
 JSONRPC_VERSION = "2.0"
@@ -290,10 +355,6 @@ def _tools() -> list[dict[str, Any]]:
     ]
 
 
-def _root_resolved(root: Path) -> Path:
-    return root.expanduser().resolve()
-
-
 def _path_parts(requested: str) -> list[str]:
     normalized = requested.replace("\\", "/")
     if normalized.startswith("/"):
@@ -329,6 +390,58 @@ def _safe_child(root: Path, requested: str) -> Path:
     return _resolved_inside_root(root, _path_parts(requested))
 
 
+def requested_path_targets_agentveil_control(root: Path, requested: str) -> bool:
+    """Return True when ``requested`` resolves to an AgentVeil control artifact."""
+
+    if is_agentveil_control_relative_path(requested):
+        return True
+    try:
+        target = _safe_child(root, requested)
+    except ValueError:
+        return False
+    return is_resolved_path_under_agentveil_control(root, target)
+
+
+def filter_agentveil_control_paths(root: Path, paths: list[str]) -> list[str]:
+    """Drop listing entries whose resolved targets live under the control root."""
+
+    root_resolved = _root_resolved(root)
+    filtered: list[str] = []
+    for path in paths:
+        if not path or is_agentveil_control_relative_path(path):
+            continue
+        try:
+            candidate = root_resolved / Path(*_path_parts(path))
+        except ValueError:
+            continue
+        if candidate.exists() or candidate.is_symlink():
+            try:
+                if is_resolved_path_under_agentveil_control(root, candidate):
+                    continue
+            except OSError:
+                continue
+        filtered.append(path)
+    return filtered
+
+
+def workspace_listing_paths(root: Path) -> list[str]:
+    """Return bounded workspace file paths excluding resolved control artifacts."""
+
+    root_resolved = _root_resolved(root)
+    listed: list[str] = []
+    for item in sorted(root_resolved.rglob("*")):
+        if not item.is_file():
+            continue
+        try:
+            resolved = item.resolve()
+        except OSError:
+            continue
+        if is_resolved_path_under_agentveil_control(root, resolved):
+            continue
+        listed.append(item.relative_to(root_resolved).as_posix())
+    return listed
+
+
 def _safe_symlink_target(root: Path, link_path: Path, target: str) -> None:
     normalized = target.replace("\\", "/")
     if normalized.startswith("/"):
@@ -347,11 +460,7 @@ def _handle_tools_call(root: Path, request_id: Any, params: Mapping[str, Any]) -
     if not isinstance(arguments, Mapping):
         return _error(request_id, -32602, "arguments must be an object")
     if name == "list_workspace":
-        files = [
-            item.relative_to(root).as_posix()
-            for item in sorted(root.rglob("*"))
-            if item.is_file()
-        ]
+        files = workspace_listing_paths(root)
         return _response(request_id, {"content": [{"type": "text", "text": "\n".join(files)}]})
     if name == "read_file":
         path = arguments.get("path")
@@ -361,6 +470,8 @@ def _handle_tools_call(root: Path, request_id: Any, params: Mapping[str, Any]) -
             target = _safe_child(root, path)
         except ValueError as exc:
             return _error(request_id, -32602, str(exc))
+        if is_resolved_path_under_agentveil_control(root, target):
+            return _error(request_id, -32602, AGENTVEIL_CONTROL_PATH_DENIED)
         if not target.is_file():
             return _error(request_id, -32602, "file not found")
         return _response(
@@ -375,6 +486,8 @@ def _handle_tools_call(root: Path, request_id: Any, params: Mapping[str, Any]) -
             target = _safe_child(root, path)
         except ValueError as exc:
             return _error(request_id, -32602, str(exc))
+        if is_resolved_path_under_agentveil_control(root, target):
+            return _error(request_id, -32602, AGENTVEIL_CONTROL_PATH_DENIED)
         if not target.exists():
             return _error(request_id, -32602, "file not found")
         if not target.is_file():

@@ -90,6 +90,12 @@ from agentveil_mcp_proxy.persistence_path_guard import (
     persistence_path_write_reason,
     scan_instruction_surfaces,
 )
+from agentveil_mcp_proxy.quickstart_filesystem import (
+    filter_agentveil_control_paths,
+    is_agentveil_control_relative_path,
+    quickstart_sandbox_root_from_downstream_args,
+    requested_path_targets_agentveil_control,
+)
 from agentveil_mcp_proxy.authority_boundary import attach_runtime_authority
 from agentveil_mcp_proxy.redirect_playbooks import (
     attach_redirect_playbook_fields,
@@ -158,6 +164,7 @@ _HARD_BLOCK_REASONS = frozenset({
     "local_policy_block",
     "filesystem_delete",
     "secret_path_blocked",
+    "agentveil_control_path_blocked",
     "tool_schema_unavailable",
     "unknown_tool_not_advertised",
     "runtime_gate_not_configured",
@@ -1322,6 +1329,10 @@ class McpPassthrough:
                 if not has_id:
                     return []
                 response = self._wait_downstream_response(request_id)
+                response = self._sanitize_filesystem_control_surface_response(
+                    message,
+                    response,
+                )
                 self._record_approval_result(approval_outcome, response)
                 self._record_allow_controlled_path_if_needed(
                     classification,
@@ -2204,6 +2215,15 @@ class McpPassthrough:
             segment for segment in resolved.split("/") if segment and segment != "."
         ]
         lowered_segments = [segment.lower() for segment in segments]
+        sandbox = quickstart_sandbox_root_from_downstream_args(list(self.downstream.args))
+        if sandbox is not None:
+            try:
+                if requested_path_targets_agentveil_control(sandbox, path):
+                    return "agentveil_control_path_blocked"
+            except OSError:
+                pass
+        elif is_agentveil_control_relative_path(path):
+            return "agentveil_control_path_blocked"
         # Secret check first: a secret target keeps the more specific
         # secret_path_blocked reason even when the path is also absolute or
         # escaping, so existing secret-path hard-deny evidence is preserved.
@@ -2222,6 +2242,51 @@ class McpPassthrough:
         if resolved == ".." or resolved.startswith("../"):
             return "path_outside_workspace"
         return None
+
+    def _sanitize_filesystem_control_surface_response(
+        self,
+        message: Mapping[str, Any],
+        response: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Remove AgentVeil control paths from generic workspace listings."""
+
+        if message.get("method") != "tools/call":
+            return response
+        params = message.get("params")
+        if not isinstance(params, Mapping):
+            return response
+        tool = params.get("name")
+        if tool != "list_workspace":
+            return response
+        result = response.get("result")
+        if not isinstance(result, Mapping):
+            return response
+        content = result.get("content")
+        if not isinstance(content, list) or not content:
+            return response
+        first = content[0]
+        if not isinstance(first, Mapping) or first.get("type") != "text":
+            return response
+        text = first.get("text")
+        if not isinstance(text, str):
+            return response
+        if not text.strip():
+            return response
+        sandbox = quickstart_sandbox_root_from_downstream_args(list(self.downstream.args))
+        if sandbox is not None:
+            filtered = filter_agentveil_control_paths(sandbox, text.splitlines())
+        else:
+            filtered = [
+                path for path in text.splitlines()
+                if path and not is_agentveil_control_relative_path(path)
+            ]
+        sanitized = dict(response)
+        sanitized_result = dict(result)
+        sanitized_content = [dict(first), *content[1:]]
+        sanitized_content[0]["text"] = "\n".join(filtered)
+        sanitized_result["content"] = sanitized_content
+        sanitized["result"] = sanitized_result
+        return sanitized
 
     @staticmethod
     def _is_absolute_path(normalized: str) -> bool:
