@@ -1,5 +1,14 @@
 # AgentVeil MCP Toolbox
 
+> This is the advanced AgentVeil MCP Toolbox. It exposes explicit AVP tools for
+> Runtime Gate, receipts, identity lookup, advisory reputation, and audit
+> checks. It is not the primary action-control product path and does not
+> intercept or gate other MCP tools.
+>
+> For downstream MCP tool-call control, project connectors, approval, redirect,
+> block, and bounded evidence, use
+> [`agentveil-mcp-proxy`](../packages/agentveil-mcp-proxy/README.md).
+
 Model Context Protocol server for **Agent Veil Protocol**. It exposes the
 **AgentVeil MCP Toolbox**: explicit AVP tools for Runtime Gate decisions,
 human approval routing, signed receipts, reputation checks, and audit
