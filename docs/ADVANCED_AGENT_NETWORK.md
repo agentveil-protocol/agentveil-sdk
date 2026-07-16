@@ -3,11 +3,16 @@
 Agent Network features are advanced AgentVeil primitives: DID identity,
 reputation, attestations, capability cards, W3C credentials, disputes, and
 remediation. They are sustained as internal mechanisms used by action control.
-Most users should start with the [Mode A Quickstart](MODE_A_QUICKSTART.md) or
-[Customer Integration](CUSTOMER_INTEGRATION.md).
 
-Use this guide when you need to work directly with agent identity or reputation
-signals.
+This is not the primary AgentVeil product path. Most users should start with
+MCP Proxy / project connectors for action control, approval, redirect, block,
+and bounded evidence. Use this guide only when you need direct access to
+advisory identity, reputation, attestations, credentials, or agent-network
+primitives.
+
+For the action-control path, start with the
+[Mode A Quickstart](MODE_A_QUICKSTART.md) or
+[Customer Integration](CUSTOMER_INTEGRATION.md).
 
 ## Quickstart
 

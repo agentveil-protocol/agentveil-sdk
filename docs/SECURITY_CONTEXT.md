@@ -1,4 +1,12 @@
-# Why Agent Trust Infrastructure Matters
+# Security Context for Agent Action Control
+
+AgentVeil's product focus is action control: mediating configured agent
+actions, requiring approval where needed, redirecting agents to controlled
+paths, blocking unsafe mutations, and recording bounded evidence.
+
+Identity, DID, attestations, and reputation remain useful protocol primitives,
+but they are advisory and supporting signals. They do not replace action
+control and do not grant execution authority by themselves.
 
 ## The Problem in Numbers
 
@@ -68,29 +76,40 @@ Meta Platforms acquired Moltbook on March 10, 2026.
 
 ## The Structural Problem
 
-These incidents share a root cause: **agents operate without verifiable
-identity, reputation history, or accountability mechanisms.**
+These incidents point to a structural control gap: agents increasingly operate
+with credentials, tools, and workflow access, but risky actions are often not
+mediated before execution and are hard to prove after the fact.
 
-Current state of agent authentication:
+Current state of many agent deployments:
 - Agents authenticate with **static API keys** (long-lived, shared, easily stolen)
-- No standard way to **verify an agent's track record** before delegating work
-- No **sybil resistance** — anyone can create N fake agents
-- No **dispute mechanism** when agent output is wrong or malicious
-- No **immutable audit trail** for agent actions
+- Mutating actions may bypass project-local approval or policy checks
+- Logs often show that something happened without binding the exact action,
+  decision, approval, and payload evidence
+- Identity and reputation signals are useful context, but they do not by
+  themselves constrain what an agent can do next
 
 
 ## What AVP Addresses
 
-| Attack Vector | AVP Mitigation |
-|--------------|----------------|
-| Agent impersonation | W3C DID (did:key) + Ed25519 challenge-response verification |
-| Credential sharing | Per-agent cryptographic keypair, locally stored |
-| Platform-wide agent hijacking | Per-agent Ed25519 keypair prevents impersonation even with leaked platform credentials |
-| Sybil attacks (fake agent farms) | Collusion cluster detection, same-owner penalty |
-| No accountability | Hash-chained audit trail (SHA-256) + IPFS anchoring |
-| Blind delegation | EigenTrust reputation from peer attestations |
-| Unfair ratings | Attestation dispute resolution with arbitrator |
-| Static trust scores | Dynamic reputation via power iteration algorithm |
+Primary action-control mitigations:
+
+| Risk | AVP mitigation |
+|------|----------------|
+| Risky agent mutation | Project connector or routed MCP boundary mediates configured actions before execution |
+| Missing human review | Approval-required decisions route sensitive actions to a review step |
+| Unsafe path available | Redirect or hard-block decisions steer the agent toward controlled tools or stop the action |
+| Weak audit trail | Bounded evidence records decision, action context, hashes, and timestamps |
+| Overbroad authority | Scoped receipts and capability-token patterns bind authority to concrete action context |
+
+Supporting protocol primitives:
+
+| Signal | Role |
+|--------|------|
+| DID (`did:key`) + Ed25519 | Local identity and signed request authentication |
+| Per-agent keypair | Reduces credential sharing inside AVP-controlled flows |
+| Advisory reputation / EigenTrust-style scoring | Selection and risk input, not execution permission |
+| Attestations and disputes | Supporting trust operations for contested outcomes |
+| Credentials and proof artifacts | Portable evidence for advanced integrations |
 
 
 ## References
