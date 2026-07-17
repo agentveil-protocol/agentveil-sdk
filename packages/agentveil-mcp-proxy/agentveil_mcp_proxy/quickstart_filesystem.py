@@ -390,6 +390,19 @@ def _safe_child(root: Path, requested: str) -> Path:
     return _resolved_inside_root(root, _path_parts(requested))
 
 
+def _sandbox_relative_display_path(root: Path, target: Path) -> str:
+    """Return a sandbox-relative display path using the resolved sandbox root.
+
+    Product setup may point the configured root at a symlink
+    (``product-profile/workspace`` → real workspace). Containment already
+    resolves through that symlink; response formatting must use the same
+    resolved root so ``Path.relative_to`` does not raise a false
+    not-in-subpath error after a successful mutation.
+    """
+
+    return target.relative_to(_root_resolved(root)).as_posix()
+
+
 def requested_path_targets_agentveil_control(root: Path, requested: str) -> bool:
     """Return True when ``requested`` resolves to an AgentVeil control artifact."""
 
@@ -494,7 +507,7 @@ def _handle_tools_call(root: Path, request_id: Any, params: Mapping[str, Any]) -
             return _error(request_id, -32602, "path is not a file")
         stat = target.stat()
         info = {
-            "path": target.relative_to(root).as_posix(),
+            "path": _sandbox_relative_display_path(root, target),
             "size_bytes": stat.st_size,
             "size_bucket": _size_bucket(stat.st_size),
         }
@@ -523,13 +536,14 @@ def _handle_tools_call(root: Path, request_id: Any, params: Mapping[str, Any]) -
             return _error(request_id, -32602, "content must be a string")
         try:
             target = _safe_child(root, path)
+            display_path = _sandbox_relative_display_path(root, target)
         except ValueError as exc:
             return _error(request_id, -32602, str(exc))
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         return _response(
             request_id,
-            {"content": [{"type": "text", "text": f"wrote {target.relative_to(root).as_posix()}"}]},
+            {"content": [{"type": "text", "text": f"wrote {display_path}"}]},
         )
     if name == "delete_file":
         path = arguments.get("path")
@@ -537,6 +551,7 @@ def _handle_tools_call(root: Path, request_id: Any, params: Mapping[str, Any]) -
             return _error(request_id, -32602, "path must be a non-empty string")
         try:
             target = _safe_child(root, path)
+            display_path = _sandbox_relative_display_path(root, target)
         except ValueError as exc:
             return _error(request_id, -32602, str(exc))
         if not target.is_file():
@@ -544,7 +559,7 @@ def _handle_tools_call(root: Path, request_id: Any, params: Mapping[str, Any]) -
         target.unlink()
         return _response(
             request_id,
-            {"content": [{"type": "text", "text": f"deleted {target.relative_to(root).as_posix()}"}]},
+            {"content": [{"type": "text", "text": f"deleted {display_path}"}]},
         )
     if name == "rmdir_tree":
         path = arguments.get("path")
@@ -552,6 +567,7 @@ def _handle_tools_call(root: Path, request_id: Any, params: Mapping[str, Any]) -
             return _error(request_id, -32602, "path must be a non-empty string")
         try:
             target = _safe_child(root, path)
+            display_path = _sandbox_relative_display_path(root, target)
         except ValueError as exc:
             return _error(request_id, -32602, str(exc))
         if not target.is_dir():
@@ -561,7 +577,7 @@ def _handle_tools_call(root: Path, request_id: Any, params: Mapping[str, Any]) -
         shutil.rmtree(target)
         return _response(
             request_id,
-            {"content": [{"type": "text", "text": f"removed {target.relative_to(root).as_posix()}"}]},
+            {"content": [{"type": "text", "text": f"removed {display_path}"}]},
         )
     if name == "move_file":
         source = arguments.get("source")

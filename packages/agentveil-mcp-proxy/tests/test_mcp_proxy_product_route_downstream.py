@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -531,3 +532,38 @@ def test_unknown_catalog_tool_is_rejected(runtime: ProductRouteRuntime) -> None:
     )
     assert response is not None
     assert response["error"]["code"] == -32601
+
+
+def test_product_route_write_through_symlinked_workspace(tmp_path: Path) -> None:
+    """Public setup uses ``product-profile/workspace`` → real workspace symlink."""
+
+    profile_root = tmp_path / "product-profile"
+    initialize_product_route_profile(profile_root)
+    workspace = profile_root / "workspace"
+    real = tmp_path / "real-workspace"
+    shutil.move(str(workspace), str(real))
+    workspace.symlink_to(real, target_is_directory=True)
+    (real / "ops").mkdir(exist_ok=True)
+    (real / "ops" / "existing.json").write_text('{"seed":true}', encoding="utf-8")
+
+    runtime = ProductRouteRuntime.from_profile_root(profile_root)
+    assert runtime.profile.filesystem_sandbox.is_symlink()
+
+    response = handle_message(
+        runtime,
+        {
+            "jsonrpc": "2.0",
+            "id": "symlink-product-write",
+            "method": "tools/call",
+            "params": {
+                "name": "write_file",
+                "arguments": {"path": "ops/existing.json", "content": '{"updated":true}'},
+            },
+        },
+    )
+    assert response is not None
+    assert "error" not in response, response
+    text = response["result"]["content"][0]["text"]
+    assert text == "wrote ops/existing.json"
+    assert "/Users/" not in text and "/private/" not in text and "/var/" not in text
+    assert (real / "ops" / "existing.json").read_text(encoding="utf-8") == '{"updated":true}'
