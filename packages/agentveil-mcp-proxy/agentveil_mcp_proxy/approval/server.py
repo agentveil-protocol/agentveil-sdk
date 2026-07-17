@@ -39,6 +39,7 @@ from agentveil_mcp_proxy.evidence.observability import (
     risk_class_plain_label,
     terminal_state_for_record_status,
 )
+from agentveil_mcp_proxy.evidence.store import ApprovalStatus
 
 
 MAX_POST_BODY_BYTES = 8192
@@ -77,6 +78,7 @@ TERMINAL_ALREADY_APPROVED_NEXT = (
 )
 TERMINAL_ALREADY_DENIED_BODY = "This request was already denied."
 TERMINAL_EXPIRED_BODY = "This approval request has expired."
+TERMINAL_CANCELLED_BODY = "This approval request was cancelled by the client."
 TERMINAL_NO_LONGER_ACTIONABLE_BODY = "This approval request is no longer actionable."
 APPROVAL_DECISION_DENIED_BODY = (
     "Decision recorded. This action was denied and will not run."
@@ -185,6 +187,7 @@ def render_local_proof_prompt_block(body_text: str, prompt: str) -> str:
 
 TERMINAL_ALREADY_DECIDED_APPROVE = "already_decided_approve"
 TERMINAL_ALREADY_DECIDED_DENY = "already_decided_deny"
+TERMINAL_CANCELLED = "approval_cancelled"
 TERMINAL_APPROVAL_EXPIRED = "approval_expired"
 TERMINAL_ALREADY_DECIDED = "already_decided"
 
@@ -464,7 +467,11 @@ class ApprovalServer:
         return f"{self.base_url}/approval/{self.session_token}/pending/{request_id}"
 
     def register(self, prompt: ApprovalPrompt) -> str:
-        """Register a prompt after durable evidence persistence succeeds."""
+        """Register a prompt after durable evidence persistence succeeds.
+
+        The caller must hold ``ApprovalManager``'s finalize lock and have
+        verified the durable record is still ``pending`` before calling this.
+        """
 
         with self._lock:
             self._prune_terminal_requests_locked()
@@ -519,6 +526,14 @@ class ApprovalServer:
         with self._lock:
             return self._decisions.get(request_id)
 
+    def notify_cancelled(self, request_id: str) -> None:
+        """Wake a waiting approval request after client-side cancellation."""
+
+        with self._lock:
+            event = self._decision_events.get(request_id)
+            if event is not None:
+                event.set()
+
     def pending_row_dict(self, prompt: ApprovalPrompt) -> dict[str, Any]:
         """Sanitized pending row shared by the dashboard HTML and JSON API."""
 
@@ -558,11 +573,16 @@ class ApprovalServer:
             self._prune_expired_pending_locked()
             decided = set(self._decisions)
             terminal = set(self._terminal_requests)
-            return [
+            candidates = [
                 prompt
                 for request_id, prompt in sorted(self._prompts.items())
                 if request_id not in decided and request_id not in terminal
             ]
+        return [
+            prompt
+            for prompt in candidates
+            if self._terminal_snapshot_from_evidence(prompt.request_id) is None
+        ]
 
     def prompt_for(self, request_id: str) -> ApprovalPrompt | None:
         """Return one pending prompt."""
@@ -571,7 +591,12 @@ class ApprovalServer:
             self._prune_terminal_requests_locked()
             if request_id in self._decisions or request_id in self._terminal_requests:
                 return None
-            return self._prompts.get(request_id)
+            prompt = self._prompts.get(request_id)
+        if prompt is None:
+            return None
+        if self._terminal_snapshot_from_evidence(request_id) is not None:
+            return None
+        return prompt
 
     def is_terminal(self, request_id: str) -> bool:
         """Return whether a prompt was already decided or expired."""
@@ -624,6 +649,8 @@ class ApprovalServer:
             raise ApprovalServerError("approval decision must be approve or deny")
         if approval_scope not in {"exact", "similar_5m"}:
             raise ApprovalServerError("approval scope is unsupported")
+        if self._terminal_snapshot_from_evidence(request_id) is not None:
+            raise ApprovalServerGone("approval already decided")
         with self._lock:
             self._prune_terminal_requests_locked()
             if request_id in self._terminal_requests or request_id in self._decisions:
@@ -965,6 +992,8 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
             return "Approved", TERMINAL_ALREADY_APPROVED_BODY
         if state == TERMINAL_ALREADY_DECIDED_DENY:
             return "Denied", TERMINAL_ALREADY_DENIED_BODY
+        if state == TERMINAL_CANCELLED:
+            return "Cancelled", TERMINAL_CANCELLED_BODY
         return "Already decided", TERMINAL_NO_LONGER_ACTIONABLE_BODY
 
     def _render_terminal_technical_details(self, snapshot: TerminalApprovalSnapshot) -> str:

@@ -1010,11 +1010,25 @@ def _coalesce_approval_outcome(
 ) -> ApprovalOutcome | None:
     """Keep an approved in-flight outcome across TrapDoor and policy layers."""
 
+    if new is not None and new.status == ApprovalStatus.CANCELLED.value:
+        return new
+    if current is not None and current.status == ApprovalStatus.CANCELLED.value:
+        return current
     if new is not None and new.approved:
         return new
     if current is not None and current.approved:
         return current
     return new if new is not None else current
+
+
+def _client_cancelled_responses(
+    outcome: ApprovalOutcome | None,
+) -> list[dict[str, Any]] | None:
+    """Return an empty response list when the client cancelled the tools/call."""
+
+    if outcome is not None and outcome.status == ApprovalStatus.CANCELLED.value:
+        return []
+    return None
 
 
 def _policy_denied_error(
@@ -1278,6 +1292,11 @@ class McpPassthrough:
         diagnostic_workers = max(1, worker_count - 1)
 
         def _handle_queued_line(item: str) -> None:
+            has_id, client_request_id = _jsonrpc_request_id_from_raw_line(item)
+            track_mutation = (
+                _raw_line_is_tools_call(item)
+                and not _raw_line_is_concurrent_tools_call(item)
+            )
             try:
                 responses = self.handle_client_line(item)
                 for response in responses:
@@ -1294,6 +1313,11 @@ class McpPassthrough:
                             data={"status": "error", "reason": "internal_error"},
                         ),
                     )
+            finally:
+                if track_mutation and has_id:
+                    manager = self.approval_manager
+                    if manager is not None:
+                        manager.clear_tracked_client_request(client_request_id)
 
         def _diagnostic_worker() -> None:
             while True:
@@ -1356,6 +1380,10 @@ class McpPassthrough:
                 if _raw_line_is_concurrent_tools_call(raw_line):
                     diagnostic_queue.put(raw_line)
                 elif _raw_line_is_tools_call(raw_line):
+                    has_id, client_request_id = _jsonrpc_request_id_from_raw_line(raw_line)
+                    manager = self.approval_manager
+                    if has_id and manager is not None:
+                        manager.register_tracked_client_request(client_request_id)
                     mutation_queue.put(raw_line)
                 else:
                     responses = self.handle_client_line(raw_line)
@@ -1390,6 +1418,10 @@ class McpPassthrough:
         has_id = "id" in message
         if message.get("jsonrpc") != JSONRPC_VERSION or not isinstance(message.get("method"), str):
             return [jsonrpc_error(request_id, JSONRPC_INVALID_REQUEST, "invalid JSON-RPC request")]
+
+        method = message.get("method")
+        if method == "notifications/cancelled":
+            return self._handle_client_cancelled_notification(message)
 
         surface_error = self._tool_surface_error_response(message, request_id)
         if surface_error is not None:
@@ -1431,6 +1463,9 @@ class McpPassthrough:
                 approval_outcome,
                 instruction_outcome,
             )
+            cancelled_responses = _client_cancelled_responses(approval_outcome)
+            if cancelled_responses is not None:
+                return cancelled_responses
             if instruction_error is not None:
                 return [instruction_error] if has_id else []
             persistence_error, persistence_outcome = (
@@ -1445,6 +1480,9 @@ class McpPassthrough:
                 approval_outcome,
                 persistence_outcome,
             )
+            cancelled_responses = _client_cancelled_responses(approval_outcome)
+            if cancelled_responses is not None:
+                return cancelled_responses
             if persistence_error is not None:
                 return [persistence_error] if has_id else []
             package_manager_error, package_manager_outcome = (
@@ -1459,6 +1497,9 @@ class McpPassthrough:
                 approval_outcome,
                 package_manager_outcome,
             )
+            cancelled_responses = _client_cancelled_responses(approval_outcome)
+            if cancelled_responses is not None:
+                return cancelled_responses
             if package_manager_error is not None:
                 return [package_manager_error] if has_id else []
             policy_error, policy_outcome = self._policy_error_response(
@@ -1470,6 +1511,9 @@ class McpPassthrough:
                 approval_outcome,
                 policy_outcome,
             )
+            cancelled_responses = _client_cancelled_responses(approval_outcome)
+            if cancelled_responses is not None:
+                return cancelled_responses
             if policy_error is not None:
                 return [policy_error] if has_id else []
             local_proof_response = self._local_proof_tool_response(
@@ -3031,6 +3075,17 @@ class McpPassthrough:
         if (
             coalesce_in_flight
             and in_flight_approval is not None
+            and in_flight_approval.status == ApprovalStatus.CANCELLED.value
+        ):
+            return None, in_flight_approval
+        if self.approval_manager is not None:
+            pre_cancelled = self.approval_manager.pre_cancelled_outcome(request_id)
+            if pre_cancelled is not None:
+                self.approval_manager.consume_prebind_cancellation(request_id)
+                return None, pre_cancelled
+        if (
+            coalesce_in_flight
+            and in_flight_approval is not None
             and in_flight_approval.approved
         ):
             return None, in_flight_approval
@@ -3048,6 +3103,7 @@ class McpPassthrough:
                 classification,
                 runtime_decision=runtime_decision,
                 reason=reason,
+                client_request_id=request_id,
             )
         except ApprovalFlowError:
             return _with_risk_metadata(jsonrpc_error(
@@ -3083,11 +3139,30 @@ class McpPassthrough:
                 "approval timed out",
                 data={"status": "timeout", "reason": outcome.reason},
             )), None
+        if outcome.status == ApprovalStatus.CANCELLED.value:
+            return None, outcome
         return _with_risk_metadata(_blocked_error(
             request_id,
             "blocked by approval decision",
             reason=outcome.reason,
         )), None
+
+    def _handle_client_cancelled_notification(
+        self,
+        message: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Handle MCP client cancellation for one in-flight tools/call request."""
+
+        params = message.get("params")
+        if not isinstance(params, Mapping):
+            return []
+        client_request_id = params.get("requestId")
+        if client_request_id is None:
+            return []
+        manager = self.approval_manager
+        if manager is not None:
+            manager.cancel_by_client_request_id(client_request_id)
+        return []
 
     def _record_approval_result(
         self,

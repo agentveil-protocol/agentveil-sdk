@@ -315,6 +315,9 @@ _DEFAULT_POLICY_STOP_USER_MESSAGE = (
     "Stopped by policy: this action is not allowed by local policy and cannot "
     "be approved."
 )
+_USER_DENIED_USER_MESSAGE = (
+    "Denied by user. This action was rejected in Approval Center and will not run."
+)
 _CLASSIFIER_ERROR_USER_MESSAGE = (
     "Proxy could not classify this tool call. Approval will not help. "
     "Retry; report if persistent."
@@ -339,6 +342,7 @@ _DEDICATED_USER_MESSAGE_REASONS = frozenset({
     "role_authority_denied",
     "path_outside_workspace",
     "secret_path_blocked",
+    "user_denied",
 })
 _DEFAULT_HARD_DENY_NEXT_STEP = (
     "This action cannot be approved. Adjust the tool call or local policy."
@@ -500,6 +504,8 @@ def mcp_error_user_message(data: Mapping[str, Any]) -> str:
         return _RUNTIME_GATE_UNAVAILABLE_USER_MESSAGE
     if reason == "runtime_gate_block":
         return _RUNTIME_GATE_BLOCKED_USER_MESSAGE
+    if reason == "user_denied":
+        return _USER_DENIED_USER_MESSAGE
     if status == "blocked":  # claim-check: allow bounded JSON-RPC status vocabulary; negative tests assert no downstream execution.
         if reason == "role_authority_denied":
             return str(data.get("explanation") or _DEFAULT_HARD_DENY_NEXT_STEP)
@@ -588,6 +594,8 @@ def terminal_state_for_record_status(status: str) -> str | None:
         return "already_decided_deny"
     if status == ApprovalStatus.EXPIRED.value:
         return "approval_expired"
+    if status == ApprovalStatus.CANCELLED.value:
+        return "approval_cancelled"
     return None
 
 

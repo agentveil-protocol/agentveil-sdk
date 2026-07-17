@@ -473,3 +473,70 @@ def test_evidence_backed_terminal_snapshot_without_in_memory_prompt(tmp_path):
     finally:
         server.stop()
         store.close()
+
+
+def test_managed_center_hides_actionable_prompt_when_evidence_cancelled(tmp_path):
+    """Managed AC must honor durable evidence even when in-memory prompt remains registered."""
+
+    config = _config(policy_rule=_write_rule())
+    proxy_dir = tmp_path / "mcp-proxy"
+    proxy_dir.mkdir(parents=True)
+    store = ApprovalEvidenceStore(proxy_dir / "evidence.sqlite")
+    server = create_persistent_server(proxy_dir=proxy_dir, evidence_store=store)
+    save_manifest(proxy_dir, build_manifest_for_server(server))
+    remote = RemoteApprovalServer(
+        load_manifest(proxy_dir),
+        evidence_store=store,
+    )
+    manager = ApprovalManager(
+        evidence_store=store,
+        approval_server=remote,
+        config=config,
+        client_id="github:managed-cancel",
+        headless=False,
+        wait_for_decision=False,
+        notifier=NoopNotifier(),
+        browser_open=lambda _url: False,
+    )
+    try:
+        outcome = manager.request_approval(
+            _classification(config),
+            reason="local_approval_required",
+        )
+        request_id = outcome.request_id
+        assert server.prompt_for(request_id) is not None
+        assert len(server.pending_prompts()) == 1
+
+        cancelled = manager.cancel_approval(request_id, reason="client_cancelled")
+        assert cancelled.status == ApprovalStatus.CANCELLED.value
+        record = store.get_pending(request_id)
+        assert record.status == ApprovalStatus.CANCELLED.value
+        assert record.error_class == "client_cancelled"
+        assert server._prompts.get(request_id) is not None
+        assert server.prompt_for(request_id) is None
+        assert server.pending_prompts() == []
+
+        approval_url = server.approval_url(request_id)
+        with httpx.Client() as client:
+            page = client.get(approval_url, follow_redirects=False)
+            assert page.status_code == 410
+            assert "<title>Cancelled</title>" in page.text
+            assert "cancelled by the client" in page.text
+            _assert_stale_html_privacy_safe(page.text, session_token=server.session_token)
+
+            post = client.post(
+                approval_url,
+                data={
+                    "decision": "approve",
+                    "approval_scope": "exact",
+                    "csrf_token": "invalid",
+                },
+                follow_redirects=False,
+            )
+            assert post.status_code == 410
+        refreshed = store.get_pending(request_id)
+        assert refreshed.status == ApprovalStatus.CANCELLED.value
+        assert refreshed.error_class == "client_cancelled"
+    finally:
+        server.stop()
+        store.close()

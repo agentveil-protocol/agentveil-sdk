@@ -136,6 +136,7 @@ class _RecordingApprovalManager:
     def __init__(self) -> None:
         self.results: list[tuple[str, str]] = []
         self.errors: list[tuple[str, str]] = []
+        self.client_request_ids: list[Any] = []
         self._lock = threading.Lock()
         self.b_done = threading.Event()
 
@@ -145,12 +146,21 @@ class _RecordingApprovalManager:
         *,
         runtime_decision: Any = None,
         reason: str,
+        client_request_id: Any = None,
     ) -> ApprovalOutcome:
+        with self._lock:
+            self.client_request_ids.append(client_request_id)
         return ApprovalOutcome(
             f"request-{classification.tool}",
             "approved",
             f"approved-{classification.tool}",
         )
+
+    def pre_cancelled_outcome(self, client_request_id: Any = None) -> None:
+        return None
+
+    def consume_prebind_cancellation(self, client_request_id: Any = None) -> bool:
+        return False
 
     def record_execution_result(self, outcome: ApprovalOutcome, response: dict[str, Any]) -> None:
         with self._lock:
@@ -214,6 +224,7 @@ def test_concurrent_handle_client_line_does_not_misattribute_approval_outcome() 
     assert not thread_a.is_alive()
     assert not thread_b.is_alive()
     assert not errors
+    assert sorted(manager.client_request_ids, key=str) == ["a", "b"]
     assert manager.results == [("request-tool-b", "b")]
     assert manager.errors == [("request-tool-a", "downstream_response_timeout")]
     assert responses["a"][0]["error"]["data"]["reason"] == "downstream_response_timeout"
