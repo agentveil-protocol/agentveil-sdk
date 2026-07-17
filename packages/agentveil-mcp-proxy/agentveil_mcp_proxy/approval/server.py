@@ -1504,6 +1504,9 @@ details {{ margin: 8px 0 12px; }}
 _MANAGED_CENTER_START_TIMEOUT_SECONDS = 60.0
 _MANAGED_CENTER_POLL_INTERVAL_SECONDS = 0.2
 _MANAGED_CENTER_STOP_GRACE_SECONDS = 2.0
+_MANAGED_CENTER_LOCK_TIMEOUT_SECONDS = 30.0
+_MANAGED_CENTER_LOCK_POLL_SECONDS = 0.05
+_MANAGED_CENTER_LIFECYCLE_LOCK_NAME = "approval-center.lifecycle.lock"
 
 
 @dataclass(frozen=True)
@@ -1528,18 +1531,107 @@ def _managed_center_proxy_dir(home: Path) -> Path:
     return Path(home) / "mcp-proxy"
 
 
+def _managed_center_lifecycle_lock_path(home: Path) -> Path:
+    return _managed_center_proxy_dir(home) / _MANAGED_CENTER_LIFECYCLE_LOCK_NAME
+
+
+class _ManagedCenterLifecycleLock:
+    """Exclusive per-home lock for inspect/prepare/spawn across processes."""
+
+    def __init__(self, home: Path, *, timeout_seconds: float):
+        self._path = _managed_center_lifecycle_lock_path(home)
+        self._timeout_seconds = timeout_seconds
+        self._handle: Any | None = None
+
+    def __enter__(self) -> "_ManagedCenterLifecycleLock":
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + self._timeout_seconds
+        while True:
+            try:
+                handle = open(self._path, "a+", encoding="utf-8")
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(_MANAGED_CENTER_LOCK_POLL_SECONDS)
+                continue
+            try:
+                if os.name == "nt":
+                    self._acquire_windows(handle)
+                else:
+                    self._acquire_posix(handle)
+            except OSError:
+                handle.close()
+                if time.monotonic() >= deadline:
+                    raise
+                self._recover_stale_lock()
+                time.sleep(_MANAGED_CENTER_LOCK_POLL_SECONDS)
+                continue
+            self._handle = handle
+            handle.seek(0)
+            handle.truncate()
+            handle.write(f"{os.getpid()}\n")
+            handle.flush()
+            return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        handle = self._handle
+        self._handle = None
+        if handle is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            handle.close()
+        except OSError:
+            pass
+
+    def _acquire_posix(self, handle: Any) -> None:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _acquire_windows(self, handle: Any) -> None:
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+
+    def _recover_stale_lock(self) -> None:
+        """Wait for a contended lock; the OS releases flock when the owner exits."""
+
+        return
+
+
 def inspect_managed_approval_center(home: Path) -> ManagedApprovalCenterStatus:
     from agentveil_mcp_proxy.approval.persistent import (
         load_manifest,
         manifest_is_reachable,
+        manifest_runtime_matches_current,
     )
 
     manifest = load_manifest(_managed_center_proxy_dir(home))
     if manifest is None:
         return ManagedApprovalCenterStatus(state="down", pid=None, port=None)
     if manifest_is_reachable(manifest):
+        if manifest_runtime_matches_current(manifest):
+            return ManagedApprovalCenterStatus(
+                state="running",
+                pid=manifest.pid,
+                port=manifest.port,
+            )
+        # Reachable but foreign/mismatched runtime must not be reused.
         return ManagedApprovalCenterStatus(
-            state="running",
+            state="stale",
             pid=manifest.pid,
             port=manifest.port,
         )
@@ -2072,6 +2164,23 @@ def ensure_managed_approval_center_running(
 ) -> ManagedApprovalCenterEnsureResult:
     """Reuse a healthy managed center or replace stale state before spawning."""
 
+    with _ManagedCenterLifecycleLock(
+        home,
+        timeout_seconds=_MANAGED_CENTER_LOCK_TIMEOUT_SECONDS,
+    ):
+        return _ensure_managed_approval_center_running_locked(
+            home=home,
+            spawn=spawn,
+            wait_for_running=wait_for_running,
+        )
+
+
+def _ensure_managed_approval_center_running_locked(
+    *,
+    home: Path,
+    spawn: Callable[[], Any],
+    wait_for_running: Callable[[Path, float], ManagedApprovalCenterStatus] | None = None,
+) -> ManagedApprovalCenterEnsureResult:
     initial = inspect_managed_approval_center(home)
     if initial.state == "running":
         return ManagedApprovalCenterEnsureResult(

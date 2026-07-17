@@ -3044,6 +3044,7 @@ def test_root_help_lists_demo_in_getting_started(capsys):
     assert "  demo" in text or ", demo" in getting_started
 
 
+@pytest.mark.allow_demo_managed_approval_center
 def test_demo_auto_approve_runs_real_flow(tmp_path, capsys):
     work_dir = tmp_path / "demo-work"
     rc = main([
@@ -3066,6 +3067,7 @@ def test_demo_auto_approve_runs_real_flow(tmp_path, capsys):
     _assert_demo_managed_approval_center_stopped(work_dir / "avp-home")
 
 
+@pytest.mark.allow_demo_managed_approval_center
 def test_demo_human_output_is_bounded_without_secrets(tmp_path, capsys):
     work_dir = tmp_path / "demo-human"
     rc = main([
@@ -3086,6 +3088,7 @@ def test_demo_human_output_is_bounded_without_secrets(tmp_path, capsys):
     _assert_demo_managed_approval_center_stopped(work_dir / "avp-home")
 
 
+@pytest.mark.allow_demo_managed_approval_center
 def test_demo_uses_source_aware_proxy_command_for_approval_center(tmp_path, monkeypatch):
     from agentveil_mcp_proxy.approval.server import ensure_managed_approval_center_for_cli
 
@@ -3202,6 +3205,7 @@ def test_init_human_output_includes_role_presets_hint(tmp_path, capsys):
     assert "Next:" in text
 
 
+@pytest.mark.allow_demo_managed_approval_center
 def test_demo_human_output_omits_role_presets_hint(tmp_path, capsys):
     work_dir = tmp_path / "demo-no-role-hint"
     assert main([

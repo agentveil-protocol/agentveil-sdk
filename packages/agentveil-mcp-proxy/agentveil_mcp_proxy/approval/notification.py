@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 from typing import Callable
+import webbrowser
 
 from agentveil_mcp_proxy.approval.server import ApprovalPrompt
 
@@ -19,6 +20,15 @@ class NotificationResult:
     channel: str
     attempted: bool
     delivered: bool
+
+
+@dataclass(frozen=True)
+class BrowserOpenResult:
+    """Bounded result of one approval-browser delivery attempt."""
+
+    attempted: bool
+    delivered: bool
+    channel: str
 
 
 class ApprovalNotifier:
@@ -71,4 +81,92 @@ def _escape_applescript(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
-__all__ = ["ApprovalNotifier", "NotificationResult"]
+def open_approval_url_webbrowser(
+    url: str,
+    *,
+    opener: Callable[[str], object] | None = None,
+) -> BrowserOpenResult:
+    """Open ``url`` through the stdlib webbrowser opener.
+
+    Success requires an explicit truthy return. ``False`` and exceptions are
+    failures so callers can retry and apply a native fallback.
+    """
+
+    open_fn = opener or webbrowser.open
+    try:
+        opened = open_fn(url)
+    except Exception:
+        return BrowserOpenResult(attempted=True, delivered=False, channel="webbrowser")
+    return BrowserOpenResult(
+        attempted=True,
+        delivered=bool(opened),
+        channel="webbrowser",
+    )
+
+
+def open_approval_url_macos_native(
+    url: str,
+    *,
+    runner: Callable[..., subprocess.CompletedProcess] | None = None,
+    enabled: bool | None = None,
+) -> BrowserOpenResult:
+    """Open ``url`` with the macOS ``open`` launcher when available."""
+
+    if enabled is None:
+        enabled = sys.platform == "darwin"
+    if not enabled:
+        return BrowserOpenResult(attempted=False, delivered=False, channel="macos-open")
+    open_bin = shutil.which("open")
+    if open_bin is None:
+        return BrowserOpenResult(attempted=False, delivered=False, channel="macos-open")
+    run = runner or subprocess.run
+    try:
+        completed = run(
+            [open_bin, url],
+            check=False,
+            timeout=2.0,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env={key: os.environ[key] for key in ("PATH", "HOME") if key in os.environ},
+        )
+    except Exception:
+        return BrowserOpenResult(attempted=True, delivered=False, channel="macos-open")
+    return BrowserOpenResult(
+        attempted=True,
+        delivered=completed.returncode == 0,
+        channel="macos-open",
+    )
+
+
+def deliver_approval_browser_url(
+    url: str,
+    *,
+    webbrowser_opener: Callable[[str], object] | None = None,
+    native_runner: Callable[..., subprocess.CompletedProcess] | None = None,
+    platform: str | None = None,
+) -> BrowserOpenResult:
+    """Deliver an approval URL via webbrowser, then bounded native fallback."""
+
+    primary = open_approval_url_webbrowser(url, opener=webbrowser_opener)
+    if primary.delivered:
+        return primary
+    host = sys.platform if platform is None else platform
+    if host == "darwin":
+        native = open_approval_url_macos_native(
+            url,
+            runner=native_runner,
+            enabled=True,
+        )
+        if native.attempted:
+            return native
+    return primary
+
+
+__all__ = [
+    "ApprovalNotifier",
+    "BrowserOpenResult",
+    "NotificationResult",
+    "deliver_approval_browser_url",
+    "open_approval_url_macos_native",
+    "open_approval_url_webbrowser",
+]

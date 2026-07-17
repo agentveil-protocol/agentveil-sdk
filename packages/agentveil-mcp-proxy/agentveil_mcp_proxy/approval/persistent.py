@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import secrets
 import socket
+import sys
 import time
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -26,6 +27,66 @@ class PersistentApprovalCenterError(RuntimeError):
     """Raised when the stable Approval Center cannot start or be reused."""
 
 
+_APPROVAL_CENTER_CODE_FILES = (
+    "approval/__init__.py",
+    "approval/client.py",
+    "approval/headless.py",
+    "approval/manager.py",
+    "approval/notification.py",
+    "approval/persistent.py",
+    "approval/server.py",
+)
+
+
+def _package_version_token() -> str:
+    try:
+        from agentveil_mcp_proxy import __version__
+
+        return str(__version__)
+    except Exception:
+        return "unknown"
+
+
+def _approval_center_code_fingerprint(package_root: Path) -> str:
+    """Hash bounded Approval Center module contents (relative names only)."""
+
+    hasher = hashlib.sha256()
+    for relative in _APPROVAL_CENTER_CODE_FILES:
+        hasher.update(relative.encode("utf-8"))
+        hasher.update(b"\0")
+        path = package_root / relative
+        try:
+            hasher.update(path.read_bytes())
+        except OSError:
+            hasher.update(b"<missing>")
+        hasher.update(b"\0")
+    return hasher.hexdigest()
+
+
+def current_approval_center_runtime_identity() -> str:
+    """Return a bounded identity for the currently executing proxy package runtime.
+
+    Distinguishes source checkouts, installed wheels, in-place upgrades, and
+    Approval Center code edits without embedding credentials or user-home
+    secrets beyond the interpreter and package-root paths already required to
+    load the module.
+    """
+
+    package_file = Path(__file__).resolve()
+    package_root = package_file.parents[1]
+    python_path = str(Path(sys.executable).resolve())
+    version_token = _package_version_token()
+    code_fingerprint = _approval_center_code_fingerprint(package_root)
+    material = (
+        f"{python_path}\n"
+        f"{package_root.as_posix()}\n"
+        f"version={version_token}\n"
+        f"approval_center_code={code_fingerprint}"
+    )
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
+
 @dataclass(frozen=True)
 class ApprovalCenterManifest:
     """On-disk metadata for one stable local Approval Center."""
@@ -38,6 +99,7 @@ class ApprovalCenterManifest:
     internal_register_token: str
     pid: int | None
     started_at: int
+    runtime_identity: str | None = None
 
     @property
     def base_url(self) -> str:
@@ -47,7 +109,7 @@ class ApprovalCenterManifest:
         return f"{self.base_url}/approval/{self.session_token}"
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "schema_version": self.schema_version,
             "host": self.host,
             "port": self.port,
@@ -57,9 +119,13 @@ class ApprovalCenterManifest:
             "pid": self.pid,
             "started_at": self.started_at,
         }
+        if self.runtime_identity is not None:
+            payload["runtime_identity"] = self.runtime_identity
+        return payload
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ApprovalCenterManifest:
+        runtime_identity = data.get("runtime_identity")
         return cls(
             schema_version=int(data["schema_version"]),
             host=str(data["host"]),
@@ -69,6 +135,9 @@ class ApprovalCenterManifest:
             internal_register_token=str(data["internal_register_token"]),
             pid=None if data.get("pid") is None else int(data["pid"]),
             started_at=int(data["started_at"]),
+            runtime_identity=(
+                None if runtime_identity is None else str(runtime_identity)
+            ),
         )
 
 
@@ -273,6 +342,14 @@ def manifest_is_reachable(manifest: ApprovalCenterManifest) -> bool:
     return _health_check(manifest)
 
 
+def manifest_runtime_matches_current(manifest: ApprovalCenterManifest) -> bool:
+    """Return True when the manifest runtime identity matches this process."""
+
+    expected = current_approval_center_runtime_identity()
+    actual = manifest.runtime_identity
+    return isinstance(actual, str) and actual == expected
+
+
 def build_manifest_for_server(server: ApprovalServer) -> ApprovalCenterManifest:
     if not server.is_running:
         raise PersistentApprovalCenterError("approval server is not started")
@@ -289,6 +366,7 @@ def build_manifest_for_server(server: ApprovalServer) -> ApprovalCenterManifest:
         internal_register_token=server.internal_register_token or "",
         pid=os.getpid(),
         started_at=int(time.time()),
+        runtime_identity=current_approval_center_runtime_identity(),
     )
 
 
@@ -331,11 +409,13 @@ __all__ = [
     "PersistentApprovalCenterError",
     "build_manifest_for_server",
     "create_persistent_server",
+    "current_approval_center_runtime_identity",
     "load_manifest",
     "loopback_http_request",
     "loopback_json_post",
     "loopback_get_status",
     "manifest_is_reachable",
     "manifest_path",
+    "manifest_runtime_matches_current",
     "save_manifest",
 ]

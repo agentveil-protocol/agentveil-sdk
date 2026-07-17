@@ -145,7 +145,7 @@ def _stack(tmp_path: Path, name: str) -> _Stack:
         client_id=f"{name}:pid:123",
         session_id=f"{name}:session",
         cli_out=io.StringIO(),
-        browser_open=lambda _url: False,
+        browser_open=lambda _url: True,
     )
     passthrough = McpPassthrough(
         DownstreamConfig(command="unused", args=(), name=name),

@@ -14,7 +14,10 @@ import uuid
 import webbrowser
 
 from agentveil_mcp_proxy.approval.headless import HeadlessPolicy
-from agentveil_mcp_proxy.approval.notification import ApprovalNotifier
+from agentveil_mcp_proxy.approval.notification import (
+    ApprovalNotifier,
+    deliver_approval_browser_url,
+)
 from agentveil_mcp_proxy.approval.server import (
     ApprovalPrompt,
     ApprovalServer,
@@ -139,6 +142,22 @@ class ApprovalManager:
             if self.config.approval.on_timeout is TimeoutAction.HANG
             else prompt_expires_at
         )
+        active_exact_deny = self.evidence_store.find_active_exact_deny(
+            downstream_server=classification.server,
+            tool_name=classification.tool,
+            policy_rule_id=classification.policy_evaluation.policy_rule_id,
+            risk_class=classification.risk_class.value,
+            policy_context_hash=classification.policy_evaluation.policy_context_hash,
+            resource_hash=classification.resource_hash,
+            payload_hash=classification.payload_hash,
+            now_timestamp=now,
+        )
+        if active_exact_deny is not None:
+            return ApprovalOutcome(
+                active_exact_deny.request_id,
+                ApprovalStatus.DENIED.value,
+                "user_denied",
+            )
         request_id = str(uuid.uuid4())
         scope_allowed = self._scope_expansion_allowed(classification)
         active_exact_grant = self.evidence_store.find_active_exact_grant(
@@ -216,8 +235,22 @@ class ApprovalManager:
             )
 
         url = self.approval_server.register(prompt)
-        self._notify(prompt, url)
+        actionable_ui = self._notify(prompt, url)
         if not self.wait_for_decision:
+            self._watch_decision_in_background(request_id, timeout)
+            return ApprovalOutcome(
+                request_id,
+                ApprovalStatus.PENDING.value,
+                reason,
+                approval_url=url,
+            )
+        # Keep synchronous wait when an actionable UI was delivered. If browser
+        # delivery failed, return the existing approval_required contract
+        # promptly instead of holding the MCP tool call for the full timeout.
+        if (
+            self._effective_ui_open_mode() is ApprovalUiOpenMode.BROWSER
+            and not actionable_ui
+        ):
             self._watch_decision_in_background(request_id, timeout)
             return ApprovalOutcome(
                 request_id,
@@ -659,20 +692,35 @@ class ApprovalManager:
             file=self.cli_out,
         )
 
-    def _maybe_open_approval_browser(self) -> None:
-        """Open the approval center in the browser at most once per manager lifetime."""
+    def _maybe_open_approval_browser(self) -> bool:
+        """Open the approval center in the browser; success is truthy opener only.
+
+        A ``False`` return or exception must not burn the one-shot flag so a
+        later approval can retry delivery. On webbrowser failure, try a bounded
+        native macOS fallback when available.
+        """
 
         if self._effective_ui_open_mode() is not ApprovalUiOpenMode.BROWSER:
-            return
+            return False
         if self._approval_ui_browser_opened:
-            return
-        try:
-            self.browser_open(self.approval_server.approval_center_url())
-        except Exception:
-            pass
-        self._approval_ui_browser_opened = True
+            return True
+        url = self.approval_server.approval_center_url()
+        # Injected openers own delivery (tests/mocks). Native fallback only when
+        # using the real stdlib webbrowser opener.
+        if self.browser_open is webbrowser.open:
+            result = deliver_approval_browser_url(url, webbrowser_opener=self.browser_open)
+        else:
+            from agentveil_mcp_proxy.approval.notification import open_approval_url_webbrowser
 
-    def _notify(self, prompt: ApprovalPrompt, url: str) -> None:
+            result = open_approval_url_webbrowser(url, opener=self.browser_open)
+        if result.delivered:
+            self._approval_ui_browser_opened = True
+            return True
+        return False
+
+    def _notify(self, prompt: ApprovalPrompt, url: str) -> bool:
+        """Notify the operator and report whether an actionable UI was delivered."""
+
         blast_summary = ""
         metadata = prompt.action_gate_metadata
         if isinstance(metadata, Mapping):
@@ -685,9 +733,15 @@ class ApprovalManager:
             f"{blast_summary}"
         )
         self._print_approval_fallback(prompt, url, summary)
-        self._maybe_open_approval_browser()
-        if self._effective_ui_open_mode() is not ApprovalUiOpenMode.NONE:
+        mode = self._effective_ui_open_mode()
+        browser_ok = self._maybe_open_approval_browser()
+        if mode is not ApprovalUiOpenMode.NONE:
             self.notifier.notify(prompt)
+        if mode is ApprovalUiOpenMode.BROWSER:
+            return browser_ok
+        if mode is ApprovalUiOpenMode.TERMINAL:
+            return bool(getattr(self.cli_out, "isatty", lambda: False)())
+        return False
 
     def _pending_record(
         self,

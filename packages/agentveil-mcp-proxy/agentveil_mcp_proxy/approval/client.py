@@ -20,6 +20,9 @@ from agentveil_mcp_proxy.approval.server import (
     ApprovalServerError,
     INTERNAL_REGISTER_TOKEN_HEADER,
     approval_prompt_to_dict,
+    ensure_managed_approval_center_running,
+    inspect_managed_approval_center,
+    spawn_managed_approval_center_process,
 )
 from agentveil_mcp_proxy.evidence import ApprovalStatus
 
@@ -146,10 +149,16 @@ def resolve_approval_server(
     evidence_store: Any,
     fallback_factory: Callable[[], ApprovalServer],
 ) -> ApprovalServer | RemoteApprovalServer:
-    """Reuse the stable Approval Center when its manifest and process are alive."""
+    """Reuse the stable Approval Center when reachable and runtime-matched."""
+
+    from agentveil_mcp_proxy.approval.persistent import manifest_runtime_matches_current
 
     manifest = load_manifest(proxy_dir)
-    if manifest is not None and manifest_is_reachable(manifest):
+    if (
+        manifest is not None
+        and manifest_is_reachable(manifest)
+        and manifest_runtime_matches_current(manifest)
+    ):
         return RemoteApprovalServer(
             manifest,
             evidence_store=evidence_store,
@@ -157,4 +166,34 @@ def resolve_approval_server(
     return fallback_factory()
 
 
-__all__ = ["RemoteApprovalServer", "resolve_approval_server"]
+def reconcile_managed_approval_center_for_runtime(
+    *,
+    home: Path,
+    proxy_command: str,
+    passphrase_file: Path | None = None,
+) -> None:
+    """Ensure one runtime-matched managed center exists before server resolution.
+
+    A reachable but runtime-mismatched managed center is replaced through the
+    shared lifecycle helpers so ``run_proxy`` does not fall back to an ephemeral
+    in-process server while the stale managed process remains alive.
+    """
+
+    if inspect_managed_approval_center(home).state == "running":
+        return
+
+    def spawn() -> Any:
+        return spawn_managed_approval_center_process(
+            proxy_command=proxy_command,
+            home=home,
+            passphrase_file=passphrase_file,
+        )
+
+    ensure_managed_approval_center_running(home=home, spawn=spawn)
+
+
+__all__ = [
+    "RemoteApprovalServer",
+    "reconcile_managed_approval_center_for_runtime",
+    "resolve_approval_server",
+]
