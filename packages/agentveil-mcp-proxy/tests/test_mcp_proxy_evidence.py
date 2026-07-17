@@ -286,6 +286,238 @@ def test_find_active_exact_grant_rejects_policy_context_drift(tmp_path):
         assert drifted is None
 
 
+def test_find_active_exact_deny_matches_identical_retry(tmp_path):
+    lookup = dict(
+        downstream_server="github-mcp",
+        tool_name="github.create_issue",
+        policy_rule_id="rule-write",
+        risk_class="write",
+        resource_hash=RESOURCE_HASH,
+        payload_hash=PAYLOAD_HASH,
+        now_timestamp=1_700_000_100,
+    )
+    with _store(tmp_path) as store:
+        store.write_pending(_record("req-deny"))
+        store.transition(
+            "req-deny",
+            ApprovalStatus.DENIED.value,
+            approval_token_hash=APPROVAL_TOKEN_HASH,
+            approval_decided_by="local-user",
+            approval_scope="exact",
+            user_decision_timestamp=1_700_000_000,
+            error_class="user_denied",
+        )
+        matched = store.find_active_exact_deny(
+            policy_context_hash=POLICY_CONTEXT_HASH,
+            **lookup,
+        )
+        assert matched is not None and matched.request_id == "req-deny"
+
+
+def test_find_active_exact_deny_rejects_payload_drift(tmp_path):
+    lookup = dict(
+        downstream_server="github-mcp",
+        tool_name="github.create_issue",
+        policy_rule_id="rule-write",
+        risk_class="write",
+        resource_hash=RESOURCE_HASH,
+        policy_context_hash=POLICY_CONTEXT_HASH,
+        now_timestamp=1_700_000_100,
+    )
+    with _store(tmp_path) as store:
+        store.write_pending(_record("req-deny"))
+        store.transition(
+            "req-deny",
+            ApprovalStatus.DENIED.value,
+            approval_token_hash=APPROVAL_TOKEN_HASH,
+            approval_decided_by="local-user",
+            approval_scope="exact",
+            user_decision_timestamp=1_700_000_000,
+            error_class="user_denied",
+        )
+        assert store.find_active_exact_deny(
+            payload_hash=PAYLOAD_HASH,
+            **lookup,
+        ) is not None
+        assert store.find_active_exact_deny(
+            payload_hash="sha256:" + "9" * 64,
+            **lookup,
+        ) is None
+
+
+def test_find_active_exact_deny_rejects_resource_drift(tmp_path):
+    lookup = dict(
+        downstream_server="github-mcp",
+        tool_name="github.create_issue",
+        policy_rule_id="rule-write",
+        risk_class="write",
+        payload_hash=PAYLOAD_HASH,
+        policy_context_hash=POLICY_CONTEXT_HASH,
+        now_timestamp=1_700_000_100,
+    )
+    with _store(tmp_path) as store:
+        store.write_pending(_record("req-deny"))
+        store.transition(
+            "req-deny",
+            ApprovalStatus.DENIED.value,
+            approval_token_hash=APPROVAL_TOKEN_HASH,
+            approval_decided_by="local-user",
+            approval_scope="exact",
+            user_decision_timestamp=1_700_000_000,
+            error_class="user_denied",
+        )
+        assert store.find_active_exact_deny(
+            resource_hash=RESOURCE_HASH,
+            **lookup,
+        ) is not None
+        assert store.find_active_exact_deny(
+            resource_hash="sha256:" + "9" * 64,
+            **lookup,
+        ) is None
+
+
+def test_find_active_exact_deny_rejects_policy_context_drift(tmp_path):
+    lookup = dict(
+        downstream_server="github-mcp",
+        tool_name="github.create_issue",
+        policy_rule_id="rule-write",
+        risk_class="write",
+        resource_hash=RESOURCE_HASH,
+        payload_hash=PAYLOAD_HASH,
+        now_timestamp=1_700_000_100,
+    )
+    with _store(tmp_path) as store:
+        store.write_pending(_record("req-deny"))
+        store.transition(
+            "req-deny",
+            ApprovalStatus.DENIED.value,
+            approval_token_hash=APPROVAL_TOKEN_HASH,
+            approval_decided_by="local-user",
+            approval_scope="exact",
+            user_decision_timestamp=1_700_000_000,
+            error_class="user_denied",
+        )
+        assert store.find_active_exact_deny(
+            policy_context_hash=POLICY_CONTEXT_HASH,
+            **lookup,
+        ) is not None
+        assert store.find_active_exact_deny(
+            policy_context_hash="a" * 64,
+            **lookup,
+        ) is None
+
+
+def test_find_active_exact_deny_rejects_expired_deadline(tmp_path):
+    lookup = dict(
+        downstream_server="github-mcp",
+        tool_name="github.create_issue",
+        policy_rule_id="rule-write",
+        risk_class="write",
+        resource_hash=RESOURCE_HASH,
+        payload_hash=PAYLOAD_HASH,
+        policy_context_hash=POLICY_CONTEXT_HASH,
+        now_timestamp=1_700_000_500,
+    )
+    with _store(tmp_path) as store:
+        store.write_pending(
+            _record(
+                "req-deny",
+                created_at=1_700_000_000,
+                expires_at=1_700_000_300,
+            )
+        )
+        store.transition(
+            "req-deny",
+            ApprovalStatus.DENIED.value,
+            approval_token_hash=APPROVAL_TOKEN_HASH,
+            approval_decided_by="local-user",
+            approval_scope="exact",
+            user_decision_timestamp=1_700_000_100,
+            error_class="user_denied",
+        )
+        assert store.find_active_exact_deny(**lookup) is None
+
+
+def test_find_active_exact_deny_ignores_timeout_not_user_denied(tmp_path):
+    lookup = dict(
+        downstream_server="github-mcp",
+        tool_name="github.create_issue",
+        policy_rule_id="rule-write",
+        risk_class="write",
+        resource_hash=RESOURCE_HASH,
+        payload_hash=PAYLOAD_HASH,
+        policy_context_hash=POLICY_CONTEXT_HASH,
+        now_timestamp=1_700_000_100,
+    )
+    with _store(tmp_path) as store:
+        store.write_pending(_record("req-expired"))
+        store.transition(
+            "req-expired",
+            ApprovalStatus.EXPIRED.value,
+            error_class="approval_timeout",
+        )
+        assert store.find_active_exact_deny(**lookup) is None
+
+
+def test_find_active_exact_deny_does_not_match_similar_scope(tmp_path):
+    lookup = dict(
+        downstream_server="github-mcp",
+        tool_name="github.create_issue",
+        policy_rule_id="rule-write",
+        risk_class="write",
+        resource_hash=RESOURCE_HASH,
+        payload_hash=PAYLOAD_HASH,
+        policy_context_hash=POLICY_CONTEXT_HASH,
+        now_timestamp=1_700_000_100,
+    )
+    with _store(tmp_path) as store:
+        store.write_pending(_record("req-similar", payload_hash="sha256:" + "8" * 64))
+        store.transition(
+            "req-similar",
+            ApprovalStatus.DENIED.value,
+            approval_token_hash=APPROVAL_TOKEN_HASH,
+            approval_decided_by="local-user",
+            approval_scope="similar_5m",
+            user_decision_timestamp=1_700_000_000,
+            error_class="user_denied",
+        )
+        assert store.find_active_exact_deny(**lookup) is None
+
+
+def test_find_active_exact_deny_rejects_null_expiry_hang_mode(tmp_path):
+    """HANG-mode denials (expires_at=NULL) must not suppress identical retries forever."""
+
+    lookup = dict(
+        downstream_server="github-mcp",
+        tool_name="github.create_issue",
+        policy_rule_id="rule-write",
+        risk_class="write",
+        resource_hash=RESOURCE_HASH,
+        payload_hash=PAYLOAD_HASH,
+        policy_context_hash=POLICY_CONTEXT_HASH,
+        now_timestamp=1_700_000_100,
+    )
+    with _store(tmp_path) as store:
+        hang_record = _record("req-hang-deny", created_at=1_700_000_000)
+        hang_record = PendingApproval(
+            **{**asdict(hang_record), "expires_at": None}
+        )
+        store.write_pending(hang_record)
+        store.transition(
+            "req-hang-deny",
+            ApprovalStatus.DENIED.value,
+            approval_token_hash=APPROVAL_TOKEN_HASH,
+            approval_decided_by="local-user",
+            approval_scope="exact",
+            user_decision_timestamp=1_700_000_000,
+            error_class="user_denied",
+        )
+        denied = store.get_pending("req-hang-deny")
+        assert denied is not None
+        assert denied.expires_at is None
+        assert store.find_active_exact_deny(**lookup) is None
+
+
 def test_write_pending_creates_durable_record_with_all_fields(tmp_path):
     db_path = tmp_path / "evidence.sqlite"
     record = _record("req-all")

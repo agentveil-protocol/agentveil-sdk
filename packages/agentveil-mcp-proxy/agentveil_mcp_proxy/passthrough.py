@@ -26,6 +26,7 @@ import ctypes
 from dataclasses import dataclass
 import hashlib
 import json
+import queue
 
 import jcs
 import math
@@ -197,6 +198,28 @@ DEFAULT_DOWNSTREAM_RESPONSE_TIMEOUT_SECONDS = 30.0
 MAX_DOWNSTREAM_MESSAGE_BYTES = 1 * 1024 * 1024
 MAX_CLIENT_MESSAGE_BYTES = 1 * 1024 * 1024
 MAX_PENDING_RESPONSES = 1000
+# Bounded stdio scheduling: keep reading client input while a wait-mode approval
+# (or other slow request) holds a worker. One pending approval must not monopolize
+# the input dispatcher. Workers > 1 so diagnostics/read-only tools can progress.
+STDIO_REQUEST_WORKERS = 4
+STDIO_REQUEST_QUEUE_MAXSIZE = 8
+# tools/call names that may share the concurrent diagnostic lane while a
+# mutation holds wait-mode approval. Everything else stays on the serial
+# mutation lane so successive writes keep arrival order.
+STDIO_CONCURRENT_TOOL_NAMES = frozenset({
+    "local_proof",
+    "get_file_info",
+    "read_file",
+    "read_text_file",
+    "read_media_file",
+    "read_multiple_files",
+    "list_directory",
+    "list_directory_with_sizes",
+    "list_workspace",
+    "directory_tree",
+    "search_files",
+    "instruction_surface_status",
+})
 DEFAULT_TIMED_OUT_ID_RETENTION_SECONDS = 600.0
 # Synthetic policy id stamped on terminal deny evidence for pre-classification
 # hard-denies (unknown tool not advertised by downstream, or arguments that fail
@@ -596,6 +619,51 @@ def _read_bounded_line(client_in: TextIO, max_bytes: int) -> tuple[str | None, b
             return "", True
         chunks.append(char)
         byte_count += char_size
+
+
+def _raw_line_is_tools_call(raw_line: str) -> bool:
+    """Return True when ``raw_line`` is a JSON-RPC ``tools/call`` request."""
+
+    try:
+        message = json.loads(raw_line)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(message, dict) and message.get("method") == "tools/call"
+
+
+def _tools_call_name(raw_line: str) -> str | None:
+    """Return the ``tools/call`` tool name when present and well-formed."""
+
+    try:
+        message = json.loads(raw_line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(message, dict) or message.get("method") != "tools/call":
+        return None
+    params = message.get("params")
+    if not isinstance(params, Mapping):
+        return None
+    tool = params.get("name")
+    return tool if isinstance(tool, str) and tool else None
+
+
+def _raw_line_is_concurrent_tools_call(raw_line: str) -> bool:
+    """Return True for diagnostic/read-only ``tools/call`` lines."""
+
+    tool = _tools_call_name(raw_line)
+    return tool is not None and tool in STDIO_CONCURRENT_TOOL_NAMES
+
+
+def _jsonrpc_request_id_from_raw_line(raw_line: str) -> tuple[bool, Any]:
+    """Return ``(has_id, request_id)`` for a client JSON-RPC line."""
+
+    try:
+        message = json.loads(raw_line)
+    except json.JSONDecodeError:
+        return False, None
+    if not isinstance(message, dict) or "id" not in message:
+        return False, None
+    return True, message.get("id")
 
 
 def _discard_line_remainder(client_in: TextIO) -> None:
@@ -1015,10 +1083,14 @@ class McpPassthrough:
         self._timed_out_response_ids: dict[str, float] = {}
         self._tool_schemas = ToolSchemaCache()
         self._schema_request_counter = 0
-        self._current_tool_arguments: Mapping[str, Any] | None = None
+        self._request_local = threading.local()
         self._downstream_tool_calls_forwarded = 0
         self._windows_job: _WindowsJobObject | None = None
-        self._active_redirect_context: RedirectContext | None = None
+        self._stdio_worker_count = STDIO_REQUEST_WORKERS
+        self._stdio_queue_maxsize = STDIO_REQUEST_QUEUE_MAXSIZE
+        self._stdio_queue: queue.Queue[str | None] | None = None
+        self._stdio_mutation_queue: queue.Queue[str | None] | None = None
+        self._schema_refresh_lock = threading.Lock()
 
     @property
     def stderr_bytes_drained(self) -> int:
@@ -1169,11 +1241,97 @@ class McpPassthrough:
             self._windows_job.close()
             self._windows_job = None
 
+    @property
+    def _current_tool_arguments(self) -> Mapping[str, Any] | None:
+        return getattr(self._request_local, "tool_arguments", None)
+
+    @_current_tool_arguments.setter
+    def _current_tool_arguments(self, value: Mapping[str, Any] | None) -> None:
+        self._request_local.tool_arguments = value
+
+    @property
+    def _active_redirect_context(self) -> RedirectContext | None:
+        return getattr(self._request_local, "redirect_context", None)
+
+    @_active_redirect_context.setter
+    def _active_redirect_context(self, value: RedirectContext | None) -> None:
+        self._request_local.redirect_context = value
+
     def run_stdio(self, client_in: TextIO, client_out: TextIO) -> int:
-        """Run pass-through until client input EOF or a fatal startup error."""
+        """Run pass-through until client input EOF or a fatal startup error.
+
+        Client input is read on a dedicated dispatcher loop. Diagnostic and
+        read-only ``tools/call`` requests use a bounded concurrent lane so a
+        wait-mode approval cannot monopolize the connection. Mutation
+        ``tools/call`` requests use a single serial lane that preserves arrival
+        order. Lifecycle methods stay on the dispatcher thread.
+        """
 
         self._notification_writer = lambda message: self._write_client(client_out, message)
         self.start()
+        worker_count = max(2, int(self._stdio_worker_count))
+        queue_maxsize = max(1, int(self._stdio_queue_maxsize))
+        diagnostic_queue: queue.Queue[str | None] = queue.Queue(maxsize=queue_maxsize)
+        mutation_queue: queue.Queue[str | None] = queue.Queue(maxsize=queue_maxsize)
+        self._stdio_queue = diagnostic_queue
+        self._stdio_mutation_queue = mutation_queue
+        diagnostic_workers = max(1, worker_count - 1)
+
+        def _handle_queued_line(item: str) -> None:
+            try:
+                responses = self.handle_client_line(item)
+                for response in responses:
+                    self._write_client(client_out, response)
+            except Exception:
+                has_id, request_id = _jsonrpc_request_id_from_raw_line(item)
+                if has_id:
+                    self._write_client(
+                        client_out,
+                        jsonrpc_error(
+                            request_id,
+                            JSONRPC_DOWNSTREAM_ERROR,
+                            "MCP proxy internal error",
+                            data={"status": "error", "reason": "internal_error"},
+                        ),
+                    )
+
+        def _diagnostic_worker() -> None:
+            while True:
+                item = diagnostic_queue.get()
+                try:
+                    if item is None:
+                        return
+                    _handle_queued_line(item)
+                finally:
+                    diagnostic_queue.task_done()
+
+        def _mutation_worker() -> None:
+            while True:
+                item = mutation_queue.get()
+                try:
+                    if item is None:
+                        return
+                    _handle_queued_line(item)
+                finally:
+                    mutation_queue.task_done()
+
+        workers = [
+            threading.Thread(
+                target=_mutation_worker,
+                name="mcp-stdio-mutation-worker",
+                daemon=True,
+            )
+        ]
+        workers.extend(
+            threading.Thread(
+                target=_diagnostic_worker,
+                name=f"mcp-stdio-diagnostic-worker-{index}",
+                daemon=True,
+            )
+            for index in range(diagnostic_workers)
+        )
+        for worker in workers:
+            worker.start()
         try:
             while True:
                 raw_line, rejected = _read_bounded_line(client_in, MAX_CLIENT_MESSAGE_BYTES)
@@ -1192,11 +1350,28 @@ class McpPassthrough:
                     break
                 if not raw_line.strip():
                     continue
-                responses = self.handle_client_line(raw_line)
-                for response in responses:
-                    self._write_client(client_out, response)
+                # Lifecycle stays on the dispatcher. Concurrent lane is only for
+                # bounded diagnostic/read-only tools/call names; mutations keep
+                # serial arrival order on their own lane.
+                if _raw_line_is_concurrent_tools_call(raw_line):
+                    diagnostic_queue.put(raw_line)
+                elif _raw_line_is_tools_call(raw_line):
+                    mutation_queue.put(raw_line)
+                else:
+                    responses = self.handle_client_line(raw_line)
+                    for response in responses:
+                        self._write_client(client_out, response)
+            diagnostic_queue.join()
+            mutation_queue.join()
+            for _ in range(diagnostic_workers):
+                diagnostic_queue.put(None)
+            mutation_queue.put(None)
+            for worker in workers:
+                worker.join(timeout=5.0)
             return 0
         finally:
+            self._stdio_queue = None
+            self._stdio_mutation_queue = None
             self.stop()
 
     def handle_client_line(self, raw_line: str) -> list[dict[str, Any]]:
@@ -1375,6 +1550,7 @@ class McpPassthrough:
             )]
         finally:
             self._active_redirect_context = None
+            self._current_tool_arguments = None
 
     @staticmethod
     def _message_without_redirect_context(message: Mapping[str, Any]) -> dict[str, Any]:
@@ -1655,12 +1831,15 @@ class McpPassthrough:
             return None
         if self._tool_schemas.is_advertised(tool):
             return None
-        response = self._request_downstream_tools_list()
-        if response is not None:
-            self._tool_schemas.update_from_response(response)
-            self._sync_downstream_surface_quarantine()
-        if self._tool_schemas.is_advertised(tool):
-            return None
+        with self._schema_refresh_lock:
+            if self._tool_schemas.is_advertised(tool):
+                return None
+            response = self._request_downstream_tools_list()
+            if response is not None:
+                self._tool_schemas.update_from_response(response)
+                self._sync_downstream_surface_quarantine()
+            if self._tool_schemas.is_advertised(tool):
+                return None
         self._record_security_event({
             "type": "unknown_tool_call",
             "action": "blocked_pre_approval",
@@ -1776,11 +1955,15 @@ class McpPassthrough:
         schema = self._tool_schemas.get(tool)
         if schema is not None:
             return schema
-        response = self._request_downstream_tools_list()
-        if response is not None:
-            self._tool_schemas.update_from_response(response)
-            self._sync_downstream_surface_quarantine()
-        return self._tool_schemas.get(tool)
+        with self._schema_refresh_lock:
+            schema = self._tool_schemas.get(tool)
+            if schema is not None:
+                return schema
+            response = self._request_downstream_tools_list()
+            if response is not None:
+                self._tool_schemas.update_from_response(response)
+                self._sync_downstream_surface_quarantine()
+            return self._tool_schemas.get(tool)
 
     def _request_downstream_tools_list(self) -> dict[str, Any] | None:
         if not self._can_refresh_tool_schemas():
@@ -3633,8 +3816,10 @@ class McpPassthrough:
         return proc is not None and proc.poll() is None and proc.stdin is not None
 
     def _internal_request_id(self, purpose: str) -> str:
-        self._schema_request_counter += 1
-        return f"__agentveil_internal_{purpose}_{self._schema_request_counter}"
+        with self._counters_lock:
+            self._schema_request_counter += 1
+            counter = self._schema_request_counter
+        return f"__agentveil_internal_{purpose}_{counter}"
 
     def _send_downstream(self, message: Mapping[str, Any]) -> None:
         proc = self._require_process()

@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import webbrowser
 
 PLATFORM_WINDOWS = "nt"
 PLATFORM_POSIX = "posix"
@@ -140,6 +141,50 @@ def proxy_cli_bin(tmp_path: Path) -> Path:
     if not is_windows_runtime() and venv_cli.is_file():
         return venv_cli.resolve()
     return write_runnable_proxy_command(tmp_path / "bin").resolve()
+
+
+@pytest.fixture(autouse=True)
+def _block_approval_browser_and_detached_spawn(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Do not open a real browser or spawn detached approval-center serve in tests."""
+
+    from agentveil_mcp_proxy.approval.notification import BrowserOpenResult
+
+    monkeypatch.setattr(webbrowser, "open", lambda _url: False)
+
+    allow_demo_spawn = request.node.get_closest_marker("allow_demo_managed_approval_center")
+    if not allow_demo_spawn:
+        def _spawn_blocked(**_kwargs):
+            raise OSError("test: real managed approval-center spawn disabled")  # claim-check: allow test guard
+
+        monkeypatch.setattr(
+            "agentveil_mcp_proxy.approval.client.spawn_managed_approval_center_process",
+            _spawn_blocked,
+        )
+        monkeypatch.setattr(
+            "agentveil_mcp_proxy.approval.server.spawn_managed_approval_center_process",
+            _spawn_blocked,
+        )
+
+    if request.node.get_closest_marker("allow_approval_browser_delivery"):
+        return
+
+    def _browser_blocked(_url: str, **_kwargs) -> BrowserOpenResult:
+        return BrowserOpenResult(attempted=True, delivered=False, channel="webbrowser")
+
+    def _macos_blocked(_url: str, **_kwargs) -> BrowserOpenResult:
+        return BrowserOpenResult(attempted=False, delivered=False, channel="macos-open")
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.approval.notification.deliver_approval_browser_url",
+        _browser_blocked,
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.approval.notification.open_approval_url_macos_native",
+        _macos_blocked,
+    )
 
 
 @pytest.fixture(autouse=True)

@@ -219,3 +219,173 @@ def test_quickstart_rmdir_tree_blocked_before_mutation(tmp_path, monkeypatch):
     assert metadata["target_reached"] is False
     assert metadata["execution_status"] == "not_reached"
     _assert_no_local_path_leaks(out.getvalue(), json.dumps(metadata))
+
+
+def _symlinked_sandbox(tmp_path: Path) -> tuple[Path, Path]:
+    """Create ``product-profile/workspace -> real-workspace`` like public setup."""
+
+    real = tmp_path / "real-workspace"
+    real.mkdir()
+    link = tmp_path / "product-profile" / "workspace"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(real, target_is_directory=True)
+    return real, link
+
+
+def test_symlink_sandbox_root_write_file_returns_relative_success(tmp_path):
+    """Approved write under a symlinked sandbox root must not fail after mutation."""
+
+    from agentveil_mcp_proxy.quickstart_filesystem import _handle_tools_call
+
+    real, link = _symlinked_sandbox(tmp_path)
+    canary = "ops/existing.json"
+    content = '{"updated":true}'
+
+    response = _handle_tools_call(
+        link,
+        "symlink-write",
+        {"name": "write_file", "arguments": {"path": canary, "content": content}},
+    )
+    assert "error" not in response, response
+    text = response["result"]["content"][0]["text"]
+    assert text == f"wrote {canary}"
+    assert not any(marker in text for marker in LOCAL_PATH_MARKERS)
+    assert (real / canary).read_text(encoding="utf-8") == content
+
+
+def test_symlink_sandbox_root_create_and_update_canaries(tmp_path):
+    from agentveil_mcp_proxy.quickstart_filesystem import _handle_tools_call
+
+    real, link = _symlinked_sandbox(tmp_path)
+    create_path = ".agentveil-test/canary.txt"
+    update_path = "ops/existing.json"
+    (real / "ops").mkdir()
+    (real / update_path).write_text('{"seed":true}', encoding="utf-8")
+
+    created = _handle_tools_call(
+        link,
+        "create-1",
+        {"name": "write_file", "arguments": {"path": create_path, "content": "canary-create"}},
+    )
+    assert "error" not in created, created
+    assert (real / create_path).read_text(encoding="utf-8") == "canary-create"
+
+    updated = _handle_tools_call(
+        link,
+        "update-1",
+        {"name": "write_file", "arguments": {"path": update_path, "content": '{"updated":true}'}},
+    )
+    assert "error" not in updated, updated
+    assert (real / update_path).read_text(encoding="utf-8") == '{"updated":true}'
+
+
+def test_symlink_sandbox_root_get_file_info_read_list(tmp_path):
+    from agentveil_mcp_proxy.quickstart_filesystem import _handle_tools_call
+
+    real, link = _symlinked_sandbox(tmp_path)
+    (real / "probe.txt").write_text("probe", encoding="utf-8")
+
+    info = _handle_tools_call(
+        link,
+        "info-1",
+        {"name": "get_file_info", "arguments": {"path": "probe.txt"}},
+    )
+    assert "error" not in info, info
+    payload = json.loads(info["result"]["content"][0]["text"])
+    assert payload["path"] == "probe.txt"
+    assert not any(marker in payload["path"] for marker in LOCAL_PATH_MARKERS)
+
+    read = _handle_tools_call(
+        link,
+        "read-1",
+        {"name": "read_file", "arguments": {"path": "probe.txt"}},
+    )
+    assert read["result"]["content"][0]["text"] == "probe"
+
+    listing = _handle_tools_call(link, "list-1", {"name": "list_workspace", "arguments": {}})
+    assert "probe.txt" in listing["result"]["content"][0]["text"]
+
+
+def test_symlink_sandbox_root_delete_file_and_rmdir_tree(tmp_path):
+    from agentveil_mcp_proxy.quickstart_filesystem import _handle_tools_call
+
+    real, link = _symlinked_sandbox(tmp_path)
+    (real / "gone.txt").write_text("x", encoding="utf-8")
+    (real / "tree" / "nested").mkdir(parents=True)
+    (real / "tree" / "nested" / "keep.txt").write_text("y", encoding="utf-8")
+
+    deleted = _handle_tools_call(
+        link,
+        "del-1",
+        {"name": "delete_file", "arguments": {"path": "gone.txt"}},
+    )
+    assert "error" not in deleted, deleted
+    assert deleted["result"]["content"][0]["text"] == "deleted gone.txt"
+    assert not (real / "gone.txt").exists()
+
+    removed = _handle_tools_call(
+        link,
+        "rmdir-1",
+        {"name": "rmdir_tree", "arguments": {"path": "tree"}},
+    )
+    assert "error" not in removed, removed
+    assert removed["result"]["content"][0]["text"] == "removed tree"
+    assert not (real / "tree").exists()
+
+
+def test_symlink_sandbox_root_keeps_escape_and_control_denials(tmp_path):
+    from agentveil_mcp_proxy.quickstart_filesystem import _handle_tools_call
+
+    real, link = _symlinked_sandbox(tmp_path)
+    outside = tmp_path / "outside-secret.txt"
+    outside.write_text("secret", encoding="utf-8")
+    (real / "escape-link.txt").symlink_to(outside)
+    control = real / ".avp" / "mcp-proxy"
+    control.mkdir(parents=True)
+    (control / "approval-center.manifest.json").write_text(
+        json.dumps({"session_token": "fixture-session-token-not-real"}),
+        encoding="utf-8",
+    )
+    (real / "alias-control").symlink_to(control, target_is_directory=True)
+    (real / "docs").mkdir()
+    (real / "docs" / "approval-center.manifest.json").write_text(
+        json.dumps({"note": "user-owned"}),
+        encoding="utf-8",
+    )
+
+    escape = _handle_tools_call(
+        link,
+        "escape-1",
+        {"name": "write_file", "arguments": {"path": "escape-link.txt", "content": "nope"}},
+    )
+    assert "error" in escape
+    assert outside.read_text(encoding="utf-8") == "secret"
+
+    denied = _handle_tools_call(
+        link,
+        "ctrl-1",
+        {
+            "name": "read_file",
+            "arguments": {"path": ".avp/mcp-proxy/approval-center.manifest.json"},
+        },
+    )
+    assert "error" in denied
+
+    alias = _handle_tools_call(
+        link,
+        "alias-1",
+        {"name": "read_file", "arguments": {"path": "alias-control/approval-center.manifest.json"}},
+    )
+    assert "error" in alias
+
+    listing = _handle_tools_call(link, "list-ctrl", {"name": "list_workspace", "arguments": {}})
+    listed = listing["result"]["content"][0]["text"]
+    assert ".avp/mcp-proxy" not in listed
+    assert "alias-control" not in listed
+
+    user_manifest = _handle_tools_call(
+        link,
+        "user-manifest",
+        {"name": "read_file", "arguments": {"path": "docs/approval-center.manifest.json"}},
+    )
+    assert "user-owned" in user_manifest["result"]["content"][0]["text"]

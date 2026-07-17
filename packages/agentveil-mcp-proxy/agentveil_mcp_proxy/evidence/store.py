@@ -858,6 +858,58 @@ class ApprovalEvidenceStore:
             ).fetchone()
         return None if row is None else _row_to_record(row)
 
+    def find_active_exact_deny(
+        self,
+        *,
+        downstream_server: str,
+        tool_name: str,
+        policy_rule_id: str | None,
+        risk_class: str,
+        policy_context_hash: str,
+        resource_hash: str | None,
+        payload_hash: str,
+        now_timestamp: int,
+    ) -> PendingApproval | None:
+        """Return one active explicit user denial for an identical retry.
+
+        Only ``error_class=user_denied`` rows match. Timeout/expired outcomes do not
+        satisfy an exact retry. Reuse requires a finite original deadline
+        that is still open (``expires_at IS NOT NULL AND expires_at > now``).
+        HANG-mode denials with ``expires_at=NULL`` must not block forever.
+        """
+
+        with self._lock:
+            # SQL uses static _COLUMNS and bound filters.  claim-check: allow SQL safety note.
+            row = self._conn.execute(
+                f"SELECT {', '.join(_COLUMNS)} FROM pending_approvals "  # nosec B608
+                "WHERE status = ? "
+                "AND error_class = ? "
+                "AND expires_at IS NOT NULL "
+                "AND expires_at > ? "
+                "AND downstream_server = ? "
+                "AND tool_name = ? "
+                "AND risk_class = ? "
+                "AND policy_rule_id IS ? "
+                "AND policy_context_hash = ? "
+                "AND resource_hash IS ? "
+                "AND payload_hash = ? "
+                "ORDER BY approval_decided_at DESC, created_at DESC, request_id DESC "
+                "LIMIT 1",
+                (
+                    ApprovalStatus.DENIED.value,
+                    "user_denied",
+                    int(now_timestamp),
+                    downstream_server,
+                    tool_name,
+                    risk_class,
+                    policy_rule_id,
+                    policy_context_hash,
+                    resource_hash,
+                    payload_hash,
+                ),
+            ).fetchone()
+        return None if row is None else _row_to_record(row)
+
     def vacuum_terminal_records(self, *, before_timestamp: int) -> int:
         """Delete old terminal records and reconstruct the remaining chain."""
 

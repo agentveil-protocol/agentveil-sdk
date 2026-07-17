@@ -47,3 +47,7 @@ include = ["agentveil_mcp_proxy*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "allow_approval_browser_delivery: opt out of global browser-delivery block for unit tests with fake runners",
+    "allow_demo_managed_approval_center: opt out of global detached approval-center spawn block for isolated demo tests",
+]

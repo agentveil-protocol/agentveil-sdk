@@ -44,7 +44,10 @@ from agentveil_mcp_proxy.approval import (
     HeadlessPolicy,
     HeadlessPolicyError,
 )
-from agentveil_mcp_proxy.approval.client import resolve_approval_server
+from agentveil_mcp_proxy.approval.client import (
+    reconcile_managed_approval_center_for_runtime,
+    resolve_approval_server,
+)
 from agentveil_mcp_proxy.approval.persistent import (
     PersistentApprovalCenterError,
     build_manifest_for_server,
@@ -2725,6 +2728,16 @@ def run_proxy(
             server.start()
             return server
 
+        # Headless/auto-deny does not need an interactive managed Approval Center.
+        # claim-check: allow describes headless run_proxy lifecycle skip.
+        # Skip lifecycle reconciliation so server-side runs do not spawn detached
+        # AC processes for a UI that will not be used.
+        if not headless:
+            reconcile_managed_approval_center_for_runtime(
+                home=paths.home,
+                proxy_command=sys.executable,
+                passphrase_file=passphrase_file,
+            )
         approval_server = resolve_approval_server(
             paths.proxy_dir,
             evidence_store=evidence_store,

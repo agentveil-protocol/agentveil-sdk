@@ -289,7 +289,7 @@ def _manager(
         auto_deny=auto_deny,
         headless_policy=headless_policy,
         cli_out=cli,
-        browser_open=browser_open or (lambda _url: False),
+        browser_open=browser_open or (lambda _url: True),
         notifier=NoopNotifier(),
         wait_for_decision=wait_for_decision,
         approval_grant_private_key_seed=approval_grant_private_key_seed,
@@ -642,6 +642,9 @@ def test_token_rotates_on_proxy_restart():
 def test_pending_approval_persisted_before_ui_render(tmp_path):
     class FailingStore:
         def find_active_exact_grant(self, **_kwargs):
+            return None
+
+        def find_active_exact_deny(self, **_kwargs):
             return None
 
         def find_active_similar_grant(self, **_kwargs):
