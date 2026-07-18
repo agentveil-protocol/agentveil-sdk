@@ -127,6 +127,26 @@ def _assert_agent_visible_privacy(serialized: str, *, server: ApprovalServer, ho
         assert str(home.resolve()) not in serialized
 
 
+def _wait_for_delivery_status(
+    store: ApprovalEvidenceStore,
+    request_id: str,
+    expected: str,
+    *,
+    timeout_seconds: float = 2.0,
+) -> PendingApproval:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        record = store.get_pending(request_id)
+        if record is not None and record.delivery_status == expected:
+            return record
+        if time.monotonic() >= deadline:
+            actual = None if record is None else record.delivery_status
+            raise AssertionError(
+                f"delivery_status did not reach {expected!r}; got {actual!r}"
+            )
+        time.sleep(0.01)
+
+
 # ---------------------------------------------------------------------------
 # A. opener=False → pending + not_delivered + recovery; no hang
 # ---------------------------------------------------------------------------
@@ -272,8 +292,11 @@ def test_d_authenticated_pending_get_marks_visible(tmp_path):
             response = client.get(outcome.approval_url)
         assert response.status_code == 200
         assert "Approve" in response.text
-        record = store.get_pending(outcome.request_id)
-        assert record is not None
+        record = _wait_for_delivery_status(
+            store,
+            outcome.request_id,
+            DELIVERY_STATUS_VISIBLE,
+        )
         assert record.status == ApprovalStatus.PENDING.value
         assert record.delivery_status == DELIVERY_STATUS_VISIBLE
         entry = build_event_show_entry(record)
