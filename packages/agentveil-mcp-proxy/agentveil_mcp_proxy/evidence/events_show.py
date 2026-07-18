@@ -13,6 +13,7 @@ from agentveil_mcp_proxy.evidence.observability import (
     bounded_reason_for_record,
     parse_action_gate_metadata,
     parse_redirect_automation_metadata,
+    target_reached_for_evidence_record,
 )
 from agentveil_mcp_proxy.evidence.store import (
     GENESIS_PREV_EVENT_HASH,
@@ -77,6 +78,12 @@ def _load_records(evidence_path: Path) -> list[PendingApproval]:
 def _event_decision(record: PendingApproval, entry: Mapping[str, Any]) -> str:
     kind = str(entry.get("event_kind", "unknown"))
     target_reached = entry.get("target_reached")
+    if record.status == ApprovalStatus.EXPIRED.value:
+        return "timed_out"
+    if record.status == ApprovalStatus.CANCELLED.value:
+        return "cancelled"
+    if record.status == ApprovalStatus.ERROR.value:
+        return "failed"
     if kind == "approval_pending":
         return "approval_required"
     if kind == "approval_granted":
@@ -90,23 +97,29 @@ def _event_decision(record: PendingApproval, entry: Mapping[str, Any]) -> str:
     if kind == "executed":
         if target_reached is True:
             return "target_reached"
-        if target_reached is False:
-            return "execution_not_reached"
-        if record.risk_class == "read" or record.action_class == "read":
-            return "allowed"
-        if record.granted_by_request_id:
-            return "approved"
-        return "allowed"
+        # Missing or false target_reached must not fall through to "allowed".
+        return "execution_not_reached"
     if record.status == ApprovalStatus.BLOCKED.value:  # claim-check: allow enum status label; bounded renderer tests cover policy deny display.
         return "hard_blocked"
     if kind == "unknown" and entry.get("metadata_state") == "unparseable_metadata":
         return "invalid"
+    # Policy-layer allow without an executed event stays "allowed".
+    if record.status == ApprovalStatus.EXECUTED.value and target_reached is True:
+        return "target_reached"
+    if record.result_status == "executed" and target_reached is not True:
+        return "execution_not_reached"
     return "allowed"
 
 
 def _reason_summary(record: PendingApproval, *, decision: str) -> str:
     if decision == "target_reached":
         return "Action reached target."
+    if decision == "timed_out":
+        return "Approval timed out before a decision."
+    if decision == "cancelled":
+        return "Cancelled by the client before execution."
+    if decision == "failed":
+        return "Execution failed after approval."
     if decision == "approved":
         return (
             "Approved by user. Retry the same MCP tool call without changing "
@@ -122,6 +135,12 @@ def _reason_summary(record: PendingApproval, *, decision: str) -> str:
     if record.error_class:
         if record.error_class == "path_outside_workspace":
             return "Path was outside the configured sandbox."
+        if record.error_class == "approval_timeout":
+            return "Approval timed out before a decision."
+        if record.error_class == "client_cancelled":
+            return "Cancelled by the client before execution."
+        if record.error_class == "downstream_error":
+            return "Downstream execution failed."
         return record.error_class.replace("_", " ")
     reason = bounded_reason_for_record(record)
     if reason == "user_denied":
@@ -225,6 +244,8 @@ def build_event_show_entry(
     }
     if "target_reached" in timeline:
         entry["target_reached"] = timeline["target_reached"]
+    else:
+        entry["target_reached"] = target_reached_for_evidence_record(record)
     if record.result_status is not None:
         entry["execution_status"] = record.result_status
     next_step = _next_step_for_decision(decision)
@@ -421,12 +442,15 @@ def build_local_proof_mcp_payload(
 
 _WRITE_OUTCOME_ACTIONS: Final[frozenset[str]] = frozenset({"write", "destructive"})
 _DECISION_PATH_LABELS: Final[Mapping[str, str]] = {
-    "approval_required": "approval required",
+    "approval_required": "pending",
     "approved": "approved",
-    "target_reached": "target reached",
+    "target_reached": "executed",
     "allowed": "allowed",
-    "hard_blocked": "stopped",
-    "execution_not_reached": "execution not reached",
+    "hard_blocked": "denied",
+    "execution_not_reached": "failed",
+    "timed_out": "timed out",
+    "cancelled": "cancelled",
+    "failed": "failed",
     "redirected": "redirected",
 }
 

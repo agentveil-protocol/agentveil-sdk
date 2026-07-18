@@ -174,6 +174,7 @@ def _build_wheel_installed_cli(tmp_path: Path) -> tuple[Path, Path, Path]:
         capture_output=True,
         check=True,
         env=env,
+        cwd=str(tmp_path),
     )
     assert "site-packages" in module_probe.stdout
     assert str(PACKAGE_ROOT.resolve()) not in module_probe.stdout

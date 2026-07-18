@@ -294,7 +294,9 @@ def test_events_show_read_only_allowed_without_target_flag() -> None:
         action_class="read",
     )
     entry = build_event_show_entry(record)
-    assert entry["decision"] == "allowed"
+    # Historical EXECUTED without explicit target_reached must not invent success.
+    assert entry["decision"] == "execution_not_reached"
+    assert entry.get("target_reached") is False
 
 
 def test_events_show_approved_event() -> None:
@@ -546,7 +548,8 @@ def test_local_proof_human_summary_prefers_write_outcome_chain(tmp_path: Path) -
     assert "Result: write approved and completed" in text
     assert "Verification:" in text
     assert "Tool: write_file" in text
-    assert "approval required -> approved -> target reached" in text
+    assert "approval required -> approved -> target reached" not in text
+    assert "pending -> approved -> executed" in text
     assert "Target: resource:" in text
     assert "Target: resource:cccccccccccc" in text
     assert "Observed read-only actions:" in text
@@ -656,5 +659,5 @@ def test_local_proof_human_summary_does_not_mix_unrelated_write_chains(tmp_path:
 
     assert "Target: resource:cccccccccccc" in text
     assert "resource:aaaaaaaaaaaa" not in text
-    assert "approval required -> approved -> target reached" in text
+    assert "pending -> approved -> executed" in text
     assert "Result: write approved and completed" in text

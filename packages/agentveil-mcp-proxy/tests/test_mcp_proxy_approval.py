@@ -3917,7 +3917,7 @@ def test_get_after_timeout_unregister_returns_expired_html_page(tmp_path):
         assert stale.status_code == 410
         _assert_stale_html_response(
             stale,
-            headline="Approval expired",
+            headline="Timed out",
             session_token=server.session_token,
         )
         assert TERMINAL_EXPIRED_BODY in stale.text
@@ -3979,7 +3979,7 @@ def test_get_expired_prompt_before_unregister_shows_expired_html(monkeypatch):
         assert response.status_code == 410
         _assert_stale_html_response(
             response,
-            headline="Approval expired",
+            headline="Timed out",
             session_token=server.session_token,
         )
         assert TERMINAL_EXPIRED_BODY in response.text

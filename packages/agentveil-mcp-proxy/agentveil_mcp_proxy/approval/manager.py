@@ -43,6 +43,7 @@ from agentveil_mcp_proxy.evidence.approval_grant import (
 from agentveil_mcp_proxy.evidence.observability import (
     approval_display_risk_class,
     approval_resource_display,
+    classify_downstream_response,
     parse_action_gate_metadata,
 )
 from agentveil_mcp_proxy.policy import (
@@ -237,6 +238,7 @@ class ApprovalManager:
             granted_by_request_id=(
                 None if active_grant is None else active_grant.request_id
             ),
+            action_gate_metadata=prompt.action_gate_metadata,
         )
         try:
             self.evidence_store.write_pending(record)
@@ -580,6 +582,9 @@ class ApprovalManager:
                         )
                     except ApprovalEvidenceTransitionError:
                         pass
+                    terminal = self._outcome_if_terminal_evidence(request_id)
+                    if terminal is not None:
+                        return terminal
                     self.approval_server.unregister(
                         request_id,
                         terminal_state=TERMINAL_APPROVAL_EXPIRED,
@@ -674,19 +679,32 @@ class ApprovalManager:
         except ApprovalEvidenceError as exc:
             raise ApprovalFlowError("runtime decision evidence persistence failed") from exc
 
-    def record_execution_result(self, outcome: ApprovalOutcome, response: dict[str, Any]) -> None:
+    def record_execution_result(
+        self,
+        outcome: ApprovalOutcome,
+        response: dict[str, Any],
+        *,
+        downstream_tool_call_seen: bool,
+    ) -> None:
         """Append execution result evidence for an approved downstream call."""
 
         if not outcome.approved:
             return
+        classified = classify_downstream_response(
+            response,
+            downstream_tool_call_seen=downstream_tool_call_seen,
+        )
         try:
-            if "error" in response:
+            if classified.error_class is not None:
+                payload = response.get("error")
+                if not isinstance(payload, Mapping):
+                    payload = response.get("result", {})
                 self.evidence_store.transition(
                     outcome.request_id,
-                    ApprovalStatus.BLOCKED.value,
-                    result_status="blocked",
-                    result_hash=sha256_jcs(response.get("error", {})),
-                    error_class="downstream_error",
+                    classified.store_status,
+                    result_status=classified.execution_status,
+                    result_hash=sha256_jcs(payload if isinstance(payload, (dict, list)) else {}),
+                    error_class=classified.error_class,
                 )
             else:
                 result_hash = sha256_jcs(response.get("result", {}))
@@ -1059,7 +1077,11 @@ class ApprovalManager:
         runtime_decision: RuntimeGateDecision | None,
         approval_token_hash: str | None = None,
         granted_by_request_id: str | None = None,
+        action_gate_metadata: Mapping[str, Any] | None = None,
     ) -> PendingApproval:
+        metadata_jcs = None
+        if isinstance(action_gate_metadata, Mapping) and action_gate_metadata:
+            metadata_jcs = json.dumps(dict(action_gate_metadata), separators=(",", ":"), sort_keys=True)
         return PendingApproval(
             request_id=request_id,
             session_id=self.session_id,
@@ -1081,6 +1103,7 @@ class ApprovalManager:
             approval_token_hash=approval_token_hash,
             matched_policy_rule=classification.policy_evaluation.policy_rule_id,
             granted_by_request_id=granted_by_request_id,
+            action_gate_metadata_jcs=metadata_jcs,
         )
 
     def _write_runtime_decision_record(

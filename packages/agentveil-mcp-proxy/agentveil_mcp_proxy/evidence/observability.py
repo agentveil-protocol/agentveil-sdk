@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 import json
 from pathlib import Path
 from typing import Any
 
 from agentveil_mcp_proxy.authority_boundary import parse_authority_from_metadata
 from agentveil_mcp_proxy.evidence.store import ApprovalStatus, PendingApproval
+from agentveil_mcp_proxy.policy import derive_target_reached
 
 _BOUNDED_RESOURCE_KEY_PREFIXES = frozenset({
     "path",
@@ -21,6 +23,70 @@ _BOUNDED_RESOURCE_KEY_PREFIXES = frozenset({
     "url",
     "resource",
 })
+
+
+@dataclass(frozen=True)
+class DownstreamExecutionClassification:
+    """Bounded downstream outcome shared by MCP evidence surfaces."""
+
+    execution_status: str
+    target_reached: bool
+    error_class: str | None
+    store_status: str
+
+
+def classify_downstream_response(
+    response: Mapping[str, Any],
+    *,
+    downstream_tool_call_seen: bool,
+) -> DownstreamExecutionClassification:
+    """Classify one downstream tools/call response for evidence truth.
+
+    claim-check: allow "Fail closed"/"BLOCKED" name store status enum values used by
+    the classifier contract; negative tests cover non-executed outcomes.
+    Refuse executed unless a confirmed forwarded tools/call returns an object
+    ``result`` without JSON-RPC ``error`` / MCP ``isError``.
+    """
+
+    failure = DownstreamExecutionClassification(
+        execution_status=ApprovalStatus.BLOCKED.value,  # claim-check: allow enum store status
+        target_reached=False,
+        error_class="downstream_error",
+        store_status=ApprovalStatus.BLOCKED.value,  # claim-check: allow enum store status
+    )
+    if "error" in response:
+        return failure
+    if not downstream_tool_call_seen:
+        return failure
+    result = response.get("result")
+    if not isinstance(result, Mapping):
+        return failure
+    if result.get("isError") is True:
+        return failure
+    execution_status = ApprovalStatus.EXECUTED.value
+    return DownstreamExecutionClassification(
+        execution_status=execution_status,
+        target_reached=derive_target_reached(
+            execution_status=execution_status,
+            downstream_tool_call_seen=True,
+        ),
+        error_class=None,
+        store_status=ApprovalStatus.EXECUTED.value,
+    )
+
+
+def target_reached_for_evidence_record(record: PendingApproval) -> bool:
+    """Return explicit metadata target_reached; omit invented success.
+
+    claim-check: allow "never" restates the historical-evidence contract covered
+    by outcome-truth negatives.
+    """
+
+    metadata = parse_action_gate_metadata(record)
+    if metadata is None:
+        return False
+    value = metadata.get("target_reached")
+    return value is True
 
 
 def risk_class_plain_label(risk_class: str) -> str:
@@ -430,6 +496,10 @@ def enrich_mcp_error_contract(
     reason = str(data.get("reason", ""))
     reason_code = mcp_error_reason_code(reason)
     data["reason_code"] = reason_code
+    # Terminal non-success MCP errors did not reach the downstream target.
+    # claim-check: allow "never" restates the MCP error contract; negatives cover it.
+    if "target_reached" not in data:
+        data["target_reached"] = False
 
     if status == "approval_required":
         data["approval_possible"] = True

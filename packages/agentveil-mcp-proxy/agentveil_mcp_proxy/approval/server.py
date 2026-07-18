@@ -987,7 +987,7 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
 
     def _terminal_titles(self, state: str) -> tuple[str, str]:
         if state == TERMINAL_APPROVAL_EXPIRED:
-            return "Approval expired", TERMINAL_EXPIRED_BODY
+            return "Timed out", TERMINAL_EXPIRED_BODY
         if state == TERMINAL_ALREADY_DECIDED_APPROVE:
             return "Approved", TERMINAL_ALREADY_APPROVED_BODY
         if state == TERMINAL_ALREADY_DECIDED_DENY:

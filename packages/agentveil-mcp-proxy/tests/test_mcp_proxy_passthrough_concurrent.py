@@ -134,9 +134,11 @@ def _run_threads(count: int, worker: Callable[[int], None]) -> None:
 
 class _RecordingApprovalManager:
     def __init__(self) -> None:
-        self.results: list[tuple[str, str]] = []
+        self.results: list[tuple[str, str, bool]] = []
         self.errors: list[tuple[str, str]] = []
         self.client_request_ids: list[Any] = []
+        self.sent_ids: list[Any] = []
+        self.seen_flags: list[bool] = []
         self._lock = threading.Lock()
         self.b_done = threading.Event()
 
@@ -162,9 +164,18 @@ class _RecordingApprovalManager:
     def consume_prebind_cancellation(self, client_request_id: Any = None) -> bool:
         return False
 
-    def record_execution_result(self, outcome: ApprovalOutcome, response: dict[str, Any]) -> None:
+    def record_execution_result(
+        self,
+        outcome: ApprovalOutcome,
+        response: dict[str, Any],
+        *,
+        downstream_tool_call_seen: bool,
+    ) -> None:
         with self._lock:
-            self.results.append((outcome.request_id, str(response["id"])))
+            self.results.append(
+                (outcome.request_id, str(response["id"]), downstream_tool_call_seen)
+            )
+            self.seen_flags.append(downstream_tool_call_seen)
         if outcome.request_id == "request-tool-b":
             self.b_done.set()
 
@@ -184,6 +195,8 @@ class _CoordinatedApprovalPassthrough(McpPassthrough):
         self.a_waiting = threading.Event()
 
     def _send_downstream(self, message: Mapping[str, Any]) -> None:
+        with self.approval_manager._lock:
+            self.approval_manager.sent_ids.append(message.get("id"))
         return None
 
     def _wait_downstream_response(self, expected_id: Any) -> dict[str, Any]:
@@ -225,9 +238,59 @@ def test_concurrent_handle_client_line_does_not_misattribute_approval_outcome() 
     assert not thread_b.is_alive()
     assert not errors
     assert sorted(manager.client_request_ids, key=str) == ["a", "b"]
-    assert manager.results == [("request-tool-b", "b")]
+    # Both concurrent tools/call requests were actually sent downstream.
+    assert sorted(manager.sent_ids, key=str) == ["a", "b"]
+    # The completed execution must carry request-local seen=True (not a stale counter).
+    assert manager.results == [("request-tool-b", "b", True)]
+    assert manager.seen_flags == [True]
     assert manager.errors == [("request-tool-a", "downstream_response_timeout")]
     assert responses["a"][0]["error"]["data"]["reason"] == "downstream_response_timeout"
+    assert responses["b"] == [{"jsonrpc": "2.0", "id": "b", "result": {"ok": True}}]
+
+
+def test_concurrent_forwarded_requests_both_pass_request_local_seen_true() -> None:
+    """Both successfully forwarded concurrent calls pass downstream_tool_call_seen=True."""
+
+    manager = _RecordingApprovalManager()
+
+    class _BothSucceedPassthrough(_CoordinatedApprovalPassthrough):
+        def _wait_downstream_response(self, expected_id: Any) -> dict[str, Any]:
+            if expected_id == "a":
+                self.a_waiting.set()
+                assert self.approval_manager.b_done.wait(timeout=2.0)
+                return {"jsonrpc": "2.0", "id": expected_id, "result": {"ok": True}}
+            assert expected_id == "b"
+            assert self.a_waiting.wait(timeout=2.0)
+            return {"jsonrpc": "2.0", "id": expected_id, "result": {"ok": True}}
+
+    passthrough = _BothSucceedPassthrough(manager)
+    seed_tool_schemas(passthrough, [tool_entry("tool-a"), tool_entry("tool-b")])
+    responses: dict[str, list[dict[str, Any]]] = {}
+    errors: list[BaseException] = []
+
+    def run_request(request_id: str, tool: str) -> None:
+        try:
+            responses[request_id] = passthrough.handle_client_line(_tool_call(request_id, tool))
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread_a = threading.Thread(target=run_request, args=("a", "tool-a"))
+    thread_a.start()
+    assert passthrough.a_waiting.wait(timeout=2.0)
+    thread_b = threading.Thread(target=run_request, args=("b", "tool-b"))
+    thread_b.start()
+    thread_a.join(timeout=5.0)
+    thread_b.join(timeout=5.0)
+
+    assert not errors
+    assert sorted(manager.sent_ids, key=str) == ["a", "b"]
+    assert sorted(manager.results) == [
+        ("request-tool-a", "a", True),
+        ("request-tool-b", "b", True),
+    ]
+    assert manager.seen_flags.count(True) == 2
+    assert manager.errors == []
+    assert responses["a"] == [{"jsonrpc": "2.0", "id": "a", "result": {"ok": True}}]
     assert responses["b"] == [{"jsonrpc": "2.0", "id": "b", "result": {"ok": True}}]
 
 

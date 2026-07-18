@@ -59,6 +59,7 @@ from agentveil_mcp_proxy.evidence.events_show import (
 )
 from agentveil_mcp_proxy.client_config import downstream_startup_fingerprint
 from agentveil_mcp_proxy.evidence.observability import (
+    classify_downstream_response,
     parse_action_gate_metadata,
     redirect_original_record_valid,
 )
@@ -1543,8 +1544,10 @@ class McpPassthrough:
                 if has_id
                 else None
             )
+            downstream_tool_call_seen = False
             try:
                 self._send_downstream(message)
+                downstream_tool_call_seen = True
                 if not has_id:
                     return []
                 response = self._wait_downstream_response(request_id)
@@ -1552,12 +1555,17 @@ class McpPassthrough:
                     message,
                     response,
                 )
-                self._record_approval_result(approval_outcome, response)
+                self._record_approval_result(
+                    approval_outcome,
+                    response,
+                    downstream_tool_call_seen=downstream_tool_call_seen,
+                )
                 self._record_allow_controlled_path_if_needed(
                     classification,
                     approval_outcome,
                     request_id,
                     response,
+                    downstream_tool_call_seen=downstream_tool_call_seen,
                 )
                 return [response]
             finally:
@@ -3133,11 +3141,17 @@ class McpPassthrough:
                 enrich_guidance=enrich_guidance,
             )), None
         if outcome.status == "expired":
+            timeout_data: dict[str, Any] = {
+                "status": "timeout",
+                "reason": outcome.reason,
+                "target_reached": False,
+            }
+            enrich_mcp_error_contract(timeout_data)
             return _with_risk_metadata(jsonrpc_error(
                 request_id,
                 JSONRPC_APPROVAL_REQUIRED,
                 "approval timed out",
-                data={"status": "timeout", "reason": outcome.reason},
+                data=timeout_data,
             )), None
         if outcome.status == ApprovalStatus.CANCELLED.value:
             return None, outcome
@@ -3168,11 +3182,21 @@ class McpPassthrough:
         self,
         outcome: ApprovalOutcome | None,
         response: dict[str, Any],
+        *,
+        downstream_tool_call_seen: bool,
     ) -> None:
         if outcome is None or self.approval_manager is None:
             return
-        self.approval_manager.record_execution_result(outcome, response)
-        self._annotate_executed_controlled_path(outcome, response)
+        self.approval_manager.record_execution_result(
+            outcome,
+            response,
+            downstream_tool_call_seen=downstream_tool_call_seen,
+        )
+        self._annotate_executed_controlled_path(
+            outcome,
+            response,
+            downstream_tool_call_seen=downstream_tool_call_seen,
+        )
 
     def _controlled_path_fixture_id(self, classification: ClassifiedToolCall) -> str:
         rule_id = classification.policy_evaluation.policy_rule_id
@@ -3599,17 +3623,20 @@ class McpPassthrough:
         self,
         outcome: ApprovalOutcome,
         response: dict[str, Any],
+        *,
+        downstream_tool_call_seen: bool,
     ) -> None:
         if not outcome.approved:
             return
         store = self._controlled_path_store()
         if store is None:
             return
-        execution_status = (
-            ApprovalStatus.BLOCKED.value  # claim-check: allow enum value; negative tests cover no target reach.
-            if "error" in response
-            else ApprovalStatus.EXECUTED.value
+        classified = classify_downstream_response(
+            response,
+            downstream_tool_call_seen=downstream_tool_call_seen,
         )
+        execution_status = classified.execution_status
+        target_reached = classified.target_reached
         record = store.get_pending(outcome.request_id)
         if record is None:
             return
@@ -3622,10 +3649,6 @@ class McpPassthrough:
                     least_agency_fields = self._least_agency_metadata_fields_from_record(parent_record)
         redirect_context = self._active_redirect_context
         redirect_fields = self._redirect_automation_fields_from_record(record)
-        target_reached = derive_target_reached(
-            execution_status=execution_status,
-            downstream_tool_call_seen=self.downstream_tool_calls_forwarded > 0,
-        )
         if redirect_context is not None:
             metadata = build_redirect_automation_metadata(
                 fixture_id=self._controlled_path_fixture_id_from_record(record),
@@ -3783,15 +3806,23 @@ class McpPassthrough:
         outcome: ApprovalOutcome | None,
         request_id: Any,
         response: dict[str, Any],
+        *,
+        downstream_tool_call_seen: bool,
     ) -> None:
-        if outcome is not None or classification is None or "error" in response:
+        if outcome is not None or classification is None:
+            return
+        classified = classify_downstream_response(
+            response,
+            downstream_tool_call_seen=downstream_tool_call_seen,
+        )
+        if classified.error_class is not None or not classified.target_reached:
             return
         store = self._controlled_path_store()
         manager = self.approval_manager
         if store is None:
             return
         request_id_text = str(request_id) if request_id is not None else str(uuid.uuid4())
-        execution_status = ApprovalStatus.EXECUTED.value
+        execution_status = classified.execution_status
         redirect_context = self._active_redirect_context
         if redirect_context is not None:
             metadata = build_redirect_automation_metadata(
@@ -3801,10 +3832,7 @@ class McpPassthrough:
                 policy_rule_id=classification.policy_evaluation.policy_rule_id,
                 approval_status=ApprovalStatus.EXECUTED.value,
                 execution_status=execution_status,
-                target_reached=derive_target_reached(
-                    execution_status=execution_status,
-                    downstream_tool_call_seen=self.downstream_tool_calls_forwarded > 0,
-                ),
+                target_reached=classified.target_reached,
                 request_id=request_id_text,
                 request_chain=[redirect_context.original_request_id, request_id_text],
                 payload_hash=classification.payload_hash,
@@ -3822,10 +3850,7 @@ class McpPassthrough:
                 policy_rule_id=classification.policy_evaluation.policy_rule_id,
                 approval_status=ApprovalStatus.EXECUTED.value,
                 execution_status=execution_status,
-                target_reached=derive_target_reached(
-                    execution_status=execution_status,
-                    downstream_tool_call_seen=self.downstream_tool_calls_forwarded > 0,
-                ),
+                target_reached=classified.target_reached,
                 request_id=request_id_text,
                 payload_hash=classification.payload_hash,
                 **self._least_agency_metadata_fields(classification),
