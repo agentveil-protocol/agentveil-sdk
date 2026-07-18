@@ -245,6 +245,20 @@ class _StdoutCollector:
         return list(self._responses)
 
 
+class _TextCollector:
+    def __init__(self, stream) -> None:
+        self._lines: list[str] = []
+        self._thread = threading.Thread(target=self._run, args=(stream,), daemon=True)
+        self._thread.start()
+
+    def _run(self, stream) -> None:
+        for line in stream:
+            self._lines.append(line)
+
+    def tail(self, limit: int = 4000) -> str:
+        return "".join(self._lines)[-limit:]
+
+
 def _get_csrf(client: httpx.Client, url: str) -> str:
     page = client.get(url)
     page.raise_for_status()
@@ -613,20 +627,24 @@ def _start_managed_proxy(home: Path, isolated_home: Path) -> tuple[subprocess.Po
     )
     assert proc.stdin is not None
     assert proc.stdout is not None
+    assert proc.stderr is not None
     collector = _StdoutCollector(proc.stdout)
+    stderr_collector = _TextCollector(proc.stderr)
     startup_deadline = time.monotonic() + 15.0
     while time.monotonic() < startup_deadline:
         if proc.poll() is not None:
-            stderr = proc.stderr.read() if proc.stderr is not None else ""
             raise AssertionError(
-                f"run_proxy exited early with code {proc.returncode}: {stderr.strip()}"
+                "run_proxy exited early with code "
+                f"{proc.returncode}: {stderr_collector.tail().strip()}"
             )
         if (home / "mcp-proxy" / "approval-center.manifest.json").exists():
             break
         time.sleep(0.05)
     else:
-        stderr = proc.stderr.read() if proc.stderr is not None else ""
-        raise AssertionError(f"run_proxy did not start managed center: {stderr.strip()}")
+        raise AssertionError(
+            "run_proxy did not start managed center: "
+            f"{stderr_collector.tail().strip()}"
+        )
     return proc, collector
 
 

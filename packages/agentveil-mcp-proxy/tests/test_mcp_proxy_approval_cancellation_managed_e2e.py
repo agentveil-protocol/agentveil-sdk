@@ -17,7 +17,11 @@ import httpx
 import pytest
 
 from agentveil_mcp_proxy.approval.persistent import load_manifest
-from agentveil_mcp_proxy.approval.server import _proxy_cli_child_env, stop_managed_approval_center
+from agentveil_mcp_proxy.approval.server import (
+    _proxy_cli_child_env,
+    scan_cmdline_proven_managed_center_pids,
+    stop_managed_approval_center,
+)
 from agentveil_mcp_proxy.cli import init_proxy, quickstart_filesystem_downstream
 from agentveil_mcp_proxy.evidence import ApprovalStatus
 
@@ -76,6 +80,70 @@ class _StdoutCollector:
         return None
 
 
+class _TextCollector:
+    def __init__(self, stream) -> None:
+        self._lines: list[str] = []
+        self._thread = threading.Thread(target=self._run, args=(stream,), daemon=True)
+        self._thread.start()
+
+    def _run(self, stream) -> None:
+        for line in stream:
+            self._lines.append(line)
+
+    def tail(self, limit: int = 4000) -> str:
+        return "".join(self._lines)[-limit:]
+
+
+def _wait_for_managed_center_start(
+    proc: subprocess.Popen,
+    home: Path,
+    stderr_collector: _TextCollector,
+    *,
+    timeout: float,
+) -> None:
+    startup_deadline = time.monotonic() + timeout
+    while time.monotonic() < startup_deadline:
+        if proc.poll() is not None:
+            raise AssertionError(
+                "run_proxy exited early with code "
+                f"{proc.returncode}: {stderr_collector.tail().strip()}"
+            )
+        if (home / "mcp-proxy" / "approval-center.manifest.json").exists():
+            return
+        time.sleep(0.05)
+    raise AssertionError(
+        "run_proxy did not start managed center: "
+        f"{stderr_collector.tail().strip()}"
+    )
+
+
+def test_managed_center_startup_timeout_does_not_wait_for_child_stderr_eof(tmp_path):
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import sys,time; print('still-running', file=sys.stderr, flush=True); time.sleep(30)",
+        ],
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert proc.stderr is not None
+    stderr_collector = _TextCollector(proc.stderr)
+    started = time.monotonic()
+    try:
+        with pytest.raises(AssertionError, match="did not start managed center"):
+            _wait_for_managed_center_start(
+                proc,
+                tmp_path / "missing-home",
+                stderr_collector,
+                timeout=0.2,
+            )
+        assert time.monotonic() - started < 2.0
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
 @pytest.mark.allow_demo_managed_approval_center
 def test_run_proxy_cancelled_request_shows_terminal_managed_center_page(tmp_path):
     home = tmp_path / "avp-home"
@@ -93,6 +161,24 @@ def test_run_proxy_cancelled_request_shows_terminal_managed_center_page(tmp_path
     target = sandbox / "cancel-target.txt"
     parent_env = os.environ.copy()
     parent_env["HOME"] = str(isolated_home)
+    open_sentinel = tmp_path / "unexpected-browser-open.txt"
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    if os.name != "nt":
+        fake_browser = fake_bin / "avp-fake-browser"
+        fake_browser.write_text(
+            "#!/bin/sh\n"
+            f"printf called > {json.dumps(str(open_sentinel))}\n",
+            encoding="utf-8",
+        )
+        fake_browser.chmod(0o755)
+        parent_env["BROWSER"] = str(fake_browser)
+        fake_open = fake_bin / "open"
+        fake_open.write_text(fake_browser.read_text(encoding="utf-8"), encoding="utf-8")
+        fake_open.chmod(0o755)
+        parent_env["PATH"] = os.pathsep.join(
+            (str(fake_bin), parent_env.get("PATH", ""))
+        )
     env = _proxy_cli_child_env(parent_env=parent_env)
 
     proc = subprocess.Popen(
@@ -114,21 +200,16 @@ def test_run_proxy_cancelled_request_shows_terminal_managed_center_page(tmp_path
     )
     assert proc.stdin is not None
     assert proc.stdout is not None
+    assert proc.stderr is not None
     collector = _StdoutCollector(proc.stdout)
+    stderr_collector = _TextCollector(proc.stderr)
     try:
-        startup_deadline = time.monotonic() + 15.0
-        while time.monotonic() < startup_deadline:
-            if proc.poll() is not None:
-                stderr = proc.stderr.read() if proc.stderr is not None else ""
-                raise AssertionError(
-                    f"run_proxy exited early with code {proc.returncode}: {stderr.strip()}"
-                )
-            if (home / "mcp-proxy" / "approval-center.manifest.json").exists():
-                break
-            time.sleep(0.05)
-        else:
-            stderr = proc.stderr.read() if proc.stderr is not None else ""
-            raise AssertionError(f"run_proxy did not start managed center: {stderr.strip()}")
+        _wait_for_managed_center_start(
+            proc,
+            home,
+            stderr_collector,
+            timeout=15.0,
+        )
         messages = [
             {"jsonrpc": "2.0", "id": "init-1", "method": "initialize", "params": {
                 "protocolVersion": "2024-11-05",
@@ -216,8 +297,19 @@ def test_run_proxy_cancelled_request_shows_terminal_managed_center_page(tmp_path
         assert refreshed is not None
         assert refreshed["status"] == ApprovalStatus.CANCELLED.value
         assert refreshed["error_class"] == "client_cancelled"
+        assert not open_sentinel.exists(), (
+            "approval-ui-mode none must not invoke browser/native open in the child proxy"
+        )
     finally:
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
         stop_managed_approval_center(home, require_healthy=False)
+    cleanup_deadline = time.monotonic() + 5.0
+    while (
+        scan_cmdline_proven_managed_center_pids(home)
+        and time.monotonic() < cleanup_deadline
+    ):
+        time.sleep(0.05)
+    assert scan_cmdline_proven_managed_center_pids(home) == ()
+    assert not open_sentinel.exists()

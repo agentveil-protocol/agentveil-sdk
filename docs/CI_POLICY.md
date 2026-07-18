@@ -24,3 +24,26 @@ This repository uses tiered CI so day-to-day agent work stays fast while release
 - Before tagging or publishing an MCP Proxy release, verify that the MCP Proxy
   release acceptance runner passed, or state explicitly why that gate was
   skipped.
+
+## Runtime Budgets And Hang Handling
+
+- Focused suites should finish within 3 minutes. The full local public SDK gate
+  has a 25-minute target budget.
+- Release compatibility jobs use a hard 35-minute timeout. A timeout or a
+  test step with no meaningful progress for 10 minutes is a CI `HOLD`; do not
+  start a duplicate workflow while the original run is active.
+- The SDK suite and MCP Proxy suite run once each with explicit test paths.
+  Pytest reports the 50 slowest tests and emits a faulthandler thread dump after
+  120 seconds so a stalled process has actionable diagnostics.
+- Tests that launch an MCP Proxy or managed Approval Center subprocess must
+  explicitly disable real browser and OS approval delivery in the child
+  process. Parent-process monkeypatches are not subprocess isolation.
+- Process tests must use bounded waits and clean up the child proxy and managed
+  Approval Center even when an assertion fails.
+- Before creating a recovery tag, run the publish workflow manually against the
+  corrective branch or commit. Manual dispatch is compatibility-only; the
+  publish job is restricted to tag refs.
+- If a tag-triggered workflow exceeds its budget, first determine whether the
+  publish job ran. Do not move or recreate the tag, rerun the same uncorrected
+  workflow, or publish manually. Record `HOLD` and require explicit operator
+  approval for cancellation and recovery.

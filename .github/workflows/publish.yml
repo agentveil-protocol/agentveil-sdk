@@ -1,6 +1,7 @@
 name: Publish to PyPI
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - "v*"
@@ -16,6 +17,7 @@ jobs:
   compatibility:
     name: compatibility (${{ matrix.os }}, ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
@@ -37,14 +39,22 @@ jobs:
         run: python -m pip install -e "packages/agentveil-mcp-proxy[test]"
 
       - name: Run SDK tests
-        run: python -m pytest -v
+        run: >-
+          python -m pytest -v tests
+          --durations=50 --durations-min=1.0
+          -o faulthandler_timeout=120
 
       - name: Run MCP Proxy tests
-        run: python -m pytest -v packages/agentveil-mcp-proxy/tests
+        run: >-
+          python -m pytest -v packages/agentveil-mcp-proxy/tests
+          --durations=50 --durations-min=1.0
+          -o faulthandler_timeout=120
 
   publish:
     needs: compatibility
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
       id-token: write
