@@ -20,7 +20,6 @@ from agentveil_mcp_proxy.approval.persistent import load_manifest
 from agentveil_mcp_proxy.approval.server import (
     _proxy_cli_child_env,
     scan_cmdline_proven_managed_center_pids,
-    stop_managed_approval_center,
 )
 from agentveil_mcp_proxy.cli import init_proxy, quickstart_filesystem_downstream
 from agentveil_mcp_proxy.evidence import ApprovalStatus
@@ -145,7 +144,10 @@ def test_managed_center_startup_timeout_does_not_wait_for_child_stderr_eof(tmp_p
 
 
 @pytest.mark.allow_demo_managed_approval_center
-def test_run_proxy_cancelled_request_shows_terminal_managed_center_page(tmp_path):
+def test_run_proxy_cancelled_request_shows_terminal_managed_center_page(
+    tmp_path,
+    managed_approval_center_server,
+):
     home = tmp_path / "avp-home"
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
@@ -181,6 +183,8 @@ def test_run_proxy_cancelled_request_shows_terminal_managed_center_page(tmp_path
         )
     env = _proxy_cli_child_env(parent_env=parent_env)
 
+    managed_center = managed_approval_center_server(home=home)
+
     proc = subprocess.Popen(
         [
             sys.executable,
@@ -204,6 +208,9 @@ def test_run_proxy_cancelled_request_shows_terminal_managed_center_page(tmp_path
     collector = _StdoutCollector(proc.stdout)
     stderr_collector = _TextCollector(proc.stderr)
     try:
+        manifest = load_manifest(home / "mcp-proxy")
+        assert manifest is not None
+        assert manifest.pid == managed_center.pid
         _wait_for_managed_center_start(
             proc,
             home,
@@ -304,8 +311,7 @@ def test_run_proxy_cancelled_request_shows_terminal_managed_center_page(tmp_path
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
-        stop_managed_approval_center(home, require_healthy=False)
-    cleanup_deadline = time.monotonic() + 5.0
+        cleanup_deadline = time.monotonic() + 5.0
     while (
         scan_cmdline_proven_managed_center_pids(home)
         and time.monotonic() < cleanup_deadline

@@ -136,6 +136,51 @@ def run_hook_shim_subprocess(
 
 
 @pytest.fixture
+def managed_approval_center_server():
+    """Start one test-owned HTTP Approval Center with fixture cleanup."""
+
+    from agentveil_mcp_proxy.approval.persistent import (
+        build_manifest_for_server,
+        create_persistent_server,
+        save_manifest,
+    )
+    from agentveil_mcp_proxy.approval.manager import ApprovalManager
+    from agentveil_mcp_proxy.approval.server import clear_managed_approval_center_manifest
+    from agentveil_mcp_proxy.cli import load_proxy_config
+    from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore
+
+    started = []
+
+    def start(*, home: Path):
+        proxy_dir = home / "mcp-proxy"
+        assert (proxy_dir / "config.json").is_file()
+        store = ApprovalEvidenceStore(proxy_dir / "evidence.sqlite")
+        server = create_persistent_server(
+            proxy_dir=proxy_dir,
+            evidence_store=store,
+        )
+        manager = ApprovalManager(
+            evidence_store=store,
+            approval_server=server,
+            config=load_proxy_config(proxy_dir / "config.json"),
+            client_id="pytest:managed-approval-center",
+            headless=True,
+            wait_for_decision=False,
+        )
+        manifest = build_manifest_for_server(server)
+        save_manifest(proxy_dir, manifest)
+        started.append((server, store, manager, home))
+        return manifest
+
+    yield start
+
+    for server, store, _manager, home in reversed(started):
+        server.stop()
+        store.close()
+        clear_managed_approval_center_manifest(home)
+
+
+@pytest.fixture
 def runnable_proxy_command(tmp_path: Path) -> str:
     """Return a temp executable that launches ``agentveil_mcp_proxy.cli`` from source."""
 

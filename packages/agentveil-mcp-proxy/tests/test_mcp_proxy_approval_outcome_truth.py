@@ -26,7 +26,6 @@ from agentveil_mcp_proxy.approval.server import (
     ApprovalServer,
     ApprovalServerDecision,
     _proxy_cli_child_env,
-    stop_managed_approval_center,
 )
 from agentveil_mcp_proxy.classification import ToolCallClassifier
 from agentveil_mcp_proxy.cli import init_proxy, quickstart_filesystem_downstream
@@ -279,6 +278,12 @@ def _approval_url(home: Path, request_id: str) -> str | None:
     if manifest is None:
         return None
     return f"{manifest.approval_center_url()}/pending/{request_id}"
+
+
+def _assert_managed_center_reused(home: Path, *, expected_pid: int) -> None:
+    manifest = load_manifest(home / "mcp-proxy")
+    assert manifest is not None
+    assert manifest.pid == expected_pid
 
 
 def _assert_privacy_clean(text: str) -> None:
@@ -676,7 +681,7 @@ def _send_init_and_list(proc: subprocess.Popen, collector: _StdoutCollector) -> 
 
 
 @pytest.mark.allow_demo_managed_approval_center
-def test_process_e2e_a_timeout_truth(tmp_path):
+def test_process_e2e_a_timeout_truth(tmp_path, managed_approval_center_server):
     home = tmp_path / "avp-home"
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
@@ -691,8 +696,10 @@ def test_process_e2e_a_timeout_truth(tmp_path):
     )
     _set_approval_timeout(init.config_path, seconds=1, wait_for_decision=True)
     target = sandbox / "timeout-target.txt"
+    managed_center = managed_approval_center_server(home=home)
     proc, collector = _start_managed_proxy(home, isolated_home)
     try:
+        _assert_managed_center_reused(home, expected_pid=managed_center.pid)
         _send_init_and_list(proc, collector)
         assert proc.stdin is not None
         proc.stdin.write(_json_line({
@@ -746,11 +753,13 @@ def test_process_e2e_a_timeout_truth(tmp_path):
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
-        stop_managed_approval_center(home, require_healthy=False)
 
 
 @pytest.mark.allow_demo_managed_approval_center
-def test_process_e2e_b_approve_downstream_success(tmp_path):
+def test_process_e2e_b_approve_downstream_success(
+    tmp_path,
+    managed_approval_center_server,
+):
     home = tmp_path / "avp-home"
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
@@ -766,8 +775,10 @@ def test_process_e2e_b_approve_downstream_success(tmp_path):
     _set_approval_timeout(init.config_path, seconds=60, wait_for_decision=True)
     target = sandbox / "approve-ok.txt"
     body = "approve-success-body"
+    managed_center = managed_approval_center_server(home=home)
     proc, collector = _start_managed_proxy(home, isolated_home)
     try:
+        _assert_managed_center_reused(home, expected_pid=managed_center.pid)
         _send_init_and_list(proc, collector)
         assert proc.stdin is not None
         proc.stdin.write(_json_line({
@@ -833,7 +844,6 @@ def test_process_e2e_b_approve_downstream_success(tmp_path):
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
-        stop_managed_approval_center(home, require_healthy=False)
 
 
 def _is_error_downstream(tmp_path: Path) -> Path:
@@ -878,7 +888,10 @@ for line in sys.stdin:
 
 
 @pytest.mark.allow_demo_managed_approval_center
-def test_process_e2e_c_approve_downstream_failure(tmp_path):
+def test_process_e2e_c_approve_downstream_failure(
+    tmp_path,
+    managed_approval_center_server,
+):
     home = tmp_path / "avp-home"
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
@@ -924,8 +937,10 @@ def test_process_e2e_c_approve_downstream_failure(tmp_path):
     _set_approval_timeout(init.config_path, seconds=60, wait_for_decision=True)
     target = sandbox / "should-not-exist.txt"
 
+    managed_center = managed_approval_center_server(home=home)
     proc, collector = _start_managed_proxy(home, isolated_home)
     try:
+        _assert_managed_center_reused(home, expected_pid=managed_center.pid)
         _send_init_and_list(proc, collector)
         assert proc.stdin is not None
         proc.stdin.write(_json_line({
@@ -1004,11 +1019,13 @@ def test_process_e2e_c_approve_downstream_failure(tmp_path):
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
-        stop_managed_approval_center(home, require_healthy=False)
 
 
 @pytest.mark.allow_demo_managed_approval_center
-def test_process_e2e_d_deny_and_cancel_regression(tmp_path):
+def test_process_e2e_d_deny_and_cancel_regression(
+    tmp_path,
+    managed_approval_center_server,
+):
     home = tmp_path / "avp-home"
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
@@ -1025,8 +1042,10 @@ def test_process_e2e_d_deny_and_cancel_regression(tmp_path):
     _set_approval_timeout(init.config_path, seconds=60, wait_for_decision=False)
     deny_target = sandbox / "deny-target.txt"
     cancel_target = sandbox / "cancel-target.txt"
+    managed_center = managed_approval_center_server(home=home)
     proc, collector = _start_managed_proxy(home, isolated_home)
     try:
+        _assert_managed_center_reused(home, expected_pid=managed_center.pid)
         _send_init_and_list(proc, collector)
         assert proc.stdin is not None
 
@@ -1161,4 +1180,3 @@ def test_process_e2e_d_deny_and_cancel_regression(tmp_path):
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
-        stop_managed_approval_center(home, require_healthy=False)
