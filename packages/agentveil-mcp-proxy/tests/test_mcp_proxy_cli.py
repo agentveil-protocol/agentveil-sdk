@@ -2967,6 +2967,16 @@ def test_root_help_still_lists_all_commands():
         assert command in help_text
 
 
+def test_approval_center_open_help_lists_record_id(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["approval-center", "open", "--help"])
+    assert exc.value.code == 0
+    text = capsys.readouterr().out
+    assert "--record-id" in text
+    assert "--home" in text
+    assert "--json" in text
+
+
 def test_init_help_retains_next_steps_guidance(capsys):
     with pytest.raises(SystemExit) as exc:
         main(["init", "--help"])

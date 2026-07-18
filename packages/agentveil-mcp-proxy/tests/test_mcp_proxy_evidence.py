@@ -1233,7 +1233,7 @@ def test_schema_version_mismatch_refuses_to_open_for_forward_incompatible(tmp_pa
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute("CREATE TABLE evidence_schema_version (version INTEGER NOT NULL)")
-        conn.execute("INSERT INTO evidence_schema_version (version) VALUES (5)")
+        conn.execute("INSERT INTO evidence_schema_version (version) VALUES (6)")
         conn.commit()
     finally:
         conn.close()
@@ -1265,7 +1265,7 @@ def test_schema_v3_migrates_to_v4_preserving_records_and_chain(tmp_path):
         count = conn.execute("SELECT COUNT(*) FROM pending_approvals").fetchone()[0]
     finally:
         conn.close()
-    assert version == 4
+    assert version == 5
     assert expires_at_notnull == 0
     assert count == 2
 
@@ -1282,7 +1282,7 @@ def test_schema_v3_to_v4_migration_preserves_non_null_expires_at(tmp_path):
     assert migrated.expires_at == 999
 
 
-def test_fresh_v4_schema_allows_null_expires_at(tmp_path):
+def test_fresh_schema_allows_null_expires_at(tmp_path):
     db_path = tmp_path / "evidence.sqlite"
     with ApprovalEvidenceStore(db_path) as store:
         store.write_pending(_record_with_null_expires_at("req-null-fresh"))
@@ -1296,7 +1296,7 @@ def test_fresh_v4_schema_allows_null_expires_at(tmp_path):
         ).fetchone()[0]
     finally:
         conn.close()
-    assert version == 4
+    assert version == 5
     assert expires_at is None
 
 
@@ -1342,7 +1342,7 @@ def test_schema_v2_migrates_to_v4_with_new_nullable_columns_without_data_loss(tm
         columns = {row[1] for row in conn.execute("PRAGMA table_info(pending_approvals)")}
     finally:
         conn.close()
-    assert version == 4
+    assert version == 5
     assert "granted_by_request_id" in columns
     assert "approval_grant_jcs" in columns
 

@@ -263,15 +263,15 @@ def test_schema_v1_migrates_to_v4_atomically_with_chain_backfill(tmp_path):
         version = conn.execute("SELECT version FROM evidence_schema_version").fetchone()[0]
     finally:
         conn.close()
-    assert version == 4
+    assert version == 5
 
 
-def test_schema_v5_rejects_forward_incompatible_version(tmp_path):
+def test_schema_rejects_forward_incompatible_version(tmp_path):
     db_path = tmp_path / "evidence.sqlite"
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute("CREATE TABLE evidence_schema_version (version INTEGER NOT NULL)")
-        conn.execute("INSERT INTO evidence_schema_version (version) VALUES (5)")
+        conn.execute("INSERT INTO evidence_schema_version (version) VALUES (6)")
         conn.commit()
     finally:
         conn.close()

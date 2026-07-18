@@ -25,11 +25,23 @@ from typing import Any, Iterable, Mapping
 import jcs
 
 
-EVIDENCE_SCHEMA_VERSION = 4
+EVIDENCE_SCHEMA_VERSION = 5
 DEFAULT_MAX_RECORDS = 10_000
 GENESIS_PREV_EVENT_HASH = "sha256:" + hashlib.sha256(
     b"agentveil_mcp_proxy/evidence/genesis-v1"
 ).hexdigest()
+
+# Per-request Approval Center browser delivery lifecycle (not a decision/outcome).
+DELIVERY_STATUS_QUEUED = "queued"
+DELIVERY_STATUS_DELIVERED = "delivered"
+DELIVERY_STATUS_NOT_DELIVERED = "not_delivered"
+DELIVERY_STATUS_VISIBLE = "visible"
+DELIVERY_STATUSES = frozenset({
+    DELIVERY_STATUS_QUEUED,
+    DELIVERY_STATUS_DELIVERED,
+    DELIVERY_STATUS_NOT_DELIVERED,
+    DELIVERY_STATUS_VISIBLE,
+})
 
 
 class ApprovalEvidenceError(RuntimeError):
@@ -135,6 +147,7 @@ class PendingApproval:
     granted_by_request_id: str | None = None
     approval_grant_jcs: str | None = None
     action_gate_metadata_jcs: str | None = None
+    delivery_status: str | None = None
 
 
 @dataclass(frozen=True)
@@ -170,6 +183,7 @@ _OPTIONAL_COLUMNS = {
     "granted_by_request_id",
     "approval_grant_jcs",
     "action_gate_metadata_jcs",
+    "delivery_status",
 }
 _TRANSITION_FIELDS = {
     "decision_audit_id",
@@ -535,6 +549,68 @@ class ApprovalEvidenceStore:
                     "UPDATE pending_approvals SET action_gate_metadata_jcs = ? "
                     "WHERE request_id = ?",
                     (metadata_jcs, request_id),
+                )
+                self._rebuild_chain_locked()
+                self._conn.commit()
+                self._secure_auxiliary_files()
+            except Exception:
+                self._conn.rollback()
+                raise
+        updated = self.get_pending(request_id)
+        if updated is None:
+            raise ApprovalEvidenceNotFoundError(f"approval record not found: {request_id}")
+        return updated
+
+    def annotate_delivery_status(
+        self,
+        request_id: str,
+        *,
+        delivery_status: str,
+    ) -> PendingApproval:
+        """Persist one request-local Approval Center delivery lifecycle status.
+
+        Transitions are monotonic:
+        queued → not_delivered | delivered | visible;
+        not_delivered → delivered | visible;
+        delivered → visible;
+        visible is terminal for this lifecycle.
+        """
+
+        if delivery_status not in DELIVERY_STATUSES:
+            raise ApprovalEvidenceTransitionError(
+                f"delivery_status must be one of {sorted(DELIVERY_STATUSES)}"
+            )
+        with self._lock:
+            self._begin()
+            try:
+                row = self._conn.execute(
+                    "SELECT delivery_status, status FROM pending_approvals WHERE request_id = ?",
+                    (request_id,),
+                ).fetchone()
+                if row is None:
+                    raise ApprovalEvidenceNotFoundError(
+                        f"approval record not found: {request_id}"
+                    )
+                current = row["delivery_status"]
+                if not _delivery_status_transition_allowed(current, delivery_status):
+                    self._conn.rollback()
+                    updated = self.get_pending(request_id)
+                    if updated is None:
+                        raise ApprovalEvidenceNotFoundError(
+                            f"approval record not found: {request_id}"
+                        )
+                    return updated
+                if current == delivery_status:
+                    self._conn.rollback()
+                    updated = self.get_pending(request_id)
+                    if updated is None:
+                        raise ApprovalEvidenceNotFoundError(
+                            f"approval record not found: {request_id}"
+                        )
+                    return updated
+                self._conn.execute(
+                    "UPDATE pending_approvals SET delivery_status = ? WHERE request_id = ?",
+                    (delivery_status, request_id),
                 )
                 self._rebuild_chain_locked()
                 self._conn.commit()
@@ -1021,6 +1097,7 @@ class ApprovalEvidenceStore:
             "granted_by_request_id": "TEXT NULL",
             "approval_grant_jcs": "TEXT NULL",
             "action_gate_metadata_jcs": "TEXT NULL",
+            "delivery_status": "TEXT NULL",
         }.items():
             if column not in existing:
                 self._conn.execute(f"ALTER TABLE pending_approvals ADD COLUMN {column} {column_type}")
@@ -1029,10 +1106,12 @@ class ApprovalEvidenceStore:
         if version in {1, 2}:
             self._rebuild_chain_locked()
             self._set_schema_version_locked(3)
-            self._migrate_v3_to_v4_locked()
-            return
+            version = 3
         if version == 3:
             self._migrate_v3_to_v4_locked()
+            version = 4
+        if version == 4:
+            self._migrate_v4_to_v5_locked()
             return
         raise ApprovalEvidenceSchemaError(f"evidence schema version {version} is unsupported")
 
@@ -1047,8 +1126,14 @@ class ApprovalEvidenceStore:
         )
         self._conn.execute("DROP TABLE pending_approvals")
         self._conn.execute("ALTER TABLE pending_approvals_new RENAME TO pending_approvals")
+        self._set_schema_version_locked(4)
+
+    def _migrate_v4_to_v5_locked(self) -> None:
+        """Add delivery_status (if needed) and rebuild the hash chain for v5."""
+
+        self._ensure_optional_columns()
+        self._rebuild_chain_locked()
         self._set_schema_version_locked(EVIDENCE_SCHEMA_VERSION)
-        self._validate_chain_locked()
 
     def _set_schema_version_locked(self, version: int) -> None:
         self._conn.execute("DELETE FROM evidence_schema_version")
@@ -1167,6 +1252,33 @@ def _record_dict(record: PendingApproval) -> dict[str, Any]:
     return {column: getattr(record, column) for column in _COLUMNS}
 
 
+def _delivery_status_transition_allowed(
+    current: str | None,
+    new_status: str,
+) -> bool:
+    """Return True when a delivery_status transition is monotonic."""
+
+    if current is None or current == new_status:
+        return True
+    allowed = {
+        DELIVERY_STATUS_QUEUED: {
+            DELIVERY_STATUS_NOT_DELIVERED,
+            DELIVERY_STATUS_DELIVERED,
+            DELIVERY_STATUS_VISIBLE,
+        },
+        DELIVERY_STATUS_NOT_DELIVERED: {
+            DELIVERY_STATUS_DELIVERED,
+            DELIVERY_STATUS_VISIBLE,
+        },
+        DELIVERY_STATUS_DELIVERED: {DELIVERY_STATUS_VISIBLE},
+        DELIVERY_STATUS_VISIBLE: set(),
+    }
+    if current not in DELIVERY_STATUSES:
+        # Unknown legacy value: allow only forward to a known status once.
+        return new_status in DELIVERY_STATUSES
+    return new_status in allowed.get(current, set())
+
+
 def record_hash(record: PendingApproval | Mapping[str, Any]) -> str:
     """Return the canonical sha256 hash for one evidence record."""
 
@@ -1245,7 +1357,8 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
     user_decision_timestamp INTEGER NULL,
     granted_by_request_id TEXT NULL,
     approval_grant_jcs TEXT NULL,
-    action_gate_metadata_jcs TEXT NULL
+    action_gate_metadata_jcs TEXT NULL,
+    delivery_status TEXT NULL
 )
 """
 
@@ -1265,6 +1378,11 @@ __all__ = [
     "ApprovalEvidenceStore",
     "ApprovalEvidenceTransitionError",
     "ApprovalStatus",
+    "DELIVERY_STATUS_DELIVERED",
+    "DELIVERY_STATUS_NOT_DELIVERED",
+    "DELIVERY_STATUS_QUEUED",
+    "DELIVERY_STATUS_VISIBLE",
+    "DELIVERY_STATUSES",
     "GENESIS_PREV_EVENT_HASH",
     "PendingApproval",
     "RecoveryReport",

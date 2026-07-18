@@ -93,8 +93,9 @@ from agentveil_mcp_proxy.persistence_path_guard import (
     scan_instruction_surfaces,
 )
 from agentveil_mcp_proxy.quickstart_filesystem import (
-    filter_agentveil_control_paths,
+    filter_workspace_listing_paths,
     is_agentveil_control_relative_path,
+    is_hidden_listing_relative_path,
     quickstart_sandbox_root_from_downstream_args,
     requested_path_targets_agentveil_control,
 )
@@ -141,8 +142,10 @@ from agentveil_mcp_proxy.runtime_gate import (
     RuntimeGateUntrustedError,
 )
 from agentveil_mcp_proxy.evidence.observability import (
+    APPROVAL_NOT_DELIVERED_USER_MESSAGE,
     APPROVAL_REQUIRED_INSTRUCTIONS,
     APPROVAL_REQUIRED_USER_MESSAGE,
+    approval_center_open_recovery_command,
     enrich_mcp_error_contract,
     mcp_error_user_message,
     reason_has_dedicated_user_message,
@@ -985,9 +988,18 @@ def _approval_required_error(
         data["record_status"] = approval_outcome.status
         # Tokenized approval_url stays internal for browser/TTY delivery only.
         # Do not put the capability URL in MCP error.data or error.message.
+        delivery_status = approval_outcome.delivery_status
+        if delivery_status:
+            data["delivery_status"] = delivery_status
         data["instructions"] = APPROVAL_REQUIRED_INSTRUCTIONS
         data["proof_inspection_hint"] = LOCAL_PROOF_AGENT_INSPECTION_HINT
-        resolved_message = APPROVAL_REQUIRED_USER_MESSAGE
+        if delivery_status == "not_delivered":
+            data["recovery_command"] = approval_center_open_recovery_command(
+                approval_outcome.request_id
+            )
+            resolved_message = APPROVAL_NOT_DELIVERED_USER_MESSAGE
+        else:
+            resolved_message = APPROVAL_REQUIRED_USER_MESSAGE
     if enrich_guidance:
         redirect_original_id = (
             approval_outcome.request_id
@@ -2519,11 +2531,13 @@ class McpPassthrough:
             return response
         sandbox = quickstart_sandbox_root_from_downstream_args(list(self.downstream.args))
         if sandbox is not None:
-            filtered = filter_agentveil_control_paths(sandbox, text.splitlines())
+            filtered = filter_workspace_listing_paths(sandbox, text.splitlines())
         else:
             filtered = [
                 path for path in text.splitlines()
-                if path and not is_agentveil_control_relative_path(path)
+                if path
+                and not is_hidden_listing_relative_path(path)
+                and not is_agentveil_control_relative_path(path)
             ]
         sanitized = dict(response)
         sanitized_result = dict(result)

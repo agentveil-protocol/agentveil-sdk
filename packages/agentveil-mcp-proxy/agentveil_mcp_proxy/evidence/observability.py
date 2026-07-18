@@ -419,11 +419,23 @@ APPROVAL_REQUIRED_INSTRUCTIONS = (
     "without changing tool, target, or payload. Do not ask the user for another message."
 )
 APPROVAL_REQUIRED_USER_MESSAGE = APPROVAL_REQUIRED_INSTRUCTIONS
+APPROVAL_NOT_DELIVERED_USER_MESSAGE = (
+    "Approval required. The pending approval card was created but did not open automatically. "
+    "Ask the operator to run the recovery command, then wait for approval or denial. "
+    "After approval, immediately retry this exact same AgentVeil MCP tool call yourself "
+    "without changing tool, target, or payload. Do not ask the user for another message."
+)
 _APPROVAL_REQUIRED_NEXT_STEP = (
     "Wait for the user to approve or deny in the approval page. "
     "After approval, immediately retry this exact same AgentVeil MCP tool call yourself "
     "without changing tool, target, or payload. Do not ask the user for another message."
 )
+
+
+def approval_center_open_recovery_command(record_id: str) -> str:
+    """Return an operator recovery command containing the pending record ID."""
+
+    return f"agentveil-mcp-proxy approval-center open --record-id {record_id}"
 APPROVAL_CONTINUE_AGENT_PROMPT = (
     "Immediately retry the exact same AgentVeil MCP tool call that required approval. "
     "Do not ask the user for another message. "

@@ -248,6 +248,8 @@ def build_event_show_entry(
         entry["target_reached"] = target_reached_for_evidence_record(record)
     if record.result_status is not None:
         entry["execution_status"] = record.result_status
+    if record.delivery_status:
+        entry["delivery_status"] = record.delivery_status
     next_step = _next_step_for_decision(decision)
     if next_step is not None:
         entry["next_step"] = next_step

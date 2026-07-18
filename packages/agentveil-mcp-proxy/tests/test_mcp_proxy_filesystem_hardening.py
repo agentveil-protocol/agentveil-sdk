@@ -594,6 +594,79 @@ def test_list_workspace_excludes_agentveil_control_artifacts(tmp_path, monkeypat
     _assert_no_local_path_leaks(out.getvalue(), json.dumps(metadata))
 
 
+def test_list_workspace_hides_git_and_avp_metadata_but_keeps_useful_paths(
+    tmp_path,
+    monkeypatch,
+):
+    """AV-08: list_workspace must not disclose .git/** or .avp/** metadata."""
+
+    home = tmp_path / "home"
+    sandbox = tmp_path / "sandbox"
+    _init_quickstart(home, sandbox)
+    _seed_sandbox_file(sandbox, "ordinary.txt", "visible")
+    _seed_sandbox_file(sandbox, ".env.example", "ENV=example")
+    _seed_sandbox_file(sandbox, ".github/workflows/ci.yml", "name: ci")
+    _seed_sandbox_file(sandbox, "docs/avp-guide.md", "guide")
+    _seed_sandbox_file(sandbox, "docs/my.git.notes", "notes")
+    _seed_sandbox_file(sandbox, "docs/approval-center.manifest.json", '{"note":"user"}')
+    _seed_sandbox_file(sandbox, ".git/config", "secret-git-config")
+    _seed_sandbox_file(sandbox, ".avp/state.json", "secret-avp-state")
+    _seed_agentveil_control_artifacts(sandbox)
+    (sandbox / "alias-git").symlink_to(sandbox / ".git", target_is_directory=True)
+    (sandbox / "alias-avp-state.json").symlink_to(sandbox / ".avp" / "state.json")
+    _block_avp_agent(monkeypatch)
+
+    out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_tool_call("list_workspace", {}, call_id="list-av08")),
+        out=out,
+        approval_ui_mode="none",
+    ) == 0
+
+    response = _responses(out.getvalue())[0]
+    listing = response["result"]["content"][0]["text"]
+    listed = [line for line in listing.splitlines() if line.strip()]
+    for expected in (
+        "ordinary.txt",
+        ".env.example",
+        ".github/workflows/ci.yml",
+        "docs/avp-guide.md",
+        "docs/my.git.notes",
+        "docs/approval-center.manifest.json",
+    ):
+        assert expected in listed, listed
+    for forbidden in (
+        ".git/config",
+        ".avp/state.json",
+        MANIFEST_REL,
+        "alias-git/config",
+        "alias-avp-state.json",
+    ):
+        assert forbidden not in listed, listed
+        assert forbidden not in listing
+    assert "secret-git-config" not in out.getvalue()
+    assert "secret-avp-state" not in out.getvalue()
+    assert FIXTURE_SESSION_TOKEN not in out.getvalue()
+    _assert_no_local_path_leaks(out.getvalue())
+
+    # Read/write outside .avp/mcp-proxy remain unchanged by the listing filter.
+    read_out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_tool_call(
+            "read_file",
+            {"path": ".git/config"},
+            call_id="read-git-still-allowed",
+        )),
+        out=read_out,
+        approval_ui_mode="none",
+    ) == 0
+    read_response = _responses(read_out.getvalue())[0]
+    assert "error" not in read_response, read_response
+    assert read_response["result"]["content"][0]["text"] == "secret-git-config"
+
+
 @pytest.mark.parametrize(
     "manifest_path",
     [

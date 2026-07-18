@@ -188,9 +188,11 @@ def test_failed_browser_delivery_returns_approval_required_without_full_timeout(
         assert outcome.status == ApprovalStatus.PENDING.value
         assert outcome.approval_url is not None
         assert outcome.approval_url.startswith(f"http://{server.host}:{server.port}/")
+        assert outcome.delivery_status == "not_delivered"
         record = store.get_pending(outcome.request_id)
         assert record is not None
         assert record.status == ApprovalStatus.PENDING.value
+        assert record.delivery_status == "not_delivered"
         assert outcome.request_id not in manager._browser_opened_request_ids
         outcome2 = manager.request_approval(
             _classification(manager.config),
@@ -237,6 +239,8 @@ def test_per_request_browser_opens_distinct_pending_cards(tmp_path):
         assert server.approval_center_url() not in opened
         assert first.request_id in manager._browser_opened_request_ids
         assert second.request_id in manager._browser_opened_request_ids
+        assert store.get_pending(first.request_id).delivery_status == "delivered"
+        assert store.get_pending(second.request_id).delivery_status == "delivered"
     finally:
         server.stop()
         store.close()
@@ -681,6 +685,9 @@ def test_fail_soft_response_excludes_sensitive_fields(tmp_path):
         )
         serialized = json.dumps(mcp_response)
         assert "approval_url" not in mcp_response["error"]["data"]
+        assert mcp_response["error"]["data"]["delivery_status"] == "not_delivered"
+        assert "recovery_command" in mcp_response["error"]["data"]
+        assert "approval-center open --record-id" in mcp_response["error"]["data"]["recovery_command"]
         assert server.session_token not in serialized
         assert f"/approval/{server.session_token}" not in serialized
         assert "csrf_token" not in serialized

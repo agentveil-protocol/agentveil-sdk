@@ -215,13 +215,12 @@ def _windows_process_alive(pid: int) -> bool:
 
 def _health_check(manifest: ApprovalCenterManifest) -> bool:
     try:
-        return (
-            loopback_get_status(
-                manifest.approval_center_url(),
-                timeout=HEALTH_TIMEOUT_SECONDS,
-            )
-            == 200
+        status = loopback_get_status(
+            manifest.approval_center_url(),
+            timeout=HEALTH_TIMEOUT_SECONDS,
         )
+        # 200 = list/empty center; 302 = single pending redirects to its card.
+        return status in {200, 302}
     except (OSError, TimeoutError, ValueError):
         return False
 
