@@ -6,6 +6,27 @@ All notable changes to the `agentveil` SDK.
 
 No unreleased changes.
 
+## [0.7.32-mcp-proxy] - 2026-07-18
+
+Public MCP Proxy path-boundary and Approval Center recovery corrective.
+
+### MCP Proxy changed
+- Canonicalized in-workspace paths containing internal parent components
+  while preserving denial of real escapes, symlink escapes, and control paths.
+- Hid `.git/**` and `.avp/**`, including resolved aliases, from
+  `list_workspace` without hiding useful similarly named user files.
+- Added per-request Approval Center delivery state and a bounded
+  recovery command for pending cards when automatic browser delivery fails.
+- Added recovery CLI validation and schema migration for existing
+  delivery evidence records.
+
+### MCP Proxy verification
+- Natural live Approve and Deny acceptance passed without reload or manual URL
+  lookup.
+- The combined local public SDK gate passed with 1769 tests and one skip.
+- GitHub Actions passed across Ubuntu 3.10–3.13, Windows, macOS, and managed
+  Approval Center E2E before merge.
+
 ## [0.7.30-mcp-proxy] / [0.7.21-sdk] - 2026-07-16
 
 Paired public SDK and MCP Proxy release candidate. The paired versions keep
