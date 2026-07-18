@@ -3059,7 +3059,7 @@ def test_demo_auto_approve_runs_real_flow(tmp_path, capsys):
     payload = json.loads(text)
     assert payload["ok"] is True
     assert payload["demo_timeline"] == "redirect -> approval -> proof"
-    assert payload["local_proof"] == "approval required -> approved -> target reached"
+    assert payload["local_proof"] == "pending -> approved -> executed"
     assert payload["target_reached"] is True
     assert "redirect_playbook" not in text
     assert "risk_family" not in text
@@ -3081,7 +3081,7 @@ def test_demo_human_output_is_bounded_without_secrets(tmp_path, capsys):
     assert proxy_cli._DEMO_BOUNDARY_LINE in text
     assert proxy_cli._DEMO_REDIRECT_LINE in text
     assert "Action continued: demo file written." in text
-    assert "Local proof: approval required -> approved -> target reached" in text
+    assert "Local proof: pending -> approved -> executed" in text
     assert "redirect_playbook" not in text
     assert "risk_family" not in text
     assert "/approval/" not in text

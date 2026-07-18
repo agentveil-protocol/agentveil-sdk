@@ -11,6 +11,15 @@ from pathlib import Path
 import pytest
 import webbrowser
 
+
+_OPERATOR_APPROVAL_URLS: dict[str, str] = {}
+
+
+def operator_approval_url(record_id: str) -> str:
+    """Return a URL captured from the operator-side ApprovalServer register path."""
+
+    return _OPERATOR_APPROVAL_URLS[record_id]
+
 PLATFORM_WINDOWS = "nt"
 PLATFORM_POSIX = "posix"
 HOOK_SHIM_WINDOWS = "agentveil-cursor-hook.cmd"
@@ -151,6 +160,17 @@ def _block_approval_browser_and_detached_spawn(
     """Do not open a real browser or spawn detached approval-center serve in tests."""
 
     from agentveil_mcp_proxy.approval.notification import BrowserOpenResult
+    from agentveil_mcp_proxy.approval.server import ApprovalServer
+
+    _OPERATOR_APPROVAL_URLS.clear()
+    original_register = ApprovalServer.register
+
+    def _register_and_capture(server: ApprovalServer, prompt):
+        url = original_register(server, prompt)
+        _OPERATOR_APPROVAL_URLS[prompt.request_id] = url
+        return url
+
+    monkeypatch.setattr(ApprovalServer, "register", _register_and_capture)
 
     monkeypatch.setattr(webbrowser, "open", lambda _url: False)
 

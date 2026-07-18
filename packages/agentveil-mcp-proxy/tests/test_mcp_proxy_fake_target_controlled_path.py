@@ -16,6 +16,7 @@ import pytest
 import webbrowser
 
 import agentveil_mcp_proxy.cli as proxy_cli
+from conftest import operator_approval_url
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore, ApprovalStatus, build_evidence_bundle
 from agentveil_mcp_proxy.evidence.proof import EvidenceVerificationError, verify_evidence_bundle
 from agentveil_mcp_proxy.evidence.observability import parse_controlled_path_metadata
@@ -386,7 +387,8 @@ def test_approval_retry_reaches_fake_target_after_approve(tmp_path, monkeypatch)
                 break
             time.sleep(0.02)
         first_response = _responses(client_out.getvalue())[0]
-        approval_url = first_response["error"]["data"]["approval_url"]
+        pending_id = first_response["error"]["data"]["record_id"]
+        approval_url = operator_approval_url(pending_id)
         assert first_response["error"]["data"]["status"] == "approval_required"
         assert not fake_target_reached(outcome_path)
 

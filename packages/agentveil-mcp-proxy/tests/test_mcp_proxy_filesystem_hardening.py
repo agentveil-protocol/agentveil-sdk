@@ -16,6 +16,7 @@ import pytest
 import webbrowser
 
 import agentveil_mcp_proxy.cli as proxy_cli
+from conftest import operator_approval_url
 from agentveil_mcp_proxy.cli import init_proxy, quickstart_filesystem_downstream, run_proxy
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore, ApprovalStatus
 from agentveil_mcp_proxy.evidence.observability import parse_controlled_path_metadata
@@ -189,7 +190,8 @@ class _StagedStdin(io.TextIOBase):
 
 
 def _approve_first_pending(home: Path, response: dict) -> None:
-    approval_url = response["error"]["data"]["approval_url"]
+    pending_id = response["error"]["data"]["record_id"]
+    approval_url = operator_approval_url(pending_id)
     with httpx.Client() as client:
         page = client.get(approval_url)
         page.raise_for_status()
@@ -200,7 +202,6 @@ def _approve_first_pending(home: Path, response: dict) -> None:
             "approval_scope": "exact",
             "csrf_token": match.group(1),
         }).raise_for_status()
-    pending_id = response["error"]["data"]["record_id"]
     deadline = time.monotonic() + 5
     with _evidence_store(home) as store:
         record = store.get_pending(pending_id)
@@ -428,7 +429,8 @@ def test_denied_write_leaves_filesystem_unchanged(tmp_path, monkeypatch):
         while time.monotonic() < deadline and not client_out.getvalue().strip():
             time.sleep(0.02)
         first = _responses(client_out.getvalue())[0]
-        approval_url = first["error"]["data"]["approval_url"]
+        pending_id = first["error"]["data"]["record_id"]
+        approval_url = operator_approval_url(pending_id)
         with httpx.Client() as client:
             page = client.get(approval_url)
             match = CSRF_RE.search(page.text)

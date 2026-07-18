@@ -148,8 +148,10 @@ def main() -> int:
         pending_response = _responses(pending_out.getvalue())[0]
         assert pending_response["error"]["data"]["status"] == "approval_required"
         assert not fake_target_reached(outcome_path)
-        approval_url = pending_response["error"]["data"].get("approval_url")
-        assert isinstance(approval_url, str) and approval_url
+        record_id = pending_response["error"]["data"]["record_id"]
+        approval_url = f"{manifest.approval_center_url()}/pending/{record_id}"
+        assert "approval_url" not in pending_response["error"]["data"]
+        assert approval_url not in json.dumps(pending_response)
         assert approval_url.startswith(f"http://127.0.0.1:{manifest.port}")
 
         with httpx.Client() as client:

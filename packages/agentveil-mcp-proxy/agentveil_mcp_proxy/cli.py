@@ -30,7 +30,7 @@ import tempfile
 import threading
 import time
 from typing import Any, Iterable, Mapping, TextIO
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import HTTPCookieProcessor, Request, build_opener
 
 from nacl.signing import SigningKey
@@ -52,6 +52,7 @@ from agentveil_mcp_proxy.approval.persistent import (
     PersistentApprovalCenterError,
     build_manifest_for_server,
     create_persistent_server,
+    load_manifest,
     save_manifest,
 )
 from agentveil_mcp_proxy.classification import ToolCallClassifier
@@ -3373,10 +3374,20 @@ def _demo_approval_error_data(response: dict[str, Any]) -> dict[str, Any]:
     data = error.get("data")
     if not isinstance(data, dict) or data.get("status") != "approval_required":
         raise ProxyCliError("demo approval_required payload missing", exit_code=1)
-    approval_url = data.get("approval_url")
-    if not isinstance(approval_url, str) or not approval_url:
-        raise ProxyCliError("demo approval_required missing approval_url", exit_code=1)
+    record_id = data.get("record_id")
+    if not isinstance(record_id, str) or not record_id:
+        raise ProxyCliError("demo approval_required missing record_id", exit_code=1)
     return data
+
+
+def _demo_operator_approval_url(home: Path, *, record_id: str) -> str:
+    """Resolve the operator-only approval URL from the local managed manifest."""
+
+    manifest = load_manifest(proxy_paths(home, None).proxy_dir)
+    if manifest is None:
+        raise ProxyCliError("demo approval center manifest unavailable", exit_code=1)
+    # claim-check: allow "safe" is urllib.parse.quote parameter syntax, not a security claim.
+    return f"{manifest.approval_center_url()}/pending/{quote(record_id, safe='')}"
 
 
 def _demo_local_proof_line(home: Path, *, observed_approval_required: bool) -> str:
@@ -3405,13 +3416,14 @@ def _demo_local_proof_line(home: Path, *, observed_approval_required: bool) -> s
         raise ProxyCliError("demo local proof decision path missing", exit_code=1)
     if "redirected" in evidence_path:
         raise ProxyCliError("demo proof must not claim redirect in evidence", exit_code=1)
-    if "target reached" not in evidence_path:
-        raise ProxyCliError("demo local proof missing target reached", exit_code=1)
+    if "executed" not in evidence_path:
+        raise ProxyCliError("demo local proof missing executed outcome", exit_code=1)
     path_labels = {part.strip() for part in evidence_path.split("->")}
-    if path_labels == {"approved", "target reached"}:
-        return "approval required -> approved -> target reached"
-    if evidence_path == "approval required -> approved -> target reached":
-        return evidence_path
+    if path_labels in ({"approved", "executed"}, {"pending", "approved", "executed"}):
+        # approval_required was observed directly from the first MCP response;
+        # the durable record may already be updated in-place by the time proof
+        # is rendered, so normalize order and retain the observed pending step.
+        return "pending -> approved -> executed"
     raise ProxyCliError(f"demo local proof unexpected: {evidence_path}", exit_code=1)
 
 
@@ -3497,22 +3509,26 @@ def run_redirect_approval_demo_cli(
             client.notify("notifications/initialized", {})
             pending = client.call("demo-write-1", "tools/call", write_call)
             approval_data = _demo_approval_error_data(pending)
+            approval_url = _demo_operator_approval_url(
+                home,
+                record_id=str(approval_data["record_id"]),
+            )
             if target_file.exists():
                 raise ProxyCliError("demo target file existed before approval", exit_code=1)
 
             if not output_json:
                 print("Approval required.", file=sink)
                 if demo_auto_approve:
-                    _demo_http_approve(str(approval_data["approval_url"]))
+                    _demo_http_approve(approval_url)
                 else:
-                    print(f"Approval Center URL: {approval_data['approval_url']}", file=sink)
+                    print(f"Approval Center URL: {approval_url}", file=sink)
                     print(
                         "Open the URL, approve the request, then press Enter here to continue.",
                         file=sink,
                     )
                     input()
             elif demo_auto_approve:
-                _demo_http_approve(str(approval_data["approval_url"]))
+                _demo_http_approve(approval_url)
             else:
                 raise ProxyCliError(
                     "demo JSON output requires --demo-auto-approve for non-interactive runs",

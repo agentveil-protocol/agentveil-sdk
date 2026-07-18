@@ -127,6 +127,7 @@ def _hard_block_data(reason: str) -> dict[str, Any]:
         "reason_code": reason,
         "approval_possible": False,
         "retry_after_approval": False,
+        "target_reached": False,
         "next_step": "This action cannot be approved. Adjust the tool call or local policy.",
     }
 

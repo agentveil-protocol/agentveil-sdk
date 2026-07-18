@@ -22,6 +22,7 @@ for path in (ROOT, TESTS_ROOT):
         sys.path.insert(0, str(path))
 
 from agentveil_mcp_proxy.cli import init_proxy, run_proxy
+from agentveil_mcp_proxy.approval.persistent import load_manifest
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore, ApprovalStatus
 from agentveil_mcp_proxy.evidence.observability import parse_controlled_path_metadata
 from mcp_fake_downstream import fake_target_reached, tool_entry, write_downstream
@@ -263,7 +264,11 @@ def main() -> int:
             assert pending["error"]["data"]["status"] == "approval_required"
             assert not fake_target_reached(outcome_path)
 
-            approval_url = pending["error"]["data"]["approval_url"]
+            record_id = pending["error"]["data"]["record_id"]
+            manifest = load_manifest(home / "mcp-proxy")
+            assert manifest is not None
+            approval_url = f"{manifest.approval_center_url()}/pending/{record_id}"
+            assert approval_url not in json.dumps(pending)
             with httpx.Client() as client:
                 page = client.get(approval_url)
                 page.raise_for_status()
@@ -276,7 +281,6 @@ def main() -> int:
                     "csrf_token": match.group(1),
                 }).raise_for_status()
 
-            record_id = pending["error"]["data"]["record_id"]
             with ApprovalEvidenceStore(home / "mcp-proxy" / "evidence.sqlite") as store:
                 approved_deadline = time.monotonic() + 5
                 record = store.get_pending(record_id)

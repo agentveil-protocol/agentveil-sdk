@@ -50,6 +50,7 @@ def _hard_block_data(reason: str, *, reason_code: str | None = None) -> dict[str
         "reason_code": reason_code or reason,
         "approval_possible": False,
         "retry_after_approval": False,
+        "target_reached": False,
         "next_step": "This action cannot be approved. Adjust the tool call or local policy.",
     }
 
