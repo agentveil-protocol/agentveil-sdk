@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 
 try:
@@ -56,7 +57,7 @@ def test_proxy_package_depends_on_public_sdk():
         pyproject = tomllib.load(f)
 
     dependencies = pyproject["project"].get("dependencies", [])
-    assert pyproject["project"]["version"] == "0.7.30"
+    assert pyproject["project"]["version"] == "0.7.31"
     assert "agentveil>=0.7.21,<0.8" in dependencies
 
 
@@ -67,6 +68,24 @@ def test_release_acceptance_verifier_pins_proxy_and_backend_signers():
         "did:key:zProxy",
         ["did:key:zBackend1", "did:key:zProxy", "did:key:zBackend2"],
     ) == ["did:key:zProxy", "did:key:zBackend1", "did:key:zBackend2"]
+
+
+def test_release_acceptance_resolves_operator_url_from_manifest(tmp_path):
+    acceptance = _release_acceptance_module()
+    proxy_dir = tmp_path / "mcp-proxy"
+    proxy_dir.mkdir()
+    (proxy_dir / "approval-center.manifest.json").write_text(
+        json.dumps({
+            "host": "127.0.0.1",
+            "port": 43127,
+            "session_token": "operator-token",
+        }),
+        encoding="utf-8",
+    )
+
+    assert acceptance.operator_approval_url(tmp_path, "request/one") == (
+        "http://127.0.0.1:43127/approval/operator-token/pending/request%2Fone"
+    )
 
 
 def test_installed_wheel_acceptance_runners_default_to_build_role():

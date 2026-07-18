@@ -24,7 +24,7 @@ import tempfile
 import threading
 import time
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import HTTPCookieProcessor, Request, build_opener
 
 
@@ -261,6 +261,27 @@ def approve_url(approval_url: str) -> None:
             raise AcceptanceError(f"approval POST returned HTTP {response.status}")
 
 
+def operator_approval_url(home: Path, record_id: str) -> str:
+    """Resolve a pending-card URL from the local operator manifest."""
+
+    manifest_path = home / "mcp-proxy" / "approval-center.manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        host = str(manifest["host"])
+        port = int(manifest["port"])
+        session_token = str(manifest["session_token"])
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise AcceptanceError("Approval Center operator manifest unavailable") from exc
+    if host not in {"127.0.0.1", "localhost", "::1"} or not (1 <= port <= 65535):
+        raise AcceptanceError("Approval Center operator manifest is not loopback-bound")
+    if not session_token or not record_id:
+        raise AcceptanceError("Approval Center operator manifest or record id is incomplete")
+    # claim-check: allow "safe" is urllib.parse.quote parameter syntax, not a security claim.
+    token_path = quote(session_token, safe="")
+    record_path = quote(record_id, safe="")  # claim-check: allow "safe" is urllib.parse.quote syntax.
+    return f"http://{host}:{port}/approval/{token_path}/pending/{record_path}"
+
+
 def assert_tool_success(response: dict[str, Any], request_id: str) -> dict[str, Any]:
     if response.get("id") != request_id or "result" not in response:
         raise AcceptanceError(f"expected success response for {request_id}: {response}")
@@ -361,10 +382,12 @@ def run_acceptance(args: argparse.Namespace) -> None:
             data = error.get("data")
             if not isinstance(data, dict):
                 raise AcceptanceError(f"approval_required data missing: {risky}")
-            approval_url = data.get("approval_url")
             record_id = data.get("record_id")
-            if data.get("status") != "approval_required" or not record_id or not approval_url:
+            if data.get("status") != "approval_required" or not record_id:
                 raise AcceptanceError(f"approval_required response missing fields: {data}")
+            if "approval_url" in data:
+                raise AcceptanceError("agent-visible approval response exposed approval_url")
+            approval_url = operator_approval_url(home, str(record_id))
             if (sandbox / "acceptance-write.txt").exists():
                 raise AcceptanceError("risky write reached downstream before approval")
 
