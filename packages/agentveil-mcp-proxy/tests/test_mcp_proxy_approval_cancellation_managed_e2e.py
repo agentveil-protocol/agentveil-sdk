@@ -20,7 +20,6 @@ from agentveil_mcp_proxy.approval.persistent import load_manifest
 from agentveil_mcp_proxy.approval.server import (
     _proxy_cli_child_env,
     scan_cmdline_proven_managed_center_pids,
-    stop_managed_approval_center,
 )
 from agentveil_mcp_proxy.cli import init_proxy, quickstart_filesystem_downstream
 from agentveil_mcp_proxy.evidence import ApprovalStatus
@@ -147,7 +146,7 @@ def test_managed_center_startup_timeout_does_not_wait_for_child_stderr_eof(tmp_p
 @pytest.mark.allow_demo_managed_approval_center
 def test_run_proxy_cancelled_request_shows_terminal_managed_center_page(
     tmp_path,
-    managed_approval_center_process,
+    managed_approval_center_server,
 ):
     home = tmp_path / "avp-home"
     sandbox = tmp_path / "sandbox"
@@ -184,10 +183,7 @@ def test_run_proxy_cancelled_request_shows_terminal_managed_center_page(
         )
     env = _proxy_cli_child_env(parent_env=parent_env)
 
-    managed_center = managed_approval_center_process(
-        home=home,
-        isolated_home=isolated_home,
-    )
+    managed_center = managed_approval_center_server(home=home)
 
     proc = subprocess.Popen(
         [
@@ -315,8 +311,7 @@ def test_run_proxy_cancelled_request_shows_terminal_managed_center_page(
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
-        stop_managed_approval_center(home, require_healthy=False)
-    cleanup_deadline = time.monotonic() + 5.0
+        cleanup_deadline = time.monotonic() + 5.0
     while (
         scan_cmdline_proven_managed_center_pids(home)
         and time.monotonic() < cleanup_deadline

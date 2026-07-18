@@ -26,7 +26,6 @@ from agentveil_mcp_proxy.approval.server import (
     ApprovalServer,
     ApprovalServerDecision,
     _proxy_cli_child_env,
-    stop_managed_approval_center,
 )
 from agentveil_mcp_proxy.classification import ToolCallClassifier
 from agentveil_mcp_proxy.cli import init_proxy, quickstart_filesystem_downstream
@@ -682,7 +681,7 @@ def _send_init_and_list(proc: subprocess.Popen, collector: _StdoutCollector) -> 
 
 
 @pytest.mark.allow_demo_managed_approval_center
-def test_process_e2e_a_timeout_truth(tmp_path, managed_approval_center_process):
+def test_process_e2e_a_timeout_truth(tmp_path, managed_approval_center_server):
     home = tmp_path / "avp-home"
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
@@ -697,10 +696,7 @@ def test_process_e2e_a_timeout_truth(tmp_path, managed_approval_center_process):
     )
     _set_approval_timeout(init.config_path, seconds=1, wait_for_decision=True)
     target = sandbox / "timeout-target.txt"
-    managed_center = managed_approval_center_process(
-        home=home,
-        isolated_home=isolated_home,
-    )
+    managed_center = managed_approval_center_server(home=home)
     proc, collector = _start_managed_proxy(home, isolated_home)
     try:
         _assert_managed_center_reused(home, expected_pid=managed_center.pid)
@@ -757,13 +753,12 @@ def test_process_e2e_a_timeout_truth(tmp_path, managed_approval_center_process):
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
-        stop_managed_approval_center(home, require_healthy=False)
 
 
 @pytest.mark.allow_demo_managed_approval_center
 def test_process_e2e_b_approve_downstream_success(
     tmp_path,
-    managed_approval_center_process,
+    managed_approval_center_server,
 ):
     home = tmp_path / "avp-home"
     sandbox = tmp_path / "sandbox"
@@ -780,10 +775,7 @@ def test_process_e2e_b_approve_downstream_success(
     _set_approval_timeout(init.config_path, seconds=60, wait_for_decision=True)
     target = sandbox / "approve-ok.txt"
     body = "approve-success-body"
-    managed_center = managed_approval_center_process(
-        home=home,
-        isolated_home=isolated_home,
-    )
+    managed_center = managed_approval_center_server(home=home)
     proc, collector = _start_managed_proxy(home, isolated_home)
     try:
         _assert_managed_center_reused(home, expected_pid=managed_center.pid)
@@ -852,7 +844,6 @@ def test_process_e2e_b_approve_downstream_success(
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
-        stop_managed_approval_center(home, require_healthy=False)
 
 
 def _is_error_downstream(tmp_path: Path) -> Path:
@@ -899,7 +890,7 @@ for line in sys.stdin:
 @pytest.mark.allow_demo_managed_approval_center
 def test_process_e2e_c_approve_downstream_failure(
     tmp_path,
-    managed_approval_center_process,
+    managed_approval_center_server,
 ):
     home = tmp_path / "avp-home"
     sandbox = tmp_path / "sandbox"
@@ -946,10 +937,7 @@ def test_process_e2e_c_approve_downstream_failure(
     _set_approval_timeout(init.config_path, seconds=60, wait_for_decision=True)
     target = sandbox / "should-not-exist.txt"
 
-    managed_center = managed_approval_center_process(
-        home=home,
-        isolated_home=isolated_home,
-    )
+    managed_center = managed_approval_center_server(home=home)
     proc, collector = _start_managed_proxy(home, isolated_home)
     try:
         _assert_managed_center_reused(home, expected_pid=managed_center.pid)
@@ -1031,13 +1019,12 @@ def test_process_e2e_c_approve_downstream_failure(
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
-        stop_managed_approval_center(home, require_healthy=False)
 
 
 @pytest.mark.allow_demo_managed_approval_center
 def test_process_e2e_d_deny_and_cancel_regression(
     tmp_path,
-    managed_approval_center_process,
+    managed_approval_center_server,
 ):
     home = tmp_path / "avp-home"
     sandbox = tmp_path / "sandbox"
@@ -1055,10 +1042,7 @@ def test_process_e2e_d_deny_and_cancel_regression(
     _set_approval_timeout(init.config_path, seconds=60, wait_for_decision=False)
     deny_target = sandbox / "deny-target.txt"
     cancel_target = sandbox / "cancel-target.txt"
-    managed_center = managed_approval_center_process(
-        home=home,
-        isolated_home=isolated_home,
-    )
+    managed_center = managed_approval_center_server(home=home)
     proc, collector = _start_managed_proxy(home, isolated_home)
     try:
         _assert_managed_center_reused(home, expected_pid=managed_center.pid)
@@ -1196,4 +1180,3 @@ def test_process_e2e_d_deny_and_cancel_regression(
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
-        stop_managed_approval_center(home, require_healthy=False)
