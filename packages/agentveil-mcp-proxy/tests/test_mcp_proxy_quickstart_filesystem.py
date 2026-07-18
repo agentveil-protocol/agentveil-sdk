@@ -221,6 +221,216 @@ def test_quickstart_rmdir_tree_blocked_before_mutation(tmp_path, monkeypatch):
     _assert_no_local_path_leaks(out.getvalue(), json.dumps(metadata))
 
 
+def test_safe_internal_dotdot_read_via_stdio_proxy(tmp_path, monkeypatch):
+    """AV-07: ``ops/../ops/file`` stays inside the workspace after canonicalize."""
+
+    home = tmp_path / "home"
+    sandbox = tmp_path / "sandbox"
+    _init_quickstart(home, sandbox)
+    content = '{"incident":true}'
+    _seed_sandbox_file(sandbox, "ops/incident.json", content)
+    _block_avp_agent(monkeypatch)
+
+    out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_tool_call(
+            "read_file",
+            {"path": "ops/../ops/incident.json"},
+            call_id="dotdot-read",
+        )),
+        out=out,
+        approval_ui_mode="none",
+    ) == 0
+
+    response = _responses(out.getvalue())[0]
+    assert "error" not in response, response
+    assert response["result"]["content"][0]["text"] == content
+    metadata = _metadata_for_tool(home, tool="read_file")
+    assert metadata["target_reached"] is True
+    _assert_no_local_path_leaks(out.getvalue(), json.dumps(metadata))
+
+
+@pytest.mark.parametrize(
+    "safe_path",
+    [
+        "ops/../ops/incident.json",
+        "./ops/./incident.json",
+        "ops//incident.json",
+        r"ops\..\ops\incident.json",
+    ],
+)
+def test_safe_internal_path_variants_reach_same_file(tmp_path, safe_path):
+    from agentveil_mcp_proxy.quickstart_filesystem import _handle_tools_call
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    content = "canonical-ok"
+    _seed_sandbox_file(sandbox, "ops/incident.json", content)
+
+    response = _handle_tools_call(
+        sandbox,
+        "canonical-variant",
+        {"name": "read_file", "arguments": {"path": safe_path}},
+    )
+    assert "error" not in response, response
+    assert response["result"]["content"][0]["text"] == content
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        ("get_file_info", {"path": "ops/../ops/incident.json"}),
+        ("write_file", {"path": "ops/../ops/new.json", "content": '{"n":1}'}),
+        ("delete_file", {"path": "ops/../ops/incident.json"}),
+        ("rmdir_tree", {"path": "ops/../ops/removable"}),
+        (
+            "create_symlink",
+            {"path": "ops/../ops/alias.json", "target": "incident.json"},
+        ),
+    ],
+)
+def test_safe_internal_dotdot_works_for_path_taking_tools(tmp_path, tool, arguments):
+    from agentveil_mcp_proxy.quickstart_filesystem import _handle_tools_call
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    outside = tmp_path / "outside-marker.txt"
+    outside.write_text("outside-stay", encoding="utf-8")
+    _seed_sandbox_file(sandbox, "ops/incident.json", "seed")
+    removable = sandbox / "ops" / "removable"
+    removable.mkdir(parents=True, exist_ok=True)
+    (removable / "nested.txt").write_text("remove-me", encoding="utf-8")
+    before_outside = {
+        path.name: path.read_text(encoding="utf-8") if path.is_file() else None
+        for path in tmp_path.iterdir()
+        if path != sandbox
+    }
+
+    response = _handle_tools_call(
+        sandbox,
+        f"canonical-{tool}",
+        {"name": tool, "arguments": arguments},
+    )
+    assert "error" not in response, response
+    blob = json.dumps(response)
+    assert not any(marker in blob for marker in LOCAL_PATH_MARKERS)
+    assert outside.read_text(encoding="utf-8") == "outside-stay"
+    after_outside = {
+        path.name: path.read_text(encoding="utf-8") if path.is_file() else None
+        for path in tmp_path.iterdir()
+        if path != sandbox
+    }
+    assert after_outside == before_outside
+    if tool == "write_file":
+        assert (sandbox / "ops" / "new.json").read_text(encoding="utf-8") == '{"n":1}'
+    if tool == "delete_file":
+        assert not (sandbox / "ops" / "incident.json").exists()
+    if tool == "rmdir_tree":
+        assert not removable.exists()
+        assert (sandbox / "ops" / "incident.json").read_text(encoding="utf-8") == "seed"
+        assert "ops/removable/nested.txt" not in _sandbox_files(sandbox)
+    if tool == "create_symlink":
+        assert (sandbox / "ops" / "alias.json").is_symlink()
+    if tool == "get_file_info":
+        payload = json.loads(response["result"]["content"][0]["text"])
+        assert payload["path"] == "ops/incident.json"
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    [
+        "../outside.txt",
+        "ops/../../outside.txt",
+        "/etc/passwd",
+        r"..\outside.txt",
+        "ops/../../../outside.txt",
+    ],
+)
+def test_escape_paths_remain_denied_after_canonicalize(tmp_path, monkeypatch, bad_path):
+    home = tmp_path / "home"
+    sandbox = tmp_path / "sandbox"
+    _init_quickstart(home, sandbox)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside-secret", encoding="utf-8")
+    _block_avp_agent(monkeypatch)
+
+    out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_tool_call(
+            "read_file",
+            {"path": bad_path},
+            call_id="escape-read",
+        )),
+        out=out,
+        approval_ui_mode="none",
+    ) == 0
+
+    response = _responses(out.getvalue())[0]
+    assert "error" in response
+    serialized = json.dumps(response) + out.getvalue()
+    assert "outside-secret" not in serialized
+    _assert_no_local_path_leaks(serialized)
+    assert outside.read_text(encoding="utf-8") == "outside-secret"
+
+
+def test_symlink_escape_and_control_alias_remain_denied(tmp_path):
+    from agentveil_mcp_proxy.quickstart_filesystem import _handle_tools_call
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    outside = tmp_path / "outside-secret.txt"
+    outside.write_text("secret-bytes", encoding="utf-8")
+    (sandbox / "looks-ok.txt").symlink_to(outside)
+    control = sandbox / ".avp" / "mcp-proxy"
+    control.mkdir(parents=True)
+    (control / "approval-center.manifest.json").write_text(
+        json.dumps({"session_token": "fixture-session-token-not-real"}),
+        encoding="utf-8",
+    )
+    (sandbox / "alias-control").symlink_to(control, target_is_directory=True)
+
+    escape = _handle_tools_call(
+        sandbox,
+        "sym-escape",
+        {"name": "read_file", "arguments": {"path": "looks-ok.txt"}},
+    )
+    assert "error" in escape
+    assert "secret-bytes" not in json.dumps(escape)
+
+    direct = _handle_tools_call(
+        sandbox,
+        "ctrl-direct",
+        {
+            "name": "read_file",
+            "arguments": {"path": ".avp/mcp-proxy/approval-center.manifest.json"},
+        },
+    )
+    assert "error" in direct
+    assert "fixture-session-token-not-real" not in json.dumps(direct)
+
+    alias = _handle_tools_call(
+        sandbox,
+        "ctrl-alias",
+        {
+            "name": "read_file",
+            "arguments": {"path": "alias-control/approval-center.manifest.json"},
+        },
+    )
+    assert "error" in alias
+    assert "fixture-session-token-not-real" not in json.dumps(alias)
+
+    listed = _handle_tools_call(
+        sandbox,
+        "list-1",
+        {"name": "list_workspace", "arguments": {}},
+    )
+    listing = listed["result"]["content"][0]["text"]
+    assert ".avp/mcp-proxy" not in listing
+    assert "alias-control" not in listing
+
+
 def _symlinked_sandbox(tmp_path: Path) -> tuple[Path, Path]:
     """Create ``product-profile/workspace -> real-workspace`` like public setup."""
 

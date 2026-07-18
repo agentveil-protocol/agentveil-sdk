@@ -356,13 +356,24 @@ def _tools() -> list[dict[str, Any]]:
 
 
 def _path_parts(requested: str) -> list[str]:
+    """Return sandbox-relative path segments after lexical ``..``/``.`` collapse.
+
+    Internal relative forms such as ``ops/../ops/file.json`` resolve to
+    ``ops/file.json``. Paths that still escape the workspace root after
+    normalization (``../outside.txt``, ``ops/../../outside.txt``) are denied.
+    Absolute paths are denied before any filesystem resolution.
+    """
+
     normalized = requested.replace("\\", "/")
     if normalized.startswith("/"):
         raise ValueError("path escapes quickstart sandbox")
-    parts = [part for part in Path(normalized).parts if part not in (".",)]
-    for part in parts:
-        if part == "..":
-            raise ValueError("path escapes quickstart sandbox")
+    # Lexical canonicalize first so in-workspace ``..`` is not rejected early.
+    resolved = posixpath.normpath(normalized)
+    if resolved.startswith("/") or resolved == ".." or resolved.startswith("../"):
+        raise ValueError("path escapes quickstart sandbox")
+    parts = [segment for segment in resolved.split("/") if segment and segment != "."]
+    if any(part == ".." for part in parts):
+        raise ValueError("path escapes quickstart sandbox")
     return parts
 
 
