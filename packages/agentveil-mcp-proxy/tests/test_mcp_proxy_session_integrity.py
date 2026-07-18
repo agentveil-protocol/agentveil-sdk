@@ -16,6 +16,7 @@ import pytest
 import webbrowser
 
 import agentveil_mcp_proxy.cli as proxy_cli
+from conftest import operator_approval_url
 from agentveil_mcp_proxy.cli import init_proxy, run_proxy
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore, ApprovalStatus
 from agentveil_mcp_proxy.evidence.observability import (
@@ -37,6 +38,12 @@ from mcp_fake_downstream import fake_target_reached, tool_entry, write_downstrea
 
 
 CSRF_RE = re.compile(r'name="csrf_token" value="([^"]+)"')
+
+
+def _operator_approval_url(home: Path, response: dict) -> str:
+    del home
+    pending_id = response["error"]["data"]["record_id"]
+    return operator_approval_url(pending_id)
 
 
 @pytest.fixture(autouse=True)
@@ -300,12 +307,13 @@ def test_approved_retry_reaches_target_when_session_facts_match(tmp_path, monkey
         assert first["error"]["data"]["status"] == "approval_required"
         assert not fake_target_reached(outcome_path)
         pending_id = first["error"]["data"]["record_id"]
+        approval_url = _operator_approval_url(home, first)
         with httpx.Client() as client:
-            page = client.get(first["error"]["data"]["approval_url"])
+            page = client.get(approval_url)
             page.raise_for_status()
             match = CSRF_RE.search(page.text)
             assert match is not None
-            client.post(first["error"]["data"]["approval_url"], data={
+            client.post(approval_url, data={
                 "decision": "approve",
                 "approval_scope": "exact",
                 "csrf_token": match.group(1),
@@ -364,11 +372,12 @@ def test_tool_schema_drift_blocks_retry_before_target(tmp_path, monkeypatch):
             time.sleep(0.02)
         first = _responses(client_out.getvalue())[0]
         pending_id = first["error"]["data"]["record_id"]
+        approval_url = _operator_approval_url(home, first)
         with httpx.Client() as client:
-            page = client.get(first["error"]["data"]["approval_url"])
+            page = client.get(approval_url)
             page.raise_for_status()
             match = CSRF_RE.search(page.text)
-            client.post(first["error"]["data"]["approval_url"], data={
+            client.post(approval_url, data={
                 "decision": "approve",
                 "approval_scope": "exact",
                 "csrf_token": match.group(1),
@@ -427,11 +436,12 @@ def test_changed_payload_retry_stays_gated_without_target_mutation(tmp_path, mon
             time.sleep(0.02)
         first = _responses(client_out.getvalue())[0]
         pending_id = first["error"]["data"]["record_id"]
+        approval_url = _operator_approval_url(home, first)
         with httpx.Client() as client:
-            page = client.get(first["error"]["data"]["approval_url"])
+            page = client.get(approval_url)
             page.raise_for_status()
             match = CSRF_RE.search(page.text)
-            client.post(first["error"]["data"]["approval_url"], data={
+            client.post(approval_url, data={
                 "decision": "approve",
                 "approval_scope": "exact",
                 "csrf_token": match.group(1),
@@ -518,7 +528,7 @@ def _run_two_step_write_flow(
             time.sleep(0.02)
         first = _responses(client_out.getvalue())[0]
         pending_id_actual = first["error"]["data"]["record_id"]
-        _approve_via_http(first["error"]["data"]["approval_url"])
+        _approve_via_http(_operator_approval_url(home, first))
         _wait_until_approved(home, pending_id_actual, deadline=deadline)
         staged_in.release_next()
         worker.join(timeout=15)
@@ -601,7 +611,7 @@ def test_fresh_action_after_mismatch_block_still_gets_approval_and_can_execute(
         while time.monotonic() < deadline and not client_out.getvalue().strip():
             time.sleep(0.02)
         first = _responses(client_out.getvalue())[0]
-        _approve_via_http(first["error"]["data"]["approval_url"])
+        _approve_via_http(_operator_approval_url(home, first))
         _wait_until_approved(home, first["error"]["data"]["record_id"], deadline=deadline)
         staged_in.release_next()
         worker.join(timeout=15)
@@ -660,11 +670,12 @@ def test_consent_laundering_blocks_risk_escalation_retry(tmp_path, monkeypatch):
             time.sleep(0.02)
         first = _responses(client_out.getvalue())[0]
         pending_id = first["error"]["data"]["record_id"]
+        approval_url = _operator_approval_url(home, first)
         with httpx.Client() as client:
-            page = client.get(first["error"]["data"]["approval_url"])
+            page = client.get(approval_url)
             page.raise_for_status()
             match = CSRF_RE.search(page.text)
-            client.post(first["error"]["data"]["approval_url"], data={
+            client.post(approval_url, data={
                 "decision": "approve",
                 "approval_scope": "exact",
                 "csrf_token": match.group(1),

@@ -191,6 +191,8 @@ def main() -> int:
     if reexec_code is not None:
         return reexec_code
 
+    from agentveil_mcp_proxy.approval.persistent import load_manifest
+
     env = clean_env()
     with tempfile.TemporaryDirectory(prefix="avp-claude-setup-approval-ux-") as tmp:
         install_root = Path(tmp) / "install"
@@ -247,9 +249,15 @@ def main() -> int:
         data = write_response["error"].get("data", {})
         if data.get("status") != "approval_required":
             raise AssertionError(f"write_file expected approval_required, got {data!r}")
-        approval_url = data.get("approval_url")
-        if not isinstance(approval_url, str) or not approval_url:
-            raise AssertionError(f"write_file missing approval_url in {data!r}")
+        record_id = data.get("record_id")
+        if not isinstance(record_id, str) or not record_id:
+            raise AssertionError(f"write_file missing record_id in {data!r}")
+        manifest = load_manifest(home / "mcp-proxy")
+        if manifest is None:
+            raise AssertionError("managed Approval Center manifest missing")
+        approval_url = f"{manifest.approval_center_url()}/pending/{record_id}"
+        if approval_url in json.dumps(write_response):
+            raise AssertionError("agent-visible response exposed operator approval URL")
 
         import httpx
 
@@ -315,7 +323,7 @@ def main() -> int:
         print(f"read_tools=list_workspace,read_file,get_file_info,instruction_surface_status,local_proof")
         print(f"write_file_status={data.get('status')}")
         print(f"write_file_reason={data.get('reason')}")
-        print(f"approval_url={approval_url}")
+        print(f"approval_record_id={record_id}")
         return 0
 
 

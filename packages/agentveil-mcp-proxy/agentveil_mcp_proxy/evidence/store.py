@@ -67,6 +67,7 @@ class ApprovalStatus(str, Enum):
     EXECUTED = "executed"
     BLOCKED = "blocked"
     ERROR = "error"
+    CANCELLED = "cancelled"
 
 
 TERMINAL_STATUSES = frozenset({
@@ -76,6 +77,7 @@ TERMINAL_STATUSES = frozenset({
     ApprovalStatus.EXECUTED.value,
     ApprovalStatus.BLOCKED.value,
     ApprovalStatus.ERROR.value,
+    ApprovalStatus.CANCELLED.value,
 })
 
 _ALLOWED_TRANSITIONS = {
@@ -87,6 +89,7 @@ _ALLOWED_TRANSITIONS = {
         ApprovalStatus.EXECUTED.value,
         ApprovalStatus.BLOCKED.value,
         ApprovalStatus.ERROR.value,
+        ApprovalStatus.CANCELLED.value,
     },
     ApprovalStatus.APPROVED.value: {
         ApprovalStatus.EXECUTED.value,
@@ -327,6 +330,8 @@ class ApprovalEvidenceStore:
                     updates.setdefault("result_status", normalized)
                 if normalized == ApprovalStatus.EXPIRED.value:
                     updates.setdefault("error_class", "approval_expired")
+                if normalized == ApprovalStatus.CANCELLED.value:
+                    updates.setdefault("error_class", "client_cancelled")
                 updates["status"] = normalized
                 self._validate_transition_fields(updates)
                 assignments = ", ".join(f"{column} = ?" for column in updates)

@@ -25,6 +25,7 @@ from agentveil_mcp_proxy.approval.server import (
     TERMINAL_ALREADY_DECIDED_APPROVE,
     TERMINAL_ALREADY_DECIDED_DENY,
     TERMINAL_APPROVAL_EXPIRED,
+    TERMINAL_CANCELLED,
 )
 from agentveil_mcp_proxy.classification import ClassifiedToolCall, sha256_jcs
 from agentveil_mcp_proxy.evidence import (
@@ -42,6 +43,7 @@ from agentveil_mcp_proxy.evidence.approval_grant import (
 from agentveil_mcp_proxy.evidence.observability import (
     approval_display_risk_class,
     approval_resource_display,
+    classify_downstream_response,
     parse_action_gate_metadata,
 )
 from agentveil_mcp_proxy.policy import (
@@ -61,6 +63,25 @@ from agentveil_mcp_proxy.runtime_gate import DEFAULT_RUNTIME_ENVIRONMENT, Runtim
 
 APPROVAL_SCOPE_EXACT = "exact"
 APPROVAL_SCOPE_SIMILAR_5M = "similar_5m"
+PREBIND_CANCELLATION_TTL_SECONDS = 300.0
+
+
+def normalize_client_request_id(client_request_id: Any) -> tuple[str, Any] | None:
+    """Return a typed hashable JSON-RPC request id, or None when unsupported."""
+
+    if isinstance(client_request_id, bool):
+        return ("bool", client_request_id)
+    if isinstance(client_request_id, int):
+        return ("int", client_request_id)
+    if isinstance(client_request_id, str):
+        return ("str", client_request_id)
+    return None
+
+
+def client_request_binding_key(client_request_id: Any) -> tuple[str, Any] | None:
+    """Return a hashable key that preserves JSON-RPC request id type."""
+
+    return normalize_client_request_id(client_request_id)
 
 
 class ApprovalFlowError(RuntimeError):
@@ -106,6 +127,8 @@ class ApprovalManager:
     ):
         self.evidence_store = evidence_store
         self.approval_server = approval_server
+        if getattr(self.approval_server, "evidence_store", None) is None:
+            self.approval_server.evidence_store = evidence_store
         self.config = config
         self.client_id = client_id
         self.session_id = session_id or secrets.token_urlsafe(16)
@@ -121,7 +144,13 @@ class ApprovalManager:
         self.approval_grant_agent_did = approval_grant_agent_did
         self.approval_grant_mint_failures = 0
         self._finalize_lock = threading.Lock()
-        self._approval_ui_browser_opened = False
+        self._bindings_lock = threading.Lock()
+        self._client_request_bindings: dict[tuple[str, Any], str] = {}
+        self._prebind_cancellations: dict[tuple[str, Any], float] = {}
+        self._tracked_client_requests: set[tuple[str, Any]] = set()
+        # Per-request browser delivery: a successful open for request A must not
+        # suppress opening the card for a later distinct request B.
+        self._browser_opened_request_ids: set[str] = set()
         self.approval_server.set_decision_handler(self._persist_server_decision)
 
     def request_approval(
@@ -130,8 +159,19 @@ class ApprovalManager:
         *,
         runtime_decision: RuntimeGateDecision | None = None,
         reason: str,
+        client_request_id: Any | None = None,
     ) -> ApprovalOutcome:
         """Persist pending approval, notify the user, and await a bounded decision."""
+
+        if client_request_id is not None and self.is_client_request_pre_cancelled(
+            client_request_id
+        ):
+            self.consume_prebind_cancellation(client_request_id)
+            return ApprovalOutcome(
+                "",
+                ApprovalStatus.CANCELLED.value,
+                "client_cancelled",
+            )
 
         now = int(time.time())
         self._materialize_server_decisions(classification, now)
@@ -200,11 +240,21 @@ class ApprovalManager:
             granted_by_request_id=(
                 None if active_grant is None else active_grant.request_id
             ),
+            action_gate_metadata=prompt.action_gate_metadata,
         )
         try:
             self.evidence_store.write_pending(record)
         except ApprovalEvidenceError as exc:
             raise ApprovalFlowError("approval evidence persistence failed") from exc
+
+        if client_request_id is not None:
+            self._bind_client_request(client_request_id, request_id)
+            if self.consume_prebind_cancellation(client_request_id):
+                return self.cancel_approval(request_id, reason="client_cancelled")
+
+        pending = self.evidence_store.get_pending(request_id)
+        if pending is not None and pending.status != ApprovalStatus.PENDING.value:
+            return self._outcome_for_terminal_record(pending)
 
         if active_grant is not None:
             return self._approve(
@@ -234,7 +284,24 @@ class ApprovalManager:
                 decided_by="headless-policy",
             )
 
-        url = self.approval_server.register(prompt)
+        pending = self.evidence_store.get_pending(request_id)
+        if pending is not None and pending.status != ApprovalStatus.PENDING.value:
+            return self._outcome_for_terminal_record(pending)
+
+        with self._finalize_lock:
+            if client_request_id is not None and self.consume_prebind_cancellation(
+                client_request_id
+            ):
+                return self._cancel_approval_locked(
+                    request_id,
+                    reason="client_cancelled",
+                )
+            pending = self.evidence_store.get_pending(request_id)
+            if pending is None:
+                raise ApprovalFlowError("approval evidence record missing")
+            if pending.status != ApprovalStatus.PENDING.value:
+                return self._outcome_for_terminal_record(pending)
+            url = self.approval_server.register(prompt)
         actionable_ui = self._notify(prompt, url)
         if not self.wait_for_decision:
             self._watch_decision_in_background(request_id, timeout)
@@ -259,6 +326,218 @@ class ApprovalManager:
                 approval_url=url,
             )
         return self._await_decision(request_id, timeout)
+
+    def cancel_by_client_request_id(
+        self,
+        client_request_id: Any,
+        *,
+        reason: str = "client_cancelled",
+    ) -> ApprovalOutcome | None:
+        """Cancel one tracked client request or its bound pending approval."""
+
+        key = normalize_client_request_id(client_request_id)
+        if key is None:
+            return None
+        request_id: str | None
+        with self._bindings_lock:
+            self._prune_prebind_cancellations_locked()
+            request_id = self._client_request_bindings.get(key)
+            if request_id is None:
+                if key not in self._tracked_client_requests:
+                    return None
+                self._record_prebind_cancellation_locked(key)
+                return ApprovalOutcome(
+                    "",
+                    ApprovalStatus.CANCELLED.value,
+                    reason,
+                )
+        return self.cancel_approval(request_id, reason=reason)
+
+    def register_tracked_client_request(self, client_request_id: Any) -> bool:
+        """Mark one queued/in-flight mutation tools/call id as cancelable."""
+
+        key = normalize_client_request_id(client_request_id)
+        if key is None:
+            return False
+        with self._bindings_lock:
+            self._tracked_client_requests.add(key)
+        return True
+
+    def clear_tracked_client_request(self, client_request_id: Any) -> None:
+        """Drop queued/in-flight tracking once the tools/call reaches a terminal outcome."""
+
+        key = normalize_client_request_id(client_request_id)
+        if key is None:
+            return
+        with self._bindings_lock:
+            self._tracked_client_requests.discard(key)
+
+    def is_client_request_tracked(self, client_request_id: Any) -> bool:
+        """Return True when the dispatcher has registered this request id as active."""
+
+        key = normalize_client_request_id(client_request_id)
+        if key is None:
+            return False
+        with self._bindings_lock:
+            return key in self._tracked_client_requests
+
+    def is_client_request_pre_cancelled(self, client_request_id: Any) -> bool:
+        """Return True when a cancel notification arrived before binding existed."""
+
+        key = normalize_client_request_id(client_request_id)
+        if key is None:
+            return False
+        with self._bindings_lock:
+            self._prune_prebind_cancellations_locked()
+            return key in self._prebind_cancellations
+
+    def consume_prebind_cancellation(self, client_request_id: Any) -> bool:
+        """Consume one pre-bind cancellation tombstone, if present."""
+
+        key = normalize_client_request_id(client_request_id)
+        if key is None:
+            return False
+        with self._bindings_lock:
+            self._prune_prebind_cancellations_locked()
+            return self._prebind_cancellations.pop(key, None) is not None
+
+    def pre_cancelled_outcome(self, client_request_id: Any) -> ApprovalOutcome | None:
+        """Return a cancelled outcome when the client aborted before binding."""
+
+        if not self.is_client_request_pre_cancelled(client_request_id):
+            return None
+        return ApprovalOutcome("", ApprovalStatus.CANCELLED.value, "client_cancelled")
+
+    def cancel_approval(
+        self,
+        request_id: str,
+        *,
+        reason: str = "client_cancelled",
+    ) -> ApprovalOutcome:
+        """Atomically cancel one pending approval when the client aborts the call."""
+
+        with self._finalize_lock:
+            return self._cancel_approval_locked(request_id, reason=reason)
+
+    def _cancel_approval_locked(
+        self,
+        request_id: str,
+        *,
+        reason: str = "client_cancelled",
+    ) -> ApprovalOutcome:
+        """Cancel pending approval while ``_finalize_lock`` is already held."""
+
+        current = self.evidence_store.get_pending(request_id)
+        if current is None:
+            self._release_client_request_binding_for_request(request_id)
+            return ApprovalOutcome(
+                request_id,
+                ApprovalStatus.CANCELLED.value,
+                reason,
+            )
+        if current.status == ApprovalStatus.CANCELLED.value:
+            self._release_client_request_binding_for_request(request_id)
+            return ApprovalOutcome(
+                request_id,
+                ApprovalStatus.CANCELLED.value,
+                reason,
+            )
+        if current.status != ApprovalStatus.PENDING.value:
+            self._release_client_request_binding_for_request(request_id)
+            return self._outcome_for_terminal_record(current)
+        try:
+            self.evidence_store.transition(
+                request_id,
+                ApprovalStatus.CANCELLED.value,
+                error_class=reason,
+            )
+        except ApprovalEvidenceTransitionError:
+            refreshed = self.evidence_store.get_pending(request_id)
+            if refreshed is None:
+                self._release_client_request_binding_for_request(request_id)
+                return ApprovalOutcome(
+                    request_id,
+                    ApprovalStatus.CANCELLED.value,
+                    reason,
+                )
+            self._release_client_request_binding_for_request(request_id)
+            return self._outcome_for_terminal_record(refreshed)
+        self.approval_server.notify_cancelled(request_id)
+        self.approval_server.unregister(
+            request_id,
+            terminal_state=TERMINAL_CANCELLED,
+        )
+        self._release_client_request_binding_for_request(request_id)
+        return ApprovalOutcome(
+            request_id,
+            ApprovalStatus.CANCELLED.value,
+            reason,
+        )
+
+    def _bind_client_request(self, client_request_id: Any, request_id: str) -> None:
+        key = client_request_binding_key(client_request_id)
+        if key is None:
+            return
+        with self._bindings_lock:
+            self._client_request_bindings[key] = request_id
+
+    def _record_prebind_cancellation_locked(self, key: tuple[str, Any]) -> None:
+        self._prebind_cancellations[key] = (
+            time.monotonic() + PREBIND_CANCELLATION_TTL_SECONDS
+        )
+
+    def _prune_prebind_cancellations_locked(self) -> None:
+        now = time.monotonic()
+        stale = [
+            key
+            for key, retain_until in self._prebind_cancellations.items()
+            if retain_until <= now
+        ]
+        for key in stale:
+            self._prebind_cancellations.pop(key, None)
+
+    def _release_client_request_binding_for_request(self, request_id: str) -> None:
+        with self._bindings_lock:
+            stale = [
+                client_id
+                for client_id, bound_request_id in self._client_request_bindings.items()
+                if bound_request_id == request_id
+            ]
+            for client_id in stale:
+                self._client_request_bindings.pop(client_id, None)
+
+    def _outcome_for_terminal_record(self, record: PendingApproval) -> ApprovalOutcome:
+        if record.status == ApprovalStatus.APPROVED.value:
+            scope = record.approval_scope or APPROVAL_SCOPE_EXACT
+            return ApprovalOutcome(
+                record.request_id,
+                ApprovalStatus.APPROVED.value,
+                "user_approved",
+                scope,
+            )
+        if record.status == ApprovalStatus.DENIED.value:
+            return ApprovalOutcome(
+                record.request_id,
+                ApprovalStatus.DENIED.value,
+                "user_denied",
+            )
+        if record.status == ApprovalStatus.CANCELLED.value:
+            return ApprovalOutcome(
+                record.request_id,
+                ApprovalStatus.CANCELLED.value,
+                record.error_class or "client_cancelled",
+            )
+        if record.status == ApprovalStatus.EXPIRED.value:
+            return ApprovalOutcome(
+                record.request_id,
+                ApprovalStatus.EXPIRED.value,
+                record.error_class or "approval_timeout",
+            )
+        return ApprovalOutcome(
+            record.request_id,
+            record.status,
+            record.error_class or record.status,
+        )
 
     def _watch_decision_in_background(self, request_id: str, timeout: int) -> None:
         """Persist the eventual local approval decision without blocking MCP stdio."""
@@ -305,10 +584,14 @@ class ApprovalManager:
                         )
                     except ApprovalEvidenceTransitionError:
                         pass
+                    terminal = self._outcome_if_terminal_evidence(request_id)
+                    if terminal is not None:
+                        return terminal
                     self.approval_server.unregister(
                         request_id,
                         terminal_state=TERMINAL_APPROVAL_EXPIRED,
                     )
+                    self._release_client_request_binding_for_request(request_id)
                     return ApprovalOutcome(
                         request_id, ApprovalStatus.EXPIRED.value, "approval_timeout"
                     )
@@ -351,6 +634,12 @@ class ApprovalManager:
             )
         if record.status == ApprovalStatus.DENIED.value:
             return ApprovalOutcome(request_id, ApprovalStatus.DENIED.value, "user_denied")
+        if record.status == ApprovalStatus.CANCELLED.value:
+            return ApprovalOutcome(
+                request_id,
+                ApprovalStatus.CANCELLED.value,
+                record.error_class or "client_cancelled",
+            )
         return None
 
     def record_runtime_allow(
@@ -392,19 +681,32 @@ class ApprovalManager:
         except ApprovalEvidenceError as exc:
             raise ApprovalFlowError("runtime decision evidence persistence failed") from exc
 
-    def record_execution_result(self, outcome: ApprovalOutcome, response: dict[str, Any]) -> None:
+    def record_execution_result(
+        self,
+        outcome: ApprovalOutcome,
+        response: dict[str, Any],
+        *,
+        downstream_tool_call_seen: bool,
+    ) -> None:
         """Append execution result evidence for an approved downstream call."""
 
         if not outcome.approved:
             return
+        classified = classify_downstream_response(
+            response,
+            downstream_tool_call_seen=downstream_tool_call_seen,
+        )
         try:
-            if "error" in response:
+            if classified.error_class is not None:
+                payload = response.get("error")
+                if not isinstance(payload, Mapping):
+                    payload = response.get("result", {})
                 self.evidence_store.transition(
                     outcome.request_id,
-                    ApprovalStatus.BLOCKED.value,
-                    result_status="blocked",
-                    result_hash=sha256_jcs(response.get("error", {})),
-                    error_class="downstream_error",
+                    classified.store_status,
+                    result_status=classified.execution_status,
+                    result_hash=sha256_jcs(payload if isinstance(payload, (dict, list)) else {}),
+                    error_class=classified.error_class,
                 )
             else:
                 result_hash = sha256_jcs(response.get("result", {}))
@@ -535,6 +837,16 @@ class ApprovalManager:
                     reason,
                     scope,
                 )
+            if current.status == ApprovalStatus.CANCELLED.value:
+                self.approval_server.unregister(
+                    request_id,
+                    terminal_state=TERMINAL_CANCELLED,
+                )
+                return ApprovalOutcome(
+                    request_id,
+                    ApprovalStatus.CANCELLED.value,
+                    current.error_class or "client_cancelled",
+                )
             approval_grant_jcs = self._approval_grant_jcs(
                 current,
                 approval_scope=approval_scope,
@@ -560,6 +872,7 @@ class ApprovalManager:
                 request_id,
                 terminal_state=TERMINAL_ALREADY_DECIDED_APPROVE,
             )
+            self._release_client_request_binding_for_request(request_id)
             return ApprovalOutcome(
                 request_id, ApprovalStatus.APPROVED.value, reason, approval_scope
             )
@@ -654,7 +967,19 @@ class ApprovalManager:
                     request_id,
                     terminal_state=TERMINAL_ALREADY_DECIDED_DENY,
                 )
+                self._release_client_request_binding_for_request(request_id)
                 return ApprovalOutcome(request_id, ApprovalStatus.DENIED.value, reason)
+            if current is not None and current.status == ApprovalStatus.CANCELLED.value:
+                self.approval_server.unregister(
+                    request_id,
+                    terminal_state=TERMINAL_CANCELLED,
+                )
+                self._release_client_request_binding_for_request(request_id)
+                return ApprovalOutcome(
+                    request_id,
+                    ApprovalStatus.CANCELLED.value,
+                    current.error_class or "client_cancelled",
+                )
             now = int(time.time())
             self.evidence_store.transition(
                 request_id,
@@ -669,6 +994,7 @@ class ApprovalManager:
                 request_id,
                 terminal_state=TERMINAL_ALREADY_DECIDED_DENY,
             )
+            self._release_client_request_binding_for_request(request_id)
             return ApprovalOutcome(request_id, ApprovalStatus.DENIED.value, reason)
 
     def _effective_ui_open_mode(self) -> ApprovalUiOpenMode:
@@ -692,19 +1018,20 @@ class ApprovalManager:
             file=self.cli_out,
         )
 
-    def _maybe_open_approval_browser(self) -> bool:
-        """Open the approval center in the browser; success is truthy opener only.
+    def _maybe_open_approval_browser(self, *, request_id: str, url: str) -> bool:
+        """Open one pending approval card; success is truthy opener only.
 
-        A ``False`` return or exception must not burn the one-shot flag so a
-        later approval can retry delivery. On webbrowser failure, try a bounded
-        native macOS fallback when available.
+        Each distinct ``request_id`` gets its own bounded open of the concrete
+        pending card URL. A ``False`` return or exception must not mark the
+        request delivered so a later retry can attempt again. The same
+        ``request_id`` must not re-open after a successful delivery (internal
+        retries must not spam the browser).
         """
 
         if self._effective_ui_open_mode() is not ApprovalUiOpenMode.BROWSER:
             return False
-        if self._approval_ui_browser_opened:
+        if request_id in self._browser_opened_request_ids:
             return True
-        url = self.approval_server.approval_center_url()
         # Injected openers own delivery (tests/mocks). Native fallback only when
         # using the real stdlib webbrowser opener.
         if self.browser_open is webbrowser.open:
@@ -714,7 +1041,7 @@ class ApprovalManager:
 
             result = open_approval_url_webbrowser(url, opener=self.browser_open)
         if result.delivered:
-            self._approval_ui_browser_opened = True
+            self._browser_opened_request_ids.add(request_id)
             return True
         return False
 
@@ -734,7 +1061,10 @@ class ApprovalManager:
         )
         self._print_approval_fallback(prompt, url, summary)
         mode = self._effective_ui_open_mode()
-        browser_ok = self._maybe_open_approval_browser()
+        browser_ok = self._maybe_open_approval_browser(
+            request_id=prompt.request_id,
+            url=url,
+        )
         if mode is not ApprovalUiOpenMode.NONE:
             self.notifier.notify(prompt)
         if mode is ApprovalUiOpenMode.BROWSER:
@@ -753,7 +1083,11 @@ class ApprovalManager:
         runtime_decision: RuntimeGateDecision | None,
         approval_token_hash: str | None = None,
         granted_by_request_id: str | None = None,
+        action_gate_metadata: Mapping[str, Any] | None = None,
     ) -> PendingApproval:
+        metadata_jcs = None
+        if isinstance(action_gate_metadata, Mapping) and action_gate_metadata:
+            metadata_jcs = json.dumps(dict(action_gate_metadata), separators=(",", ":"), sort_keys=True)
         return PendingApproval(
             request_id=request_id,
             session_id=self.session_id,
@@ -775,6 +1109,7 @@ class ApprovalManager:
             approval_token_hash=approval_token_hash,
             matched_policy_rule=classification.policy_evaluation.policy_rule_id,
             granted_by_request_id=granted_by_request_id,
+            action_gate_metadata_jcs=metadata_jcs,
         )
 
     def _write_runtime_decision_record(
@@ -887,4 +1222,7 @@ __all__ = [
     "ApprovalFlowError",
     "ApprovalManager",
     "ApprovalOutcome",
+    "PREBIND_CANCELLATION_TTL_SECONDS",
+    "client_request_binding_key",
+    "normalize_client_request_id",
 ]

@@ -2982,7 +2982,7 @@ def _assert_t1_privacy_safe_text(text: str) -> None:
 @pytest.mark.parametrize(
     ("ui_open_mode", "headless", "auto_deny", "expected_browser_open_calls"),
     [
-        ("browser", False, False, 1),
+        ("browser", False, False, 10),
         ("terminal", False, False, 0),
         ("none", False, False, 0),
         ("browser", True, True, 0),
@@ -2995,7 +2995,7 @@ def test_t1_browser_open_budget_uses_injected_mock_only(
     auto_deny,
     expected_browser_open_calls,
 ):
-    """Browser spam fix through injected browser_open."""
+    """Per-request browser opens use injected browser_open only."""
 
     opened_urls: list[str] = []
     config = _config(ui_open_mode=ui_open_mode)
@@ -3011,13 +3011,24 @@ def test_t1_browser_open_budget_uses_injected_mock_only(
     assert manager.browser_open is not webbrowser.open
     try:
         repeat = 1 if headless else 10
+        request_ids: list[str] = []
         for _index in range(repeat):
-            manager.request_approval(_classification(config), reason="local_approval_required")
+            outcome = manager.request_approval(
+                _classification(config),
+                reason="local_approval_required",
+            )
+            if outcome.request_id:
+                request_ids.append(outcome.request_id)
         assert len(opened_urls) == expected_browser_open_calls
-        if expected_browser_open_calls == 1:
-            assert opened_urls[0] == server.approval_center_url()
-            for fragment in T1_FORBIDDEN_HTML_FRAGMENTS:
-                assert fragment not in opened_urls[0]
+        if expected_browser_open_calls > 0:
+            assert len(opened_urls) == len(set(opened_urls))
+            for request_id, url in zip(request_ids, opened_urls, strict=True):
+                assert url == server.approval_url(request_id)
+                assert request_id in url
+                assert "/pending/" in url
+                assert url != server.approval_center_url()
+                for fragment in T1_FORBIDDEN_HTML_FRAGMENTS:
+                    assert fragment not in url
     finally:
         server.stop()
         store.close()
@@ -3085,14 +3096,17 @@ def test_t1_center_output_lines_exclude_raw_payload(tmp_path):
             )
         output = cli.getvalue()
         _assert_t1_privacy_safe_text(output)
-        assert len(opened_urls) == 1
-        assert opened_urls[0] == server.approval_center_url()
+        assert len(opened_urls) == 3
+        assert len(set(opened_urls)) == 3
+        for url in opened_urls:
+            assert "/pending/" in url
+            assert url != server.approval_center_url()
     finally:
         server.stop()
         store.close()
 
 
-def test_browser_mode_opens_approval_center_once_for_repeated_pending(tmp_path):
+def test_browser_mode_opens_each_pending_card(tmp_path):
     opened_urls: list[str] = []
     config = _config()
     manager, store, server, _cli = _manager(
@@ -3103,14 +3117,18 @@ def test_browser_mode_opens_approval_center_once_for_repeated_pending(tmp_path):
         browser_open=lambda url: opened_urls.append(url) or True,
     )
     try:
+        request_ids: list[str] = []
         for _index in range(10):
             outcome = manager.request_approval(
                 _classification(config),
                 reason="local_approval_required",
             )
             assert outcome.status == ApprovalStatus.PENDING.value
-        assert len(opened_urls) == 1
-        assert opened_urls[0] == server.approval_center_url()
+            request_ids.append(outcome.request_id)
+        assert len(opened_urls) == 10
+        assert len(set(opened_urls)) == 10
+        for request_id, url in zip(request_ids, opened_urls, strict=True):
+            assert url == server.approval_url(request_id)
         assert len(server.pending_prompts()) == 10
     finally:
         server.stop()
@@ -3917,7 +3935,7 @@ def test_get_after_timeout_unregister_returns_expired_html_page(tmp_path):
         assert stale.status_code == 410
         _assert_stale_html_response(
             stale,
-            headline="Approval expired",
+            headline="Timed out",
             session_token=server.session_token,
         )
         assert TERMINAL_EXPIRED_BODY in stale.text
@@ -3979,7 +3997,7 @@ def test_get_expired_prompt_before_unregister_shows_expired_html(monkeypatch):
         assert response.status_code == 410
         _assert_stale_html_response(
             response,
-            headline="Approval expired",
+            headline="Timed out",
             session_token=server.session_token,
         )
         assert TERMINAL_EXPIRED_BODY in response.text

@@ -59,6 +59,7 @@ from agentveil_mcp_proxy.evidence.events_show import (
 )
 from agentveil_mcp_proxy.client_config import downstream_startup_fingerprint
 from agentveil_mcp_proxy.evidence.observability import (
+    classify_downstream_response,
     parse_action_gate_metadata,
     redirect_original_record_valid,
 )
@@ -103,7 +104,6 @@ from agentveil_mcp_proxy.redirect_playbooks import (
     attach_redirect_playbook_fields_for_evidence_record,
     build_risk_family_guidance,
     enrich_risk_family_error_data,
-    message_visible_approval_redirect,
     message_visible_blocked_redirect,
     redirect_playbook_id_for_risk_family,
     uses_risk_family_redirects,
@@ -143,7 +143,6 @@ from agentveil_mcp_proxy.runtime_gate import (
 from agentveil_mcp_proxy.evidence.observability import (
     APPROVAL_REQUIRED_INSTRUCTIONS,
     APPROVAL_REQUIRED_USER_MESSAGE,
-    approval_required_actionable_message,
     enrich_mcp_error_contract,
     mcp_error_user_message,
     reason_has_dedicated_user_message,
@@ -178,17 +177,26 @@ _REDIRECT_STOP_AND_CLASSIFY = "stop_and_classify_unknown_action"
 
 
 def approval_required_user_message(*, approval_url: str | None = None) -> str:
-    """Return the default user-facing approval-required message."""
+    """Return the agent-visible approval-required message.
 
-    if approval_url:
-        return actionable_approval_required_message(approval_url)
+    Tokenized approval URLs are operator-local capability tokens. They must not
+    appear in MCP error text even when an internal ``approval_url`` exists for
+    browser/TTY delivery.
+    """
+
+    del approval_url  # retained for call-site compatibility; not agent-visible
     return APPROVAL_REQUIRED_USER_MESSAGE
 
 
 def actionable_approval_required_message(approval_url: str) -> str:
-    """Return a client-visible MCP error message that includes the approval URL."""
+    """Return agent-visible approval text without embedding capability URLs.
 
-    return approval_required_actionable_message(approval_url)
+    ``approval_url`` is accepted for call-site compatibility but intentionally
+    ignored: tokenized URLs must stay on the operator delivery path only.
+    """
+
+    del approval_url
+    return APPROVAL_REQUIRED_USER_MESSAGE
 
 
 JSONRPC_RUNTIME_GATE_UNAVAILABLE = -32012
@@ -847,15 +855,18 @@ def _approval_redirect_message(
 ) -> str:
     if classification is None or not uses_risk_family_redirects(classification):
         return default_message
-    approval_url = data.get("approval_url")
-    if not isinstance(approval_url, str) or not approval_url:
-        return default_message
     guidance = build_risk_family_guidance(
         classification,
         outcome="approval",
         reason=str(data.get("reason", "")),
     )
-    return message_visible_approval_redirect(guidance, approval_url=approval_url)
+    # Do not embed tokenized approval URLs in agent-visible redirect text.
+    # Browser/TTY delivery keeps the concrete pending URL on the operator path.
+    return (
+        f"Approval required for {guidance.risk_family}.\n"
+        f"Redirect playbook: {guidance.redirect_playbook}.\n"
+        "Open the local Approval Center, approve or deny, then retry the same request."
+    )
 
 
 def _risk_family_redirect_metadata_fields(
@@ -972,11 +983,11 @@ def _approval_required_error(
     if approval_outcome is not None:
         data["record_id"] = approval_outcome.request_id
         data["record_status"] = approval_outcome.status
-        if approval_outcome.approval_url is not None:
-            data["approval_url"] = approval_outcome.approval_url
-            data["instructions"] = APPROVAL_REQUIRED_INSTRUCTIONS
-            data["proof_inspection_hint"] = LOCAL_PROOF_AGENT_INSPECTION_HINT
-            resolved_message = actionable_approval_required_message(approval_outcome.approval_url)
+        # Tokenized approval_url stays internal for browser/TTY delivery only.
+        # Do not put the capability URL in MCP error.data or error.message.
+        data["instructions"] = APPROVAL_REQUIRED_INSTRUCTIONS
+        data["proof_inspection_hint"] = LOCAL_PROOF_AGENT_INSPECTION_HINT
+        resolved_message = APPROVAL_REQUIRED_USER_MESSAGE
     if enrich_guidance:
         redirect_original_id = (
             approval_outcome.request_id
@@ -1010,11 +1021,25 @@ def _coalesce_approval_outcome(
 ) -> ApprovalOutcome | None:
     """Keep an approved in-flight outcome across TrapDoor and policy layers."""
 
+    if new is not None and new.status == ApprovalStatus.CANCELLED.value:
+        return new
+    if current is not None and current.status == ApprovalStatus.CANCELLED.value:
+        return current
     if new is not None and new.approved:
         return new
     if current is not None and current.approved:
         return current
     return new if new is not None else current
+
+
+def _client_cancelled_responses(
+    outcome: ApprovalOutcome | None,
+) -> list[dict[str, Any]] | None:
+    """Return an empty response list when the client cancelled the tools/call."""
+
+    if outcome is not None and outcome.status == ApprovalStatus.CANCELLED.value:
+        return []
+    return None
 
 
 def _policy_denied_error(
@@ -1278,6 +1303,11 @@ class McpPassthrough:
         diagnostic_workers = max(1, worker_count - 1)
 
         def _handle_queued_line(item: str) -> None:
+            has_id, client_request_id = _jsonrpc_request_id_from_raw_line(item)
+            track_mutation = (
+                _raw_line_is_tools_call(item)
+                and not _raw_line_is_concurrent_tools_call(item)
+            )
             try:
                 responses = self.handle_client_line(item)
                 for response in responses:
@@ -1294,6 +1324,11 @@ class McpPassthrough:
                             data={"status": "error", "reason": "internal_error"},
                         ),
                     )
+            finally:
+                if track_mutation and has_id:
+                    manager = self.approval_manager
+                    if manager is not None:
+                        manager.clear_tracked_client_request(client_request_id)
 
         def _diagnostic_worker() -> None:
             while True:
@@ -1356,6 +1391,10 @@ class McpPassthrough:
                 if _raw_line_is_concurrent_tools_call(raw_line):
                     diagnostic_queue.put(raw_line)
                 elif _raw_line_is_tools_call(raw_line):
+                    has_id, client_request_id = _jsonrpc_request_id_from_raw_line(raw_line)
+                    manager = self.approval_manager
+                    if has_id and manager is not None:
+                        manager.register_tracked_client_request(client_request_id)
                     mutation_queue.put(raw_line)
                 else:
                     responses = self.handle_client_line(raw_line)
@@ -1390,6 +1429,10 @@ class McpPassthrough:
         has_id = "id" in message
         if message.get("jsonrpc") != JSONRPC_VERSION or not isinstance(message.get("method"), str):
             return [jsonrpc_error(request_id, JSONRPC_INVALID_REQUEST, "invalid JSON-RPC request")]
+
+        method = message.get("method")
+        if method == "notifications/cancelled":
+            return self._handle_client_cancelled_notification(message)
 
         surface_error = self._tool_surface_error_response(message, request_id)
         if surface_error is not None:
@@ -1431,6 +1474,9 @@ class McpPassthrough:
                 approval_outcome,
                 instruction_outcome,
             )
+            cancelled_responses = _client_cancelled_responses(approval_outcome)
+            if cancelled_responses is not None:
+                return cancelled_responses
             if instruction_error is not None:
                 return [instruction_error] if has_id else []
             persistence_error, persistence_outcome = (
@@ -1445,6 +1491,9 @@ class McpPassthrough:
                 approval_outcome,
                 persistence_outcome,
             )
+            cancelled_responses = _client_cancelled_responses(approval_outcome)
+            if cancelled_responses is not None:
+                return cancelled_responses
             if persistence_error is not None:
                 return [persistence_error] if has_id else []
             package_manager_error, package_manager_outcome = (
@@ -1459,6 +1508,9 @@ class McpPassthrough:
                 approval_outcome,
                 package_manager_outcome,
             )
+            cancelled_responses = _client_cancelled_responses(approval_outcome)
+            if cancelled_responses is not None:
+                return cancelled_responses
             if package_manager_error is not None:
                 return [package_manager_error] if has_id else []
             policy_error, policy_outcome = self._policy_error_response(
@@ -1470,6 +1522,9 @@ class McpPassthrough:
                 approval_outcome,
                 policy_outcome,
             )
+            cancelled_responses = _client_cancelled_responses(approval_outcome)
+            if cancelled_responses is not None:
+                return cancelled_responses
             if policy_error is not None:
                 return [policy_error] if has_id else []
             local_proof_response = self._local_proof_tool_response(
@@ -1499,8 +1554,10 @@ class McpPassthrough:
                 if has_id
                 else None
             )
+            downstream_tool_call_seen = False
             try:
                 self._send_downstream(message)
+                downstream_tool_call_seen = True
                 if not has_id:
                     return []
                 response = self._wait_downstream_response(request_id)
@@ -1508,12 +1565,17 @@ class McpPassthrough:
                     message,
                     response,
                 )
-                self._record_approval_result(approval_outcome, response)
+                self._record_approval_result(
+                    approval_outcome,
+                    response,
+                    downstream_tool_call_seen=downstream_tool_call_seen,
+                )
                 self._record_allow_controlled_path_if_needed(
                     classification,
                     approval_outcome,
                     request_id,
                     response,
+                    downstream_tool_call_seen=downstream_tool_call_seen,
                 )
                 return [response]
             finally:
@@ -3031,6 +3093,17 @@ class McpPassthrough:
         if (
             coalesce_in_flight
             and in_flight_approval is not None
+            and in_flight_approval.status == ApprovalStatus.CANCELLED.value
+        ):
+            return None, in_flight_approval
+        if self.approval_manager is not None:
+            pre_cancelled = self.approval_manager.pre_cancelled_outcome(request_id)
+            if pre_cancelled is not None:
+                self.approval_manager.consume_prebind_cancellation(request_id)
+                return None, pre_cancelled
+        if (
+            coalesce_in_flight
+            and in_flight_approval is not None
             and in_flight_approval.approved
         ):
             return None, in_flight_approval
@@ -3048,6 +3121,7 @@ class McpPassthrough:
                 classification,
                 runtime_decision=runtime_decision,
                 reason=reason,
+                client_request_id=request_id,
             )
         except ApprovalFlowError:
             return _with_risk_metadata(jsonrpc_error(
@@ -3077,27 +3151,62 @@ class McpPassthrough:
                 enrich_guidance=enrich_guidance,
             )), None
         if outcome.status == "expired":
+            timeout_data: dict[str, Any] = {
+                "status": "timeout",
+                "reason": outcome.reason,
+                "target_reached": False,
+            }
+            enrich_mcp_error_contract(timeout_data)
             return _with_risk_metadata(jsonrpc_error(
                 request_id,
                 JSONRPC_APPROVAL_REQUIRED,
                 "approval timed out",
-                data={"status": "timeout", "reason": outcome.reason},
+                data=timeout_data,
             )), None
+        if outcome.status == ApprovalStatus.CANCELLED.value:
+            return None, outcome
         return _with_risk_metadata(_blocked_error(
             request_id,
             "blocked by approval decision",
             reason=outcome.reason,
         )), None
 
+    def _handle_client_cancelled_notification(
+        self,
+        message: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Handle MCP client cancellation for one in-flight tools/call request."""
+
+        params = message.get("params")
+        if not isinstance(params, Mapping):
+            return []
+        client_request_id = params.get("requestId")
+        if client_request_id is None:
+            return []
+        manager = self.approval_manager
+        if manager is not None:
+            manager.cancel_by_client_request_id(client_request_id)
+        return []
+
     def _record_approval_result(
         self,
         outcome: ApprovalOutcome | None,
         response: dict[str, Any],
+        *,
+        downstream_tool_call_seen: bool,
     ) -> None:
         if outcome is None or self.approval_manager is None:
             return
-        self.approval_manager.record_execution_result(outcome, response)
-        self._annotate_executed_controlled_path(outcome, response)
+        self.approval_manager.record_execution_result(
+            outcome,
+            response,
+            downstream_tool_call_seen=downstream_tool_call_seen,
+        )
+        self._annotate_executed_controlled_path(
+            outcome,
+            response,
+            downstream_tool_call_seen=downstream_tool_call_seen,
+        )
 
     def _controlled_path_fixture_id(self, classification: ClassifiedToolCall) -> str:
         rule_id = classification.policy_evaluation.policy_rule_id
@@ -3524,17 +3633,20 @@ class McpPassthrough:
         self,
         outcome: ApprovalOutcome,
         response: dict[str, Any],
+        *,
+        downstream_tool_call_seen: bool,
     ) -> None:
         if not outcome.approved:
             return
         store = self._controlled_path_store()
         if store is None:
             return
-        execution_status = (
-            ApprovalStatus.BLOCKED.value  # claim-check: allow enum value; negative tests cover no target reach.
-            if "error" in response
-            else ApprovalStatus.EXECUTED.value
+        classified = classify_downstream_response(
+            response,
+            downstream_tool_call_seen=downstream_tool_call_seen,
         )
+        execution_status = classified.execution_status
+        target_reached = classified.target_reached
         record = store.get_pending(outcome.request_id)
         if record is None:
             return
@@ -3547,10 +3659,6 @@ class McpPassthrough:
                     least_agency_fields = self._least_agency_metadata_fields_from_record(parent_record)
         redirect_context = self._active_redirect_context
         redirect_fields = self._redirect_automation_fields_from_record(record)
-        target_reached = derive_target_reached(
-            execution_status=execution_status,
-            downstream_tool_call_seen=self.downstream_tool_calls_forwarded > 0,
-        )
         if redirect_context is not None:
             metadata = build_redirect_automation_metadata(
                 fixture_id=self._controlled_path_fixture_id_from_record(record),
@@ -3708,15 +3816,23 @@ class McpPassthrough:
         outcome: ApprovalOutcome | None,
         request_id: Any,
         response: dict[str, Any],
+        *,
+        downstream_tool_call_seen: bool,
     ) -> None:
-        if outcome is not None or classification is None or "error" in response:
+        if outcome is not None or classification is None:
+            return
+        classified = classify_downstream_response(
+            response,
+            downstream_tool_call_seen=downstream_tool_call_seen,
+        )
+        if classified.error_class is not None or not classified.target_reached:
             return
         store = self._controlled_path_store()
         manager = self.approval_manager
         if store is None:
             return
         request_id_text = str(request_id) if request_id is not None else str(uuid.uuid4())
-        execution_status = ApprovalStatus.EXECUTED.value
+        execution_status = classified.execution_status
         redirect_context = self._active_redirect_context
         if redirect_context is not None:
             metadata = build_redirect_automation_metadata(
@@ -3726,10 +3842,7 @@ class McpPassthrough:
                 policy_rule_id=classification.policy_evaluation.policy_rule_id,
                 approval_status=ApprovalStatus.EXECUTED.value,
                 execution_status=execution_status,
-                target_reached=derive_target_reached(
-                    execution_status=execution_status,
-                    downstream_tool_call_seen=self.downstream_tool_calls_forwarded > 0,
-                ),
+                target_reached=classified.target_reached,
                 request_id=request_id_text,
                 request_chain=[redirect_context.original_request_id, request_id_text],
                 payload_hash=classification.payload_hash,
@@ -3747,10 +3860,7 @@ class McpPassthrough:
                 policy_rule_id=classification.policy_evaluation.policy_rule_id,
                 approval_status=ApprovalStatus.EXECUTED.value,
                 execution_status=execution_status,
-                target_reached=derive_target_reached(
-                    execution_status=execution_status,
-                    downstream_tool_call_seen=self.downstream_tool_calls_forwarded > 0,
-                ),
+                target_reached=classified.target_reached,
                 request_id=request_id_text,
                 payload_hash=classification.payload_hash,
                 **self._least_agency_metadata_fields(classification),

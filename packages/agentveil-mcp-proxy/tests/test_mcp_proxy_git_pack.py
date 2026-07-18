@@ -16,6 +16,7 @@ import pytest
 import webbrowser
 
 import agentveil_mcp_proxy.cli as proxy_cli
+from conftest import operator_approval_url
 from agentveil_mcp_proxy.cli import init_proxy, run_proxy
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore, ApprovalStatus
 from agentveil_mcp_proxy.evidence.observability import (
@@ -200,7 +201,8 @@ class _StagedStdin(io.TextIOBase):
 
 
 def _approve_first_pending(home: Path, response: dict) -> str:
-    approval_url = response["error"]["data"]["approval_url"]
+    pending_id = response["error"]["data"]["record_id"]
+    approval_url = operator_approval_url(pending_id)
     with httpx.Client() as client:
         page = client.get(approval_url)
         page.raise_for_status()
@@ -211,7 +213,6 @@ def _approve_first_pending(home: Path, response: dict) -> str:
             "approval_scope": "exact",
             "csrf_token": match.group(1),
         }).raise_for_status()
-    pending_id = response["error"]["data"]["record_id"]
     deadline = time.monotonic() + 5
     with _evidence_store(home) as store:
         record = store.get_pending(pending_id)
@@ -281,12 +282,10 @@ def test_git_add_write_gated_before_mutation(tmp_path, monkeypatch):
     assert dirty.exists()
     response = _responses(out.getvalue())[0]
     assert response["error"]["data"]["status"] == "approval_required"
-    approval_url = response["error"]["data"]["approval_url"]
-    assert approval_url.startswith("http://127.0.0.1:")
-    assert "/pending/" in approval_url
-    assert approval_url in response["error"]["message"]
+    assert "approval_url" not in response["error"]["data"]
+    assert "/approval/" not in json.dumps(response)
     assert "Approval required" in response["error"]["message"]
-    assert "same MCP tool call" in response["error"]["message"]
+    assert "same AgentVeil MCP tool call" in response["error"]["message"]
     assert "without changing tool, target, or payload" in response["error"]["message"]
     assert response["error"]["data"]["instructions"] == APPROVAL_REQUIRED_INSTRUCTIONS
     data = response["error"]["data"]

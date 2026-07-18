@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 import json
 from pathlib import Path
 from typing import Any
 
 from agentveil_mcp_proxy.authority_boundary import parse_authority_from_metadata
 from agentveil_mcp_proxy.evidence.store import ApprovalStatus, PendingApproval
+from agentveil_mcp_proxy.policy import derive_target_reached
 
 _BOUNDED_RESOURCE_KEY_PREFIXES = frozenset({
     "path",
@@ -21,6 +23,70 @@ _BOUNDED_RESOURCE_KEY_PREFIXES = frozenset({
     "url",
     "resource",
 })
+
+
+@dataclass(frozen=True)
+class DownstreamExecutionClassification:
+    """Bounded downstream outcome shared by MCP evidence surfaces."""
+
+    execution_status: str
+    target_reached: bool
+    error_class: str | None
+    store_status: str
+
+
+def classify_downstream_response(
+    response: Mapping[str, Any],
+    *,
+    downstream_tool_call_seen: bool,
+) -> DownstreamExecutionClassification:
+    """Classify one downstream tools/call response for evidence truth.
+
+    claim-check: allow "Fail closed"/"BLOCKED" name store status enum values used by
+    the classifier contract; negative tests cover non-executed outcomes.
+    Refuse executed unless a confirmed forwarded tools/call returns an object
+    ``result`` without JSON-RPC ``error`` / MCP ``isError``.
+    """
+
+    failure = DownstreamExecutionClassification(
+        execution_status=ApprovalStatus.BLOCKED.value,  # claim-check: allow enum store status
+        target_reached=False,
+        error_class="downstream_error",
+        store_status=ApprovalStatus.BLOCKED.value,  # claim-check: allow enum store status
+    )
+    if "error" in response:
+        return failure
+    if not downstream_tool_call_seen:
+        return failure
+    result = response.get("result")
+    if not isinstance(result, Mapping):
+        return failure
+    if result.get("isError") is True:
+        return failure
+    execution_status = ApprovalStatus.EXECUTED.value
+    return DownstreamExecutionClassification(
+        execution_status=execution_status,
+        target_reached=derive_target_reached(
+            execution_status=execution_status,
+            downstream_tool_call_seen=True,
+        ),
+        error_class=None,
+        store_status=ApprovalStatus.EXECUTED.value,
+    )
+
+
+def target_reached_for_evidence_record(record: PendingApproval) -> bool:
+    """Return explicit metadata target_reached; omit invented success.
+
+    claim-check: allow "never" restates the historical-evidence contract covered
+    by outcome-truth negatives.
+    """
+
+    metadata = parse_action_gate_metadata(record)
+    if metadata is None:
+        return False
+    value = metadata.get("target_reached")
+    return value is True
 
 
 def risk_class_plain_label(risk_class: str) -> str:
@@ -315,6 +381,9 @@ _DEFAULT_POLICY_STOP_USER_MESSAGE = (
     "Stopped by policy: this action is not allowed by local policy and cannot "
     "be approved."
 )
+_USER_DENIED_USER_MESSAGE = (
+    "Denied by user. This action was rejected in Approval Center and will not run."
+)
 _CLASSIFIER_ERROR_USER_MESSAGE = (
     "Proxy could not classify this tool call. Approval will not help. "
     "Retry; report if persistent."
@@ -339,6 +408,7 @@ _DEDICATED_USER_MESSAGE_REASONS = frozenset({
     "role_authority_denied",
     "path_outside_workspace",
     "secret_path_blocked",
+    "user_denied",
 })
 _DEFAULT_HARD_DENY_NEXT_STEP = (
     "This action cannot be approved. Adjust the tool call or local policy."
@@ -426,6 +496,10 @@ def enrich_mcp_error_contract(
     reason = str(data.get("reason", ""))
     reason_code = mcp_error_reason_code(reason)
     data["reason_code"] = reason_code
+    # Terminal non-success MCP errors did not reach the downstream target.
+    # claim-check: allow "never" restates the MCP error contract; negatives cover it.
+    if "target_reached" not in data:
+        data["target_reached"] = False
 
     if status == "approval_required":
         data["approval_possible"] = True
@@ -500,6 +574,8 @@ def mcp_error_user_message(data: Mapping[str, Any]) -> str:
         return _RUNTIME_GATE_UNAVAILABLE_USER_MESSAGE
     if reason == "runtime_gate_block":
         return _RUNTIME_GATE_BLOCKED_USER_MESSAGE
+    if reason == "user_denied":
+        return _USER_DENIED_USER_MESSAGE
     if status == "blocked":  # claim-check: allow bounded JSON-RPC status vocabulary; negative tests assert no downstream execution.
         if reason == "role_authority_denied":
             return str(data.get("explanation") or _DEFAULT_HARD_DENY_NEXT_STEP)
@@ -588,6 +664,8 @@ def terminal_state_for_record_status(status: str) -> str | None:
         return "already_decided_deny"
     if status == ApprovalStatus.EXPIRED.value:
         return "approval_expired"
+    if status == ApprovalStatus.CANCELLED.value:
+        return "approval_cancelled"
     return None
 
 

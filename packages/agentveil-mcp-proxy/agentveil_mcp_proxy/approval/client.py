@@ -104,6 +104,9 @@ class RemoteApprovalServer:
     def unregister(self, request_id: str, *, terminal_state: str = "already_decided") -> None:
         return
 
+    def notify_cancelled(self, request_id: str) -> None:
+        return
+
     def list_decided_request_ids(self) -> tuple[str, ...]:
         with self._lock:
             return tuple(self._local_decisions.keys())

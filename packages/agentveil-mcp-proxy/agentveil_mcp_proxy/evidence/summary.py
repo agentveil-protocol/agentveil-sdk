@@ -12,6 +12,7 @@ from agentveil_mcp_proxy.authority_boundary import parse_authority_from_metadata
 from agentveil_mcp_proxy.redirect_playbooks import redirect_metadata_from_action_gate
 from agentveil_mcp_proxy.evidence.observability import execution_record_id_by_parent
 from agentveil_mcp_proxy.evidence.observability import parse_action_gate_metadata
+from agentveil_mcp_proxy.evidence.observability import target_reached_for_evidence_record
 from agentveil_mcp_proxy.evidence.store import ApprovalStatus, PendingApproval
 from agentveil_mcp_proxy.passthrough import DownstreamConfig, PassthroughError
 from agentveil_mcp_proxy.policy import ProxyConfig
@@ -71,9 +72,7 @@ def bounded_downstream_info(config: ProxyConfig) -> dict[str, Any]:
 
 
 def _target_reached(record: PendingApproval) -> bool:
-    if record.status == ApprovalStatus.EXECUTED.value:
-        return True
-    return record.result_status == "executed"
+    return target_reached_for_evidence_record(record)
 
 
 def _summary_reason(record: PendingApproval) -> str | None:

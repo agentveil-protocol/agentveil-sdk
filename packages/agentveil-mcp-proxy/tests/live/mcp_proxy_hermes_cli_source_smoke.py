@@ -38,6 +38,7 @@ from agentveil_mcp_proxy.agent_launcher import (  # noqa: E402
     write_hermes_config,
 )
 from agentveil_mcp_proxy.cli import _launch_init_proxy  # noqa: E402
+from agentveil_mcp_proxy.approval.persistent import load_manifest  # noqa: E402
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore, ApprovalStatus  # noqa: E402
 from agentveil_mcp_proxy.evidence.observability import parse_controlled_path_metadata  # noqa: E402
 
@@ -261,11 +262,12 @@ def main() -> int:
             assert pending["error"]["data"]["status"] == "approval_required"
             assert not (project / PROOF_FILENAME).exists()
 
-            _approve_via_center(
-                pending["error"]["data"]["approval_url"],
-                pending["error"]["data"]["record_id"],
-                home,
-            )
+            record_id = pending["error"]["data"]["record_id"]
+            manifest = load_manifest(home / "mcp-proxy")
+            assert manifest is not None
+            approval_url = f"{manifest.approval_center_url()}/pending/{record_id}"
+            assert approval_url not in json.dumps(pending)
+            _approve_via_center(approval_url, record_id, home)
 
             process.stdin.write(_tool_call("write_file", call_id="write-retry", arguments=write_args))
             process.stdin.flush()
