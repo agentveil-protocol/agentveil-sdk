@@ -5,8 +5,16 @@ This repository uses tiered CI so day-to-day agent work stays fast while release
 ## Gates
 
 - Fast gate: runs on normal branch pushes. It uses Ubuntu and the primary Python version, and must run the full regular pytest suite.
-- Compatibility gate: runs on pull requests to `main`, manual dispatch, and release tags. It uses the full supported OS/Python matrix.
-- Publish gate: package publication is allowed only after the compatibility gate has passed for the release candidate or tag.
+- Pull-request compatibility gate: exercises supported Python versions on Ubuntu,
+  bounded platform checks on Windows and macOS, and managed Approval Center E2E
+  on macOS.
+- Release gate: runs the full SDK and MCP Proxy suites once on Ubuntu/Python
+  3.12. Additional Python and OS combinations run bounded compatibility smoke,
+  and Ubuntu, Windows, and macOS each run one managed Approval Center process
+  E2E on Python 3.12.
+- Publish gate: package publication is allowed only after the full suite,
+  compatibility smoke, and cross-platform Approval Center E2E jobs pass for
+  the release tag.
 - MCP Proxy release acceptance: for releases that change MCP Proxy setup,
   passthrough, approval UX, evidence, or Runtime Gate behavior, run
   `packages/agentveil-mcp-proxy/scripts/mcp_proxy_release_acceptance.py`
@@ -20,7 +28,8 @@ This repository uses tiered CI so day-to-day agent work stays fast while release
 - Do not treat the fast gate as release verification.
 - Do not use `[skip ci]` for code, packaging, security, or behavior changes.
 - Before reporting a change as done, state which local commands and which CI gates actually ran.
-- Before tagging or publishing a release, verify that the compatibility gate passed.
+- Before tagging or publishing a release, verify that the single full suite,
+  bounded compatibility smoke, and cross-platform Approval Center E2E passed.
 - Before tagging or publishing an MCP Proxy release, verify that the MCP Proxy
   release acceptance runner passed, or state explicitly why that gate was
   skipped.
@@ -29,12 +38,15 @@ This repository uses tiered CI so day-to-day agent work stays fast while release
 
 - Focused suites should finish within 3 minutes. The full local public SDK gate
   has a 25-minute target budget.
-- Release compatibility jobs use a hard 35-minute timeout. A timeout or a
+- The single full release suite uses a hard 30-minute timeout. Compatibility
+  smoke uses 12 minutes, and Approval Center process E2E uses 10 minutes. A timeout or a
   test step with no meaningful progress for 10 minutes is a CI `HOLD`; do not
   start a duplicate workflow while the original run is active.
-- The SDK suite and MCP Proxy suite run once each with explicit test paths.
+- The SDK suite and MCP Proxy suite run once each on Ubuntu/Python 3.12 with explicit test paths.
   Pytest reports the 50 slowest tests and emits a faulthandler thread dump after
   120 seconds so a stalled process has actionable diagnostics.
+- Release tags are handled by `publish.yml`; `tests.yml` must not start a
+  second tag-triggered full matrix.
 - Tests that launch an MCP Proxy or managed Approval Center subprocess must
   explicitly disable real browser and OS approval delivery in the child
   process. Parent-process monkeypatches are not subprocess isolation.
