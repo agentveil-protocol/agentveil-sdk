@@ -104,7 +104,6 @@ from agentveil_mcp_proxy.redirect_playbooks import (
     attach_redirect_playbook_fields_for_evidence_record,
     build_risk_family_guidance,
     enrich_risk_family_error_data,
-    message_visible_approval_redirect,
     message_visible_blocked_redirect,
     redirect_playbook_id_for_risk_family,
     uses_risk_family_redirects,
@@ -144,7 +143,6 @@ from agentveil_mcp_proxy.runtime_gate import (
 from agentveil_mcp_proxy.evidence.observability import (
     APPROVAL_REQUIRED_INSTRUCTIONS,
     APPROVAL_REQUIRED_USER_MESSAGE,
-    approval_required_actionable_message,
     enrich_mcp_error_contract,
     mcp_error_user_message,
     reason_has_dedicated_user_message,
@@ -179,17 +177,26 @@ _REDIRECT_STOP_AND_CLASSIFY = "stop_and_classify_unknown_action"
 
 
 def approval_required_user_message(*, approval_url: str | None = None) -> str:
-    """Return the default user-facing approval-required message."""
+    """Return the agent-visible approval-required message.
 
-    if approval_url:
-        return actionable_approval_required_message(approval_url)
+    Tokenized approval URLs are operator-local capability tokens. They must not
+    appear in MCP error text even when an internal ``approval_url`` exists for
+    browser/TTY delivery.
+    """
+
+    del approval_url  # retained for call-site compatibility; not agent-visible
     return APPROVAL_REQUIRED_USER_MESSAGE
 
 
 def actionable_approval_required_message(approval_url: str) -> str:
-    """Return a client-visible MCP error message that includes the approval URL."""
+    """Return agent-visible approval text without embedding capability URLs.
 
-    return approval_required_actionable_message(approval_url)
+    ``approval_url`` is accepted for call-site compatibility but intentionally
+    ignored: tokenized URLs must stay on the operator delivery path only.
+    """
+
+    del approval_url
+    return APPROVAL_REQUIRED_USER_MESSAGE
 
 
 JSONRPC_RUNTIME_GATE_UNAVAILABLE = -32012
@@ -848,15 +855,18 @@ def _approval_redirect_message(
 ) -> str:
     if classification is None or not uses_risk_family_redirects(classification):
         return default_message
-    approval_url = data.get("approval_url")
-    if not isinstance(approval_url, str) or not approval_url:
-        return default_message
     guidance = build_risk_family_guidance(
         classification,
         outcome="approval",
         reason=str(data.get("reason", "")),
     )
-    return message_visible_approval_redirect(guidance, approval_url=approval_url)
+    # Do not embed tokenized approval URLs in agent-visible redirect text.
+    # Browser/TTY delivery keeps the concrete pending URL on the operator path.
+    return (
+        f"Approval required for {guidance.risk_family}.\n"
+        f"Redirect playbook: {guidance.redirect_playbook}.\n"
+        "Open the local Approval Center, approve or deny, then retry the same request."
+    )
 
 
 def _risk_family_redirect_metadata_fields(
@@ -973,11 +983,11 @@ def _approval_required_error(
     if approval_outcome is not None:
         data["record_id"] = approval_outcome.request_id
         data["record_status"] = approval_outcome.status
-        if approval_outcome.approval_url is not None:
-            data["approval_url"] = approval_outcome.approval_url
-            data["instructions"] = APPROVAL_REQUIRED_INSTRUCTIONS
-            data["proof_inspection_hint"] = LOCAL_PROOF_AGENT_INSPECTION_HINT
-            resolved_message = actionable_approval_required_message(approval_outcome.approval_url)
+        # Tokenized approval_url stays internal for browser/TTY delivery only.
+        # Do not put the capability URL in MCP error.data or error.message.
+        data["instructions"] = APPROVAL_REQUIRED_INSTRUCTIONS
+        data["proof_inspection_hint"] = LOCAL_PROOF_AGENT_INSPECTION_HINT
+        resolved_message = APPROVAL_REQUIRED_USER_MESSAGE
     if enrich_guidance:
         redirect_original_id = (
             approval_outcome.request_id

@@ -48,6 +48,54 @@ def _responses(text: str) -> list[dict]:
     return [json.loads(line) for line in text.splitlines() if line.strip()]
 
 
+def _install_operator_browser_capture(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Capture tokenized pending URLs from the operator browser delivery path.
+
+    Returns False so fail-soft wait_for_decision configs still emit
+    ``approval_required`` promptly. The captured URL remains available for
+    operator-side Approve/Deny without reading agent-visible MCP payloads.
+    """
+
+    opened: list[str] = []
+
+    def capture_open(url: str) -> bool:
+        opened.append(url)
+        return False
+
+    monkeypatch.setattr("webbrowser.open", capture_open)
+    return opened
+
+
+def _wait_operator_pending_url(opened: list[str], request_id: str, *, deadline: float) -> str:
+    while time.monotonic() < deadline:
+        for url in opened:
+            if request_id in url and "/pending/" in url:
+                return url
+        time.sleep(0.02)
+    assert opened, "expected operator browser opener to receive a pending URL"
+    raise AssertionError(f"pending URL for {request_id} not opened; saw={opened!r}")
+
+
+def _assert_mcp_fail_soft_has_no_capability_token(response: dict, *, session_token: str | None = None) -> None:
+    """Agent-visible fail-soft must omit tokenized approval surfaces."""
+
+    error = response["error"]
+    data = error["data"]
+    serialized = json.dumps(response)
+    assert data["status"] == "approval_required"
+    assert data["record_id"]
+    assert data["record_status"] == "pending"
+    assert "approval_url" not in data
+    assert "csrf_token" not in serialized
+    assert "/approval/" not in serialized
+    if session_token is not None:
+        assert session_token not in serialized
+        assert f"/approval/{session_token}" not in serialized
+    message = error.get("message", "")
+    assert "http://127.0.0.1" not in message
+    assert "http://localhost" not in message
+
+
 def _write_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data), encoding="utf-8")
 
@@ -235,9 +283,7 @@ def test_run_proxy_fail_soft_delivery_prompts_approval_without_downstream(
     response = _responses(client_out.getvalue())[0]
     assert elapsed < 10.0
     assert response["error"]["code"] == JSONRPC_APPROVAL_REQUIRED
-    assert response["error"]["data"]["status"] == "approval_required"
-    assert response["error"]["data"]["record_status"] == "pending"
-    assert response["error"]["data"]["approval_url"].startswith("http://127.0.0.1:")
+    _assert_mcp_fail_soft_has_no_capability_token(response)
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
 
 
@@ -297,6 +343,7 @@ def test_run_proxy_fail_soft_approve_then_retry_executes_once(
 ):
     home, _config_path, log_path = _init_run_proxy_fixture(tmp_path)
     _exploding_agent(monkeypatch)
+    opened = _install_operator_browser_capture(monkeypatch)
 
     staged_in = _StagedStdin([
         _tool_call("write_file", call_id="pending"),
@@ -321,7 +368,11 @@ def test_run_proxy_fail_soft_approve_then_retry_executes_once(
         assert first["error"]["data"]["status"] == "approval_required"
         assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
         pending_id = first["error"]["data"]["record_id"]
-        approval_url = first["error"]["data"]["approval_url"]
+        _assert_mcp_fail_soft_has_no_capability_token(first)
+        approval_url = _wait_operator_pending_url(opened, pending_id, deadline=deadline)
+        assert pending_id in approval_url
+        assert "/pending/" in approval_url
+        assert approval_url not in json.dumps(first)
         with httpx.Client() as client:
             csrf = _get_csrf(client, approval_url)
             _post_decision(client, approval_url, decision="approve", csrf=csrf).raise_for_status()
@@ -348,6 +399,7 @@ def test_run_proxy_fail_soft_deny_retry_does_not_execute(
 ):
     home, _config_path, log_path = _init_run_proxy_fixture(tmp_path)
     _exploding_agent(monkeypatch)
+    opened = _install_operator_browser_capture(monkeypatch)
 
     staged_in = _StagedStdin([
         _tool_call("write_file", call_id="pending"),
@@ -369,8 +421,9 @@ def test_run_proxy_fail_soft_deny_retry_does_not_execute(
         while time.monotonic() < deadline and not client_out.getvalue().strip():
             time.sleep(0.02)
         first = _responses(client_out.getvalue())[0]
-        approval_url = first["error"]["data"]["approval_url"]
         pending_id = first["error"]["data"]["record_id"]
+        _assert_mcp_fail_soft_has_no_capability_token(first)
+        approval_url = _wait_operator_pending_url(opened, pending_id, deadline=deadline)
         with httpx.Client() as client:
             csrf = _get_csrf(client, approval_url)
             _post_decision(client, approval_url, decision="deny", csrf=csrf).raise_for_status()
@@ -442,6 +495,7 @@ def test_run_proxy_fail_soft_response_has_no_sensitive_leaks(
         "agentveil_mcp_proxy.approval.server.managed_center_owns_pid",
         lambda _home, _pid: False,
     )
+    opened = _install_operator_browser_capture(monkeypatch)
     try:
         client_out = io.StringIO()
         assert run_proxy(
@@ -452,18 +506,28 @@ def test_run_proxy_fail_soft_response_has_no_sensitive_leaks(
         ) == 0
         response = _responses(client_out.getvalue())[0]
         data = response["error"]["data"]
-        current_url = data["approval_url"]
-        assert current_url.startswith("http://127.0.0.1:")
         serialized = json.dumps(response)
+        _assert_mcp_fail_soft_has_no_capability_token(response)
         assert secret_internal not in serialized
         assert secret_session not in serialized
         assert other_pending_url not in serialized
         assert "internal_register_token" not in serialized
-        assert load_manifest(proxy_dir) is None
+        assert "approval_url" not in data
+        assert "csrf_token" not in serialized
+        # Stale foreign manifest cleared; ephemeral in-process center may leave no manifest.
+        live_manifest = load_manifest(proxy_dir)
+        assert live_manifest is None or live_manifest.session_token != secret_session
+        assert opened, "operator browser delivery must receive the tokenized pending URL"
+        assert any(data["record_id"] in url for url in opened)
+        assert len([url for url in opened if "/pending/" in url]) == len(opened)  # claim-check: allow pending-path assertion
+        assert len([url for url in opened if url not in serialized]) == len(opened)  # claim-check: allow privacy assertion
+        for url in opened:
+            token_part = url.split("/approval/", 1)[1].split("/", 1)[0]
+            assert token_part
+            assert token_part not in serialized
+            assert f"/approval/{token_part}" not in serialized
         assert os.getpid() == foreign_pid
         assert data["record_id"]
-        assert secret_internal not in current_url
-        assert secret_session not in current_url
         assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
     finally:
         foreign_server.stop()

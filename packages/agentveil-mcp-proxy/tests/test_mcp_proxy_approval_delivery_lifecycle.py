@@ -191,19 +191,111 @@ def test_failed_browser_delivery_returns_approval_required_without_full_timeout(
         record = store.get_pending(outcome.request_id)
         assert record is not None
         assert record.status == ApprovalStatus.PENDING.value
-        assert manager._approval_ui_browser_opened is False
+        assert outcome.request_id not in manager._browser_opened_request_ids
         outcome2 = manager.request_approval(
             _classification(manager.config),
             reason="local_approval_required",
         )
         assert outcome2.status == ApprovalStatus.PENDING.value
         assert len(opened) >= 2
+        assert outcome.request_id in opened[0]
+        assert any(outcome2.request_id in url for url in opened)
+        assert outcome2.request_id not in manager._browser_opened_request_ids
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_per_request_browser_opens_distinct_pending_cards(tmp_path):
+    """First and second pending approvals each open their own card URL."""
+
+    opened: list[str] = []
+
+    def opener(url: str) -> bool:
+        opened.append(url)
+        return True
+
+    manager, store, server = _manager(tmp_path, browser_open=opener, wait_for_decision=False)
+    try:
+        first = manager.request_approval(
+            _classification(manager.config),
+            reason="local_approval_required",
+        )
+        second = manager.request_approval(
+            _classification(manager.config),
+            reason="local_approval_required",
+        )
+        assert first.request_id != second.request_id
+        assert len(opened) == 2
+        assert opened[0] == server.approval_url(first.request_id)
+        assert opened[1] == server.approval_url(second.request_id)
+        assert first.request_id in opened[0]
+        assert second.request_id in opened[1]
+        assert opened[0] != opened[1]
+        assert "/pending/" in opened[0]
+        assert "/pending/" in opened[1]
+        assert server.approval_center_url() not in opened
+        assert first.request_id in manager._browser_opened_request_ids
+        assert second.request_id in manager._browser_opened_request_ids
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_same_request_id_does_not_reopen_browser_after_successful_delivery(tmp_path):
+    opened: list[str] = []
+
+    def opener(url: str) -> bool:
+        opened.append(url)
+        return True
+
+    manager, store, server = _manager(tmp_path, browser_open=opener, wait_for_decision=False)
+    try:
+        outcome = manager.request_approval(
+            _classification(manager.config),
+            reason="local_approval_required",
+        )
+        assert len(opened) == 1
+        again = manager._maybe_open_approval_browser(
+            request_id=outcome.request_id,
+            url=server.approval_url(outcome.request_id),
+        )
+        assert again is True
+        assert len(opened) == 1
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_non_tty_fallback_omits_session_token(tmp_path):
+    opened: list[str] = []
+    cli = io.StringIO()
+    manager, store, server = _manager(
+        tmp_path,
+        browser_open=lambda url: opened.append(url) or True,
+        wait_for_decision=False,
+    )
+    manager.cli_out = cli
+    try:
+        outcome = manager.request_approval(
+            _classification(manager.config),
+            reason="local_approval_required",
+            client_request_id="cli-1",
+        )
+        text = cli.getvalue()
+        assert server.session_token not in text
+        assert "session token omitted" in text
+        assert outcome.approval_url is not None
+        assert server.session_token in outcome.approval_url
+        assert server.session_token in opened[0]
     finally:
         server.stop()
         store.close()
 
 
 def test_successful_browser_delivery_keeps_synchronous_wait(tmp_path):
+    """Truthy browser delivery must keep the synchronous wait path."""
+
     opened: list[str] = []
 
     def opener(url: str) -> bool:
@@ -234,18 +326,11 @@ def test_successful_browser_delivery_keeps_synchronous_wait(tmp_path):
         elapsed = time.monotonic() - started
         assert outcome.status == ApprovalStatus.APPROVED.value
         assert elapsed < 5.0
-        assert manager._approval_ui_browser_opened is True
-        assert opened
-        before = len(opened)
-        outcome2 = manager.request_approval(
-            _classification(manager.config),
-            reason="local_approval_required",
-        )
-        assert len(opened) == before
-        assert outcome2.status in {
-            ApprovalStatus.APPROVED.value,
-            ApprovalStatus.PENDING.value,
-        }
+        assert outcome.request_id in manager._browser_opened_request_ids
+        assert len(opened) == 1
+        assert outcome.request_id in opened[0]
+        assert "/pending/" in opened[0]
+        assert opened[0] == server.approval_url(outcome.request_id)
     finally:
         server.stop()
         store.close()
@@ -585,16 +670,26 @@ def test_fail_soft_response_excludes_sensitive_fields(tmp_path):
             reason="local_approval_required",
         )
         assert outcome.approval_url is not None
-        serialized = json.dumps({
-            "approval_url": outcome.approval_url,
-            "request_id": outcome.request_id,
-            "status": outcome.status,
-            "reason": outcome.reason,
-        })
+        # Internal outcome may retain the operator URL for browser/TTY delivery.
+        assert server.session_token in outcome.approval_url
+        from agentveil_mcp_proxy.passthrough import _approval_required_error
+
+        mcp_response = _approval_required_error(
+            "call-1",
+            reason="local_approval_required",
+            approval_outcome=outcome,
+        )
+        serialized = json.dumps(mcp_response)
+        assert "approval_url" not in mcp_response["error"]["data"]
+        assert server.session_token not in serialized
+        assert f"/approval/{server.session_token}" not in serialized
+        assert "csrf_token" not in serialized
         assert secret_internal not in serialized
         assert other_url not in serialized
         assert "internal_register_token" not in serialized
-        assert server.session_token not in serialized or server.session_token in outcome.approval_url
+        assert opened
+        assert server.session_token in opened[0]
+        assert outcome.request_id in opened[0]
     finally:
         server.stop()
         store.close()

@@ -148,7 +148,9 @@ class ApprovalManager:
         self._client_request_bindings: dict[tuple[str, Any], str] = {}
         self._prebind_cancellations: dict[tuple[str, Any], float] = {}
         self._tracked_client_requests: set[tuple[str, Any]] = set()
-        self._approval_ui_browser_opened = False
+        # Per-request browser delivery: a successful open for request A must not
+        # suppress opening the card for a later distinct request B.
+        self._browser_opened_request_ids: set[str] = set()
         self.approval_server.set_decision_handler(self._persist_server_decision)
 
     def request_approval(
@@ -1016,19 +1018,20 @@ class ApprovalManager:
             file=self.cli_out,
         )
 
-    def _maybe_open_approval_browser(self) -> bool:
-        """Open the approval center in the browser; success is truthy opener only.
+    def _maybe_open_approval_browser(self, *, request_id: str, url: str) -> bool:
+        """Open one pending approval card; success is truthy opener only.
 
-        A ``False`` return or exception must not burn the one-shot flag so a
-        later approval can retry delivery. On webbrowser failure, try a bounded
-        native macOS fallback when available.
+        Each distinct ``request_id`` gets its own bounded open of the concrete
+        pending card URL. A ``False`` return or exception must not mark the
+        request delivered so a later retry can attempt again. The same
+        ``request_id`` must not re-open after a successful delivery (internal
+        retries must not spam the browser).
         """
 
         if self._effective_ui_open_mode() is not ApprovalUiOpenMode.BROWSER:
             return False
-        if self._approval_ui_browser_opened:
+        if request_id in self._browser_opened_request_ids:
             return True
-        url = self.approval_server.approval_center_url()
         # Injected openers own delivery (tests/mocks). Native fallback only when
         # using the real stdlib webbrowser opener.
         if self.browser_open is webbrowser.open:
@@ -1038,7 +1041,7 @@ class ApprovalManager:
 
             result = open_approval_url_webbrowser(url, opener=self.browser_open)
         if result.delivered:
-            self._approval_ui_browser_opened = True
+            self._browser_opened_request_ids.add(request_id)
             return True
         return False
 
@@ -1058,7 +1061,10 @@ class ApprovalManager:
         )
         self._print_approval_fallback(prompt, url, summary)
         mode = self._effective_ui_open_mode()
-        browser_ok = self._maybe_open_approval_browser()
+        browser_ok = self._maybe_open_approval_browser(
+            request_id=prompt.request_id,
+            url=url,
+        )
         if mode is not ApprovalUiOpenMode.NONE:
             self.notifier.notify(prompt)
         if mode is ApprovalUiOpenMode.BROWSER:

@@ -193,7 +193,8 @@ def test_approval_required_error_includes_bounded_redirect_metadata() -> None:
     assert data["status"] == "approval_required"
     assert data["redirect_outcome"] == "approval_required"
     assert data["record_id"] == "approval-1"
-    assert data["approval_url"].startswith("http://127.0.0.1/")
+    assert "approval_url" not in data
+    assert "http://127.0.0.1/approval/test" not in response["error"]["message"]
     assert data["redirect"]["then_retry_original"] is True
     assert data["original_request_fingerprint"]["tool"] == "write_file"
 

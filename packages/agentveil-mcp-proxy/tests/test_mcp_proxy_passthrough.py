@@ -997,11 +997,13 @@ def test_run_returns_approval_required_without_waiting_or_forwarding(tmp_path, m
     assert response["error"]["data"]["reason"] == "local_approval_required"
     assert response["error"]["data"]["record_status"] == "pending"
     assert response["error"]["data"]["record_id"]
-    approval_url = response["error"]["data"]["approval_url"]
-    assert approval_url.startswith("http://127.0.0.1:")
-    assert approval_url in response["error"]["message"]
+    assert "approval_url" not in response["error"]["data"]
+    serialized = json.dumps(response)
+    assert "/approval/" not in serialized
+    assert "csrf_token" not in serialized
+    assert "http://127.0.0.1" not in response["error"]["message"]
     assert "Approval required" in response["error"]["message"]
-    assert "same MCP tool call" in response["error"]["message"]
+    assert "same AgentVeil MCP tool call" in response["error"]["message"]
     assert "without changing tool, target, or payload" in response["error"]["message"]
     assert "Do not ask the user for another message" in response["error"]["message"]
     assert response["error"]["data"]["instructions"] == APPROVAL_REQUIRED_INSTRUCTIONS
@@ -1241,7 +1243,7 @@ def test_valid_write_file_args_still_create_approval(tmp_path, monkeypatch):
     assert response["error"]["data"]["reason"] == "local_approval_required"
     assert response["error"]["data"]["record_status"] == "pending"
     assert response["error"]["data"]["record_id"]
-    assert response["error"]["data"]["approval_url"].startswith("http://127.0.0.1:")
+    assert "approval_url" not in response["error"]["data"]
     assert _pending_approval_count(home) == 1
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
 
@@ -1382,7 +1384,7 @@ def test_normalized_inside_path_is_not_falsely_denied(tmp_path, monkeypatch):
     assert response["error"]["data"]["status"] == "approval_required"
     assert response["error"]["data"]["reason"] == "local_approval_required"
     assert response["error"]["data"]["record_status"] == "pending"
-    assert response["error"]["data"]["approval_url"].startswith("http://127.0.0.1:")
+    assert "approval_url" not in response["error"]["data"]
     # And it was not falsely classified as escaping the workspace.
     assert response["error"]["data"].get("reason") != "path_outside_workspace"
 
@@ -2815,7 +2817,7 @@ def test_instruction_file_write_requires_approval_before_downstream(
     assert response["error"]["code"] == JSONRPC_APPROVAL_REQUIRED
     assert response["error"]["data"]["status"] == "approval_required"
     assert response["error"]["data"]["reason"] == "instruction_file_write_requires_approval"
-    assert response["error"]["data"]["approval_url"].startswith("http://127.0.0.1:")
+    assert "approval_url" not in response["error"]["data"]
     assert instruction_path not in client_out.getvalue()
     assert _pending_approval_count(home) == 1
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
@@ -3271,7 +3273,7 @@ def test_hidden_unicode_instruction_file_cursor_rule_still_requires_approval(
     response = _responses(client_out.getvalue())[1]
     assert response["error"]["code"] == JSONRPC_APPROVAL_REQUIRED
     assert response["error"]["data"]["reason"] == "instruction_file_write_requires_approval"
-    assert response["error"]["data"]["approval_url"].startswith("http://127.0.0.1:")
+    assert "approval_url" not in response["error"]["data"]
     assert _pending_approval_count(home) == 1
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
 
@@ -3361,7 +3363,7 @@ def test_persistence_path_write_requires_approval_before_downstream(
     assert response["error"]["code"] == JSONRPC_APPROVAL_REQUIRED
     assert response["error"]["data"]["status"] == "approval_required"
     assert response["error"]["data"]["reason"] == "persistence_path_write_requires_approval"
-    assert response["error"]["data"]["approval_url"].startswith("http://127.0.0.1:")
+    assert "approval_url" not in response["error"]["data"]
     assert persistence_path not in client_out.getvalue()
     assert "hook body" not in client_out.getvalue()
     assert _pending_approval_count(home) == 1
@@ -3570,7 +3572,7 @@ def test_package_manager_mutation_requires_approval_before_downstream(
     assert response["error"]["code"] == JSONRPC_APPROVAL_REQUIRED
     assert response["error"]["data"]["status"] == "approval_required"
     assert response["error"]["data"]["reason"] == "package_manager_action_requires_approval"
-    assert response["error"]["data"]["approval_url"].startswith("http://127.0.0.1:")
+    assert "approval_url" not in response["error"]["data"]
     output = client_out.getvalue()
     assert command not in output
     for secret_fragment in ("left-pad", "requests", "pandas", "httpx", "ripgrep", "marker-pkg"):
