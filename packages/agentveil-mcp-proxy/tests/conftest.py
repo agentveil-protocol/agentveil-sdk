@@ -6,6 +6,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -132,6 +134,102 @@ def run_hook_shim_subprocess(
         check=False,
         env=env,
         timeout=timeout,
+    )
+
+
+class _ProcessOutputCollector:
+    """Drain a test subprocess pipe without ever waiting for EOF on failure."""
+
+    def __init__(self, stream) -> None:
+        self._lines: list[str] = []
+        self._thread = threading.Thread(target=self._run, args=(stream,), daemon=True)
+        self._thread.start()
+
+    def _run(self, stream) -> None:
+        for line in stream:
+            self._lines.append(line)
+
+    def tail(self, limit: int = 4000) -> str:
+        return "".join(self._lines)[-limit:]
+
+
+@pytest.fixture
+def managed_approval_center_process():
+    """Start one foreground test-owned managed center with fixture cleanup."""
+
+    from agentveil_mcp_proxy.approval.persistent import (
+        load_manifest,
+        manifest_is_reachable,
+    )
+    from agentveil_mcp_proxy.approval.server import (
+        _proxy_cli_child_env,
+        clear_managed_approval_center_manifest,
+    )
+
+    started: list[tuple[subprocess.Popen[str], Path]] = []
+
+    def start(*, home: Path, isolated_home: Path) -> subprocess.Popen[str]:
+        config_path = home / "mcp-proxy" / "config.json"
+        assert config_path.is_file()
+        parent_env = os.environ.copy()
+        parent_env["HOME"] = str(isolated_home)
+        env = _proxy_cli_child_env(parent_env=parent_env)
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "agentveil_mcp_proxy.cli",
+                "approval-center",
+                "serve",
+                "--home",
+                str(home),
+                "--config",
+                str(config_path),
+                "--port",
+                "0",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+        )
+        assert proc.stdout is not None
+        output = _ProcessOutputCollector(proc.stdout)
+        started.append((proc, home))
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                raise AssertionError(
+                    "test managed approval center exited before readiness "
+                    f"(exit {proc.returncode}): {output.tail().strip()}"
+                )
+            manifest = load_manifest(home / "mcp-proxy")
+            if manifest is not None and manifest_is_reachable(manifest):
+                return proc
+            time.sleep(0.05)
+        raise AssertionError(
+            "test managed approval center did not become ready: "
+            f"{output.tail().strip()}"
+        )
+
+    yield start
+
+    cleanup_failures: list[str] = []
+    for proc, home in reversed(started):
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        if proc.poll() is None:
+            cleanup_failures.append(str(home))
+        clear_managed_approval_center_manifest(home)
+    assert not cleanup_failures, (
+        "managed approval center test processes were not reaped: "
+        + ", ".join(cleanup_failures)
     )
 
 
