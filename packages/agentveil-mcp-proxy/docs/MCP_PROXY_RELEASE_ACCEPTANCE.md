@@ -58,8 +58,11 @@ gate must not use it, because it does not verify `register` or
 
 - Focused verification has a 3-minute target; the full local public
   SDK gate has a 25-minute target budget.
-- Tag-triggered compatibility jobs have a hard 35-minute limit. Treat a job
-  that exceeds the limit as `HOLD`, not as an indefinitely slow success.
+- The tag-triggered release gate runs the full SDK and MCP Proxy suites once on
+  Ubuntu/Python 3.12 with a hard 30-minute limit. Bounded Python/OS smoke and
+  one managed Approval Center process E2E on Ubuntu, Windows, and macOS run in
+  parallel. Treat a job that exceeds its declared limit as `HOLD`, not as an
+  indefinitely slow success.
 - Approval process tests must launch child proxies with browser/OS delivery
   explicitly disabled, use deterministic decisions, and stop managed Approval
   Center processes during cleanup.
@@ -67,9 +70,9 @@ gate must not use it, because it does not verify `register` or
   stalled pytest process.
 - On a hang, record the run id, tag SHA, active job/step, elapsed time, completed
   jobs, and whether publication started. Do not launch a duplicate run.
-- Validate a corrective commit with one manual compatibility-only publish
-  workflow run before creating a recovery tag; manual dispatch must not enter
-  the publish job.
+- Validate a corrective commit with one manual release-gate run before creating
+  a recovery tag; manual dispatch must run the same bounded gate topology and
+  must not enter the publish job.
 - Do not delete, move, or reuse a public release tag as recovery. Do not publish
   manually. Cancellation, a corrective commit, and any recovery tag or publish
   action each require their own explicit operator approval.
