@@ -879,6 +879,27 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
                 self._render_prompt(prompt),
                 extra_headers={"Set-Cookie": self._session_cookie_header()},
             )
+            store = self.server_owner.evidence_store
+            if store is not None:
+                try:
+                    from agentveil_mcp_proxy.evidence.store import (
+                        ApprovalEvidenceError,
+                        ApprovalStatus,
+                        DELIVERY_STATUS_VISIBLE,
+                    )
+
+                    record = store.get_pending(request_id)
+                    if (
+                        record is not None
+                        and record.status == ApprovalStatus.PENDING.value
+                    ):
+                        store.annotate_delivery_status(
+                            request_id,
+                            delivery_status=DELIVERY_STATUS_VISIBLE,
+                        )
+                except ApprovalEvidenceError:
+                    # Delivery annotation must not fail the successful page response.
+                    pass
             return
         self._respond_stale_pending(request_id)
 

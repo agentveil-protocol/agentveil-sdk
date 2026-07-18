@@ -142,8 +142,10 @@ from agentveil_mcp_proxy.runtime_gate import (
     RuntimeGateUntrustedError,
 )
 from agentveil_mcp_proxy.evidence.observability import (
+    APPROVAL_NOT_DELIVERED_USER_MESSAGE,
     APPROVAL_REQUIRED_INSTRUCTIONS,
     APPROVAL_REQUIRED_USER_MESSAGE,
+    approval_center_open_recovery_command,
     enrich_mcp_error_contract,
     mcp_error_user_message,
     reason_has_dedicated_user_message,
@@ -986,9 +988,18 @@ def _approval_required_error(
         data["record_status"] = approval_outcome.status
         # Tokenized approval_url stays internal for browser/TTY delivery only.
         # Do not put the capability URL in MCP error.data or error.message.
+        delivery_status = approval_outcome.delivery_status
+        if delivery_status:
+            data["delivery_status"] = delivery_status
         data["instructions"] = APPROVAL_REQUIRED_INSTRUCTIONS
         data["proof_inspection_hint"] = LOCAL_PROOF_AGENT_INSPECTION_HINT
-        resolved_message = APPROVAL_REQUIRED_USER_MESSAGE
+        if delivery_status == "not_delivered":
+            data["recovery_command"] = approval_center_open_recovery_command(
+                approval_outcome.request_id
+            )
+            resolved_message = APPROVAL_NOT_DELIVERED_USER_MESSAGE
+        else:
+            resolved_message = APPROVAL_REQUIRED_USER_MESSAGE
     if enrich_guidance:
         redirect_original_id = (
             approval_outcome.request_id

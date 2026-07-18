@@ -35,6 +35,11 @@ from agentveil_mcp_proxy.evidence import (
     ApprovalStatus,
     PendingApproval,
 )
+from agentveil_mcp_proxy.evidence.store import (
+    DELIVERY_STATUS_DELIVERED,
+    DELIVERY_STATUS_NOT_DELIVERED,
+    DELIVERY_STATUS_QUEUED,
+)
 from agentveil_mcp_proxy.evidence.approval_grant import (
     APPROVAL_GRANT_SCHEMA,
     ApprovalGrantError,
@@ -97,6 +102,7 @@ class ApprovalOutcome:
     reason: str
     approval_scope: str = APPROVAL_SCOPE_EXACT
     approval_url: str | None = None
+    delivery_status: str | None = None
 
     @property
     def approved(self) -> bool:
@@ -302,7 +308,9 @@ class ApprovalManager:
             if pending.status != ApprovalStatus.PENDING.value:
                 return self._outcome_for_terminal_record(pending)
             url = self.approval_server.register(prompt)
+            self._set_delivery_status(request_id, DELIVERY_STATUS_QUEUED)
         actionable_ui = self._notify(prompt, url)
+        delivery_status = self._delivery_status_for(request_id)
         if not self.wait_for_decision:
             self._watch_decision_in_background(request_id, timeout)
             return ApprovalOutcome(
@@ -310,6 +318,7 @@ class ApprovalManager:
                 ApprovalStatus.PENDING.value,
                 reason,
                 approval_url=url,
+                delivery_status=delivery_status,
             )
         # Keep synchronous wait when an actionable UI was delivered. If browser
         # delivery failed, return the existing approval_required contract
@@ -324,8 +333,17 @@ class ApprovalManager:
                 ApprovalStatus.PENDING.value,
                 reason,
                 approval_url=url,
+                delivery_status=delivery_status or DELIVERY_STATUS_NOT_DELIVERED,
             )
-        return self._await_decision(request_id, timeout)
+        outcome = self._await_decision(request_id, timeout)
+        return ApprovalOutcome(
+            outcome.request_id,
+            outcome.status,
+            outcome.reason,
+            approval_scope=outcome.approval_scope,
+            approval_url=outcome.approval_url,
+            delivery_status=self._delivery_status_for(request_id) or delivery_status,
+        )
 
     def cancel_by_client_request_id(
         self,
@@ -1042,7 +1060,9 @@ class ApprovalManager:
             result = open_approval_url_webbrowser(url, opener=self.browser_open)
         if result.delivered:
             self._browser_opened_request_ids.add(request_id)
+            self._set_delivery_status(request_id, DELIVERY_STATUS_DELIVERED)
             return True
+        self._set_delivery_status(request_id, DELIVERY_STATUS_NOT_DELIVERED)
         return False
 
     def _notify(self, prompt: ApprovalPrompt, url: str) -> bool:
@@ -1110,7 +1130,23 @@ class ApprovalManager:
             matched_policy_rule=classification.policy_evaluation.policy_rule_id,
             granted_by_request_id=granted_by_request_id,
             action_gate_metadata_jcs=metadata_jcs,
+            delivery_status=DELIVERY_STATUS_QUEUED,
         )
+
+    def _set_delivery_status(self, request_id: str, delivery_status: str) -> None:
+        try:
+            self.evidence_store.annotate_delivery_status(
+                request_id,
+                delivery_status=delivery_status,
+            )
+        except ApprovalEvidenceError:
+            return
+
+    def _delivery_status_for(self, request_id: str) -> str | None:
+        record = self.evidence_store.get_pending(request_id)
+        if record is None:
+            return None
+        return record.delivery_status
 
     def _write_runtime_decision_record(
         self,

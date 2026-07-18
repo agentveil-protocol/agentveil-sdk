@@ -29,7 +29,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, Iterable, Mapping, TextIO
+from typing import Any, Callable, Iterable, Mapping, TextIO
 from urllib.parse import quote, urlencode
 from urllib.request import HTTPCookieProcessor, Request, build_opener
 
@@ -2652,6 +2652,140 @@ def serve_approval_center(
         evidence_store.close()
 
 
+def open_approval_center(
+    *,
+    home: Path | None = None,
+    config_path: Path | None = None,
+    record_id: str | None = None,
+    out: TextIO | None = None,
+    err: TextIO | None = None,
+    browser_open: Callable[[str], bool] | None = None,
+    output_json: bool = False,
+) -> int:
+    """Open the local Approval Center or one pending card without printing secrets."""
+
+    from agentveil_mcp_proxy.approval.notification import deliver_approval_browser_url
+    from agentveil_mcp_proxy.approval.persistent import (
+        load_manifest,
+        manifest_is_reachable,
+        manifest_runtime_matches_current,
+    )
+    from agentveil_mcp_proxy.approval.server import inspect_managed_approval_center
+    from agentveil_mcp_proxy.evidence import ApprovalStatus
+    from agentveil_mcp_proxy.evidence.store import (
+        DELIVERY_STATUS_DELIVERED,
+        ApprovalEvidenceError,
+    )
+    from urllib.parse import quote
+
+    sink = out or sys.stdout
+    err_sink = err or sys.stderr
+    paths = proxy_paths(home, config_path)
+
+    def _emit_error(*, code: int, reason: str, **fields: Any) -> int:
+        if output_json:
+            payload: dict[str, Any] = {
+                "ok": False,
+                "action": "open",
+                "reason": reason,
+                "exit_code": code,
+            }
+            if record_id:
+                payload["record_id"] = record_id
+            payload.update(fields)
+            print(json.dumps(payload, separators=(",", ":"), sort_keys=True), file=sink)
+        else:
+            print(f"approval-center open: {reason}", file=err_sink)
+        return code
+
+    def _emit_success(*, target: str, delivery_status: str | None = None) -> int:
+        if output_json:
+            payload: dict[str, Any] = {
+                "ok": True,
+                "action": "open",
+                "target": target,
+                "exit_code": 0,
+            }
+            if record_id:
+                payload["record_id"] = record_id
+            if delivery_status is not None:
+                payload["delivery_status"] = delivery_status
+            print(json.dumps(payload, separators=(",", ":"), sort_keys=True), file=sink)
+        else:
+            label = (
+                f"pending record_id={record_id}"
+                if record_id
+                else "approval center"
+            )
+            print(f"approval-center open: delivered {label}", file=sink)
+        return 0
+
+    status = inspect_managed_approval_center(paths.home)
+    if status.state != "running":
+        return _emit_error(
+            code=2,
+            reason="managed Approval Center is not running",
+            center_state=status.state,
+        )
+    manifest = load_manifest(paths.proxy_dir)
+    if manifest is None:
+        return _emit_error(code=2, reason="no managed Approval Center manifest found")
+    if not manifest_is_reachable(manifest) or not manifest_runtime_matches_current(manifest):
+        return _emit_error(
+            code=2,
+            reason="managed Approval Center manifest is stale or foreign",
+        )
+
+    if record_id:
+        evidence_path = paths.proxy_dir / "evidence.sqlite"
+        if not evidence_path.exists():
+            return _emit_error(code=2, reason="evidence store not found")
+        try:
+            with ApprovalEvidenceStore(evidence_path) as store:
+                record = store.get_pending(record_id)
+        except ApprovalEvidenceError as exc:
+            return _emit_error(code=2, reason=f"evidence store unavailable ({type(exc).__name__})")
+        if record is None:
+            return _emit_error(code=2, reason="record_id not found")
+        if record.status != ApprovalStatus.PENDING.value:
+            return _emit_error(
+                code=2,
+                reason="record is not pending",
+                record_status=record.status,
+            )
+        # claim-check: allow "safe" is urllib.parse.quote parameter syntax.
+        target_url = f"{manifest.approval_center_url()}/pending/{quote(record_id, safe='')}"
+        target = "pending"
+    else:
+        target_url = manifest.approval_center_url()
+        target = "center"
+
+    opener = browser_open
+    if opener is None:
+        result = deliver_approval_browser_url(target_url)
+        delivered = result.delivered
+    else:
+        try:
+            delivered = bool(opener(target_url))
+        except Exception:
+            delivered = False
+    if not delivered:
+        return _emit_error(code=1, reason="browser delivery failed")
+
+    delivery_status: str | None = None
+    if record_id:
+        try:
+            with ApprovalEvidenceStore(paths.proxy_dir / "evidence.sqlite") as store:
+                updated = store.annotate_delivery_status(
+                    record_id,
+                    delivery_status=DELIVERY_STATUS_DELIVERED,
+                )
+                delivery_status = updated.delivery_status
+        except ApprovalEvidenceError:
+            delivery_status = None
+    return _emit_success(target=target, delivery_status=delivery_status)
+
+
 def run_proxy(
     *,
     home: Path | None = None,
@@ -3716,6 +3850,22 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="Loopback port for the Approval Center (0 = reuse manifest or assign)",
+    )
+    approval_center_open = approval_center_subparsers.add_parser(
+        "open",
+        help="Open the local Approval Center or one pending approval card",
+    )
+    _add_common_path_args(approval_center_open)
+    approval_center_open.add_argument(
+        "--record-id",
+        default=None,
+        help="Open one pending approval card by durable record id",
+    )
+    approval_center_open.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        help="Emit a bounded JSON result without secrets or absolute paths",
     )
 
     launch = subparsers.add_parser(
@@ -6604,8 +6754,15 @@ def main(argv: list[str] | None = None) -> int:
                 output_json=args.json_output,
             )
         if args.command == "approval-center":
+            if args.approval_center_action == "open":
+                return open_approval_center(
+                    home=args.home,
+                    config_path=args.config,
+                    record_id=args.record_id,
+                    output_json=bool(getattr(args, "json_output", False)),
+                )
             if args.approval_center_action != "serve":
-                raise ProxyCliError("approval-center action must be serve")
+                raise ProxyCliError("approval-center action must be serve or open")
             return serve_approval_center(
                 home=args.home,
                 config_path=args.config,
