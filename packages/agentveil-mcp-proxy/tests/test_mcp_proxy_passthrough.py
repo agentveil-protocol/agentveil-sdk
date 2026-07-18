@@ -1477,6 +1477,66 @@ def test_agentveil_control_manifest_read_blocked_before_downstream(tmp_path, mon
     assert fixture_token not in json.dumps(record)
 
 
+def test_list_workspace_response_sanitizes_git_and_avp_metadata_lines(tmp_path):
+    """Passthrough must strip .git/.avp listing lines before returning to the client."""
+
+    from agentveil_mcp_proxy.passthrough import McpPassthrough
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    (sandbox / ".git").mkdir()
+    (sandbox / ".git" / "config").write_text("secret-git", encoding="utf-8")
+    (sandbox / ".avp").mkdir()
+    (sandbox / ".avp" / "state.json").write_text("secret-avp", encoding="utf-8")
+    (sandbox / "alias-avp-state.json").symlink_to(sandbox / ".avp" / "state.json")
+    (sandbox / "docs").mkdir()
+    (sandbox / "docs" / "avp-guide.md").write_text("guide", encoding="utf-8")
+    (sandbox / "docs" / "my.git.notes").write_text("notes", encoding="utf-8")
+    (sandbox / ".env.example").write_text("ENV=1", encoding="utf-8")
+
+    # External-style listing payload (as if downstream returned everything).
+    leaked = "\n".join([
+        ".git/config",
+        ".avp/state.json",
+        "alias-avp-state.json",
+        "docs/avp-guide.md",
+        "docs/my.git.notes",
+        ".env.example",
+        ".github/workflows/ci.yml",
+        "docs/approval-center.manifest.json",
+    ])
+    passthrough = McpPassthrough(
+        DownstreamConfig(
+            command=sys.executable,
+            args=(str(tmp_path / "agentveil_mcp_proxy_quickstart_filesystem.py"), str(sandbox)),
+            name="fake-downstream",
+        ),
+    )
+    message = {
+        "jsonrpc": "2.0",
+        "id": "list-1",
+        "method": "tools/call",
+        "params": {"name": "list_workspace", "arguments": {}},
+    }
+    response = {
+        "jsonrpc": "2.0",
+        "id": "list-1",
+        "result": {"content": [{"type": "text", "text": leaked}]},
+    }
+    sanitized = passthrough._sanitize_filesystem_control_surface_response(message, response)
+    text = sanitized["result"]["content"][0]["text"]
+    assert ".git/config" not in text
+    assert ".avp/state.json" not in text
+    assert "alias-avp-state.json" not in text
+    assert "secret-git" not in text
+    assert "secret-avp" not in text
+    assert "docs/avp-guide.md" in text
+    assert "docs/my.git.notes" in text
+    assert ".env.example" in text
+    assert ".github/workflows/ci.yml" in text
+    assert "docs/approval-center.manifest.json" in text
+
+
 def test_secret_path_in_paths_list_blocks_broadened_tool(tmp_path):
     # read_multiple_files carries paths in a list arg key; a secret entry must be
     # denied before downstream, and the value must not appear in proxy output.

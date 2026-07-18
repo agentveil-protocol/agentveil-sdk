@@ -93,8 +93,9 @@ from agentveil_mcp_proxy.persistence_path_guard import (
     scan_instruction_surfaces,
 )
 from agentveil_mcp_proxy.quickstart_filesystem import (
-    filter_agentveil_control_paths,
+    filter_workspace_listing_paths,
     is_agentveil_control_relative_path,
+    is_hidden_listing_relative_path,
     quickstart_sandbox_root_from_downstream_args,
     requested_path_targets_agentveil_control,
 )
@@ -2519,11 +2520,13 @@ class McpPassthrough:
             return response
         sandbox = quickstart_sandbox_root_from_downstream_args(list(self.downstream.args))
         if sandbox is not None:
-            filtered = filter_agentveil_control_paths(sandbox, text.splitlines())
+            filtered = filter_workspace_listing_paths(sandbox, text.splitlines())
         else:
             filtered = [
                 path for path in text.splitlines()
-                if path and not is_agentveil_control_relative_path(path)
+                if path
+                and not is_hidden_listing_relative_path(path)
+                and not is_agentveil_control_relative_path(path)
             ]
         sanitized = dict(response)
         sanitized_result = dict(result)

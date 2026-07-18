@@ -124,6 +124,39 @@ def test_quickstart_list_workspace_reaches_real_sandbox(tmp_path, monkeypatch):
     _assert_no_local_path_leaks(out.getvalue(), json.dumps(metadata))
 
 
+def test_listing_filter_exact_metadata_components_only():
+    from agentveil_mcp_proxy.quickstart_filesystem import (
+        filter_workspace_listing_paths,
+        is_hidden_listing_relative_path,
+    )
+
+    assert is_hidden_listing_relative_path(".git/config") is True
+    assert is_hidden_listing_relative_path(".avp/state.json") is True
+    assert is_hidden_listing_relative_path("docs/my.git.notes") is False
+    assert is_hidden_listing_relative_path("docs/avp-guide.md") is False
+    assert is_hidden_listing_relative_path(".github/workflows/ci.yml") is False
+    assert is_hidden_listing_relative_path(".env.example") is False
+
+    filtered = filter_workspace_listing_paths(
+        None,
+        [
+            ".git/config",
+            ".avp/state.json",
+            ".avp/mcp-proxy/approval-center.manifest.json",
+            "docs/my.git.notes",
+            "docs/avp-guide.md",
+            ".github/workflows/ci.yml",
+            ".env.example",
+        ],
+    )
+    assert filtered == [
+        "docs/my.git.notes",
+        "docs/avp-guide.md",
+        ".github/workflows/ci.yml",
+        ".env.example",
+    ]
+
+
 def test_quickstart_write_file_requires_approval_before_mutation(tmp_path, monkeypatch):
     home = tmp_path / "home"
     sandbox = tmp_path / "sandbox"

@@ -28,6 +28,8 @@ _INSTRUCTION_SURFACE_BASENAMES = frozenset({
     ".cursorrules",
 })
 _COPILOT_INSTRUCTIONS_PATH = (".github", "copilot-instructions.md")
+# Exact metadata components hidden from list_workspace; unrelated dotfiles stay visible.
+_LISTING_HIDDEN_METADATA_COMPONENTS = frozenset({".git", ".avp"})
 
 
 def normalized_relative_path_segments(path: str) -> list[str]:
@@ -52,6 +54,17 @@ def is_agentveil_control_relative_path(path: str) -> bool:
     return False
 
 
+def is_hidden_listing_relative_path(path: str) -> bool:
+    """Return True when ``path`` lexically includes a listing-hidden metadata component.
+
+    Exact segment match only: ``.git/config`` and ``.avp/state.json`` are hidden,
+    while ``docs/my.git.notes`` and ``docs/avp-guide.md`` stay visible.
+    """
+
+    lowered = [segment.lower() for segment in normalized_relative_path_segments(path)]
+    return any(segment in _LISTING_HIDDEN_METADATA_COMPONENTS for segment in lowered)
+
+
 def _root_resolved(root: Path) -> Path:
     return root.expanduser().resolve()
 
@@ -60,6 +73,16 @@ def agentveil_control_root(root: Path) -> Path:
     """Return the resolved AgentVeil control directory under ``root``."""
 
     return (_root_resolved(root) / ".avp" / "mcp-proxy").resolve()
+
+
+def listing_metadata_roots(root: Path) -> tuple[Path, ...]:
+    """Return resolved ``.git`` and ``.avp`` roots under the sandbox."""
+
+    root_resolved = _root_resolved(root)
+    return tuple(
+        (root_resolved / name).resolve()
+        for name in sorted(_LISTING_HIDDEN_METADATA_COMPONENTS)
+    )
 
 
 def is_resolved_path_under_agentveil_control(root: Path, resolved: Path) -> bool:
@@ -77,6 +100,24 @@ def is_resolved_path_under_agentveil_control(root: Path, resolved: Path) -> bool
     except ValueError:
         return False
     return True
+
+
+def is_resolved_path_under_listing_metadata(root: Path, resolved: Path) -> bool:
+    """Return True when a resolved target lives under ``.git`` or ``.avp``."""
+
+    try:
+        target = resolved.resolve()
+    except OSError:
+        return False
+    for meta_root in listing_metadata_roots(root):
+        if target == meta_root:
+            return True
+        try:
+            target.relative_to(meta_root)
+        except ValueError:
+            continue
+        return True
+    return False
 
 
 def quickstart_sandbox_root_from_downstream_args(args: list[str]) -> Path | None:
@@ -427,12 +468,28 @@ def requested_path_targets_agentveil_control(root: Path, requested: str) -> bool
 
 
 def filter_agentveil_control_paths(root: Path, paths: list[str]) -> list[str]:
-    """Drop listing entries whose resolved targets live under the control root."""
+    """Drop listing entries under control/metadata roots or aliases to them.
 
-    root_resolved = _root_resolved(root)
+    Hides exact ``.git`` / ``.avp`` path components and resolved targets under
+    those roots (including symlink aliases). Does not hide unrelated dotfiles
+    such as ``.github/**`` or ``.env.example``.
+    """
+
+    return filter_workspace_listing_paths(root, paths)
+
+
+def filter_workspace_listing_paths(root: Path | None, paths: list[str]) -> list[str]:
+    """Filter ``list_workspace`` lines for quickstart and external downstreams."""
+
     filtered: list[str] = []
+    root_resolved = None if root is None else _root_resolved(root)
     for path in paths:
-        if not path or is_agentveil_control_relative_path(path):
+        if not path or is_hidden_listing_relative_path(path):
+            continue
+        if is_agentveil_control_relative_path(path):
+            continue
+        if root_resolved is None:
+            filtered.append(path)
             continue
         try:
             candidate = root_resolved / Path(*_path_parts(path))
@@ -440,6 +497,8 @@ def filter_agentveil_control_paths(root: Path, paths: list[str]) -> list[str]:
             continue
         if candidate.exists() or candidate.is_symlink():
             try:
+                if is_resolved_path_under_listing_metadata(root, candidate):
+                    continue
                 if is_resolved_path_under_agentveil_control(root, candidate):
                     continue
             except OSError:
@@ -449,20 +508,25 @@ def filter_agentveil_control_paths(root: Path, paths: list[str]) -> list[str]:
 
 
 def workspace_listing_paths(root: Path) -> list[str]:
-    """Return bounded workspace file paths excluding resolved control artifacts."""
+    """Return bounded workspace file paths excluding listing-hidden metadata."""
 
     root_resolved = _root_resolved(root)
     listed: list[str] = []
     for item in sorted(root_resolved.rglob("*")):
         if not item.is_file():
             continue
+        relative = item.relative_to(root_resolved).as_posix()
+        if is_hidden_listing_relative_path(relative):
+            continue
         try:
             resolved = item.resolve()
         except OSError:
             continue
+        if is_resolved_path_under_listing_metadata(root, resolved):
+            continue
         if is_resolved_path_under_agentveil_control(root, resolved):
             continue
-        listed.append(item.relative_to(root_resolved).as_posix())
+        listed.append(relative)
     return listed
 
 
