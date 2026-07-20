@@ -34,6 +34,9 @@ from pathlib import Path
 from typing import Any, Mapping, MutableMapping
 
 from agentveil_mcp_proxy.classification import infer_action_family, infer_risk_class
+from agentveil_mcp_proxy.client_guidance import (
+    NATIVE_CONTROLLED_MCP_REDIRECT_INSTRUCTION as NATIVE_REDIRECT_INSTRUCTION,
+)
 from agentveil_mcp_proxy.policy import (
     PolicyConfig,
     PolicyDecision,
@@ -56,18 +59,12 @@ HOOK_EVENT_DEFAULT = "PreToolUse"
 AGENTVEIL_CONTROLLED_MCP_SERVER = "agentveil-mcp-proxy"
 
 # Generic agent-facing redirect appended to NATIVE-tool deny reasons (S2
-# corrective). This is static instruction text only: no approval round-trip
-# (S3), no auto-transformation of Write into an MCP call, and no private
-# playbook content. It tells the agent to re-route the same intent through a
-# controlled AgentVeil MCP tool when one is available.
+# corrective). Shared across connectors via client_guidance so unavailable-route
+# recovery stays connector-independent. Static instruction text only: no
+# approval round-trip (S3), no auto-transformation of Write into an MCP call,
+# and no private playbook content.
 # claim-check: allow "blocked" is literal hook-deny user-facing text; tested in
 # tests/test_mcp_proxy_claude_hook.py native redirect assertions.
-NATIVE_REDIRECT_INSTRUCTION = (
-    "Direct native tool use was blocked before mutation. "  # claim-check: allow literal hook-deny text tested below.
-    "Use an AgentVeil controlled MCP tool for the same operation when available, "
-    "preserving the same path, content, and intent. "
-    "If approval is required, ask the user to approve and then retry the controlled tool call."
-)
 
 
 # Claude Code built-in tool names and their natural risk class. Bash is

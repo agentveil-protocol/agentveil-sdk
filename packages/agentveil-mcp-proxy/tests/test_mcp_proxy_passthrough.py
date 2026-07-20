@@ -2343,7 +2343,8 @@ def test_downstream_crash_mid_run_returns_sanitized_jsonrpc_error(tmp_path):
     assert responses[0] == {"jsonrpc": "2.0", "id": 1, "result": {"ok": True}}
     assert responses[1]["id"] == 2
     assert responses[1]["error"]["code"] == -32000
-    assert "downstream MCP server unavailable" == responses[1]["error"]["message"]
+    assert responses[1]["error"]["data"]["reason"] == "downstream_unavailable"
+    assert "Stop this action" in responses[1]["error"]["message"]
     assert SECRET not in client_out.getvalue()
 
 
@@ -2528,7 +2529,8 @@ def test_oversized_downstream_response_is_rejected_safely(tmp_path):
         assert elapsed < 1.0
         assert response["id"] == "large-1"
         assert response["error"]["code"] == -32000
-        assert response["error"]["message"] == "downstream MCP server unavailable"
+        assert response["error"]["data"]["reason"] == "downstream_unavailable"
+        assert "Stop this action" in response["error"]["message"]
         rendered = json.dumps(response)
         assert SECRET not in rendered
         assert "blob" not in rendered

@@ -148,6 +148,7 @@ from agentveil_mcp_proxy.evidence.observability import (
     approval_center_open_recovery_command,
     enrich_mcp_error_contract,
     mcp_error_user_message,
+    mcp_route_unavailable_user_message,
     reason_has_dedicated_user_message,
 )
 
@@ -600,6 +601,22 @@ def jsonrpc_error(
         "id": request_id,
         "error": error,
     }
+
+
+def _downstream_unavailable_error(request_id: Any) -> dict[str, Any]:
+    """Return the bounded unavailable-route JSON-RPC error for one request."""
+
+    unavailable_data: dict[str, Any] = {
+        "status": "blocked",  # claim-check: allow bounded JSON-RPC status vocabulary; negatives assert no downstream execution.
+        "reason": "downstream_unavailable",
+    }
+    enrich_mcp_error_contract(unavailable_data)
+    return jsonrpc_error(
+        request_id,
+        JSONRPC_DOWNSTREAM_ERROR,
+        mcp_route_unavailable_user_message(),
+        data=unavailable_data,
+    )
 
 
 def _read_bounded_line(client_in: TextIO, max_bytes: int) -> tuple[str | None, bool]:
@@ -1474,6 +1491,18 @@ class McpPassthrough:
             )
             if path_error is not None:
                 return [path_error] if has_id else []
+            local_proof_response = self._local_proof_tool_response(
+                message,
+                request_id,
+            )
+            if local_proof_response is not None:
+                return [local_proof_response] if has_id else []
+            # Known-unavailable must not mask local validation/diagnostics above.
+            # Run it only immediately before the first approval-producing path.
+            if method == "tools/call" and has_id:
+                known_unavailable = self._known_downstream_unavailable_response(request_id)
+                if known_unavailable is not None:
+                    return [known_unavailable]
             instruction_error, instruction_outcome = (
                 self._instruction_file_write_policy_response(
                     message,
@@ -1539,12 +1568,6 @@ class McpPassthrough:
                 return cancelled_responses
             if policy_error is not None:
                 return [policy_error] if has_id else []
-            local_proof_response = self._local_proof_tool_response(
-                message,
-                request_id,
-            )
-            if local_proof_response is not None:
-                return [local_proof_response] if has_id else []
             if (
                 approval_outcome is not None
                 and approval_outcome.approved
@@ -1617,14 +1640,27 @@ class McpPassthrough:
             self._record_approval_error(approval_outcome, "downstream_unavailable")
             if not has_id:
                 return []
-            return [jsonrpc_error(
-                request_id,
-                JSONRPC_DOWNSTREAM_ERROR,
-                "downstream MCP server unavailable",
-            )]
+            return [_downstream_unavailable_error(request_id)]
         finally:
             self._active_redirect_context = None
             self._current_tool_arguments = None
+
+    def _latch_downstream_unavailable_if_exited(self) -> None:
+        """Persist a known-unavailable latch when the downstream process has exited."""
+
+        process = self.process
+        if process is None or process.poll() is None:
+            return
+        if self._downstream_error is None:
+            self._set_downstream_error(PassthroughError("downstream process exited"))
+
+    def _known_downstream_unavailable_response(self, request_id: Any) -> dict[str, Any] | None:
+        """Return unavailable before approval when the downstream is already known dead."""
+
+        self._latch_downstream_unavailable_if_exited()
+        if self._downstream_error is None:
+            return None
+        return _downstream_unavailable_error(request_id)
 
     @staticmethod
     def _message_without_redirect_context(message: Mapping[str, Any]) -> dict[str, Any]:

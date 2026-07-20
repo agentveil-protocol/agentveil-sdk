@@ -39,6 +39,24 @@ _LIST_ONLY_NEXT_STEP = (
 )
 LIST_ONLY_NEXT_STEP = _LIST_ONLY_NEXT_STEP
 
+# Shared native-hook redirect + unavailable-route recovery. Connector adapters
+# must import these strings rather than invent client-specific recovery loops.
+MCP_ROUTE_UNAVAILABLE_USER_MESSAGE = (
+    "Stop this action and tell the user that the AgentVeil MCP route is unavailable. "
+    "Do not retry, request another approval, inspect raw configuration, or bypass "
+    "through native tools. The route must be restored before a new attempt."
+)
+MCP_ROUTE_UNAVAILABLE_NEXT_STEP = MCP_ROUTE_UNAVAILABLE_USER_MESSAGE
+NATIVE_CONTROLLED_MCP_REDIRECT_INSTRUCTION = (
+    # claim-check: allow "blocked before mutation" is bounded native-hook deny text covered by connector negative tests.
+    "Direct native tool use was blocked before mutation. "
+    "Use an AgentVeil controlled MCP tool (for example write_file) for the same operation "
+    "when that route is available, preserving the same path, content, and intent. "
+    "If the controlled MCP route is unavailable, stop and tell the user. "
+    "Do not retry, request another approval, inspect raw configuration, or bypass "
+    "through native tools. The route must be restored before a new attempt."
+)
+
 
 def build_client_guidance_payload(*, client_id: str) -> dict[str, Any]:
     """Return bounded routing guidance for one client pack."""
@@ -106,6 +124,9 @@ def supported_client_pack_ids() -> tuple[str, ...]:
 
 
 __all__ = [
+    "MCP_ROUTE_UNAVAILABLE_NEXT_STEP",
+    "MCP_ROUTE_UNAVAILABLE_USER_MESSAGE",
+    "NATIVE_CONTROLLED_MCP_REDIRECT_INSTRUCTION",
     "assert_client_guidance_payload_is_privacy_safe",
     "build_client_guidance_payload",
     "build_client_guidance_set_payload",
