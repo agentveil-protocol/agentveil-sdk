@@ -616,6 +616,31 @@ def test_windows_open_root_accepts_integer_createfilew_handle(
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="native Windows ABI")
+def test_windows_query_basic_passes_numeric_information_class(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    root_handle = qfs._win32_open_root(sandbox)
+    original_query = qfs._ntdll.NtQueryInformationFile
+    observed: list[object] = []
+
+    def recording_query(*args):
+        observed.append(args[4])
+        return original_query(*args)
+
+    monkeypatch.setattr(qfs._ntdll, "NtQueryInformationFile", recording_query)
+    try:
+        qfs._win32_query_basic(root_handle)
+    finally:
+        qfs._win32_close(root_handle)
+
+    assert observed == [4]
+    assert isinstance(observed[0], int)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="native Windows ABI")
 def test_windows_list_directory_handles_signed_status_no_more_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

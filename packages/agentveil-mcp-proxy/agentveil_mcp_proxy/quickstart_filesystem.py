@@ -995,9 +995,9 @@ if sys.platform == "win32":
     _WIN32_STATUS_OBJECT_PATH_NOT_FOUND = 0xC000003A
     _WIN32_STATUS_NOT_A_DIRECTORY = 0xC0000103
     _WIN32_STATUS_OBJECT_NAME_COLLISION = 0xC0000035
-    _WIN32_FILE_BASIC_INFORMATION = 4
-    _WIN32_FILE_RENAME_INFORMATION = 10
-    _WIN32_FILE_DISPOSITION_INFORMATION = 13
+    _WIN32_FILE_INFORMATION_CLASS_BASIC = 4
+    _WIN32_FILE_INFORMATION_CLASS_RENAME = 10
+    _WIN32_FILE_INFORMATION_CLASS_DISPOSITION = 13
     _WIN32_FILE_NAME_OPENED = 34
     _WIN32_FILE_OPENED = 1
     _WIN32_FILE_CREATED = 2
@@ -1252,7 +1252,7 @@ if sys.platform == "win32":
             ctypes.byref(iosb),
             ctypes.byref(info),
             ctypes.sizeof(info),
-            _WIN32_FILE_BASIC_INFORMATION,
+            _WIN32_FILE_INFORMATION_CLASS_BASIC,
         )
         if not _win32_status_eq(status, _WIN32_STATUS_SUCCESS):
             raise _win32_status_to_oserror(status)
@@ -1448,7 +1448,7 @@ if sys.platform == "win32":
             ctypes.byref(iosb),
             ctypes.byref(info),
             ctypes.sizeof(info),
-            _WIN32_FILE_BASIC_INFORMATION,
+            _WIN32_FILE_INFORMATION_CLASS_BASIC,
         )
         if not _win32_status_eq(status, _WIN32_STATUS_SUCCESS):
             raise _win32_status_to_oserror(status)
@@ -1584,7 +1584,7 @@ if sys.platform == "win32":
             ctypes.byref(iosb),
             ctypes.byref(info),
             ctypes.sizeof(info),
-            _WIN32_FILE_DISPOSITION_INFORMATION,
+            _WIN32_FILE_INFORMATION_CLASS_DISPOSITION,
         )
         if not _win32_status_eq(status, _WIN32_STATUS_SUCCESS):
             raise _win32_status_to_oserror(status)
@@ -1622,7 +1622,7 @@ if sys.platform == "win32":
                 ctypes.byref(iosb),
                 buf,
                 buf_size,
-                _WIN32_FILE_RENAME_INFORMATION,
+                _WIN32_FILE_INFORMATION_CLASS_RENAME,
             )
             if not _win32_status_eq(status, _WIN32_STATUS_SUCCESS):
                 raise _win32_status_to_oserror(status)
