@@ -455,13 +455,13 @@ def test_back_to_back_tools_call_and_cancel_before_binding(tmp_path):
             lambda: manager.is_client_request_tracked("early-cancel"),
             timeout=3.0,
         )
+        assert _wait_until(approval_entered.is_set, timeout=3.0)
         client_in.write_line(_cancel_notification(request_id="early-cancel"))
         assert _wait_until(
             lambda: manager.is_client_request_pre_cancelled("early-cancel"),
             timeout=3.0,
         )
         approval_release.set()
-        assert _wait_until(approval_entered.is_set, timeout=3.0)
         assert _wait_until(
             lambda: not manager.is_client_request_tracked("early-cancel"),
             timeout=3.0,
