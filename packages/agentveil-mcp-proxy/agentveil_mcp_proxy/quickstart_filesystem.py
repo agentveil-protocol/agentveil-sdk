@@ -1435,7 +1435,10 @@ if sys.platform == "win32":
                     ctypes.POINTER(_Win32FileDirectoryInformation),
                 ).contents
                 name_len = entry.FileNameLength // 2
-                name = ctypes.wstring_at(ctypes.addressof(entry.FileName), name_len)
+                name_address = (
+                    ctypes.addressof(entry) + _Win32FileDirectoryInformation.FileName.offset
+                )
+                name = ctypes.wstring_at(name_address, name_len)
                 if name not in {".", ".."}:
                     names.append(name)
                 if entry.NextEntryOffset == 0:
@@ -1613,8 +1616,11 @@ if sys.platform == "win32":
         info.ReplaceIfExists = 1 if replace_if_exists else 0
         info.RootDirectory = _win32_handle(dst_parent)
         info.FileNameLength = len(dst_name) * 2
+        file_name_address = (
+            ctypes.addressof(info) + _WIN32_FILE_RENAME_INFORMATION.FileName.offset
+        )
         ctypes.memmove(
-            ctypes.addressof(info.FileName),
+            file_name_address,
             dst_bytes,
             len(dst_bytes),
         )

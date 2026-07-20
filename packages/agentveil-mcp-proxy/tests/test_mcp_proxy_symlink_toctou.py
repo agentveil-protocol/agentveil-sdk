@@ -452,7 +452,11 @@ def test_post_fd_parent_swap_never_reaches_symlink_target(
         assert not (bound_parent / victim_path.name).exists()
     elif tool == "chmod_file":
         assert "error" not in response, response
-        assert (bound_parent / victim_path.name).stat().st_mode & 0o777 == 0o777
+        resulting_mode = (bound_parent / victim_path.name).stat().st_mode
+        if sys.platform == "win32":
+            assert resulting_mode & 0o200
+        else:
+            assert resulting_mode & 0o777 == 0o777
     elif tool == "create_symlink":
         assert "error" not in response, response
         assert (bound_parent / victim_path.name).is_symlink()
@@ -484,9 +488,12 @@ def test_move_copy_symlink_race_contract(
     canary_kind: str,
 ) -> None:
     sandbox, outside, control, control_dir, outside_dir = _prepare_canaries(tmp_path)
-    _seed(sandbox / "ops" / "source.txt", "source-seed")
-    _seed(sandbox / "ops" / "destination.txt", "dest-seed")
-    arguments = {"source": "ops/source.txt", "destination": "ops/destination.txt"}
+    _seed(sandbox / "source" / "source.txt", "source-seed")
+    _seed(sandbox / "destination" / "destination.txt", "dest-seed")
+    arguments = {
+        "source": "source/source.txt",
+        "destination": "destination/destination.txt",
+    }
     victim = arguments[path_key]
     victim_path = sandbox / Path(victim)
     parent_path = victim_path.parent
@@ -527,7 +534,7 @@ def test_move_copy_symlink_race_contract(
         assert response["error"]["code"] == -32602
         return
 
-    bound_parent = sandbox / "ops.bound-toctou"
+    bound_parent = sandbox / f"{parent_path.name}.bound-toctou"
     if tool == "move_file" and path_key == "source":
         assert not (bound_parent / "source.txt").exists()
     if tool == "copy_file" and path_key == "destination":
