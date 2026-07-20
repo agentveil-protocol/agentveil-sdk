@@ -987,7 +987,6 @@ if sys.platform == "win32":
     _WIN32_FILE_OPEN = 1
     _WIN32_FILE_CREATE = 2
     _WIN32_FILE_OPEN_IF = 3
-    _WIN32_FILE_OVERWRITE_IF = 5
     _WIN32_FILE_CREATE_NEW = 4
     _WIN32_OBJ_CASE_INSENSITIVE = 0x00000040
     _WIN32_STATUS_SUCCESS = 0
@@ -1648,7 +1647,7 @@ if sys.platform == "win32":
                 parent_handle,
                 parts[-1],
                 access=_WIN32_GENERIC_WRITE | _WIN32_SYNCHRONIZE,
-                disposition=_WIN32_FILE_OVERWRITE_IF,
+                disposition=_WIN32_FILE_OPEN_IF,
             )
             try:
                 _win32_write_handle(handle, content.encode("utf-8"))
@@ -1756,7 +1755,7 @@ if sys.platform == "win32":
                 dst_parent,
                 dest_parts[-1],
                 access=_WIN32_GENERIC_WRITE | _WIN32_SYNCHRONIZE,
-                disposition=_WIN32_FILE_OVERWRITE_IF,
+                disposition=_WIN32_FILE_OPEN_IF,
             )
             offset = 0
             while True:

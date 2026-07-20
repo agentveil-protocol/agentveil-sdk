@@ -146,5 +146,5 @@ jobs:
 
       - name: Run bounded Windows symlink TOCTOU tests
         run: >-
-          python -m pytest -q --maxfail=1
+          python -m pytest -q
           packages/agentveil-mcp-proxy/tests/test_mcp_proxy_symlink_toctou.py
