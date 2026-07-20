@@ -123,6 +123,10 @@ class RemoteApprovalServer:
                 with self._lock:
                     self._local_decisions[request_id] = decision
                 return decision
+            record = self.evidence_store.get_pending(request_id)
+            if record is not None and record.status != ApprovalStatus.PENDING.value:
+                # Terminal non-approve/deny (invalidated/cancelled/...) — stop polling.
+                return None
             time.sleep(POLL_INTERVAL_SECONDS)
         return None
 

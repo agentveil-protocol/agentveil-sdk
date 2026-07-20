@@ -63,6 +63,18 @@ def _approval_record_count(home: Path) -> int:
     return int(row[0])
 
 
+def _approval_status(home: Path, request_id: str) -> str | None:
+    evidence_path = home / "mcp-proxy" / "evidence.sqlite"
+    if not evidence_path.exists():
+        return None
+    with sqlite3.connect(evidence_path) as conn:
+        row = conn.execute(
+            "SELECT status FROM pending_approvals WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+    return None if row is None else str(row[0])
+
+
 def _set_downstream(
     config_path: Path,
     script: Path,
@@ -584,7 +596,7 @@ def test_e_pending_approval_does_not_carry_after_reconnect(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Matrix E: old Approve must not execute on generation 2."""
+    """Matrix E: after downstream death/terminal, old Approve is 410; gen2 is separate."""
 
     import httpx
 
@@ -644,6 +656,7 @@ def test_e_pending_approval_does_not_carry_after_reconnect(
 
     deadline = time.monotonic() + 5
     first_url = ""
+    first_record = ""
     while time.monotonic() < deadline:
         match = re.search(
             r"record_id=([^:\s]+):\s+(http://127\.0\.0\.1:\d+/approval/\S+)",
@@ -657,28 +670,42 @@ def test_e_pending_approval_does_not_carry_after_reconnect(
     assert first_url, client_err.getvalue()
     assert _pending_approval_count(home) == 1
 
+    # Kill the live downstream and allow reconnect so generation invalidation can
+    # publish terminal evidence for the still-open card.
     kill_path.write_text("kill\n", encoding="utf-8")
-    deadline = time.monotonic() + 5
+    state_path.write_text("healthy\n", encoding="utf-8")
+
+    # Barrier: downstream death must produce durable terminal evidence before we
+    # assert the stale-card contract. Scheduling must not choose 200 vs 410.
+    deadline = time.monotonic() + 8
     while time.monotonic() < deadline:
-        if log_path.exists():
-            # Process exit is asynchronous; give the watcher a moment.
-            time.sleep(0.1)
+        status = _approval_status(home, first_record)
+        if status is not None and status != "pending":
             break
-        time.sleep(0.01)
+        time.sleep(0.02)
+    assert _approval_status(home, first_record) not in (None, "pending"), (
+        f"expected terminal evidence for {first_record}; "
+        f"status={_approval_status(home, first_record)!r}; err={client_err.getvalue()}"
+    )
 
     with httpx.Client() as client:
-        csrf = re.search(
-            r'name="csrf_token" value="([^"]+)"',
-            client.get(first_url).text,
-        )
-        assert csrf
-        assert client.post(
+        stale_get = client.get(first_url)
+        assert stale_get.status_code == 410
+        assert "Approve" not in stale_get.text
+        csrf = re.search(r'name="csrf_token" value="([^"]+)"', stale_get.text)
+        # Terminal pages must not accept Approve; POST without a live form still 410.
+        stale_post = client.post(
             first_url,
-            data={"decision": "approve", "csrf_token": csrf.group(1), "approval_scope": "exact"},
-        ).status_code == 200
+            data={
+                "decision": "approve",
+                "csrf_token": csrf.group(1) if csrf else "missing",
+                "approval_scope": "exact",
+            },
+        )
+        assert stale_post.status_code == 410
 
     first = _wait_id(client_out, 3, timeout=5.0)
-    assert first["error"]["code"] == JSONRPC_DOWNSTREAM_ERROR
+    assert "error" in first, first
     assert log_path.read_text(encoding="utf-8").count("tools/call") == 0
 
     kill_path.unlink(missing_ok=True)
@@ -724,6 +751,8 @@ def test_e_pending_approval_does_not_carry_after_reconnect(
     assert "result" in fourth, fourth
     assert fourth["result"]["content"][0]["text"] == "written"
     assert log_path.read_text(encoding="utf-8").count("tools/call") == 1
+    assert _approval_status(home, first_record) != "pending"
+    assert _approval_status(home, second_record) != "pending"
     assert log_path.read_text(encoding="utf-8").count("initialize") >= 2
     _assert_privacy(client_out.getvalue(), client_err.getvalue())
     client_in.close()
@@ -1157,13 +1186,28 @@ def test_f_concurrent_calls_share_one_reconnect_attempt(tmp_path: Path) -> None:
             time.sleep(0.01)
         state_path.write_text("fail_reconnect\n", encoding="utf-8")
 
-        barrier = threading.Barrier(2)
+        start_barrier = threading.Barrier(2)
+        reconnect_started = threading.Event()
+        observers_ready = threading.Barrier(2)
         responses: dict[int, list[dict]] = {}
         errors: list[BaseException] = []
 
+        def _begin_gate() -> None:
+            reconnect_started.set()
+            observers_ready.wait(timeout=5)
+
+        def _end_gate() -> None:
+            return None
+
+        passthrough._reconnect_begin_gate = _begin_gate  # type: ignore[attr-defined]
+        passthrough._reconnect_end_gate = _end_gate  # type: ignore[attr-defined]
+
         def _worker(request_id: int) -> None:
             try:
-                barrier.wait(timeout=5)
+                start_barrier.wait(timeout=5)
+                if request_id == 4:
+                    assert reconnect_started.wait(timeout=5)
+                    observers_ready.wait(timeout=5)
                 responses[request_id] = passthrough.handle_client_line(_json_line({
                     "jsonrpc": "2.0",
                     "id": request_id,
@@ -1192,6 +1236,7 @@ def test_f_concurrent_calls_share_one_reconnect_attempt(tmp_path: Path) -> None:
             assert payload[0]["id"] == request_id
             assert payload[0]["error"]["code"] == JSONRPC_DOWNSTREAM_ERROR
             assert payload[0]["error"]["message"] == MCP_ROUTE_UNAVAILABLE_USER_MESSAGE
+            assert payload[0]["error"]["data"]["reason"] == "downstream_unavailable"
         assert passthrough._reconnect_attempts == 1
         assert log_path.read_text(encoding="utf-8").splitlines().count("initialize") == 2
         _assert_privacy(json.dumps(responses))

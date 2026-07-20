@@ -1268,6 +1268,14 @@ class McpPassthrough:
     def stop(self, *, timeout: float = 2.0) -> None:
         """Terminate downstream cleanly, then kill if it does not exit."""
 
+        manager = self.approval_manager
+        if manager is not None:
+            close = getattr(manager, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
         self._stopping = True
         proc = self.process
         if proc is None:
@@ -1695,8 +1703,39 @@ class McpPassthrough:
         process = self.process
         if process is None or process.poll() is None:
             return
-        if self._downstream_error is None:
-            self._set_downstream_error(PassthroughError("downstream process exited"))
+        self._note_downstream_process_exited()
+
+    def _note_downstream_process_exited(self) -> None:
+        """Latch unavailable and retire approvals bound to the dead generation."""
+
+        first_observation = self._downstream_error is None and not self._stopping
+        self._set_downstream_error(PassthroughError("downstream process exited"))
+        if first_observation:
+            self._retire_pending_approvals_after_downstream_death()
+
+    def _retire_pending_approvals_after_downstream_death(self) -> None:
+        """Retire waiters for the dead process without advancing generation.
+
+        Successful reconnect still owns the generation bump so route-recovery
+        tests keep a single +1 transition across death→reconnect.
+        """
+
+        acquired = self._reconnect_lock.acquire(blocking=False)
+        if not acquired:
+            # A reconnect in progress will publish a new generation on success.
+            return
+        try:
+            if self._stopping:
+                return
+            manager = self.approval_manager
+            invalidate_all = getattr(manager, "invalidate_all_bound_approvals", None)
+            if callable(invalidate_all):
+                try:
+                    invalidate_all(reason="downstream_generation_changed")
+                except Exception:
+                    pass
+        finally:
+            self._reconnect_lock.release()
 
     def _process_is_alive(self) -> bool:
         process = self.process
@@ -1716,6 +1755,23 @@ class McpPassthrough:
         self._latch_downstream_unavailable_if_exited()
         if self._downstream_error is None and self._process_is_alive():
             self._bound_downstream_generation = self._downstream_generation
+            note = getattr(self.approval_manager, "note_downstream_generation", None)
+            if callable(note):
+                try:
+                    note(self._downstream_generation)
+                except Exception:
+                    pass
+            return None
+        # A missing process is common in unit stubs that override send/wait, not a
+        # dead route. Leave readiness to the normal send path.
+        if self.process is None and self._downstream_error is None:
+            self._bound_downstream_generation = self._downstream_generation
+            note = getattr(self.approval_manager, "note_downstream_generation", None)
+            if callable(note):
+                try:
+                    note(self._downstream_generation)
+                except Exception:
+                    pass
             return None
         if not self._attempt_bounded_reconnect():
             return _downstream_unavailable_error(request_id)
@@ -1800,6 +1856,9 @@ class McpPassthrough:
                 return False
             self._last_reconnect_attempt_at = now
             self._reconnect_attempts += 1
+            begin_gate = getattr(self, "_reconnect_begin_gate", None)
+            if callable(begin_gate):
+                begin_gate()
             try:
                 self._reconnect_downstream_locked()
             except Exception:
@@ -1810,6 +1869,10 @@ class McpPassthrough:
                         PassthroughError("downstream reconnect failed")
                     )
                 return False
+            finally:
+                end_gate = getattr(self, "_reconnect_end_gate", None)
+                if callable(end_gate):
+                    end_gate()
             self._last_reconnect_failed = False
             return True
 
@@ -1817,7 +1880,9 @@ class McpPassthrough:
         """Replace the dead downstream and run initialize + tools/list."""
 
         self._stop_downstream_for_replace(timeout=2.0)
-        self._tool_schemas.clear()
+        # Keep the previous advertised-tool cache until the new tools/list
+        # succeeds. Clearing early lets concurrent callers observe an empty
+        # cache and emit a false unknown_tool / policy_blocked outcome.
         with self._stdout_condition:
             self._responses.clear()
             self._downstream_error = None
@@ -1872,6 +1937,20 @@ class McpPassthrough:
         self._tool_schemas.update_from_response(list_response)
         self._sync_downstream_surface_quarantine()
         self._downstream_generation += 1
+        manager = self.approval_manager
+        publish = getattr(manager, "publish_downstream_generation", None)
+        if callable(publish):
+            try:
+                publish(self._downstream_generation)
+            except Exception:
+                pass
+        else:
+            invalidate = getattr(manager, "invalidate_stale_generation_approvals", None)
+            if callable(invalidate):
+                try:
+                    invalidate(self._downstream_generation)
+                except Exception:
+                    pass
         with self._stdout_condition:
             self._downstream_error = None
 
@@ -2199,14 +2278,25 @@ class McpPassthrough:
             return None
         if self._tool_schemas.is_advertised(tool):
             return None
+        # During outage / reconnect the advertised cache may be empty or mid-refresh.
+        # Defer to `_ensure_downstream_ready_for_routed_call` so callers get a single
+        # downstream_unavailable contract instead of a false unknown_tool deny.
+        if self._downstream_error is not None or not self._process_is_alive():
+            return None
         with self._schema_refresh_lock:
             if self._tool_schemas.is_advertised(tool):
+                return None
+            if self._downstream_error is not None or not self._process_is_alive():
                 return None
             response = self._request_downstream_tools_list()
             if response is not None:
                 self._tool_schemas.update_from_response(response)
                 self._sync_downstream_surface_quarantine()
             if self._tool_schemas.is_advertised(tool):
+                return None
+            # Refresh could not prove advertisement while the route still looks
+            # alive; only then emit unknown_tool.
+            if self._downstream_error is not None or not self._process_is_alive():
                 return None
         self._record_security_event({
             "type": "unknown_tool_call",
@@ -3430,6 +3520,7 @@ class McpPassthrough:
                 runtime_decision=runtime_decision,
                 reason=reason,
                 client_request_id=request_id,
+                downstream_generation=self._bound_downstream_generation,
             )
         except ApprovalFlowError:
             return _with_risk_metadata(jsonrpc_error(
@@ -3473,6 +3564,9 @@ class McpPassthrough:
             )), None
         if outcome.status == ApprovalStatus.CANCELLED.value:
             return None, outcome
+        if outcome.status == ApprovalStatus.INVALIDATED.value:
+            unavailable = _downstream_unavailable_error(request_id)
+            return unavailable, outcome
         return _with_risk_metadata(_blocked_error(
             request_id,
             "blocked by approval decision",
@@ -4355,7 +4449,7 @@ class McpPassthrough:
                     self._set_downstream_error(PassthroughError("downstream sent invalid JSON"))
                     return
                 if not self._stopping and proc.poll() is not None:
-                    self._set_downstream_error(PassthroughError("downstream process exited"))
+                    self._note_downstream_process_exited()
                 elif not self._stopping:
                     self._set_downstream_error(PassthroughError("downstream closed stdout"))
                 return

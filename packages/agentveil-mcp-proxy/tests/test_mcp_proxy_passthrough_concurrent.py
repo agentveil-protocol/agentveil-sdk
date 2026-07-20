@@ -150,6 +150,7 @@ class _RecordingApprovalManager:
         runtime_decision: Any = None,
         reason: str,
         client_request_id: Any = None,
+        downstream_generation: Any = None,
     ) -> ApprovalOutcome:
         with self._lock:
             self.client_request_ids.append(client_request_id)

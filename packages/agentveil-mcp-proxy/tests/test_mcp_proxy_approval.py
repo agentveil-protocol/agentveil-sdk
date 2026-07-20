@@ -6,6 +6,7 @@ from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 import io
 import json
+import os
 from pathlib import Path
 import re
 import signal
@@ -283,7 +284,7 @@ def _manager(
         evidence_store=store,
         approval_server=server,
         config=config or _config(policy_rule=_write_rule()),
-        client_id="cursor:pid:123",
+        client_id=f"cursor:pid:{os.getpid()}",
         session_id="session-1234567890",
         headless=headless,
         auto_deny=auto_deny,

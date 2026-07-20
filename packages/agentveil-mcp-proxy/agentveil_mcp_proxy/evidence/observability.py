@@ -698,6 +698,16 @@ def terminal_state_for_record_status(status: str) -> str | None:
         return "approval_expired"
     if status == ApprovalStatus.CANCELLED.value:
         return "approval_cancelled"
+    if status == ApprovalStatus.INVALIDATED.value:
+        # Stale generation / dead-owner retirements stay non-actionable without
+        # looking like a user deny or a successful allow/execute.
+        return "already_decided"
+    if status in {
+        ApprovalStatus.BLOCKED.value,  # claim-check: allow existing terminal evidence status
+        ApprovalStatus.ERROR.value,
+        ApprovalStatus.EXECUTED.value,
+    }:
+        return "already_decided"
     return None
 
 
@@ -724,6 +734,8 @@ def bounded_reason_for_record(record: PendingApproval) -> str:
         return "user_approved"
     if record.status == ApprovalStatus.DENIED.value:
         return "user_denied"
+    if record.status == ApprovalStatus.INVALIDATED.value:
+        return "approval_invalidated"
     return "local_approval_required"
 
 

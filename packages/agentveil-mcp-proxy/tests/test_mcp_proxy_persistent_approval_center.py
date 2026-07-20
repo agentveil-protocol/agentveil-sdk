@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
 import sys
 import threading
@@ -81,7 +82,7 @@ def _start_persistent_center(
         evidence_store=store,
         approval_server=server,
         config=config,
-        client_id="github:approval-center",
+        client_id=f"github:pid:{os.getpid()}",
         headless=True,
         wait_for_decision=False,
         notifier=NoopNotifier(),
@@ -106,7 +107,7 @@ def _run_manager(
         evidence_store=store,
         approval_server=server,
         config=config,
-        client_id="github:pid:123",
+        client_id=f"github:pid:{os.getpid()}",
         session_id="session-1234567890",
         headless=False,
         wait_for_decision=False,
@@ -436,7 +437,7 @@ def test_evidence_backed_terminal_snapshot_without_in_memory_prompt(tmp_path):
             evidence_store=store,
             approval_server=server,
             config=config,
-            client_id="github:pid:1",
+            client_id=f"github:pid:{os.getpid()}",
             headless=False,
             wait_for_decision=False,
             notifier=NoopNotifier(),
@@ -492,7 +493,7 @@ def test_managed_center_hides_actionable_prompt_when_evidence_cancelled(tmp_path
         evidence_store=store,
         approval_server=remote,
         config=config,
-        client_id="github:managed-cancel",
+        client_id=f"github:pid:{os.getpid()}",
         headless=False,
         wait_for_decision=False,
         notifier=NoopNotifier(),
