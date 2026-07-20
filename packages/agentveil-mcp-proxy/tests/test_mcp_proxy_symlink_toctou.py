@@ -218,6 +218,12 @@ def test_safe_internal_symlink_mutation_still_works(tmp_path: Path) -> None:
         "write_file",
         {"path": "ops/alias/target.txt", "content": "updated"},
     )
+    if sys.platform == "win32" and "error" in response:
+        # Keep the product response privacy-bounded while surfacing the native
+        # exception in the Windows-only CI log for this regression.
+        parts, _target = qfs._resolved_mutation_parts(sandbox, "ops/alias/target.txt")
+        qfs._write_file_windows(sandbox, parts, "updated")
+        pytest.fail(f"public handler rejected a successful native write: {response!r}")
     assert "error" not in response, response
     assert (sandbox / "ops" / "real" / "target.txt").read_text(encoding="utf-8") == "updated"
     _assert_privacy(json.dumps(response))

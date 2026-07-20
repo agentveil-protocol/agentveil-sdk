@@ -1286,11 +1286,21 @@ if sys.platform == "win32":
             raise _deny_symlink_race()
         return root_handle
 
-    def _win32_open_dir_nofollow(parent_handle: int, name: str) -> int:
+    def _win32_open_dir_nofollow(
+        parent_handle: int,
+        name: str,
+        *,
+        additional_access: int = 0,
+    ) -> int:
         handle, _info = _win32_nt_create_file(
             name,
             root_directory=parent_handle,
-            access=_WIN32_GENERIC_READ | _WIN32_SYNCHRONIZE | _WIN32_FILE_READ_ATTRIBUTES,
+            access=(
+                _WIN32_GENERIC_READ
+                | _WIN32_SYNCHRONIZE
+                | _WIN32_FILE_READ_ATTRIBUTES
+                | additional_access
+            ),
             disposition=_WIN32_FILE_OPEN,
             options=_WIN32_FILE_DIRECTORY_FILE | _WIN32_FILE_OPEN_REPARSE_POINT,
         )
@@ -1504,7 +1514,7 @@ if sys.platform == "win32":
         handle, _info = _win32_nt_create_file(
             name,
             root_directory=parent_handle,
-            access=_WIN32_GENERIC_WRITE | _WIN32_SYNCHRONIZE,
+            access=_WIN32_GENERIC_WRITE | _WIN32_DELETE | _WIN32_SYNCHRONIZE,
             disposition=_WIN32_FILE_CREATE,
             options=_WIN32_FILE_NON_DIRECTORY_FILE | _WIN32_FILE_OPEN_REPARSE_POINT,
         )
@@ -1519,7 +1529,11 @@ if sys.platform == "win32":
         _win32_close(handle)
 
     def _win32_rmtree_at(parent_handle: int, name: str) -> None:
-        dir_handle = _win32_open_dir_nofollow(parent_handle, name)
+        dir_handle = _win32_open_dir_nofollow(
+            parent_handle,
+            name,
+            additional_access=_WIN32_DELETE,
+        )
         try:
             for entry in _win32_list_directory(dir_handle):
                 probe, _info = _win32_nt_create_file(
@@ -1548,10 +1562,6 @@ if sys.platform == "win32":
                         _win32_delete_handle(file_handle)
                     finally:
                         _win32_close(file_handle)
-        finally:
-            _win32_close(dir_handle)
-        dir_handle = _win32_open_dir_nofollow(parent_handle, name)
-        try:
             _win32_delete_handle(dir_handle)
         finally:
             _win32_close(dir_handle)
@@ -1566,7 +1576,7 @@ if sys.platform == "win32":
         handle, _info = _win32_nt_create_file(
             name,
             root_directory=parent_handle,
-            access=access,
+            access=access | _WIN32_FILE_READ_ATTRIBUTES,
             disposition=disposition,
             options=_WIN32_FILE_NON_DIRECTORY_FILE | _WIN32_FILE_OPEN_REPARSE_POINT,
         )
