@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -1320,7 +1321,7 @@ def test_waiting_immediate_retry_after_approve_post(tmp_path):
             evidence_store=store,
             approval_server=server,
             config=config,
-            client_id="pytest",
+            client_id=f"pytest:pid:{os.getpid()}",
             session_id="session-waiting-retry",
             cli_out=io.StringIO(),
             browser_open=lambda _url: False,

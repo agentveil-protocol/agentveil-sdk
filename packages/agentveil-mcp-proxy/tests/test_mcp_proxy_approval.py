@@ -642,6 +642,8 @@ def test_token_rotates_on_proxy_restart():
 
 def test_pending_approval_persisted_before_ui_render(tmp_path):
     class FailingStore:
+        db_path = tmp_path / "evidence.sqlite"
+
         def find_active_exact_grant(self, **_kwargs):
             return None
 
@@ -670,8 +672,11 @@ def test_pending_approval_persisted_before_ui_render(tmp_path):
         notifier=NoopNotifier(),
     )
 
-    with pytest.raises(ApprovalFlowError):
-        manager.request_approval(_classification(), reason="local_approval_required")
+    try:
+        with pytest.raises(ApprovalFlowError):
+            manager.request_approval(_classification(), reason="local_approval_required")
+    finally:
+        manager.close()
 
 
 def test_headless_auto_deny_records_denial_evidence_and_does_not_render_ui(tmp_path):

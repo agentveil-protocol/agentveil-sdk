@@ -2278,15 +2278,21 @@ class McpPassthrough:
             return None
         if self._tool_schemas.is_advertised(tool):
             return None
-        # During outage / reconnect the advertised cache may be empty or mid-refresh.
-        # Defer to `_ensure_downstream_ready_for_routed_call` so callers get a single
-        # downstream_unavailable contract instead of a false unknown_tool deny.
-        if self._downstream_error is not None or not self._process_is_alive():
+        # During outage / reconnect an empty advertised cache may be mid-refresh.
+        # Defer only when no prior tool surface exists; a populated cache remains
+        # authoritative for local unknown-tool denial, including processless stubs.
+        observed_tools = self._tool_schemas.observed_tool_names()
+        if not observed_tools and (
+            self._downstream_error is not None or not self._process_is_alive()
+        ):
             return None
         with self._schema_refresh_lock:
             if self._tool_schemas.is_advertised(tool):
                 return None
-            if self._downstream_error is not None or not self._process_is_alive():
+            observed_tools = self._tool_schemas.observed_tool_names()
+            if not observed_tools and (
+                self._downstream_error is not None or not self._process_is_alive()
+            ):
                 return None
             response = self._request_downstream_tools_list()
             if response is not None:
@@ -2296,7 +2302,10 @@ class McpPassthrough:
                 return None
             # Refresh could not prove advertisement while the route still looks
             # alive; only then emit unknown_tool.
-            if self._downstream_error is not None or not self._process_is_alive():
+            observed_tools = self._tool_schemas.observed_tool_names()
+            if not observed_tools and (
+                self._downstream_error is not None or not self._process_is_alive()
+            ):
                 return None
         self._record_security_event({
             "type": "unknown_tool_call",
