@@ -215,6 +215,9 @@ MAX_PENDING_RESPONSES = 1000
 # the input dispatcher. Workers > 1 so diagnostics/read-only tools can progress.
 STDIO_REQUEST_WORKERS = 4
 STDIO_REQUEST_QUEUE_MAXSIZE = 8
+# Concurrent mutation approvals may register and wait independently; approved
+# downstream execution stays on a separate serialized lock.
+STDIO_MUTATION_PENDING_WORKERS = 2
 # At most one reconnect attempt may own the downstream lifecycle. Failed
 # handshakes keep the AV-05 unavailable latch and cool down before another spawn.
 DOWNSTREAM_RECONNECT_COOLDOWN_SECONDS = 2.0
@@ -690,6 +693,16 @@ def _raw_line_is_concurrent_tools_call(raw_line: str) -> bool:
     return tool is not None and tool in STDIO_CONCURRENT_TOOL_NAMES
 
 
+def _message_is_concurrent_tools_call(message: Mapping[str, Any]) -> bool:
+    """Return True for diagnostic/read-only ``tools/call`` messages."""
+
+    params = message.get("params")
+    if not isinstance(params, Mapping):
+        return False
+    tool = params.get("name")
+    return isinstance(tool, str) and tool in STDIO_CONCURRENT_TOOL_NAMES
+
+
 def _jsonrpc_request_id_from_raw_line(raw_line: str) -> tuple[bool, Any]:
     """Return ``(has_id, request_id)`` for a client JSON-RPC line."""
 
@@ -1150,10 +1163,12 @@ class McpPassthrough:
         self._windows_job: _WindowsJobObject | None = None
         self._stdio_worker_count = STDIO_REQUEST_WORKERS
         self._stdio_queue_maxsize = STDIO_REQUEST_QUEUE_MAXSIZE
+        self._stdio_mutation_pending_workers = STDIO_MUTATION_PENDING_WORKERS
         self._stdio_queue: queue.Queue[str | None] | None = None
         self._stdio_mutation_queue: queue.Queue[str | None] | None = None
         self._schema_refresh_lock = threading.Lock()
         self._reconnect_lock = threading.Lock()
+        self._mutation_execution_lock = threading.Lock()
         self._last_reconnect_attempt_at = 0.0
         self._last_reconnect_failed = False
         self._cached_initialize_params: dict[str, Any] | None = None
@@ -1348,8 +1363,10 @@ class McpPassthrough:
         Client input is read on a dedicated dispatcher loop. Diagnostic and
         read-only ``tools/call`` requests use a bounded concurrent lane so a
         wait-mode approval cannot monopolize the connection. Mutation
-        ``tools/call`` requests use a single serial lane that preserves arrival
-        order. Lifecycle methods stay on the dispatcher thread.
+        ``tools/call`` requests use a bounded pending lane so multiple
+        independent approvals can register concurrently. Approved downstream
+        execution is serialized separately and does not block other pending
+        waits. Lifecycle methods stay on the dispatcher thread.
         """
 
         self._notification_writer = lambda message: self._write_client(client_out, message)
@@ -1360,7 +1377,11 @@ class McpPassthrough:
         mutation_queue: queue.Queue[str | None] = queue.Queue(maxsize=queue_maxsize)
         self._stdio_queue = diagnostic_queue
         self._stdio_mutation_queue = mutation_queue
-        diagnostic_workers = max(1, worker_count - 1)
+        mutation_workers = max(
+            1,
+            min(int(self._stdio_mutation_pending_workers), worker_count - 1),
+        )
+        diagnostic_workers = max(1, worker_count - mutation_workers)
 
         def _handle_queued_line(item: str) -> None:
             has_id, client_request_id = _jsonrpc_request_id_from_raw_line(item)
@@ -1413,9 +1434,10 @@ class McpPassthrough:
         workers = [
             threading.Thread(
                 target=_mutation_worker,
-                name="mcp-stdio-mutation-worker",
+                name=f"mcp-stdio-mutation-worker-{index}",
                 daemon=True,
             )
+            for index in range(mutation_workers)
         ]
         workers.extend(
             threading.Thread(
@@ -1446,8 +1468,8 @@ class McpPassthrough:
                 if not raw_line.strip():
                     continue
                 # Lifecycle stays on the dispatcher. Concurrent lane is only for
-                # bounded diagnostic/read-only tools/call names; mutations keep
-                # serial arrival order on their own lane.
+                # bounded diagnostic/read-only tools/call names; mutations use a
+                # bounded pending lane with serialized downstream execution.
                 if _raw_line_is_concurrent_tools_call(raw_line):
                     diagnostic_queue.put(raw_line)
                 elif _raw_line_is_tools_call(raw_line):
@@ -1464,7 +1486,8 @@ class McpPassthrough:
             mutation_queue.join()
             for _ in range(diagnostic_workers):
                 diagnostic_queue.put(None)
-            mutation_queue.put(None)
+            for _ in range(mutation_workers):
+                mutation_queue.put(None)
             for worker in workers:
                 worker.join(timeout=5.0)
             return 0
@@ -1632,15 +1655,38 @@ class McpPassthrough:
             )
             downstream_tool_call_seen = False
             try:
-                if method == "tools/call" and has_id:
-                    stale_generation = self._send_tools_call_if_current_generation(
-                        message,
-                        request_id,
-                        approval_outcome,
-                    )
-                    if stale_generation is not None:
-                        return [stale_generation]
-                    downstream_tool_call_seen = True
+                if (
+                    method == "tools/call"
+                    and has_id
+                    and not _message_is_concurrent_tools_call(message)
+                ):
+                    with self._mutation_execution_lock:
+                        stale_generation = self._send_tools_call_if_current_generation(
+                            message,
+                            request_id,
+                            approval_outcome,
+                        )
+                        if stale_generation is not None:
+                            return [stale_generation]
+                        downstream_tool_call_seen = True
+                        response = self._wait_downstream_response(request_id)
+                        response = self._sanitize_filesystem_control_surface_response(
+                            message,
+                            response,
+                        )
+                        self._record_approval_result(
+                            approval_outcome,
+                            response,
+                            downstream_tool_call_seen=downstream_tool_call_seen,
+                        )
+                        self._record_allow_controlled_path_if_needed(
+                            classification,
+                            approval_outcome,
+                            request_id,
+                            response,
+                            downstream_tool_call_seen=downstream_tool_call_seen,
+                        )
+                        return [response]
                 else:
                     self._send_downstream(message)
                     downstream_tool_call_seen = True
