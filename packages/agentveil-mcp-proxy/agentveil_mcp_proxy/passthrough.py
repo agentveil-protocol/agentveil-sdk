@@ -211,13 +211,14 @@ MAX_DOWNSTREAM_MESSAGE_BYTES = 1 * 1024 * 1024
 MAX_CLIENT_MESSAGE_BYTES = 1 * 1024 * 1024
 MAX_PENDING_RESPONSES = 1000
 # Bounded stdio scheduling: keep reading client input while a wait-mode approval
-# (or other slow request) holds a worker. One pending approval must not monopolize
-# the input dispatcher. Workers > 1 so diagnostics/read-only tools can progress.
-STDIO_REQUEST_WORKERS = 4
-STDIO_REQUEST_QUEUE_MAXSIZE = 8
-# Concurrent mutation approvals may register and wait independently; approved
-# downstream execution stays on a separate serialized lock.
+# (or other slow request) holds a worker. Diagnostic/read-only tools use a lane
+# sized for AV-09 read bursts. Concurrent mutation approvals register on their
+# own bounded lane while downstream mutation execution remains serialized.
+STDIO_READ_CONCURRENCY = 20
 STDIO_MUTATION_PENDING_WORKERS = 2
+STDIO_DIAGNOSTIC_WORKERS = STDIO_READ_CONCURRENCY
+STDIO_REQUEST_WORKERS = STDIO_DIAGNOSTIC_WORKERS + STDIO_MUTATION_PENDING_WORKERS
+STDIO_REQUEST_QUEUE_MAXSIZE = STDIO_READ_CONCURRENCY + 4
 # At most one reconnect attempt may own the downstream lifecycle. Failed
 # handshakes keep the AV-05 unavailable latch and cool down before another spawn.
 DOWNSTREAM_RECONNECT_COOLDOWN_SECONDS = 2.0
@@ -1164,6 +1165,7 @@ class McpPassthrough:
         self._stdio_worker_count = STDIO_REQUEST_WORKERS
         self._stdio_queue_maxsize = STDIO_REQUEST_QUEUE_MAXSIZE
         self._stdio_mutation_pending_workers = STDIO_MUTATION_PENDING_WORKERS
+        self._stdio_diagnostic_workers = STDIO_DIAGNOSTIC_WORKERS
         self._stdio_queue: queue.Queue[str | None] | None = None
         self._stdio_mutation_queue: queue.Queue[str | None] | None = None
         self._schema_refresh_lock = threading.Lock()
@@ -1381,7 +1383,10 @@ class McpPassthrough:
             1,
             min(int(self._stdio_mutation_pending_workers), worker_count - 1),
         )
-        diagnostic_workers = max(1, worker_count - mutation_workers)
+        diagnostic_workers = max(
+            1,
+            min(int(self._stdio_diagnostic_workers), worker_count - mutation_workers),
+        )
 
         def _handle_queued_line(item: str) -> None:
             has_id, client_request_id = _jsonrpc_request_id_from_raw_line(item)

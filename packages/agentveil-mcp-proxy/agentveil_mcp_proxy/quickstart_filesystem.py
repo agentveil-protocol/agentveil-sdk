@@ -15,6 +15,8 @@ import posixpath
 import shutil
 import stat as stat_mod
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -28,6 +30,13 @@ _INSTRUCTION_SURFACE_BASENAMES = frozenset({
     "agents.md",
     "claude.md",
     ".cursorrules",
+})
+QUICKSTART_READ_POOL_SIZE = 20
+READ_ONLY_TOOL_NAMES = frozenset({
+    "read_file",
+    "get_file_info",
+    "list_workspace",
+    "instruction_surface_status",
 })
 _COPILOT_INSTRUCTIONS_PATH = (".github", "copilot-instructions.md")
 # Exact metadata components hidden from list_workspace; unrelated dotfiles stay visible.
@@ -2115,6 +2124,16 @@ def handle_message(root: Path, message: Mapping[str, Any]) -> dict[str, Any] | N
     return _error(request_id, -32601, "method not found")
 
 
+def _is_read_only_tools_call(message: Mapping[str, Any]) -> bool:
+    if message.get("method") != "tools/call":
+        return False
+    params = message.get("params")
+    if not isinstance(params, Mapping):
+        return False
+    name = params.get("name")
+    return isinstance(name, str) and name in READ_ONLY_TOOL_NAMES
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv in (["-h"], ["--help"]):
@@ -2125,21 +2144,54 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     root = Path(argv[0]).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
-    for raw_line in sys.stdin:
-        if not raw_line.strip():
-            continue
-        try:
-            message = json.loads(raw_line)
-        except json.JSONDecodeError:
-            response = _error(None, -32700, "parse error")
-        else:
-            if not isinstance(message, Mapping):
-                response = _error(None, -32600, "request must be an object")
-            else:
-                response = handle_message(root, message)
-        if response is not None:
+    stdout_lock = threading.Lock()
+    mutation_lock = threading.Lock()
+    read_slots = threading.Semaphore(QUICKSTART_READ_POOL_SIZE)
+    read_pool = ThreadPoolExecutor(
+        max_workers=QUICKSTART_READ_POOL_SIZE,
+        thread_name_prefix="quickstart-read",
+    )
+
+    def _emit(response: dict[str, Any] | None) -> None:
+        if response is None:
+            return
+        with stdout_lock:
             sys.stdout.write(json.dumps(response, separators=(",", ":")) + "\n")
             sys.stdout.flush()
+
+    def _dispatch(message: Mapping[str, Any]) -> None:
+        if _is_read_only_tools_call(message):
+            if not read_slots.acquire(blocking=False):
+                request_id = message.get("id")
+                _emit(_error(request_id, -32000, "read concurrency limit reached"))
+                return
+
+            def _read_task() -> None:
+                try:
+                    _emit(handle_message(root, message))
+                finally:
+                    read_slots.release()
+
+            read_pool.submit(_read_task)
+            return
+        with mutation_lock:
+            _emit(handle_message(root, message))
+
+    try:
+        for raw_line in sys.stdin:
+            if not raw_line.strip():
+                continue
+            try:
+                message = json.loads(raw_line)
+            except json.JSONDecodeError:
+                _emit(_error(None, -32700, "parse error"))
+                continue
+            if not isinstance(message, Mapping):
+                _emit(_error(None, -32600, "request must be an object"))
+                continue
+            _dispatch(message)
+    finally:
+        read_pool.shutdown(wait=True)
     return 0
 
 

@@ -185,7 +185,13 @@ def _start_session(
         passthrough._stdio_mutation_pending_workers = mutation_pending_workers
     if execution_lock is not None:
         passthrough._mutation_execution_lock = execution_lock
-    client_in = _TrackingTextIO()
+    class _SessionTrackingTextIO(_TrackingTextIO):
+        def close(self) -> None:
+            for prompt in server.pending_prompts():
+                manager.cancel_approval(prompt.request_id)
+            super().close()
+
+    client_in = _SessionTrackingTextIO()
     client_out = _ThreadSafeClientOut()
     worker = _run_stdio_session(passthrough, client_in, client_out)
     worker.start()

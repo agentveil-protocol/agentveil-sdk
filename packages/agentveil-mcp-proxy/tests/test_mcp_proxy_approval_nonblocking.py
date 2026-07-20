@@ -15,10 +15,14 @@ from typing import Any
 import httpx
 
 from agentveil_mcp_proxy.classification import ToolCallClassifier
+from agentveil_mcp_proxy.approval.manager import normalize_client_request_id
 from agentveil_mcp_proxy.evidence import ApprovalStatus, PendingApproval
 from agentveil_mcp_proxy.passthrough import (
     DownstreamConfig,
     McpPassthrough,
+    STDIO_DIAGNOSTIC_WORKERS,
+    STDIO_MUTATION_PENDING_WORKERS,
+    STDIO_READ_CONCURRENCY,
     STDIO_REQUEST_QUEUE_MAXSIZE,
     STDIO_REQUEST_WORKERS,
 )
@@ -996,7 +1000,10 @@ def test_eof_shutdown_does_not_corrupt_completed_responses(tmp_path):
 
 
 def test_stdio_worker_defaults_are_bounded():
-    assert STDIO_REQUEST_WORKERS >= 2
+    assert STDIO_READ_CONCURRENCY >= 2
+    assert STDIO_DIAGNOSTIC_WORKERS == STDIO_READ_CONCURRENCY
+    assert STDIO_MUTATION_PENDING_WORKERS == 2
+    assert STDIO_REQUEST_WORKERS == STDIO_DIAGNOSTIC_WORKERS + STDIO_MUTATION_PENDING_WORKERS
     assert STDIO_REQUEST_QUEUE_MAXSIZE >= 1
-    assert STDIO_REQUEST_WORKERS <= 16
+    assert STDIO_REQUEST_WORKERS <= 32
     assert STDIO_REQUEST_QUEUE_MAXSIZE <= 64

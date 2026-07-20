@@ -178,7 +178,7 @@ class _RecordingApprovalManager:
                 (outcome.request_id, str(response["id"]), downstream_tool_call_seen)
             )
             self.seen_flags.append(downstream_tool_call_seen)
-        if outcome.request_id == "request-tool-b":
+        if response["id"] == "b":
             self.b_done.set()
 
     def record_execution_error(self, outcome: ApprovalOutcome, error_class: str) -> None:
@@ -218,7 +218,7 @@ def test_concurrent_handle_client_line_does_not_misattribute_approval_outcome() 
     # the steady state where tool schemas are already known so the internal
     # tools/list probe is a cache hit and does not perturb the coordinated
     # downstream-response sequencing this test asserts.
-    seed_tool_schemas(passthrough, [tool_entry("tool-a"), tool_entry("tool-b")])
+    seed_tool_schemas(passthrough, [tool_entry("read_file"), tool_entry("get_file_info")])
     responses: dict[str, list[dict[str, Any]]] = {}
     errors: list[BaseException] = []
 
@@ -228,10 +228,10 @@ def test_concurrent_handle_client_line_does_not_misattribute_approval_outcome() 
         except BaseException as exc:
             errors.append(exc)
 
-    thread_a = threading.Thread(target=run_request, args=("a", "tool-a"))
+    thread_a = threading.Thread(target=run_request, args=("a", "read_file"))
     thread_a.start()
     assert passthrough.a_waiting.wait(timeout=2.0)
-    thread_b = threading.Thread(target=run_request, args=("b", "tool-b"))
+    thread_b = threading.Thread(target=run_request, args=("b", "get_file_info"))
     thread_b.start()
     thread_a.join(timeout=5.0)
     thread_b.join(timeout=5.0)
@@ -243,9 +243,9 @@ def test_concurrent_handle_client_line_does_not_misattribute_approval_outcome() 
     # Both concurrent tools/call requests were actually sent downstream.
     assert sorted(manager.sent_ids, key=str) == ["a", "b"]
     # The completed execution must carry request-local seen=True (not a stale counter).
-    assert manager.results == [("request-tool-b", "b", True)]
+    assert manager.results == [("request-get_file_info", "b", True)]
     assert manager.seen_flags == [True]
-    assert manager.errors == [("request-tool-a", "downstream_response_timeout")]
+    assert manager.errors == [("request-read_file", "downstream_response_timeout")]
     assert responses["a"][0]["error"]["data"]["reason"] == "downstream_response_timeout"
     assert responses["b"] == [{"jsonrpc": "2.0", "id": "b", "result": {"ok": True}}]
 
@@ -266,7 +266,7 @@ def test_concurrent_forwarded_requests_both_pass_request_local_seen_true() -> No
             return {"jsonrpc": "2.0", "id": expected_id, "result": {"ok": True}}
 
     passthrough = _BothSucceedPassthrough(manager)
-    seed_tool_schemas(passthrough, [tool_entry("tool-a"), tool_entry("tool-b")])
+    seed_tool_schemas(passthrough, [tool_entry("read_file"), tool_entry("get_file_info")])
     responses: dict[str, list[dict[str, Any]]] = {}
     errors: list[BaseException] = []
 
@@ -276,10 +276,10 @@ def test_concurrent_forwarded_requests_both_pass_request_local_seen_true() -> No
         except BaseException as exc:
             errors.append(exc)
 
-    thread_a = threading.Thread(target=run_request, args=("a", "tool-a"))
+    thread_a = threading.Thread(target=run_request, args=("a", "read_file"))
     thread_a.start()
     assert passthrough.a_waiting.wait(timeout=2.0)
-    thread_b = threading.Thread(target=run_request, args=("b", "tool-b"))
+    thread_b = threading.Thread(target=run_request, args=("b", "get_file_info"))
     thread_b.start()
     thread_a.join(timeout=5.0)
     thread_b.join(timeout=5.0)
@@ -287,8 +287,8 @@ def test_concurrent_forwarded_requests_both_pass_request_local_seen_true() -> No
     assert not errors
     assert sorted(manager.sent_ids, key=str) == ["a", "b"]
     assert sorted(manager.results) == [
-        ("request-tool-a", "a", True),
-        ("request-tool-b", "b", True),
+        ("request-get_file_info", "b", True),
+        ("request-read_file", "a", True),
     ]
     assert manager.seen_flags.count(True) == 2
     assert manager.errors == []
