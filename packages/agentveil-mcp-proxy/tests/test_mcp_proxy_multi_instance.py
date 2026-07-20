@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import io
 import json
+import os
 from pathlib import Path
 import sqlite3
 import threading
@@ -71,7 +72,7 @@ def _classification(config: ProxyConfig | None = None, *, nonce: str = "one"):
 def _prompt(request_id: str) -> ApprovalPrompt:
     return ApprovalPrompt(
         request_id=request_id,
-        client_id="cursor:pid:1",
+        client_id=f"cursor:pid:{os.getpid()}",
         session_id="session-1",
         downstream_server="github",
         tool_name="create_issue",
@@ -142,7 +143,7 @@ def _stack(tmp_path: Path, name: str) -> _Stack:
         evidence_store=store,
         approval_server=server,
         config=config,
-        client_id=f"{name}:pid:123",
+        client_id=f"{name}:pid:{os.getpid()}",
         session_id=f"{name}:session",
         cli_out=io.StringIO(),
         browser_open=lambda _url: True,

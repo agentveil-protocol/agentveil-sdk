@@ -46,6 +46,289 @@ MAX_POST_BODY_BYTES = 8192
 REQUEST_SOCKET_TIMEOUT_SECONDS = 5.0
 DEFAULT_TERMINAL_REQUEST_RETENTION_SECONDS = 600.0
 MIN_TERMINAL_REQUEST_RETENTION_SECONDS = 1.0
+APPROVAL_OWNER_PID_MARKER = ":pid:"
+APPROVAL_OWNER_INSTANCE_MARKER = ":inst:"
+ERROR_CLASS_OWNER_GONE = "approval_owner_gone"
+ERROR_CLASS_GENERATION_CHANGED = "downstream_generation_changed"
+
+
+def owner_pid_from_client_id(client_id: str | None) -> int | None:
+    """Extract the owner process id from ``name:pid:N`` client ids."""
+
+    if not isinstance(client_id, str) or APPROVAL_OWNER_PID_MARKER not in client_id:
+        return None
+    after_pid = client_id.rsplit(APPROVAL_OWNER_PID_MARKER, 1)[-1]
+    raw = after_pid.split(APPROVAL_OWNER_INSTANCE_MARKER, 1)[0]
+    try:
+        pid = int(raw)
+    except ValueError:
+        return None
+    return pid if pid > 0 else None
+
+
+def owner_instance_from_client_id(client_id: str | None) -> str | None:
+    """Extract the per-process instance token from an owner client id."""
+
+    if not isinstance(client_id, str) or APPROVAL_OWNER_INSTANCE_MARKER not in client_id:
+        return None
+    token = client_id.rsplit(APPROVAL_OWNER_INSTANCE_MARKER, 1)[-1].strip()
+    return token or None
+
+
+def redact_owner_client_id_for_display(client_id: str | None) -> str:
+    """Strip the raw instance token from owner ids used in user-visible surfaces."""
+
+    if not isinstance(client_id, str) or not client_id:
+        return "-"
+    if APPROVAL_OWNER_INSTANCE_MARKER not in client_id:
+        return client_id
+    return client_id.rsplit(APPROVAL_OWNER_INSTANCE_MARKER, 1)[0]
+
+
+def enrich_owner_client_id(client_id: str, *, instance_token: str) -> str:
+    """Attach a process-instance token to pid-shaped owner client ids."""
+
+    if APPROVAL_OWNER_INSTANCE_MARKER in client_id:
+        return client_id
+    if APPROVAL_OWNER_PID_MARKER not in client_id:
+        return client_id
+    return f"{client_id}{APPROVAL_OWNER_INSTANCE_MARKER}{instance_token}"
+
+
+def build_owner_client_id(
+    name: str,
+    *,
+    pid: int | None = None,
+    instance_token: str,
+) -> str:
+    """Build a verifiable owner client id for one proxy instance."""
+
+    owner_pid = os.getpid() if pid is None else int(pid)
+    return (
+        f"{name}{APPROVAL_OWNER_PID_MARKER}{owner_pid}"
+        f"{APPROVAL_OWNER_INSTANCE_MARKER}{instance_token}"
+    )
+
+
+def _owner_claim_path(claim_dir: Path, pid: int, instance_token: str) -> Path:
+    safe_token = instance_token.replace("/", "_")
+    return claim_dir / f"{int(pid)}-{safe_token}.claim"
+
+
+def _try_exclusive_claim_lock(fh: Any) -> bool:
+    """Return True when an exclusive non-blocking lock was acquired."""
+
+    if os.name == "nt":
+        import msvcrt
+
+        try:
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+    import fcntl
+
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+    except OSError:
+        return False
+
+
+def _release_claim_lock(fh: Any) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        try:
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+        return
+    import fcntl
+
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+@dataclass
+class OwnerClaimLease:
+    """Process-held owner claim: file payload plus an exclusive OS lock."""
+
+    path: Path
+    _fh: Any
+
+    def close(self) -> None:
+        """Release the live lease and remove the claim file on clean shutdown."""
+
+        fh = self._fh
+        self._fh = None
+        if fh is None:
+            return
+        try:
+            _release_claim_lock(fh)
+        finally:
+            try:
+                fh.close()
+            except OSError:
+                pass
+        try:
+            self.path.unlink()
+        except OSError:
+            pass
+
+
+def publish_owner_claim(
+    claim_dir: Path,
+    *,
+    pid: int,
+    instance_token: str,
+    session_id: str,
+) -> OwnerClaimLease:
+    """Publish a live owner claim and hold an exclusive OS lock for this process.
+
+    Crash leaves the file behind, but the OS releases the lock. A later verifier
+    that can acquire the lock treats the claim as non-actionable, so a reused PID
+    cannot revive a stale token/session pair.
+    """
+
+    claim_dir.mkdir(parents=True, exist_ok=True)
+    path = _owner_claim_path(claim_dir, pid, instance_token)
+    payload = {
+        "pid": int(pid),
+        "instance_token": instance_token,
+        "session_id": session_id,
+    }
+    fh = path.open("a+", encoding="utf-8")
+    try:
+        if not _try_exclusive_claim_lock(fh):
+            raise OSError("owner claim lease is already held")
+        fh.seek(0)
+        fh.truncate()
+        fh.write(json.dumps(payload, separators=(",", ":")))
+        fh.flush()
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+    except Exception:
+        try:
+            fh.close()
+        except OSError:
+            pass
+        raise
+    return OwnerClaimLease(path=path, _fh=fh)
+
+
+def clear_owner_claim(lease: OwnerClaimLease | Path | None) -> None:
+    """Best-effort release of a published owner claim lease or leftover path."""
+
+    if lease is None:
+        return
+    if isinstance(lease, OwnerClaimLease):
+        lease.close()
+        return
+    try:
+        lease.unlink()
+    except OSError:
+        pass
+
+
+def read_owner_claim(
+    claim_dir: Path,
+    pid: int,
+    *,
+    instance_token: str,
+) -> dict[str, Any] | None:
+    """Load one pid+instance owner claim when present and well-formed."""
+
+    path = _owner_claim_path(claim_dir, pid, instance_token)
+    try:
+        raw = path.read_text(encoding="utf-8")
+        payload = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    token = payload.get("instance_token")
+    session_id = payload.get("session_id")
+    if not isinstance(token, str) or not token:
+        return None
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    return {"instance_token": token, "session_id": session_id, "path": path}
+
+
+def owner_claim_lease_is_held(path: Path) -> bool:
+    """Return True only when another process currently holds the claim lock."""
+
+    try:
+        fh = path.open("a+", encoding="utf-8")
+    except OSError:
+        return False
+    try:
+        if _try_exclusive_claim_lock(fh):
+            _release_claim_lock(fh)
+            return False
+        return True
+    finally:
+        try:
+            fh.close()
+        except OSError:
+            pass
+
+
+def approval_owner_process_alive(client_id: str | None) -> bool:
+    """Compatibility wrapper: True only for a currently verifiable live owner.
+
+    PID existence alone is not enough: the client id must carry an instance
+    token whose claim file is currently lock-held by a live process. Unknown or
+    legacy unprovable owners are treated as non-actionable.
+    """
+
+    return approval_owner_is_actionable(client_id, session_id=None)
+
+
+def approval_owner_is_actionable(
+    client_id: str | None,
+    *,
+    session_id: str | None,
+    claim_dir: Path | None = None,
+) -> bool:
+    """Return True only when owner identity proves the same live proxy instance."""
+
+    pid = owner_pid_from_client_id(client_id)
+    instance_token = owner_instance_from_client_id(client_id)
+    if pid is None or instance_token is None:
+        return False
+    # Lazy import avoids approval.server ↔ approval.persistent cycle.
+    from agentveil_mcp_proxy.approval.persistent import is_process_alive
+
+    if not is_process_alive(pid):
+        return False
+    if claim_dir is None:
+        return False
+    claim = read_owner_claim(claim_dir, pid, instance_token=instance_token)
+    if claim is None:
+        return False
+    if claim["instance_token"] != instance_token:
+        return False
+    if session_id is not None and claim["session_id"] != session_id:
+        return False
+    claim_path = claim.get("path")
+    if not isinstance(claim_path, Path):
+        return False
+    # Stale file after crash is unlocked; a reused PID cannot revive it.
+    if not owner_claim_lease_is_held(claim_path):
+        return False
+    return True
+
+
 SECURITY_HEADERS = {
     "Referrer-Policy": "no-referrer",
     "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
@@ -260,7 +543,7 @@ class TerminalApprovalSnapshot:
         return cls(
             request_id=prompt.request_id,
             state=state,
-            client_id=prompt.client_id,
+            client_id=redact_owner_client_id_for_display(prompt.client_id),
             session_id_prefix=prompt.session_id[:8],
             downstream_server=prompt.downstream_server,
             tool_name=prompt.tool_name,
@@ -292,7 +575,7 @@ class TerminalApprovalSnapshot:
         return cls(
             request_id=record.request_id,
             state=resolved_state,
-            client_id=client_id,
+            client_id=redact_owner_client_id_for_display(client_id),
             session_id_prefix=session_prefix,
             downstream_server=record.downstream_server,
             tool_name=record.tool_name,
@@ -385,13 +668,13 @@ class ApprovalServer:
         self._decision_events: dict[str, threading.Event] = {}
         self._terminal_requests: dict[str, float] = {}
         self._terminal_snapshots: dict[str, TerminalApprovalSnapshot] = {}
-        self._decision_handler: Callable[[ApprovalServerDecision], None] | None = None
+        self._decision_handler: Callable[[ApprovalServerDecision], Any] | None = None
         self._httpd: _DaemonThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
     def set_decision_handler(
         self,
-        handler: Callable[[ApprovalServerDecision], None] | None,
+        handler: Callable[[ApprovalServerDecision], Any] | None,
     ) -> None:
         """Register a callback invoked after each approve/deny POST is accepted.
 
@@ -399,6 +682,9 @@ class ApprovalServer:
         before the HTTP response returns. That closes the live-console race
         where the client retries immediately after POST while the background
         watcher has not yet written APPROVED to the evidence store.
+
+        When the handler returns ``False``, ``submit_decision`` rejects the POST
+        as gone so a concurrent invalidation cannot look successful.
         """
 
         self._decision_handler = handler
@@ -539,7 +825,7 @@ class ApprovalServer:
 
         return pending_approval_dict(
             request_id=prompt.request_id,
-            client_id=prompt.client_id,
+            client_id=redact_owner_client_id_for_display(prompt.client_id),
             session_id=prompt.session_id,
             downstream_server=prompt.downstream_server,
             tool_name=prompt.tool_name,
@@ -594,6 +880,8 @@ class ApprovalServer:
             prompt = self._prompts.get(request_id)
         if prompt is None:
             return None
+        if self._retire_if_not_actionable(request_id) is not None:
+            return None
         if self._terminal_snapshot_from_evidence(request_id) is not None:
             return None
         return prompt
@@ -629,6 +917,9 @@ class ApprovalServer:
                 elif decision.decision == "deny":
                     state = TERMINAL_ALREADY_DECIDED_DENY
                 return TerminalApprovalSnapshot.from_prompt(prompt, state=state)
+        retired = self._retire_if_not_actionable(request_id)
+        if retired is not None:
+            return retired
         return self._terminal_snapshot_from_evidence(request_id)
 
     def _terminal_snapshot_from_evidence(self, request_id: str) -> TerminalApprovalSnapshot | None:
@@ -642,6 +933,51 @@ class ApprovalServer:
             return None
         return TerminalApprovalSnapshot.from_pending_record(record)
 
+    def _retire_if_not_actionable(self, request_id: str) -> TerminalApprovalSnapshot | None:
+        """Invalidate dead-owner pending rows and return their terminal snapshot."""
+
+        store = self.evidence_store
+        if store is None:
+            return None
+        record = store.get_pending(request_id)
+        if record is None:
+            return None
+        if record.status != ApprovalStatus.PENDING.value:
+            return TerminalApprovalSnapshot.from_pending_record(record)
+        claim_dir = None
+        store_path = getattr(store, "db_path", None)
+        if isinstance(store_path, Path):
+            claim_dir = store_path.parent / "owner_claims"
+        if approval_owner_is_actionable(
+            record.client_id,
+            session_id=record.session_id,
+            claim_dir=claim_dir,
+        ):
+            return None
+        try:
+            store.transition(
+                request_id,
+                ApprovalStatus.INVALIDATED.value,
+                error_class=ERROR_CLASS_OWNER_GONE,
+            )
+        except Exception:
+            refreshed = store.get_pending(request_id)
+            if refreshed is None:
+                return None
+            return TerminalApprovalSnapshot.from_pending_record(refreshed)
+        with self._lock:
+            self._prune_terminal_requests_locked()
+            prompt = self._prompts.get(request_id)
+            if prompt is not None:
+                self._terminal_snapshots[request_id] = TerminalApprovalSnapshot.from_prompt(
+                    prompt,
+                    state=TERMINAL_ALREADY_DECIDED,
+                )
+                self._terminal_requests[request_id] = self._terminal_retain_until(prompt)
+            self._prompts.pop(request_id, None)
+        refreshed = store.get_pending(request_id)
+        return TerminalApprovalSnapshot.from_pending_record(refreshed) if refreshed else None
+
     def submit_decision(self, request_id: str, decision: str, approval_scope: str) -> None:
         """Record a local approve/deny POST."""
 
@@ -649,6 +985,8 @@ class ApprovalServer:
             raise ApprovalServerError("approval decision must be approve or deny")
         if approval_scope not in {"exact", "similar_5m"}:
             raise ApprovalServerError("approval scope is unsupported")
+        if self._retire_if_not_actionable(request_id) is not None:
+            raise ApprovalServerGone("approval already decided")
         if self._terminal_snapshot_from_evidence(request_id) is not None:
             raise ApprovalServerGone("approval already decided")
         with self._lock:
@@ -669,7 +1007,25 @@ class ApprovalServer:
             snapshot = self._decisions[request_id]
             handler = self._decision_handler
         if handler is not None:
-            handler(snapshot)
+            accepted = handler(snapshot)
+            if accepted is False:
+                with self._lock:
+                    self._decisions.pop(request_id, None)
+                raise ApprovalServerGone("approval already decided")
+            return
+        record = (
+            None
+            if self.evidence_store is None
+            else self.evidence_store.get_pending(request_id)
+        )
+        if record is not None and record.status not in {
+            ApprovalStatus.PENDING.value,
+            ApprovalStatus.APPROVED.value,
+            ApprovalStatus.DENIED.value,
+        }:
+            with self._lock:
+                self._decisions.pop(request_id, None)
+            raise ApprovalServerGone("approval already decided")
 
     def _cookie_value(self) -> str:
         message = f"{self.session_token}:{self._cookie_nonce}".encode("utf-8")
@@ -1177,7 +1533,7 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
             for label, value in proof_rows
         )
         raw_rows = approval_raw_evidence_rows(
-            client_id=prompt.client_id,
+            client_id=redact_owner_client_id_for_display(prompt.client_id),
             session_id_prefix=session_prefix,
             action_display=prompt.action_display,
             action_gate_metadata=prompt.action_gate_metadata,
@@ -2338,4 +2694,12 @@ __all__ = [
     "TERMINAL_ALREADY_DECIDED_DENY",
     "TERMINAL_APPROVAL_EXPIRED",
     "TerminalApprovalSnapshot",
+    "OwnerClaimLease",
+    "approval_owner_is_actionable",
+    "approval_owner_process_alive",
+    "build_owner_client_id",
+    "clear_owner_claim",
+    "enrich_owner_client_id",
+    "publish_owner_claim",
+    "redact_owner_client_id_for_display",
 ]

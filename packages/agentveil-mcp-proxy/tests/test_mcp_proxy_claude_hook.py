@@ -562,7 +562,10 @@ def test_native_mutation_deny_includes_redirect_instruction(tool_name, tool_inpu
     assert "Direct native tool use was blocked before mutation" in reason  # claim-check: allow literal hook-deny text asserted by this test.
     assert "controlled MCP tool" in reason
     assert "same path, content, and intent" in reason
-    assert "ask the user to approve" in reason and "retry the controlled tool call" in reason
+    assert "stop and tell the user" in reason.lower()
+    assert "Do not retry, request another approval" in reason
+    assert "Do not bypass through native tools" in reason or "bypass through native tools" in reason
+    assert "ask the user to approve" not in reason
     assert NATIVE_REDIRECT_INSTRUCTION in reason
 
 

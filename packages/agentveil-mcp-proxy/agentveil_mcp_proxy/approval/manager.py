@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import atexit
 import hashlib
 import json
+import os
 import secrets
 import sys
 import threading
@@ -22,10 +24,16 @@ from agentveil_mcp_proxy.approval.server import (
     ApprovalPrompt,
     ApprovalServer,
     ApprovalServerDecision,
+    ERROR_CLASS_GENERATION_CHANGED,
+    TERMINAL_ALREADY_DECIDED,
     TERMINAL_ALREADY_DECIDED_APPROVE,
     TERMINAL_ALREADY_DECIDED_DENY,
     TERMINAL_APPROVAL_EXPIRED,
     TERMINAL_CANCELLED,
+    clear_owner_claim,
+    enrich_owner_client_id,
+    publish_owner_claim,
+    redact_owner_client_id_for_display,
 )
 from agentveil_mcp_proxy.classification import ClassifiedToolCall, sha256_jcs
 from agentveil_mcp_proxy.evidence import (
@@ -136,7 +144,8 @@ class ApprovalManager:
         if getattr(self.approval_server, "evidence_store", None) is None:
             self.approval_server.evidence_store = evidence_store
         self.config = config
-        self.client_id = client_id
+        self._instance_token = secrets.token_urlsafe(12)
+        self.client_id = enrich_owner_client_id(client_id, instance_token=self._instance_token)
         self.session_id = session_id or secrets.token_urlsafe(16)
         self.environment = environment
         self.headless = headless
@@ -145,6 +154,15 @@ class ApprovalManager:
         self.cli_out = cli_out or sys.stderr
         self.browser_open = browser_open or webbrowser.open
         self.notifier = notifier or ApprovalNotifier()
+        self._downstream_generation = 0
+        self._owner_claim_lease = publish_owner_claim(
+            evidence_store.db_path.parent / "owner_claims",
+            pid=os.getpid(),
+            instance_token=self._instance_token,
+            session_id=self.session_id,
+        )
+        self._owner_claim_path = self._owner_claim_lease.path
+        atexit.register(self.close)
         self.wait_for_decision = wait_for_decision
         self.approval_grant_private_key_seed = approval_grant_private_key_seed
         self.approval_grant_agent_did = approval_grant_agent_did
@@ -157,7 +175,15 @@ class ApprovalManager:
         # Per-request browser delivery: a successful open for request A must not
         # suppress opening the card for a later distinct request B.
         self._browser_opened_request_ids: set[str] = set()
+        self._approval_generations: dict[str, int] = {}
         self.approval_server.set_decision_handler(self._persist_server_decision)
+
+    def close(self) -> None:
+        """Release the live owner claim lease on clean shutdown."""
+
+        lease = getattr(self, "_owner_claim_lease", None)
+        self._owner_claim_lease = None
+        clear_owner_claim(lease)
 
     def request_approval(
         self,
@@ -166,6 +192,7 @@ class ApprovalManager:
         runtime_decision: RuntimeGateDecision | None = None,
         reason: str,
         client_request_id: Any | None = None,
+        downstream_generation: int | None = None,
     ) -> ApprovalOutcome:
         """Persist pending approval, notify the user, and await a bounded decision."""
 
@@ -307,6 +334,17 @@ class ApprovalManager:
                 raise ApprovalFlowError("approval evidence record missing")
             if pending.status != ApprovalStatus.PENDING.value:
                 return self._outcome_for_terminal_record(pending)
+            # Bind generation before register so reconnect invalidation cannot
+            # miss this request while the card is already actionable.
+            if downstream_generation is not None:
+                bound_generation = int(downstream_generation)
+                with self._bindings_lock:
+                    self._approval_generations[request_id] = bound_generation
+                if bound_generation != self._downstream_generation:
+                    return self._invalidate_approval_locked(
+                        request_id,
+                        reason=ERROR_CLASS_GENERATION_CHANGED,
+                    )
             url = self.approval_server.register(prompt)
             self._set_delivery_status(request_id, DELIVERY_STATUS_QUEUED)
         actionable_ui = self._notify(prompt, url)
@@ -370,6 +408,144 @@ class ApprovalManager:
                     reason,
                 )
         return self.cancel_approval(request_id, reason=reason)
+
+    def invalidate_approval(
+        self,
+        request_id: str,
+        *,
+        reason: str = ERROR_CLASS_GENERATION_CHANGED,
+    ) -> ApprovalOutcome:
+        """Retire one pending approval as non-actionable without a user decision."""
+
+        with self._finalize_lock:
+            return self._invalidate_approval_locked(request_id, reason=reason)
+
+    def publish_downstream_generation(self, current_generation: int) -> tuple[str, ...]:
+        """Publish the live downstream generation and retire stale bindings."""
+
+        with self._finalize_lock:
+            self._downstream_generation = int(current_generation)
+            return self._invalidate_stale_generation_approvals_locked(
+                self._downstream_generation
+            )
+
+    def note_downstream_generation(self, current_generation: int) -> None:
+        """Track the live downstream generation without invalidating cards."""
+
+        self._downstream_generation = int(current_generation)
+
+    def invalidate_stale_generation_approvals(
+        self,
+        current_generation: int,
+    ) -> tuple[str, ...]:
+        """Invalidate only approvals bound to a different downstream generation."""
+
+        with self._finalize_lock:
+            return self._invalidate_stale_generation_approvals_locked(current_generation)
+
+    def invalidate_all_bound_approvals(
+        self,
+        *,
+        reason: str = ERROR_CLASS_GENERATION_CHANGED,
+    ) -> tuple[str, ...]:
+        """Retire generation-bound pending approvals without bumping generation."""
+
+        with self._finalize_lock:
+            with self._bindings_lock:
+                request_ids = tuple(self._approval_generations.keys())
+            invalidated: list[str] = []
+            for request_id in request_ids:
+                outcome = self._invalidate_approval_locked(request_id, reason=reason)
+                if outcome.status == ApprovalStatus.INVALIDATED.value:
+                    invalidated.append(request_id)
+            return tuple(invalidated)
+
+    def _invalidate_stale_generation_approvals_locked(
+        self,
+        current_generation: int,
+    ) -> tuple[str, ...]:
+        """Invalidate stale generation bindings while ``_finalize_lock`` is held."""
+
+        with self._bindings_lock:
+            stale_ids = [
+                request_id
+                for request_id, bound in self._approval_generations.items()
+                if bound != current_generation
+            ]
+        invalidated: list[str] = []
+        for request_id in stale_ids:
+            outcome = self._invalidate_approval_locked(
+                request_id,
+                reason=ERROR_CLASS_GENERATION_CHANGED,
+            )
+            if outcome.status == ApprovalStatus.INVALIDATED.value:
+                invalidated.append(request_id)
+        return tuple(invalidated)
+
+    def _invalidate_approval_locked(
+        self,
+        request_id: str,
+        *,
+        reason: str,
+    ) -> ApprovalOutcome:
+        """Invalidate pending approval while ``_finalize_lock`` is already held."""
+
+        current = self.evidence_store.get_pending(request_id)
+        if current is None:
+            self._forget_approval_generation(request_id)
+            self._release_client_request_binding_for_request(request_id)
+            return ApprovalOutcome(
+                request_id,
+                ApprovalStatus.INVALIDATED.value,
+                reason,
+            )
+        if current.status == ApprovalStatus.INVALIDATED.value:
+            self._forget_approval_generation(request_id)
+            self._release_client_request_binding_for_request(request_id)
+            return ApprovalOutcome(
+                request_id,
+                ApprovalStatus.INVALIDATED.value,
+                current.error_class or reason,
+            )
+        if current.status != ApprovalStatus.PENDING.value:
+            self._forget_approval_generation(request_id)
+            self._release_client_request_binding_for_request(request_id)
+            return self._outcome_for_terminal_record(current)
+        try:
+            self.evidence_store.transition(
+                request_id,
+                ApprovalStatus.INVALIDATED.value,
+                error_class=reason,
+            )
+        except ApprovalEvidenceTransitionError:
+            refreshed = self.evidence_store.get_pending(request_id)
+            if refreshed is None:
+                self._forget_approval_generation(request_id)
+                self._release_client_request_binding_for_request(request_id)
+                return ApprovalOutcome(
+                    request_id,
+                    ApprovalStatus.INVALIDATED.value,
+                    reason,
+                )
+            self._forget_approval_generation(request_id)
+            self._release_client_request_binding_for_request(request_id)
+            return self._outcome_for_terminal_record(refreshed)
+        self.approval_server.notify_cancelled(request_id)
+        self.approval_server.unregister(
+            request_id,
+            terminal_state=TERMINAL_ALREADY_DECIDED,
+        )
+        self._forget_approval_generation(request_id)
+        self._release_client_request_binding_for_request(request_id)
+        return ApprovalOutcome(
+            request_id,
+            ApprovalStatus.INVALIDATED.value,
+            reason,
+        )
+
+    def _forget_approval_generation(self, request_id: str) -> None:
+        with self._bindings_lock:
+            self._approval_generations.pop(request_id, None)
 
     def register_tracked_client_request(self, client_request_id: Any) -> bool:
         """Mark one queued/in-flight mutation tools/call id as cancelable."""
@@ -485,6 +661,7 @@ class ApprovalManager:
             request_id,
             terminal_state=TERMINAL_CANCELLED,
         )
+        self._forget_approval_generation(request_id)
         self._release_client_request_binding_for_request(request_id)
         return ApprovalOutcome(
             request_id,
@@ -602,14 +779,14 @@ class ApprovalManager:
                         )
                     except ApprovalEvidenceTransitionError:
                         pass
-                    terminal = self._outcome_if_terminal_evidence(request_id)
-                    if terminal is not None:
-                        return terminal
                     self.approval_server.unregister(
                         request_id,
                         terminal_state=TERMINAL_APPROVAL_EXPIRED,
                     )
                     self._release_client_request_binding_for_request(request_id)
+                    terminal = self._outcome_if_terminal_evidence(request_id)
+                    if terminal is not None:
+                        return terminal
                     return ApprovalOutcome(
                         request_id, ApprovalStatus.EXPIRED.value, "approval_timeout"
                     )
@@ -657,6 +834,23 @@ class ApprovalManager:
                 request_id,
                 ApprovalStatus.CANCELLED.value,
                 record.error_class or "client_cancelled",
+            )
+        if record.status == ApprovalStatus.INVALIDATED.value:
+            return ApprovalOutcome(
+                request_id,
+                ApprovalStatus.INVALIDATED.value,
+                record.error_class or ERROR_CLASS_GENERATION_CHANGED,
+            )
+        if record.status in {
+            ApprovalStatus.EXPIRED.value,
+            ApprovalStatus.BLOCKED.value,  # claim-check: allow existing terminal evidence status
+            ApprovalStatus.ERROR.value,
+            ApprovalStatus.EXECUTED.value,
+        }:
+            return ApprovalOutcome(
+                request_id,
+                record.status,
+                record.error_class or record.status,
             )
         return None
 
@@ -759,26 +953,47 @@ class ApprovalManager:
         except ApprovalEvidenceError:
             return
 
-    def _persist_server_decision(self, decision: ApprovalServerDecision) -> None:
-        """Persist evidence as soon as the approval UI POST is accepted."""
+    def _persist_server_decision(self, decision: ApprovalServerDecision) -> bool:
+        """Persist evidence as soon as the approval UI POST is accepted.
+
+        Returns False when a concurrent invalidation/owner retirement already
+        made the row non-pending so the HTTP layer can surface 410 instead of
+        a successful decision page.
+        """
 
         record = self.evidence_store.get_pending(decision.request_id)
         if record is None or record.status != ApprovalStatus.PENDING.value:
-            return
+            return False
+        claim_dir = self.evidence_store.db_path.parent / "owner_claims"
+        from agentveil_mcp_proxy.approval.server import approval_owner_is_actionable
+
+        if not approval_owner_is_actionable(
+            record.client_id,
+            session_id=record.session_id,
+            claim_dir=claim_dir,
+        ):
+            try:
+                self.invalidate_approval(
+                    decision.request_id,
+                    reason="approval_owner_gone",
+                )
+            except Exception:
+                return False
+            return False
         now = int(time.time())
         try:
             if decision.decision == "approve":
-                self._approve(
+                outcome = self._approve(
                     decision.request_id,
                     decision.approval_scope,
                     now,
                     "user_approved",
                 )
-            else:
-                self._deny(decision.request_id, "user_denied")
+                return outcome.status == ApprovalStatus.APPROVED.value
+            outcome = self._deny(decision.request_id, "user_denied")
+            return outcome.status == ApprovalStatus.DENIED.value
         except Exception:
-            # Best-effort: the background watcher can still finalize later.
-            return
+            return False
 
     def _materialize_server_decisions(
         self,
@@ -860,10 +1075,22 @@ class ApprovalManager:
                     request_id,
                     terminal_state=TERMINAL_CANCELLED,
                 )
+                self._forget_approval_generation(request_id)
                 return ApprovalOutcome(
                     request_id,
                     ApprovalStatus.CANCELLED.value,
                     current.error_class or "client_cancelled",
+                )
+            if current.status == ApprovalStatus.INVALIDATED.value:
+                self.approval_server.unregister(
+                    request_id,
+                    terminal_state=TERMINAL_ALREADY_DECIDED,
+                )
+                self._forget_approval_generation(request_id)
+                return ApprovalOutcome(
+                    request_id,
+                    ApprovalStatus.INVALIDATED.value,
+                    current.error_class or ERROR_CLASS_GENERATION_CHANGED,
                 )
             approval_grant_jcs = self._approval_grant_jcs(
                 current,
@@ -890,6 +1117,7 @@ class ApprovalManager:
                 request_id,
                 terminal_state=TERMINAL_ALREADY_DECIDED_APPROVE,
             )
+            self._forget_approval_generation(request_id)
             self._release_client_request_binding_for_request(request_id)
             return ApprovalOutcome(
                 request_id, ApprovalStatus.APPROVED.value, reason, approval_scope
@@ -985,6 +1213,7 @@ class ApprovalManager:
                     request_id,
                     terminal_state=TERMINAL_ALREADY_DECIDED_DENY,
                 )
+                self._forget_approval_generation(request_id)
                 self._release_client_request_binding_for_request(request_id)
                 return ApprovalOutcome(request_id, ApprovalStatus.DENIED.value, reason)
             if current is not None and current.status == ApprovalStatus.CANCELLED.value:
@@ -992,6 +1221,7 @@ class ApprovalManager:
                     request_id,
                     terminal_state=TERMINAL_CANCELLED,
                 )
+                self._forget_approval_generation(request_id)
                 self._release_client_request_binding_for_request(request_id)
                 return ApprovalOutcome(
                     request_id,
@@ -1012,6 +1242,7 @@ class ApprovalManager:
                 request_id,
                 terminal_state=TERMINAL_ALREADY_DECIDED_DENY,
             )
+            self._forget_approval_generation(request_id)
             self._release_client_request_binding_for_request(request_id)
             return ApprovalOutcome(request_id, ApprovalStatus.DENIED.value, reason)
 
@@ -1075,7 +1306,8 @@ class ApprovalManager:
             if isinstance(blast_radius, Mapping):
                 blast_summary = "; " + format_blast_radius_summary(blast_radius)
         summary = (
-            f"approval pending: {prompt.client_id} session {prompt.session_id[:8]} "
+            f"approval pending: {redact_owner_client_id_for_display(prompt.client_id)} "
+            f"session {prompt.session_id[:8]} "
             f"{prompt.downstream_server}.{prompt.tool_name} {prompt.risk_class}"
             f"{blast_summary}"
         )

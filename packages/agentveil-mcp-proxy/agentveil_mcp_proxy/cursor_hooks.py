@@ -16,6 +16,9 @@ from pathlib import Path
 from typing import Any, Mapping, MutableMapping
 
 from agentveil_mcp_proxy.classification import infer_action_family, infer_risk_class
+from agentveil_mcp_proxy.client_guidance import (
+    NATIVE_CONTROLLED_MCP_REDIRECT_INSTRUCTION as NATIVE_REDIRECT_INSTRUCTION,
+)
 from agentveil_mcp_proxy.policy import (
     PolicyConfig,
     PolicyDecision,
@@ -29,12 +32,6 @@ from agentveil_mcp_proxy.policy import (
 CURSOR_SERVER_LABEL = "cursor"
 AGENTVEIL_CONTROLLED_MCP_SERVER = "agentveil-mcp-proxy"
 AGENTVEIL_MCP_SERVER_KEY = AGENTVEIL_CONTROLLED_MCP_SERVER
-
-NATIVE_REDIRECT_INSTRUCTION = (
-    "Do not retry native Write, StrReplace, ApplyPatch, Edit, Delete, or Shell file mutations. "
-    "Use AgentVeil MCP write_file with the same intended path and content. "
-    "After approval, retry the same MCP tool call once."
-)
 
 _MCP_READ_TOOLS = frozenset({
     "list_workspace",

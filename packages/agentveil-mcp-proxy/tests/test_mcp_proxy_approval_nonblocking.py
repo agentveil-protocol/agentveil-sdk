@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import queue
 import sys
 import threading
@@ -388,7 +389,7 @@ def _seed_redirect_original(store, *, request_id: str, playbook_id: str = "use_r
         PendingApproval(
             request_id=request_id,
             session_id="session-1234567890",
-            client_id="cursor:pid:123",
+            client_id=f"cursor:pid:{os.getpid()}",
             downstream_server="filesystem",
             tool_name="write_file",
             action_class="write",
@@ -709,10 +710,10 @@ def test_tool_arguments_and_redirect_context_are_request_local_via_handle_client
     _seed_redirect_original(store, request_id="orig-a", playbook_id="use_read_only_tool")
     _seed_redirect_original(store, request_id="orig-b", playbook_id="use_read_only_tool")
 
-    barrier = threading.Barrier(2)
     observed: dict[str, dict[str, Any]] = {}
     errors: list[BaseException] = []
     original_send = passthrough._send_downstream
+    ready_to_send = threading.Barrier(2)
 
     def observing_send(message):
         request_id = str(message.get("id"))
@@ -726,7 +727,8 @@ def test_tool_arguments_and_redirect_context_are_request_local_via_handle_client
             "downstream_path": arguments.get("path"),
             "downstream_has_redirect": "redirect_context" in arguments,
         }
-        barrier.wait(timeout=2.0)
+        # tools/call send is serialized under the reconnect lock; capture
+        # request-local state here without barrier-waiting while holding it.
         observed[request_id]["tool_args_after"] = dict(passthrough._current_tool_arguments or {})
         redirect_after = passthrough._active_redirect_context
         observed[request_id]["redirect_original_after"] = (
@@ -734,7 +736,13 @@ def test_tool_arguments_and_redirect_context_are_request_local_via_handle_client
         )
         return original_send(message)
 
+    def _coordinate_before_send_lock() -> None:
+        # Both concurrent calls reach the pre-lock gate together so the test
+        # still stresses overlapping handle_client_line work before serialized send.
+        ready_to_send.wait(timeout=2.0)
+
     passthrough._send_downstream = observing_send  # type: ignore[method-assign]
+    passthrough._tools_call_send_gate = _coordinate_before_send_lock  # type: ignore[attr-defined]
     passthrough.start()
     try:
         def run_read(request_id: str, path: str, original_id: str) -> None:

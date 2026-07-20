@@ -446,6 +446,22 @@ _RETRY_CONTRACT_SAME_TOOL_CALL = "same_tool_call"
 _TOOL_NOT_AVAILABLE_NEXT_STEP = (
     "Configure or enable the MCP route that advertises this tool."
 )
+
+
+def _mcp_route_unavailable_next_step() -> str:
+    from agentveil_mcp_proxy.client_guidance import MCP_ROUTE_UNAVAILABLE_NEXT_STEP
+
+    return MCP_ROUTE_UNAVAILABLE_NEXT_STEP
+
+
+def mcp_route_unavailable_user_message() -> str:
+    """Return the connector-visible unavailable-route message."""
+
+    from agentveil_mcp_proxy.client_guidance import MCP_ROUTE_UNAVAILABLE_USER_MESSAGE
+
+    return MCP_ROUTE_UNAVAILABLE_USER_MESSAGE
+
+
 _DEFAULT_SANDBOX_PATH_HINT = (
     "Use a relative path under the configured sandbox, for example notes/example.txt."
 )
@@ -539,6 +555,10 @@ def enrich_mcp_error_contract(
 
     if reason in {"unknown_tool_not_advertised", "tool_schema_unavailable"}:
         data["next_step"] = _TOOL_NOT_AVAILABLE_NEXT_STEP
+        return data
+
+    if reason == "downstream_unavailable":
+        data["next_step"] = _mcp_route_unavailable_next_step()
         return data
 
     if "next_step" not in data:
@@ -678,6 +698,16 @@ def terminal_state_for_record_status(status: str) -> str | None:
         return "approval_expired"
     if status == ApprovalStatus.CANCELLED.value:
         return "approval_cancelled"
+    if status == ApprovalStatus.INVALIDATED.value:
+        # Stale generation / dead-owner retirements stay non-actionable without
+        # looking like a user deny or a successful allow/execute.
+        return "already_decided"
+    if status in {
+        ApprovalStatus.BLOCKED.value,  # claim-check: allow existing terminal evidence status
+        ApprovalStatus.ERROR.value,
+        ApprovalStatus.EXECUTED.value,
+    }:
+        return "already_decided"
     return None
 
 
@@ -704,6 +734,8 @@ def bounded_reason_for_record(record: PendingApproval) -> str:
         return "user_approved"
     if record.status == ApprovalStatus.DENIED.value:
         return "user_denied"
+    if record.status == ApprovalStatus.INVALIDATED.value:
+        return "approval_invalidated"
     return "local_approval_required"
 
 

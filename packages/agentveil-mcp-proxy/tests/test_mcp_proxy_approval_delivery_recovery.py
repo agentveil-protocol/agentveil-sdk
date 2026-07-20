@@ -106,7 +106,7 @@ def _manager(tmp_path: Path, *, browser_open, wait_for_decision: bool = True):
         evidence_store=store,
         approval_server=server,
         config=_config(),
-        client_id="cursor:pid:1",
+        client_id=f"cursor:pid:{os.getpid()}",
         session_id="session-delivery-recovery-123456",
         cli_out=io.StringIO(),
         browser_open=browser_open,
@@ -633,7 +633,7 @@ def test_f_cli_open_rejects_stale_manifest_and_terminal_record(tmp_path):
         evidence_store=store,
         approval_server=server,
         config=_config(),
-        client_id="cli:terminal",
+        client_id=f"cli:pid:{os.getpid()}",
         session_id="session-cli-terminal-123456",
         cli_out=io.StringIO(),
         browser_open=lambda _url: True,
@@ -669,6 +669,7 @@ def test_f_cli_open_rejects_stale_manifest_and_terminal_record(tmp_path):
         assert payload["ok"] is False
         assert payload["reason"] == "record is not pending"
     finally:
+        manager.close()
         server.stop()
         store.close()
 

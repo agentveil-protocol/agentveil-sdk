@@ -14,9 +14,7 @@ import httpx
 import pytest
 
 from agentveil_mcp_proxy.approval.manager import ApprovalFlowError, normalize_client_request_id
-from agentveil_mcp_proxy.classification import ToolCallClassifier
-
-from agentveil_mcp_proxy.approval.server import TERMINAL_CANCELLED
+from agentveil_mcp_proxy.approval.server import TERMINAL_CANCELLED, enrich_owner_client_id
 from agentveil_mcp_proxy.classification import ToolCallClassifier
 from agentveil_mcp_proxy.evidence import ApprovalStatus, PendingApproval
 from agentveil_mcp_proxy.evidence.observability import mcp_error_user_message
@@ -28,7 +26,7 @@ from test_mcp_proxy_approval_nonblocking import (
     _TrackingTextIO,
     _ThreadSafeClientOut,
     _approve,
-    _build_passthrough,
+    _build_passthrough as _build_passthrough_raw,
     _deny,
     _json_line,
     _local_proof_call,
@@ -38,6 +36,18 @@ from test_mcp_proxy_approval_nonblocking import (
     _wait_until,
     _write_file_call,
 )
+import os
+
+
+def _build_passthrough(*args, **kwargs):
+    """Bind approvals to this process so dead-owner retirement stays accurate."""
+
+    passthrough, manager, store, server = _build_passthrough_raw(*args, **kwargs)
+    manager.client_id = enrich_owner_client_id(
+        f"cursor:pid:{os.getpid()}",
+        instance_token=manager._instance_token,
+    )
+    return passthrough, manager, store, server
 
 
 def _cancel_notification(*, request_id: Any, reason: str = "user cancelled") -> str:
@@ -445,13 +455,13 @@ def test_back_to_back_tools_call_and_cancel_before_binding(tmp_path):
             lambda: manager.is_client_request_tracked("early-cancel"),
             timeout=3.0,
         )
+        assert _wait_until(approval_entered.is_set, timeout=3.0)
         client_in.write_line(_cancel_notification(request_id="early-cancel"))
         assert _wait_until(
             lambda: manager.is_client_request_pre_cancelled("early-cancel"),
             timeout=3.0,
         )
         approval_release.set()
-        assert _wait_until(approval_entered.is_set, timeout=3.0)
         assert _wait_until(
             lambda: not manager.is_client_request_tracked("early-cancel"),
             timeout=3.0,
@@ -800,7 +810,10 @@ def test_cancel_approval_locked_under_finalize_lock_does_not_deadlock(tmp_path):
         PendingApproval(
             request_id=request_id,
             session_id="session-1234567890",
-            client_id="cursor:pid:123",
+            client_id=enrich_owner_client_id(
+                f"cursor:pid:{os.getpid()}",
+                instance_token=manager._instance_token,
+            ),
             downstream_server="filesystem",
             tool_name="write_file",
             action_class="write",

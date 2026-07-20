@@ -220,6 +220,14 @@ class ToolSchemaCache:
         with self._lock:
             self._quarantined_names.clear()
 
+    def clear(self) -> None:
+        """Drop cached advertised names and schemas after a generation change."""
+
+        with self._lock:
+            self._schemas.clear()
+            self._advertised_names.clear()
+            self._quarantined_names.clear()
+
 
 __all__ = [
     "ToolSchemaCache",
