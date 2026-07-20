@@ -9,6 +9,7 @@ import queue
 import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -241,6 +242,7 @@ class _ProxySubprocess:
     def __init__(self, *, home: Path) -> None:
         env = os.environ.copy()
         env["HOME"] = str(home)
+        self._stderr_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
         self._proc = subprocess.Popen(
             [
                 sys.executable,
@@ -255,7 +257,7 @@ class _ProxySubprocess:
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=self._stderr_file,
             text=True,
             bufsize=1,
             env=env,
@@ -283,7 +285,10 @@ class _ProxySubprocess:
             except subprocess.TimeoutExpired:
                 self._proc.kill()
                 self._proc.wait(timeout=5.0)
-        stderr = self._proc.stderr.read() if self._proc.stderr is not None else ""
+        self._stderr_file.flush()
+        self._stderr_file.seek(0)
+        stderr = self._stderr_file.read()
+        self._stderr_file.close()
         if self._proc.returncode not in (0, None):
             raise AssertionError(
                 f"proxy subprocess failed rc={self._proc.returncode}: {stderr}"
