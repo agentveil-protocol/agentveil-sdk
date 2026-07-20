@@ -215,6 +215,14 @@ MAX_PENDING_RESPONSES = 1000
 # the input dispatcher. Workers > 1 so diagnostics/read-only tools can progress.
 STDIO_REQUEST_WORKERS = 4
 STDIO_REQUEST_QUEUE_MAXSIZE = 8
+# At most one reconnect attempt may own the downstream lifecycle. Failed
+# handshakes keep the AV-05 unavailable latch and cool down before another spawn.
+DOWNSTREAM_RECONNECT_COOLDOWN_SECONDS = 2.0
+_DEFAULT_RECONNECT_INITIALIZE_PARAMS: dict[str, Any] = {
+    "protocolVersion": "2024-11-05",
+    "capabilities": {},
+    "clientInfo": {"name": "agentveil-mcp-proxy", "version": "0"},
+}
 # tools/call names that may share the concurrent diagnostic lane while a
 # mutation holds wait-mode approval. Everything else stays on the serial
 # mutation lane so successive writes keep arrival order.
@@ -1145,6 +1153,12 @@ class McpPassthrough:
         self._stdio_queue: queue.Queue[str | None] | None = None
         self._stdio_mutation_queue: queue.Queue[str | None] | None = None
         self._schema_refresh_lock = threading.Lock()
+        self._reconnect_lock = threading.Lock()
+        self._last_reconnect_attempt_at = 0.0
+        self._last_reconnect_failed = False
+        self._cached_initialize_params: dict[str, Any] | None = None
+        self._downstream_generation = 0
+        self._reconnect_attempts = 0
 
     @property
     def stderr_bytes_drained(self) -> int:
@@ -1311,6 +1325,15 @@ class McpPassthrough:
     def _active_redirect_context(self, value: RedirectContext | None) -> None:
         self._request_local.redirect_context = value
 
+    @property
+    def _bound_downstream_generation(self) -> int | None:
+        value = getattr(self._request_local, "downstream_generation", None)
+        return value if isinstance(value, int) else None
+
+    @_bound_downstream_generation.setter
+    def _bound_downstream_generation(self, value: int | None) -> None:
+        self._request_local.downstream_generation = value
+
     def run_stdio(self, client_in: TextIO, client_out: TextIO) -> int:
         """Run pass-through until client input EOF or a fatal startup error.
 
@@ -1463,6 +1486,13 @@ class McpPassthrough:
         if method == "notifications/cancelled":
             return self._handle_client_cancelled_notification(message)
 
+        if method == "initialize":
+            params = message.get("params")
+            if isinstance(params, Mapping):
+                self._cached_initialize_params = dict(params)
+            else:
+                self._cached_initialize_params = {}
+
         surface_error = self._tool_surface_error_response(message, request_id)
         if surface_error is not None:
             return [surface_error] if has_id else []
@@ -1498,9 +1528,12 @@ class McpPassthrough:
             if local_proof_response is not None:
                 return [local_proof_response] if has_id else []
             # Known-unavailable must not mask local validation/diagnostics above.
-            # Run it only immediately before the first approval-producing path.
+            # Attempt one bounded reconnect immediately before approval paths.
             if method == "tools/call" and has_id:
-                known_unavailable = self._known_downstream_unavailable_response(request_id)
+                known_unavailable = self._ensure_downstream_ready_for_routed_call(
+                    message,
+                    request_id,
+                )
                 if known_unavailable is not None:
                     return [known_unavailable]
             instruction_error, instruction_outcome = (
@@ -1591,8 +1624,18 @@ class McpPassthrough:
             )
             downstream_tool_call_seen = False
             try:
-                self._send_downstream(message)
-                downstream_tool_call_seen = True
+                if method == "tools/call" and has_id:
+                    stale_generation = self._send_tools_call_if_current_generation(
+                        message,
+                        request_id,
+                        approval_outcome,
+                    )
+                    if stale_generation is not None:
+                        return [stale_generation]
+                    downstream_tool_call_seen = True
+                else:
+                    self._send_downstream(message)
+                    downstream_tool_call_seen = True
                 if not has_id:
                     return []
                 response = self._wait_downstream_response(request_id)
@@ -1644,6 +1687,7 @@ class McpPassthrough:
         finally:
             self._active_redirect_context = None
             self._current_tool_arguments = None
+            self._bound_downstream_generation = None
 
     def _latch_downstream_unavailable_if_exited(self) -> None:
         """Persist a known-unavailable latch when the downstream process has exited."""
@@ -1654,13 +1698,227 @@ class McpPassthrough:
         if self._downstream_error is None:
             self._set_downstream_error(PassthroughError("downstream process exited"))
 
-    def _known_downstream_unavailable_response(self, request_id: Any) -> dict[str, Any] | None:
-        """Return unavailable before approval when the downstream is already known dead."""
+    def _process_is_alive(self) -> bool:
+        process = self.process
+        return process is not None and process.poll() is None
+
+    def _ensure_downstream_ready_for_routed_call(
+        self,
+        message: Mapping[str, Any],
+        request_id: Any,
+    ) -> dict[str, Any] | None:
+        """Return unavailable when the route cannot be made ready; else None.
+
+        Local validation and diagnostics already ran. A dead downstream may be
+        recovered once via bounded reconnect before approval is requested.
+        """
 
         self._latch_downstream_unavailable_if_exited()
-        if self._downstream_error is None:
+        if self._downstream_error is None and self._process_is_alive():
+            self._bound_downstream_generation = self._downstream_generation
             return None
+        if not self._attempt_bounded_reconnect():
+            return _downstream_unavailable_error(request_id)
+        params = message.get("params")
+        tool = params.get("name") if isinstance(params, Mapping) else None
+        if isinstance(tool, str) and tool and not self._tool_schemas.is_advertised(tool):
+            self._record_security_event({
+                "type": "unknown_tool_call",
+                "action": "blocked_pre_approval",
+                "reason": "unknown_tool",
+                "risk_class": "tool_identity_violation",
+                "tool": tool,
+            })
+            self._record_pre_classification_deny_evidence(
+                tool=tool,
+                arguments=params.get("arguments") if isinstance(params, Mapping) else None,
+                reason="unknown_tool",
+            )
+            return _blocked_error(
+                request_id,
+                "blocked by MCP proxy: tool not advertised by downstream",  # claim-check: allow tested unknown-tool denial message
+                reason="unknown_tool",
+            )
+        self._bound_downstream_generation = self._downstream_generation
+        return None
+
+    def _stale_downstream_generation_response(
+        self,
+        request_id: Any,
+        approval_outcome: ApprovalOutcome | None,
+    ) -> dict[str, Any] | None:
+        """Reject only this request when its bound downstream generation changed."""
+
+        bound = self._bound_downstream_generation
+        if bound is None or bound == self._downstream_generation:
+            return None
+        self._record_approval_error(approval_outcome, "downstream_generation_changed")
         return _downstream_unavailable_error(request_id)
+
+    def _send_tools_call_if_current_generation(
+        self,
+        message: Mapping[str, Any],
+        request_id: Any,
+        approval_outcome: ApprovalOutcome | None,
+    ) -> dict[str, Any] | None:
+        """Atomically validate generation and write tools/call under reconnect lock.
+
+        The lock is released before the caller waits for a downstream response so
+        reconnect handshakes can acquire it without waiting for tool latency. Returns an error
+        response when the bound generation is stale; otherwise ``None`` after the
+        write completes.
+        """
+
+        gate = getattr(self, "_tools_call_send_gate", None)
+        if callable(gate):
+            gate()
+        with self._reconnect_lock:
+            stale = self._stale_downstream_generation_response(
+                request_id,
+                approval_outcome,
+            )
+            if stale is not None:
+                return stale
+            self._send_downstream(message)
+        return None
+
+    def _attempt_bounded_reconnect(self) -> bool:
+        """Try one cooldown-protected reconnect; True when the route is ready."""
+
+        with self._reconnect_lock:
+            self._latch_downstream_unavailable_if_exited()
+            if self._downstream_error is None and self._process_is_alive():
+                return True
+            now = time.monotonic()
+            if (
+                self._last_reconnect_failed
+                and (now - self._last_reconnect_attempt_at)
+                < DOWNSTREAM_RECONNECT_COOLDOWN_SECONDS
+            ):
+                return False
+            if self._cached_initialize_params is None:
+                return False
+            self._last_reconnect_attempt_at = now
+            self._reconnect_attempts += 1
+            try:
+                self._reconnect_downstream_locked()
+            except Exception:
+                self._last_reconnect_failed = True
+                self._latch_downstream_unavailable_if_exited()
+                if self._downstream_error is None:
+                    self._set_downstream_error(
+                        PassthroughError("downstream reconnect failed")
+                    )
+                return False
+            self._last_reconnect_failed = False
+            return True
+
+    def _reconnect_downstream_locked(self) -> None:
+        """Replace the dead downstream and run initialize + tools/list."""
+
+        self._stop_downstream_for_replace(timeout=2.0)
+        self._tool_schemas.clear()
+        with self._stdout_condition:
+            self._responses.clear()
+            self._downstream_error = None
+        self._stopping = False
+        self.start()
+        if not self._process_is_alive():
+            raise PassthroughError("downstream reconnect spawn failed")
+
+        init_params = (
+            dict(self._cached_initialize_params)
+            if self._cached_initialize_params is not None
+            else dict(_DEFAULT_RECONNECT_INITIALIZE_PARAMS)
+        )
+        init_id = self._internal_request_id("reconnect-initialize")
+        init_key = self._register_inflight_id(init_id, method="initialize")
+        try:
+            self._send_downstream({
+                "jsonrpc": JSONRPC_VERSION,
+                "id": init_id,
+                "method": "initialize",
+                "params": init_params,
+            })
+            init_response = self._wait_downstream_response(init_id)
+            if "error" in init_response:
+                raise PassthroughError("downstream reconnect initialize failed")
+        finally:
+            self._unregister_inflight_id(init_key)
+
+        try:
+            self._send_downstream({
+                "jsonrpc": JSONRPC_VERSION,
+                "method": "notifications/initialized",
+                "params": {},
+            })
+        except PassthroughError:
+            raise
+
+        list_response = self._request_downstream_tools_list()
+        if list_response is None or "error" in list_response:
+            raise PassthroughError("downstream reconnect tools/list failed")
+        # Processes that answer tools/list and then exit (fail-after-list) must
+        # not clear the unavailable latch. Brief settle catches immediate exits.
+        settle_deadline = time.monotonic() + 0.2
+        while True:
+            self._latch_downstream_unavailable_if_exited()
+            if not self._process_is_alive() or self._downstream_error is not None:
+                raise PassthroughError("downstream exited after reconnect handshake")
+            if time.monotonic() >= settle_deadline:
+                break
+            time.sleep(0.01)
+        self._tool_schemas.clear()
+        self._tool_schemas.update_from_response(list_response)
+        self._sync_downstream_surface_quarantine()
+        self._downstream_generation += 1
+        with self._stdout_condition:
+            self._downstream_error = None
+
+    def _stop_downstream_for_replace(self, *, timeout: float = 2.0) -> None:
+        """Terminate the current downstream generation without ending the proxy session."""
+
+        self._stopping = True
+        proc = self.process
+        if proc is not None:
+            try:
+                if proc.stdin:
+                    proc.stdin.close()
+            except OSError:
+                pass
+            if proc.poll() is None:
+                try:
+                    if os.name == "posix":
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    else:
+                        proc.terminate()
+                    proc.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    try:
+                        if os.name == "posix":
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        else:
+                            proc.kill()
+                        proc.wait(timeout=timeout)
+                    except (OSError, ProcessLookupError, subprocess.TimeoutExpired):
+                        pass
+                except (OSError, ProcessLookupError):
+                    pass
+            try:
+                if proc.stdout:
+                    proc.stdout.close()
+            except OSError:
+                pass
+        if self._stderr_thread is not None:
+            self._stderr_thread.join(timeout=timeout)
+        if self._stdout_thread is not None:
+            self._stdout_thread.join(timeout=timeout)
+        if self._windows_job is not None:
+            self._windows_job.close()
+            self._windows_job = None
+        self.process = None
+        self._stderr_thread = None
+        self._stdout_thread = None
 
     @staticmethod
     def _message_without_redirect_context(message: Mapping[str, Any]) -> dict[str, Any]:

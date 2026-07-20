@@ -180,6 +180,7 @@ for line in sys.stdin:
 
 def _die_on_tools_call_downstream(tmp_path: Path) -> Path:
     script = tmp_path / "die_on_tools_call.py"
+    marker = tmp_path / "die_on_tools_call.dead"
     script.write_text(
         f"""
 import json
@@ -187,6 +188,7 @@ import os
 import sys
 
 log_path = os.environ.get("DOWNSTREAM_LOG")
+marker = {str(marker)!r}
 
 def log(method):
     if log_path:
@@ -203,6 +205,10 @@ for line in sys.stdin:
     log(method)
     if "id" not in msg:
         continue
+    if os.path.exists(marker):
+        sys.stderr.write("{SECRET}\\n")
+        sys.stderr.flush()
+        sys.exit(17)
     if method == "initialize":
         result = {{
             "protocolVersion": "2024-11-05",
@@ -213,6 +219,8 @@ for line in sys.stdin:
     elif method == "tools/list":
         print(json.dumps({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"tools": TOOLS}}}}), flush=True)
     elif method == "tools/call":
+        with open(marker, "w", encoding="utf-8") as fh:
+            fh.write("dead\\n")
         sys.stderr.write("{SECRET}\\n")
         sys.stderr.flush()
         sys.exit(17)
@@ -397,7 +405,7 @@ def test_approval_enabled_known_unavailable_skips_pending_and_ac(
             break
         time.sleep(0.01)
     else:
-    raise AssertionError(f"no tools/list response before deadline: {client_out.getvalue()}")
+        raise AssertionError(f"no tools/list response before deadline: {client_out.getvalue()}")
 
     # Wait until the downstream exit is observable before the mutation call.
     deadline = time.monotonic() + 5
@@ -434,7 +442,11 @@ def test_approval_enabled_known_unavailable_skips_pending_and_ac(
     assert _pending_approval_count(home) == 0
     assert _approval_record_count(home) == 0
     assert opened == []
-    assert log_path.read_text(encoding="utf-8").splitlines() == ["initialize", "tools/list"]
+    methods = log_path.read_text(encoding="utf-8").splitlines()
+    assert methods[:2] == ["initialize", "tools/list"]
+    # Permanently dead routes may get one failed bounded reconnect attempt.
+    assert methods.count("initialize") <= 2
+    assert "tools/call" not in methods
     _assert_privacy_clean(client_out.getvalue(), json.dumps(error))
 
     client_in.close()
@@ -751,7 +763,7 @@ def _wait_for_list_then_push_call(
             break
         time.sleep(0.01)
     else:
-    raise AssertionError(f"no tools/list response before deadline: {client_out.getvalue()}")
+        raise AssertionError(f"no tools/list response before deadline: {client_out.getvalue()}")
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         if log_path.exists() and "tools/list" in log_path.read_text(encoding="utf-8"):
