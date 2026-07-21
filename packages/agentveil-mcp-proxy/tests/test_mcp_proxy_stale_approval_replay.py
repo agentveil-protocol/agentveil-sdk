@@ -40,6 +40,7 @@ from test_mcp_proxy_approval_nonblocking import (
     _build_passthrough,
     _path_logging_downstream,
     _run_stdio_session,
+    _shutdown_stdio_session,
     _wait_until,
     _write_file_call,
 )
@@ -431,10 +432,16 @@ def test_dead_owner_pending_not_actionable_after_restart(tmp_path: Path) -> None
             now_timestamp=int(time.time()),
         ) is None
         assert (not log_path.exists()) or ("tools/call" not in log_path.read_text(encoding="utf-8"))
+
+        # Retiring the owner invalidates evidence, while the approval waiter
+        # continues waiting until the decision event is signaled.
+        server.notify_cancelled(request_id)
+        assert _wait_until(
+            lambda: client_out.response_by_id("write-orphan") is not None,
+            timeout=3.0,
+        )
     finally:
-        client_in.close()
-        worker.join(timeout=5)
-        passthrough.stop()
+        _shutdown_stdio_session(worker, client_in, passthrough)
         server.stop()
         store.close()
 
