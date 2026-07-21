@@ -40,6 +40,8 @@ from agentveil_mcp_proxy.passthrough import (
 )
 from agentveil_mcp_proxy.policy import ProxyConfig
 from agentveil_mcp_proxy.runtime_gate import (
+    CANONICAL_RUNTIME_ENVIRONMENTS,
+    DEFAULT_RUNTIME_ENVIRONMENT,
     RuntimeGateClient,
     RuntimeGateDecision,
     RuntimeGateUnavailableError,
@@ -386,7 +388,7 @@ def test_ask_backend_runtime_request_is_privacy_safe_metadata_only():
     }
     assert call["action"] == "redacted"
     assert call["resource"].startswith("sha256:")
-    assert call["environment"] == "mcp_proxy"
+    assert call["environment"] == "unknown"
     assert call["payload_hash"].startswith("sha256:")
     assert call["risk_class"] == "write"
     body_text = json.dumps(call, sort_keys=True)
@@ -401,6 +403,64 @@ def test_ask_backend_runtime_request_is_privacy_safe_metadata_only():
         "github.create_issue",
     ):
         assert forbidden not in body_text
+
+
+def test_default_runtime_environment_is_unknown():
+    assert DEFAULT_RUNTIME_ENVIRONMENT == "unknown"
+
+
+@pytest.mark.parametrize("environment", sorted(CANONICAL_RUNTIME_ENVIRONMENTS))
+def test_runtime_gate_accepts_canonical_environments(environment):
+    config = _config()
+    agent = RecordingAgent()
+    client = RuntimeGateClient(
+        agent=agent,
+        config=config,
+        control_grant={"id": "grant"},
+        environment=environment,
+    )
+
+    result = client.evaluate(_classification(config))
+
+    assert result.decision == "ALLOW"
+    assert agent.calls[0]["environment"] == environment
+    assert client.environment == environment
+
+
+@pytest.mark.parametrize(
+    "invalid_environment",
+    # claim-check: allow uppercase negative fixture, not a production claim.
+    ["mcp_proxy", "prod", "", "PRODUCTION", "staging\n", "x" * 256],
+)
+def test_runtime_gate_rejects_invalid_environment_before_runtime_evaluate(
+    invalid_environment,
+):
+    config = _config()
+    agent = RecordingAgent()
+
+    with pytest.raises(ValueError, match="environment invalid") as exc_info:
+        RuntimeGateClient(
+            agent=agent,
+            config=config,
+            control_grant={"id": "grant"},
+            environment=invalid_environment,
+        )
+
+    if invalid_environment:
+        assert invalid_environment not in str(exc_info.value)
+    assert agent.calls == []
+
+
+def test_receipt_verification_succeeds_with_default_unknown_environment():
+    config = _config()
+    agent = RecordingAgent()
+    client = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+
+    result = client.evaluate(_classification(config))
+
+    assert result.decision == "ALLOW"
+    assert result.receipt_body["environment"] == "unknown"
+    assert agent.calls[0]["environment"] == "unknown"
 
 
 def test_runtime_gate_rejects_zero_cache_ttl():
@@ -930,7 +990,7 @@ def test_avp_agent_rejects_raw_install_clone_context_before_post():
             agent.runtime_evaluate(
                 action="redacted",
                 resource="sha256:" + ("a" * 64),
-                environment="mcp_proxy",
+                environment="unknown",
                 delegation_receipt={"id": "grant"},
                 payload_hash="sha256:" + ("c" * 64),
                 risk_class="write",

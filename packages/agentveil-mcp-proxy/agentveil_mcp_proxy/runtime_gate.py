@@ -37,7 +37,15 @@ from agentveil_mcp_proxy.policy import ProxyConfig
 
 
 DEFAULT_RUNTIME_GATE_TIMEOUT_SECONDS = 2.0
-DEFAULT_RUNTIME_ENVIRONMENT = "mcp_proxy"
+DEFAULT_RUNTIME_ENVIRONMENT = "unknown"
+CANONICAL_RUNTIME_ENVIRONMENTS = frozenset(
+    {
+        "production",  # claim-check: allow canonical transport enum, not a readiness claim.
+        "staging",
+        "development",
+        "unknown",
+    }
+)
 DEFAULT_DECISION_RECEIPT_CACHE_TTL_SECONDS = 300.0
 DEFAULT_DECISION_RECEIPT_CACHE_MAX_ENTRIES = 1024
 DECISION_ALLOW = "ALLOW"
@@ -110,7 +118,7 @@ class RuntimeGateClient:
         self.agent = agent
         self.config = config
         self.control_grant = dict(control_grant)
-        self.environment = environment
+        self.environment = _validate_runtime_environment(environment)
         self.trusted_signer_dids = tuple(config.avp.trusted_signer_dids)
         self.circuit_breaker = circuit_breaker or CircuitBreaker(
             config.circuit_breaker.to_runtime_config()
@@ -392,6 +400,12 @@ def _read_json_object(path: Path, label: str) -> dict[str, Any]:
     return data
 
 
+def _validate_runtime_environment(environment: Any) -> str:
+    if not isinstance(environment, str) or environment not in CANONICAL_RUNTIME_ENVIRONMENTS:
+        raise ValueError("environment invalid")
+    return environment
+
+
 def _runtime_field(value: Any) -> str:
     if isinstance(value, str) and value:
         return value
@@ -425,6 +439,7 @@ __all__ = [
     "DEFAULT_DECISION_RECEIPT_CACHE_MAX_ENTRIES",
     "DEFAULT_DECISION_RECEIPT_CACHE_TTL_SECONDS",
     "DEFAULT_RUNTIME_GATE_TIMEOUT_SECONDS",
+    "CANONICAL_RUNTIME_ENVIRONMENTS",
     "DEFAULT_RUNTIME_ENVIRONMENT",
     "RuntimeGateClient",
     "RuntimeGateDecision",
