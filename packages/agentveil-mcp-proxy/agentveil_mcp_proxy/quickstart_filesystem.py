@@ -1385,6 +1385,8 @@ if sys.platform == "win32":
             raise OSError("short write")
 
     class _Win32FileDirectoryInformation(ctypes.Structure):
+        # FILE_DIRECTORY_INFORMATION for FileDirectoryInformation (class 1).
+        # Do not append the EA/short-name fields from FILE_BOTH_DIR_INFORMATION.
         _fields_ = [
             ("NextEntryOffset", wintypes.ULONG),
             ("FileIndex", wintypes.ULONG),
@@ -1396,9 +1398,6 @@ if sys.platform == "win32":
             ("AllocationSize", wintypes.LARGE_INTEGER),
             ("FileAttributes", wintypes.ULONG),
             ("FileNameLength", wintypes.ULONG),
-            ("EaSize", wintypes.ULONG),
-            ("ShortNameLength", ctypes.c_ubyte),
-            ("ShortName", wintypes.WCHAR * 12),
             ("FileName", wintypes.WCHAR * 1),
         ]
 
