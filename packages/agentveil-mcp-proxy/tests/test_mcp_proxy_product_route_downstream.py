@@ -29,6 +29,10 @@ from agentveil_mcp_proxy.product_route import (
 from agentveil_mcp_proxy.product_route_downstream import ProductRouteRuntime, handle_message
 from agentveil_mcp_proxy.product_route_local_fixtures import prepare_product_route_profile
 from agentveil_mcp_proxy.product_route_offline_wheel import PRODUCT_ROUTE_TEST_WHEEL_NAME
+from agentveil_mcp_proxy.product_route_pack_handlers import (
+    DEFAULT_PRODUCT_ROUTE_PACKAGE_NAME,
+    validate_product_route_package_name,
+)
 from agentveil_mcp_proxy.product_route_tool_schemas import (
     build_product_route_tool_entries,
     product_route_tool_catalog_hash,
@@ -465,6 +469,123 @@ def test_explicit_wrong_profile_path_rejects(
     assert expected_message in response["error"]["message"]
 
 
+@pytest.mark.parametrize(
+    "invalid_name",
+    [
+        "-q",
+        "--index-url",
+        "-r",
+        "https://evil.example/pkg",
+        "/etc/passwd",
+        " pkg",
+        "pkg ",
+        "pkg\n",
+        "a;rm",
+        "a|b",
+        "a&b",
+        "a`b",
+        "a$b",
+        123,
+        True,
+        None,
+        "x" * 129,
+        "",
+        ".hidden",
+        "-leading",
+        "trailing-",
+    ],
+)
+def test_invalid_package_name_rejects_before_pip(
+    runtime: ProductRouteRuntime,
+    invalid_name: object,
+) -> None:
+    pip_calls: list[list[str]] = []
+    original_pip = runtime.package._pip
+
+    def tracking_pip(args: list[str]) -> subprocess.CompletedProcess[str]:
+        pip_calls.append(list(args))
+        return original_pip(args)
+
+    runtime.package._pip = tracking_pip  # type: ignore[method-assign]
+    response = handle_message(
+        runtime,
+        {
+            "jsonrpc": "2.0",
+            "id": "invalid-package-name",
+            "method": "tools/call",
+            "params": {
+                "name": "pip_install",
+                "arguments": {"package_name": invalid_name},
+            },
+        },
+    )
+    assert response is not None
+    assert response.get("error") == {
+        "code": -32602,
+        "message": "package_name invalid",
+    }
+    assert pip_calls == []
+    rendered = json.dumps(response)
+    if isinstance(invalid_name, str) and invalid_name:
+        assert invalid_name not in rendered
+
+
+@pytest.mark.parametrize(
+    "valid_name",
+    [
+        "a",
+        DEFAULT_PRODUCT_ROUTE_PACKAGE_NAME,
+        "zope.interface",
+        "my_pkg",
+    ],
+)
+def test_valid_package_name_is_accepted(
+    runtime: ProductRouteRuntime,
+    valid_name: str,
+) -> None:
+    response = handle_message(
+        runtime,
+        {
+            "jsonrpc": "2.0",
+            "id": f"valid-{valid_name}",
+            "method": "tools/call",
+            "params": {
+                "name": "package_inspect_state",
+                "arguments": {"package_name": valid_name},
+            },
+        },
+    )
+    assert response is not None
+    assert "error" not in response, response
+    parsed = _tool_result_text(response)
+    assert parsed.get("tool") == "package_inspect_state"
+
+
+def test_missing_package_name_keeps_default(runtime: ProductRouteRuntime) -> None:
+    response = handle_message(
+        runtime,
+        {
+            "jsonrpc": "2.0",
+            "id": "default-package-name",
+            "method": "tools/call",
+            "params": {"name": "pip_install", "arguments": {}},
+        },
+    )
+    assert response is not None
+    assert "error" not in response, response
+    parsed = _tool_result_text(response)
+    assert parsed.get("target_installed") is True
+
+
+@pytest.mark.parametrize(
+    "invalid_name",
+    ["-q", "--index-url", "-r"],
+)
+def test_validate_product_route_package_name_rejects_cli_like_values(invalid_name: str) -> None:
+    with pytest.raises(ValueError, match="package_name invalid"):
+        validate_product_route_package_name(invalid_name)
+
+
 def test_tool_schemas_do_not_require_profile_paths() -> None:
     entries = {entry["name"]: entry for entry in build_product_route_tool_entries()}
     for name in PRODUCT_ROUTE_TOOL_CATALOG:
@@ -474,6 +595,12 @@ def test_tool_schemas_do_not_require_profile_paths() -> None:
         elif name.startswith("package_") or name.startswith("pip_"):
             schema = entries[name]["inputSchema"]
             assert "project_path" not in schema.get("required", [])
+            package_name = schema["properties"]["package_name"]
+            assert package_name["minLength"] == 1
+            assert package_name["maxLength"] == 128
+            assert package_name["pattern"] == (
+                "^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$"
+            )
         elif name in {
             "get_repository",
             "list_issues",

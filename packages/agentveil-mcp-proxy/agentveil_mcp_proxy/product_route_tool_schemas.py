@@ -37,6 +37,17 @@ _GIT_REPO_PATH_SCHEMA: dict[str, Any] = {
     "additionalProperties": True,
 }
 
+_PACKAGE_NAME_SCHEMA: dict[str, Any] = {
+    "type": "string",
+    "minLength": 1,
+    "maxLength": 128,
+    "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$",
+    "description": (
+        "Optional PyPI distribution name for package tools. Defaults to the "
+        "configured offline product-route test package when omitted."
+    ),
+}
+
 _PACKAGE_PROJECT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -47,7 +58,7 @@ _PACKAGE_PROJECT_SCHEMA: dict[str, Any] = {
                 "product profile package project when omitted."
             ),
         },
-        "package_name": {"type": "string"},
+        "package_name": dict(_PACKAGE_NAME_SCHEMA),
     },
     "required": [],
     "additionalProperties": True,
