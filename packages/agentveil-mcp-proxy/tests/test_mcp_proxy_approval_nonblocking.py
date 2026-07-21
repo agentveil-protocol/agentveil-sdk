@@ -15,14 +15,19 @@ from typing import Any
 import httpx
 
 from agentveil_mcp_proxy.classification import ToolCallClassifier
+from agentveil_mcp_proxy.approval.manager import normalize_client_request_id
 from agentveil_mcp_proxy.evidence import ApprovalStatus, PendingApproval
 from agentveil_mcp_proxy.passthrough import (
     DownstreamConfig,
     McpPassthrough,
+    STDIO_DIAGNOSTIC_WORKERS,
+    STDIO_MUTATION_PENDING_WORKERS,
+    STDIO_READ_CONCURRENCY,
     STDIO_REQUEST_QUEUE_MAXSIZE,
     STDIO_REQUEST_WORKERS,
 )
 from agentveil_mcp_proxy.policy import build_redirect_automation_metadata
+from agentveil_mcp_proxy.approval.manager import normalize_client_request_id
 
 from mcp_fake_downstream import seed_tool_schemas, tool_entry, write_downstream
 from test_mcp_proxy_approval import (
@@ -861,9 +866,9 @@ def test_worker_exception_returns_jsonrpc_error_without_closing_stdin(tmp_path):
         store.close()
 
 
-def test_mutations_preserve_arrival_order_while_diagnostics_proceed(tmp_path):
+def test_mutations_allow_concurrent_pending_while_diagnostics_proceed(tmp_path):
     log_path = tmp_path / "mutation-order.log"
-    passthrough, _manager_obj, store, server = _build_passthrough(
+    passthrough, manager_obj, store, server = _build_passthrough(
         tmp_path,
         log_path=log_path,
         downstream_script=_path_logging_downstream(tmp_path),
@@ -875,7 +880,6 @@ def test_mutations_preserve_arrival_order_while_diagnostics_proceed(tmp_path):
     try:
         client_in.write_line(_write_file_call(call_id="write-a", path="a.txt"))
         assert _wait_until(lambda: bool(server.pending_prompts()), timeout=2.0)
-        prompt_a = server.pending_prompts()[0]
 
         client_in.write_line(_write_file_call(call_id="write-b", path="b.txt"))
         client_in.write_line(_local_proof_call(call_id="proof-order"))
@@ -883,31 +887,33 @@ def test_mutations_preserve_arrival_order_while_diagnostics_proceed(tmp_path):
             lambda: client_out.response_by_id("proof-order") is not None,
             timeout=2.0,
         )
-        # Serial mutation lane: B must not become pending until A finishes.
-        assert len(server.pending_prompts()) == 1
-        assert server.pending_prompts()[0].request_id == prompt_a.request_id
+        assert _wait_until(lambda: len(server.pending_prompts()) == 2, timeout=2.0)
+        prompt_a_id = manager_obj._client_request_bindings[
+            normalize_client_request_id("write-a")
+        ]
+        prompt_b_id = manager_obj._client_request_bindings[
+            normalize_client_request_id("write-b")
+        ]
+        assert prompt_a_id != prompt_b_id
         assert client_out.response_by_id("write-a") is None
         assert client_out.response_by_id("write-b") is None
 
-        _approve(server, prompt_a.request_id)
+        _approve(server, prompt_a_id)
         assert _wait_until(
-            lambda: client_out.response_by_id("write-a") is not None
-            and bool(server.pending_prompts()),
+            lambda: client_out.response_by_id("write-a") is not None,
             timeout=3.0,
         )
-        prompt_b = server.pending_prompts()[0]
-        assert prompt_b.request_id != prompt_a.request_id
-        # Approving A must not release or decide B.
         assert client_out.response_by_id("write-b") is None
-        record_a = store.get_pending(prompt_a.request_id)
+        record_a = store.get_pending(prompt_a_id)
         assert record_a.status == ApprovalStatus.EXECUTED.value
+        assert store.get_pending(prompt_b_id).status == ApprovalStatus.PENDING.value
 
-        _deny(server, prompt_b.request_id)
+        _deny(server, prompt_b_id)
         assert _wait_until(lambda: client_out.response_by_id("write-b") is not None, timeout=3.0)
         write_b = client_out.response_by_id("write-b")
         assert write_b is not None
         assert write_b["error"]["data"]["reason"] == "user_denied"
-        record_b = store.get_pending(prompt_b.request_id)
+        record_b = store.get_pending(prompt_b_id)
         assert record_b.status == ApprovalStatus.DENIED.value
 
         rows = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
@@ -925,6 +931,7 @@ def test_mutations_preserve_arrival_order_while_diagnostics_proceed(tmp_path):
 def test_bounded_stdio_queue_applies_backpressure(tmp_path):
     passthrough, _manager_obj, store, server = _build_passthrough(tmp_path)
     passthrough._stdio_queue_maxsize = 1
+    passthrough._stdio_mutation_pending_workers = 1
     client_in = _TrackingTextIO()
     client_out = _ThreadSafeClientOut()
     worker = _run_stdio_session(passthrough, client_in, client_out)
@@ -993,7 +1000,10 @@ def test_eof_shutdown_does_not_corrupt_completed_responses(tmp_path):
 
 
 def test_stdio_worker_defaults_are_bounded():
-    assert STDIO_REQUEST_WORKERS >= 2
+    assert STDIO_READ_CONCURRENCY >= 2
+    assert STDIO_DIAGNOSTIC_WORKERS == STDIO_READ_CONCURRENCY
+    assert STDIO_MUTATION_PENDING_WORKERS == 2
+    assert STDIO_REQUEST_WORKERS == STDIO_DIAGNOSTIC_WORKERS + STDIO_MUTATION_PENDING_WORKERS
     assert STDIO_REQUEST_QUEUE_MAXSIZE >= 1
-    assert STDIO_REQUEST_WORKERS <= 16
+    assert STDIO_REQUEST_WORKERS <= 32
     assert STDIO_REQUEST_QUEUE_MAXSIZE <= 64

@@ -123,3 +123,28 @@ jobs:
           packages/agentveil-mcp-proxy/tests/test_mcp_proxy_approval_outcome_truth.py::test_process_e2e_b_approve_downstream_success
           packages/agentveil-mcp-proxy/tests/test_mcp_proxy_approval_outcome_truth.py::test_process_e2e_c_approve_downstream_failure
           packages/agentveil-mcp-proxy/tests/test_mcp_proxy_approval_outcome_truth.py::test_process_e2e_d_deny_and_cancel_regression
+
+  windows-symlink-toctou:
+    name: Windows symlink TOCTOU (bounded)
+    if: github.event_name == 'pull_request'
+    runs-on: windows-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: python -m pip install -e ".[test]"
+
+      - name: Install MCP Proxy package
+        run: python -m pip install -e "packages/agentveil-mcp-proxy[test]"
+
+      - name: Run bounded Windows symlink TOCTOU tests
+        run: >-
+          python -m pytest -q
+          packages/agentveil-mcp-proxy/tests/test_mcp_proxy_symlink_toctou.py
