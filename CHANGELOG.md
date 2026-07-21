@@ -6,6 +6,33 @@ All notable changes to the `agentveil` SDK.
 
 No unreleased changes.
 
+## [0.7.33-mcp-proxy] - 2026-07-21
+
+Public MCP Proxy availability, replay protection, filesystem containment, and
+concurrency corrective.
+
+### MCP Proxy changed
+- Added bounded unavailable-route handling and one-at-a-time downstream
+  reconnect without repeated approvals, native-tool bypass guidance, or
+  automatic mutation replay.
+- Retired approvals owned by dead proxy instances or obsolete downstream
+  generations so stale cards cannot execute after reconnect or PID reuse.
+- Bound filesystem mutations to verified directory handles on POSIX and
+  Windows to contain symlink swaps between validation and execution.
+- Allowed two independent mutation approvals to remain pending concurrently
+  while keeping downstream mutation execution serialized and request-local.
+- Added bounded concurrent processing for read-only tools, including overload
+  backpressure, exact response-ID attribution, and deterministic shutdown.
+
+### MCP Proxy verification
+- Natural live outage/reconnect, stale-card recovery, and concurrent
+  Approve/Deny acceptance passed without connector-specific product changes.
+- An independent cumulative audit covered the three fixes released in 0.7.32
+  together with the six fixes in this release and found no P0/P1 blocker.
+- The combined local public SDK gate passed with 1903 tests and 51 platform
+  skips; GitHub Actions passed on Ubuntu, Windows, macOS, managed Approval
+  Center E2E, and the bounded native Windows TOCTOU job.
+
 ## [0.7.32-mcp-proxy] - 2026-07-18
 
 Public MCP Proxy path-boundary and Approval Center recovery corrective.
