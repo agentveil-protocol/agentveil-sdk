@@ -223,6 +223,21 @@ verified = verify_signed_jcs(
 )
 ```
 
+<!-- claim-check: allow "W3C" is a literal protocol identifier, not a conformance claim; the externally pinned verifier boundary is tested in tests/test_decision_receipt_v3.py. -->
+Verify one W3C Data Integrity `/3` receipt:
+
+```python
+from agentveil import verify_eddsa_jcs_2022
+
+verified = verify_eddsa_jcs_2022(
+    receipt_jcs,
+    expected_signer_did=trusted_decision_signer_did,
+)
+```
+
+The `/3` verifier requires an externally pinned signer DID. A document's own
+`verificationMethod` is never treated as trust authority.
+
 Verify a proof packet:
 
 ```python

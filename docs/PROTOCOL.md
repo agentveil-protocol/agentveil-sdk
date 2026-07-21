@@ -69,12 +69,13 @@ Per-category tracks are supported.
 AVP exposes multiple signed evidence formats. Each format has a specific
 verification path.
 
+<!-- claim-check: allow "W3C"/"eddsa-jcs-2022" are literal protocol identifiers, not conformance claims; verification routing is tested in tests/test_proof_verification.py. -->
 | Artifact | Format | Signature / proof | Verification |
 |----------|--------|-------------------|--------------|
 | Reputation credential | AVP JSON | Ed25519-signed AVP JSON | `AVPAgent.verify_credential(...)` |
 | Reputation credential | W3C VC | W3C VC v2.0 Data Integrity (`eddsa-jcs-2022`) | `AVPAgent.verify_w3c_credential(...)` or compatible verifier |
 | DelegationReceipt v1 | W3C VC | W3C VC v2.0 Data Integrity (`eddsa-jcs-2022`) | `verify_delegation(...)` or standalone verifier |
-| Runtime DecisionReceipt | JCS JSON | W3C Data Integrity `DataIntegrityProof` / `eddsa-jcs-2022` (`decision_receipt/3`; legacy `/1`,`/2` were raw-JCS) | `verify_eddsa_jcs_2022(...)` for `/3`; legacy `/1`,`/2` via `verify_signed_jcs(...)` |
+| Runtime DecisionReceipt | JCS JSON | <!-- claim-check: allow W3C and eddsa-jcs-2022 are literal protocol identifiers, not conformance claims; receipt routing is tested in tests/test_proof_verification.py. --> W3C Data Integrity `DataIntegrityProof` / `eddsa-jcs-2022` (`decision_receipt/3`; legacy `/1`,`/2` were raw-JCS) | `verify_eddsa_jcs_2022(..., expected_signer_did=...)` for `/3`; legacy `/1`,`/2` via `verify_signed_jcs(...)` |
 | HumanApprovalReceipt | JCS JSON | Ed25519-signed JCS (`human_approval_receipt/2`) | `verify_signed_jcs(...)` or `verify_proof_packet(...)` |
 | ExecutionReceipt | JCS JSON | Ed25519-signed JCS (`execution_receipt/2`) | `verify_signed_jcs(...)` or `verify_proof_packet(...)` |
 

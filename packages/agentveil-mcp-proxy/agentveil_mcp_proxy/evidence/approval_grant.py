@@ -200,14 +200,19 @@ def verify_approval_grant(
     if not isinstance(grant_jcs, str) or not grant_jcs:
         raise ApprovalGrantError("grant_jcs must be a non-empty string")
 
-    try:
-        result = verify_eddsa_jcs_2022(grant_jcs)
-    except DataIntegrityError as exc:
-        raise ApprovalGrantError(f"approval grant signature invalid: {exc}") from exc
+    last_error: Exception | None = None
+    result: dict[str, Any] | None = None
+    for signer_did in pinned:
+        try:
+            result = verify_eddsa_jcs_2022(grant_jcs, expected_signer_did=signer_did)
+        except DataIntegrityError as exc:
+            last_error = exc
+            continue
+        break
+    else:
+        raise ApprovalGrantError("approval grant signature invalid") from last_error
 
-    signer_did = result.get("signer_did")
-    if not isinstance(signer_did, str) or signer_did not in pinned:
-        raise ApprovalGrantError("approval grant signer is not in the pinned signer set")
+    signer_did = result["signer_did"]
 
     body = result.get("document")
     if not isinstance(body, Mapping):

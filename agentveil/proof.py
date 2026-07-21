@@ -188,7 +188,11 @@ _STRICT_APPROVAL_SCHEMAS = frozenset({"human_approval_receipt/2", "human_approva
 _STRICT_INTENT_SCHEMAS = _STRICT_EXECUTION_SCHEMAS | _STRICT_APPROVAL_SCHEMAS
 
 
-def _verify_backend_receipt(receipt_jcs: Any) -> dict[str, Any]:
+def _verify_backend_receipt(
+    receipt_jcs: Any,
+    trusted_backend_signer_dids: set[str],
+    label: str,
+) -> dict[str, Any]:
     """Verify one backend receipt JCS, routing the /3 receipt family to the
     claim-check: allow "W3C"/eddsa-jcs-2022 are literal cryptosuite identifiers (no external-conformance claim); "all"-receipts routing tested in tests/test_proof_verification.py
     first-party data-integrity (eddsa-jcs-2022) verifier and /1,/2 to the legacy
@@ -214,18 +218,29 @@ def _verify_backend_receipt(receipt_jcs: Any) -> dict[str, Any]:
             and parsed.get("schema_version") in _W3C_DI_RECEIPT_SCHEMAS
         )
     if not is_w3c:
-        return verify_signed_jcs(receipt_jcs)
-    try:
-        verified = verify_eddsa_jcs_2022(receipt_jcs)
-    except DataIntegrityError as exc:
-        raise ProofVerificationError(str(exc)) from exc
-    return {
-        "valid": True,
-        "body": verified["document"],
-        "signer_did": verified["signer_did"],
-        "schema_version": verified["schema_version"],
-        "digest": _sha256_text(receipt_jcs),
-    }
+        verified = verify_signed_jcs(receipt_jcs)
+        _require_backend_trust(verified, trusted_backend_signer_dids, label)
+        return verified
+    if not trusted_backend_signer_dids:
+        raise ProofVerificationError("trusted signer DID(s) are required")
+    last_error: Exception | None = None
+    for signer_did in trusted_backend_signer_dids:
+        try:
+            verified = verify_eddsa_jcs_2022(
+                receipt_jcs,
+                expected_signer_did=signer_did,
+            )
+        except DataIntegrityError as exc:
+            last_error = exc
+            continue
+        return {
+            "valid": True,
+            "body": verified["document"],
+            "signer_did": verified["signer_did"],
+            "schema_version": verified["schema_version"],
+            "digest": _sha256_text(receipt_jcs),
+        }
+    raise ProofVerificationError(f"{label} signature verification failed") from last_error
 
 
 def _verify_optional_backend_receipt(
@@ -237,8 +252,7 @@ def _verify_optional_backend_receipt(
     receipt_jcs = packet.get(key)
     if receipt_jcs is None:
         return None
-    verified = _verify_backend_receipt(receipt_jcs)
-    _require_backend_trust(verified, trusted_backend_signer_dids, label)
+    verified = _verify_backend_receipt(receipt_jcs, trusted_backend_signer_dids, label)
     return verified
 
 
