@@ -769,13 +769,13 @@ POOL.shutdown(wait=True)
 
 def test_eof_shutdown_reaps_stdio_worker_threads(av09_env):
     home, _sandbox = av09_env
-    from test_mcp_proxy_approval_nonblocking import _ThreadSafeClientOut, _TrackingTextIO
+    from test_mcp_proxy_approval_nonblocking import (
+        _ThreadSafeClientOut,
+        _TrackingTextIO,
+        _stdio_worker_threads,
+    )
 
-    before_workers = {
-        thread.name
-        for thread in threading.enumerate()
-        if thread.name.startswith(("mcp-stdio-diagnostic-worker-", "mcp-stdio-mutation-worker"))
-    }
+    before_ids = {id(thread) for thread in threading.enumerate()}
     client_in = _TrackingTextIO()
     client_out = _ThreadSafeClientOut()
     runner = threading.Thread(
@@ -791,11 +791,11 @@ def test_eof_shutdown_reaps_stdio_worker_threads(av09_env):
     runner.start()
     try:
         assert _wait_until(
-            lambda: len({
-                thread.name
-                for thread in threading.enumerate()
-                if thread.name.startswith("mcp-stdio-diagnostic-worker-")
-            }) >= STDIO_DIAGNOSTIC_WORKERS,
+            lambda: len([
+                thread
+                for thread in _stdio_worker_threads()
+                if id(thread) not in before_ids
+            ]) >= STDIO_DIAGNOSTIC_WORKERS,
             timeout=5.0,
         )
         for line in _initialize_lines():
@@ -804,9 +804,8 @@ def test_eof_shutdown_reaps_stdio_worker_threads(av09_env):
         proof_snapshot = list(client_out.responses())
         session_workers = [
             thread
-            for thread in threading.enumerate()
-            if thread.name.startswith(("mcp-stdio-diagnostic-worker-", "mcp-stdio-mutation-worker"))
-            and thread.name not in before_workers
+            for thread in _stdio_worker_threads()
+            if id(thread) not in before_ids
         ]
         assert len(session_workers) == STDIO_REQUEST_WORKERS
         client_in.close()

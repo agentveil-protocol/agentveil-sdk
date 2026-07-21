@@ -435,6 +435,27 @@ def _run_stdio_session(passthrough: McpPassthrough, client_in: _TrackingTextIO, 
     )
 
 
+def _stdio_worker_threads() -> list[threading.Thread]:
+    return [
+        thread
+        for thread in threading.enumerate()
+        if thread.name.startswith(("mcp-stdio-diagnostic-worker-", "mcp-stdio-mutation-worker"))
+    ]
+
+
+def _shutdown_stdio_session(
+    worker: threading.Thread,
+    client_in: _TrackingTextIO,
+    passthrough: McpPassthrough,
+    *,
+    timeout: float = 10.0,
+) -> None:
+    client_in.close()
+    worker.join(timeout=timeout)
+    passthrough.stop()
+    assert not worker.is_alive(), "run_stdio session must exit after stdin EOF"
+
+
 def test_pending_write_does_not_block_local_proof_on_run_stdio(tmp_path):
     passthrough, _manager_obj, store, server = _build_passthrough(tmp_path)
     client_in = _TrackingTextIO()
