@@ -6,6 +6,25 @@ All notable changes to the `agentveil` SDK.
 
 No unreleased changes.
 
+## [0.7.34-mcp-proxy] - 2026-07-22
+
+Public Runtime Gate interoperability and package trust-boundary corrective.
+
+### MCP Proxy changed
+- Aligned outbound Runtime Gate environment values with the canonical public
+  contract while retaining bounded compatibility for legacy headless policies.
+- Required an externally configured signer identity when verifying
+  EdDSA-JCS-2022 receipts and approval grants. Verification boundary: a
+  document cannot establish its own trust authority.
+- Rejected CLI-like, path-like, URL-like, malformed, and explicit null package
+  names before any product-route pip subprocess call.
+
+### MCP Proxy verification
+- The canonical local public SDK gate passed with 1950 tests and 51 platform
+  skips.
+- GitHub Actions passed on Ubuntu Python 3.10-3.13, Windows, macOS, managed
+  Approval Center E2E, and the bounded Windows symlink job before release prep.
+
 ## [0.7.33-mcp-proxy] - 2026-07-21
 
 Public MCP Proxy availability, replay protection, filesystem containment, and
