@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import time
 from typing import Any
 
 from agentveil_mcp_proxy.authority_boundary import parse_authority_from_metadata
@@ -989,9 +990,164 @@ def verified_redirect_projection_rows(
         ("Original action", original_label),
         ("Hook decision", _REDIRECT_HOOK_DECISION_LABEL),
         ("Controlled route", controlled_label),
-        ("Intent binding", intent_label),
+        ("Intent", intent_label),
         ("Target reached", _redirect_target_reached_label(original_meta)),
     )
+
+
+RICH_REDIRECT_CARD_TITLE = "Review redirected action"
+RICH_REDIRECT_CARD_SUMMARY = (
+    "A native write action was stopped and redirected to the controlled write path. "
+    "Needs your approval before it can run."
+)
+_BOUNDED_PREVIEW_MAX_LEN = 80
+_FORBIDDEN_PREVIEW_FRAGMENTS = (
+    "/users/",
+    "/home/",
+    "sha256:",
+    "csrf",
+    "token",
+    "manifest.json",
+    '"arguments"',
+    "internal_register",
+)
+
+
+def rich_ordinary_card_title(tool_name: str) -> str:
+    """Return the default Approval Center detail title for ordinary cards."""
+
+    return f"Review: {tool_name}"
+
+
+def rich_redirect_card_title() -> str:
+    """Return the detail title for verified redirected cards."""
+
+    return RICH_REDIRECT_CARD_TITLE
+
+
+def rich_redirect_card_summary() -> str:
+    """Return the bounded summary shown on verified redirected cards."""
+
+    return RICH_REDIRECT_CARD_SUMMARY
+
+
+def rich_approval_controlled_tool_label(tool_name: str) -> str:
+    """Return the controlled-tool label for rich action summaries."""
+
+    normalized = tool_name.strip()
+    return normalized or "unknown"
+
+
+def rich_approval_target_label(resource_display: str | None) -> str:
+    """Return the bounded target label for rich action summaries."""
+
+    if resource_display in (None, "", "none"):
+        return "none"
+    return resource_display
+
+
+def rich_approval_action_semantics_label(tool_name: str) -> str:
+    """Return a bounded action label derived only from tool semantics."""
+
+    normalized = tool_name.strip().lower()
+    explicit = {
+        "delete_file": "Delete file",
+        "remove_file": "Delete file",
+        "move_file": "Move file",
+        "copy_file": "Copy file",
+        "create_symlink": "Create symlink",
+        "rmdir_tree": "Remove directory",
+        "write_file": "File change",
+    }
+    if normalized in explicit:
+        return explicit[normalized]
+    if "symlink" in normalized:
+        return "Create symlink"
+    if "delete" in normalized or normalized.startswith("remove_"):
+        if any(token in normalized for token in ("dir", "tree", "folder")):
+            return "Remove directory"
+        return "Delete file"
+    if "move" in normalized or "rename" in normalized:
+        return "Move file"
+    if "copy" in normalized:
+        return "Copy file"
+    return "Tool action"
+
+
+def _bounded_preview_value(value: str | None) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if len(text) > _BOUNDED_PREVIEW_MAX_LEN:
+        text = text[:_BOUNDED_PREVIEW_MAX_LEN]
+    lowered = text.lower()
+    if text.startswith(("/", "\\")) or "://" in text:
+        return None
+    for fragment in _FORBIDDEN_PREVIEW_FRAGMENTS:
+        if fragment in lowered:
+            return None
+    return text
+
+
+def rich_approval_requested_change_label(
+    *,
+    tool_name: str,
+    action_details: str | None,
+) -> str:
+    """Return a bounded requested-change preview without guessing create/update."""
+
+    preview = _bounded_preview_value(action_details)
+    if preview is not None:
+        return preview
+    semantics = rich_approval_action_semantics_label(tool_name)
+    if semantics != "Tool action":
+        return semantics
+    return "Change details unavailable"
+
+
+def rich_approval_action_summary_rows(
+    *,
+    is_redirected: bool,
+    tool_name: str,
+    resource_display: str | None,
+    risk_class: str,
+    action_details: str | None,
+) -> tuple[tuple[str, str], ...]:
+    """Return bounded action-summary rows for rich Approval Center cards."""
+
+    tool_label = "Controlled tool" if is_redirected else "Tool"
+    return (
+        (tool_label, rich_approval_controlled_tool_label(tool_name)),
+        ("Target", rich_approval_target_label(resource_display)),
+        (
+            "Requested change",
+            rich_approval_requested_change_label(
+                tool_name=tool_name,
+                action_details=action_details,
+            ),
+        ),
+        ("Risk", risk_class_plain_label(risk_class)),
+    )
+
+
+def approval_remaining_seconds(expires_at: int, *, now: int | None = None) -> int:
+    """Return bounded remaining approval seconds for client countdown rendering."""
+
+    current = int(time.time()) if now is None else now
+    return max(0, int(expires_at) - current)
+
+
+def format_approval_remaining_time(remaining_seconds: int) -> str:
+    """Return a human-readable remaining approval time label."""
+
+    if remaining_seconds <= 0:
+        return "Approval time expired"
+    minutes, seconds = divmod(remaining_seconds, 60)
+    if minutes:
+        return f"{minutes}m {seconds:02d}s remaining"
+    return f"{seconds}s remaining"
 
 
 def event_record_dict(

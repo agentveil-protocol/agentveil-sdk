@@ -3689,8 +3689,9 @@ def test_pending_approval_page_shows_quiet_local_recording_note():
         text = response.text
         csp = response.headers.get("content-security-policy", "")
         _assert_no_unsafe_inline_script_csp(csp)
-        assert "nonce-" not in csp
-        assert "<script" not in text
+        assert "nonce-" in csp
+        assert 'id="approval-countdown"' in text
+        assert "<script" in text
         assert "This decision will be recorded locally" in text
         assert "approval-local-proof-command" not in text
         assert "Copy command" not in text

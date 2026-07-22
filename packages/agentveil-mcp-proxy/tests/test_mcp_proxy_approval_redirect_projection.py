@@ -305,7 +305,8 @@ def test_verified_evidence_and_claim_renders_bounded_redirect_section(redirect_f
     assert "Stopped before mutation" in html
     assert "Controlled route" in html
     assert "AgentVeil MCP / write_file" in html
-    assert "Intent binding" in html
+    assert "Intent" in html
+    assert "Intent binding" not in html
     assert "Same target and requested change" in html
     assert "Target reached" in html
     assert "No" in html
