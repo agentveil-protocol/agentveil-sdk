@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import io
 import json
 import os
@@ -344,15 +345,26 @@ def _build_passthrough(
     approval_timeout_seconds: int = 300,
     log_path: Path | None = None,
     downstream_script: Path | None = None,
+    trusted_workspace: Path | None = None,
 ):
+    script = downstream_script or _approval_downstream(tmp_path)
     config = _nonblocking_config(approval_timeout_seconds=approval_timeout_seconds)
+    if trusted_workspace is not None:
+        config = replace(
+            config,
+            downstream={
+                "name": "filesystem",
+                "command": sys.executable,
+                "args": ["-u", str(script)],
+                "cwd": str(trusted_workspace),
+            },
+        )
     manager, store, server, _cli = _manager(
         tmp_path,
         config=config,
         wait_for_decision=wait_for_decision,
     )
     env = {"DOWNSTREAM_LOG": str(log_path)} if log_path is not None else None
-    script = downstream_script or _approval_downstream(tmp_path)
     passthrough = McpPassthrough(
         DownstreamConfig(
             command=sys.executable,
@@ -375,7 +387,16 @@ def _build_passthrough(
     return passthrough, manager, store, server
 
 
-def _seed_redirect_original(store, *, request_id: str, playbook_id: str = "use_read_only_tool") -> None:
+def _seed_redirect_original(
+    store,
+    *,
+    request_id: str,
+    project_scope: str,
+    session_id: str,
+    client_id: str,
+    resource_hash: str,
+    playbook_id: str = "use_read_only_tool",
+) -> None:
     metadata = build_redirect_automation_metadata(
         fixture_id="nonblocking.redirect",
         tool_name="write_file",
@@ -389,26 +410,23 @@ def _seed_redirect_original(store, *, request_id: str, playbook_id: str = "use_r
         redirect_playbook_id=playbook_id,
         original_request_id=request_id,
     )
+    metadata["project_scope_fingerprint"] = project_scope
     now = int(time.time())
-    store.write_pending(
-        PendingApproval(
-            request_id=request_id,
-            session_id="session-1234567890",
-            client_id=f"cursor:pid:{os.getpid()}",
-            downstream_server="filesystem",
-            tool_name="write_file",
-            action_class="write",
-            risk_class="write",
-            resource_hash="sha256:" + ("a" * 64),
-            payload_hash="sha256:" + ("b" * 64),
-            policy_id="nonblocking-diagnostics",
-            policy_rule_id="seed-redirect",
-            policy_context_hash="c" * 64,
-            status=ApprovalStatus.PENDING.value,
-            created_at=now,
-            expires_at=now + 300,
-            action_gate_metadata_jcs=json.dumps(metadata, separators=(",", ":"), sort_keys=True),
-        )
+    store.record_terminal_deny(
+        request_id=request_id,
+        session_id=session_id,
+        client_id=client_id,
+        downstream_server="filesystem",
+        tool_name="write_file",
+        risk_class="write",
+        resource_hash=resource_hash,
+        payload_hash="sha256:" + ("b" * 64),
+        policy_id="nonblocking-diagnostics",
+        policy_rule_id="seed-redirect",
+        policy_context_hash="c" * 64,
+        created_at=now,
+        reason="role_authority_denied",
+        action_gate_metadata_jcs=json.dumps(metadata, separators=(",", ":"), sort_keys=True),
     )
 
 
@@ -728,13 +746,45 @@ def test_client_stdout_lines_remain_complete_json_under_concurrency(tmp_path):
 
 def test_tool_arguments_and_redirect_context_are_request_local_via_handle_client_line(tmp_path):
     log_path = tmp_path / "downstream.log"
-    passthrough, _manager_obj, store, server = _build_passthrough(
+    passthrough, manager_obj, store, server = _build_passthrough(
         tmp_path,
         log_path=log_path,
         downstream_script=_path_logging_downstream(tmp_path),
+        trusted_workspace=tmp_path,
     )
-    _seed_redirect_original(store, request_id="orig-a", playbook_id="use_read_only_tool")
-    _seed_redirect_original(store, request_id="orig-b", playbook_id="use_read_only_tool")
+    project_scope = passthrough._current_project_scope_fingerprint(
+        downstream_server="filesystem"
+    )
+    assert project_scope is not None
+    assert passthrough.classifier is not None
+    resource_a = passthrough.classifier.classify(
+        tool="read_file",
+        arguments={"path": "a.txt"},
+    ).resource_hash
+    resource_b = passthrough.classifier.classify(
+        tool="read_file",
+        arguments={"path": "b.txt"},
+    ).resource_hash
+    assert resource_a is not None
+    assert resource_b is not None
+    _seed_redirect_original(
+        store,
+        request_id="orig-a",
+        project_scope=project_scope,
+        session_id=manager_obj.session_id,
+        client_id=manager_obj.client_id,
+        resource_hash=resource_a,
+        playbook_id="use_read_only_tool",
+    )
+    _seed_redirect_original(
+        store,
+        request_id="orig-b",
+        project_scope=project_scope,
+        session_id=manager_obj.session_id,
+        client_id=manager_obj.client_id,
+        resource_hash=resource_b,
+        playbook_id="use_read_only_tool",
+    )
 
     observed: dict[str, dict[str, Any]] = {}
     errors: list[BaseException] = []

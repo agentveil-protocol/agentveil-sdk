@@ -894,7 +894,7 @@ def _create_pre_slice_v4_evidence_db(db_path: Path) -> tuple[str, str]:
     return base_a.request_id, base_b.request_id
 
 
-def test_pre_slice_v4_evidence_db_migrates_to_v5_without_chain_break(tmp_path):
+def test_pre_slice_v4_evidence_db_migrates_to_current_without_chain_break(tmp_path):
     db_path = tmp_path / "evidence.sqlite"
     first_id, second_id = _create_pre_slice_v4_evidence_db(db_path)
 
@@ -918,6 +918,6 @@ def test_pre_slice_v4_evidence_db_migrates_to_v5_without_chain_break(tmp_path):
         count = conn.execute("SELECT COUNT(*) FROM pending_approvals").fetchone()[0]
     finally:
         conn.close()
-    assert version == EVIDENCE_SCHEMA_VERSION == 5
+    assert version == EVIDENCE_SCHEMA_VERSION
     assert "delivery_status" in columns
     assert count == 2
