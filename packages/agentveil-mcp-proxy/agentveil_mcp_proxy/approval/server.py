@@ -38,6 +38,7 @@ from agentveil_mcp_proxy.evidence.observability import (
     pending_approval_dict,
     risk_class_plain_label,
     terminal_state_for_record_status,
+    verified_redirect_projection_rows,
 )
 from agentveil_mcp_proxy.evidence.store import ApprovalStatus
 
@@ -1480,6 +1481,32 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
             "</article>"
         )
 
+    def _render_verified_redirect_context_section(self, prompt: ApprovalPrompt) -> str:
+        from agentveil_mcp_proxy.evidence.store import ApprovalEvidenceError
+
+        store = self.server_owner.evidence_store
+        if store is None:
+            return ""
+        try:
+            record = store.get_pending(prompt.request_id)
+            if record is None:
+                return ""
+            rows = verified_redirect_projection_rows(record, store=store)
+        except ApprovalEvidenceError:
+            return ""
+        if rows is None:
+            return ""
+        items = "".join(
+            f"<dt>{escape(label)}</dt><dd>{escape(value)}</dd>"
+            for label, value in rows
+        )
+        return (
+            '<section class="approval-redirect-context">'
+            "<h2>Redirect context</h2>"
+            f'<dl class="approval-detail">{items}</dl>'
+            "</section>"
+        )
+
     def _render_prompt(self, prompt: ApprovalPrompt) -> str:
         token = self.server_owner.session_token
         summary = human_approval_summary(
@@ -1542,6 +1569,7 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
             f"<dt>{escape(label)}</dt><dd>{escape(value)}</dd>"
             for label, value in raw_rows
         )
+        redirect_context = self._render_verified_redirect_context_section(prompt)
         body = f"""
 {back_link}
 <p class="approval-summary">{escape(summary)}</p>
@@ -1551,6 +1579,7 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
 <dt>Target</dt><dd>{escape(prompt.resource_display or "none")}</dd>
 <dt>Risk</dt><dd>{escape(risk_label)}</dd>
 </dl>
+{redirect_context}
 <form method=\"post\">
 <input type=\"hidden\" name=\"csrf_token\" value=\"{escape(prompt.csrf_token)}\">
 <input type=\"hidden\" name=\"approval_scope\" value=\"exact\">
@@ -1620,6 +1649,21 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
   color: var(--muted);
   word-break: break-word;
   overflow-wrap: anywhere;
+}
+.approval-redirect-context {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--card-bg);
+}
+.approval-redirect-context h2 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--text);
 }
 .approval-meta {
   margin: 0 0 8px;

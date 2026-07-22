@@ -25,6 +25,7 @@ from agentveil_mcp_proxy.approval.persistent import (
 )
 from agentveil_mcp_proxy.approval.server import (
     INTERNAL_REGISTER_TOKEN_HEADER,
+    ApprovalPrompt,
     ApprovalServer,
     approval_prompt_to_dict,
 )
@@ -32,6 +33,11 @@ from agentveil_mcp_proxy.classification import ToolCallClassifier
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore, ApprovalStatus
 from agentveil_mcp_proxy.passthrough import DownstreamConfig, McpPassthrough
 from agentveil_mcp_proxy.policy import ProxyConfig
+
+from test_mcp_proxy_approval_redirect_projection import (
+    FOLLOW_ID,
+    seed_verified_native_redirect_bundle,
+)
 
 from test_mcp_proxy_approval import (
     SECRET,
@@ -541,3 +547,73 @@ def test_managed_center_hides_actionable_prompt_when_evidence_cancelled(tmp_path
     finally:
         server.stop()
         store.close()
+
+
+def test_managed_persistent_center_renders_verified_redirect_context(tmp_path):
+    config = _config(policy_rule=_write_rule())
+    persistent_store, persistent_server, _persistent_manager, proxy_dir = _start_persistent_center(
+        tmp_path,
+        config=config,
+    )
+    run_manager, run_store, run_server = _run_manager(tmp_path, proxy_dir=proxy_dir, config=config)
+    try:
+        assert isinstance(run_server, RemoteApprovalServer)
+        seed_verified_native_redirect_bundle(
+            persistent_store,
+            client_id=run_manager.client_id,
+            session_id=run_manager.session_id,
+            follow_id=FOLLOW_ID,
+        )
+        now = int(time.time())
+        prompt = ApprovalPrompt(
+            request_id=FOLLOW_ID,
+            client_id=run_manager.client_id,
+            session_id=run_manager.session_id,
+            downstream_server="filesystem",
+            tool_name="write_file",
+            action_display="filesystem.write_file",
+            action_details=None,
+            resource_display="note.txt",
+            resource_details=None,
+            risk_class="write",
+            payload_hash="sha256:" + "a" * 64,
+            policy_rule_id="write-approval",
+            reason="local_approval_required",
+            created_at=now,
+            expires_at=now + 300,
+            csrf_token="managed-redirect-csrf",
+        )
+        approval_url = run_server.register(prompt)
+        assert approval_url.startswith(persistent_server.base_url)
+
+        with httpx.Client() as client:
+            page = client.get(approval_url)
+            assert page.status_code == 200
+            assert '<section class="approval-redirect-context">' in page.text
+            assert "Native Write" in page.text
+            assert "AgentVeil MCP / write_file" in page.text
+            assert 'name="decision" value="approve"' in page.text
+
+            csrf = _get_csrf(client, approval_url)
+            assert _post_decision(
+                client,
+                approval_url,
+                decision="approve",
+                csrf=csrf,
+            ).status_code == 200
+
+        approved = persistent_store.get_pending(FOLLOW_ID)
+        assert approved is not None
+        assert approved.status == ApprovalStatus.APPROVED.value
+
+        stale = httpx.get(approval_url)
+        assert stale.status_code == 410
+        assert '<section class="approval-redirect-context">' not in stale.text
+        _assert_stale_html_privacy_safe(
+            stale.text,
+            session_token=persistent_server.session_token,
+        )
+    finally:
+        run_store.close()
+        persistent_server.stop()
+        persistent_store.close()

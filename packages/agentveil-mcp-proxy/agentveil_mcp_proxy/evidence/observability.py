@@ -854,6 +854,146 @@ def build_verified_redirect_lineage_fields(
     return fields
 
 
+_REDIRECT_INTENT_RELATIONSHIP_LABELS = {
+    "resource_identity_preserved": "Same target and requested change",
+    "explicit_playbook_transition": "Confirmed playbook follow-up",
+}
+
+_REDIRECT_ORIGINAL_ACTION_LABEL = "Native Write"
+_REDIRECT_CONTROLLED_ROUTE_LABEL = "AgentVeil MCP / write_file"
+_REDIRECT_HOOK_DECISION_LABEL = "Stopped before mutation"
+_CANONICAL_NATIVE_WRITE_ACTION_FAMILIES = frozenset({"write", "create", "update"})
+
+
+def _native_hook_redirect_origin_valid(
+    original: PendingApproval,
+    original_meta: Mapping[str, Any],
+) -> bool:
+    from agentveil_mcp_proxy.client_guidance import (
+        NATIVE_REDIRECT_ORIGIN_REASON,
+        native_write_redirect_supported,
+    )
+
+    if original.error_class != NATIVE_REDIRECT_ORIGIN_REASON:
+        return False
+    if original_meta.get("native_hook_denied") is not True:
+        return False
+    if not native_write_redirect_supported(native_tool=original.tool_name):
+        return False
+    family = original_meta.get("action_family")
+    if not isinstance(family, str) or not family.strip():
+        return False
+    return family.strip().lower() in _CANONICAL_NATIVE_WRITE_ACTION_FAMILIES
+
+
+def _redirect_original_action_label(original: PendingApproval) -> str | None:
+    from agentveil_mcp_proxy.client_guidance import native_write_redirect_supported
+
+    if not native_write_redirect_supported(native_tool=original.tool_name):
+        return None
+    return _REDIRECT_ORIGINAL_ACTION_LABEL
+
+
+def _redirect_controlled_route_label(follow_up: PendingApproval) -> str | None:
+    from agentveil_mcp_proxy.client_guidance import NATIVE_REDIRECT_FOLLOW_UP_TOOL
+
+    if follow_up.tool_name != NATIVE_REDIRECT_FOLLOW_UP_TOOL:
+        return None
+    return _REDIRECT_CONTROLLED_ROUTE_LABEL
+
+
+def _redirect_intent_binding_label(intent_relationship: Any) -> str | None:
+    if not isinstance(intent_relationship, str) or not intent_relationship.strip():
+        return None
+    return _REDIRECT_INTENT_RELATIONSHIP_LABELS.get(intent_relationship.strip())
+
+
+def _redirect_target_reached_label(original_meta: Mapping[str, Any]) -> str:
+    return "Yes" if original_meta.get("target_reached") is True else "No"
+
+
+def verified_redirect_projection_rows(
+    follow_up: PendingApproval,
+    *,
+    store: Any,
+) -> tuple[tuple[str, str], ...] | None:
+    """Return bounded Redirect context rows when durable lineage correlation succeeds.
+
+    Correlates follow-up evidence, verified metadata, the original record, and the
+    atomic ``redirect_lineage_claims`` row. Returns ``None`` when correlation
+    fails so callers omit forged or inconsistent redirect context.
+    """
+
+    from agentveil_mcp_proxy.role_doctor import (
+        REDIRECT_LINEAGE_STATUS_VERIFIED,
+        REDIRECT_ROLE_FOLLOW_UP,
+    )
+    from agentveil_mcp_proxy.evidence.store import ApprovalEvidenceError
+
+    follow_meta = parse_redirect_automation_metadata(follow_up)
+    if follow_meta is None:
+        return None
+    if follow_meta.get("redirect_role") != REDIRECT_ROLE_FOLLOW_UP:
+        return None
+    if follow_meta.get("lineage_status") != REDIRECT_LINEAGE_STATUS_VERIFIED:
+        return None
+    if follow_up.status != ApprovalStatus.PENDING.value:
+        return None
+
+    original_request_id = follow_meta.get("original_request_id")
+    if not isinstance(original_request_id, str) or not original_request_id.strip():
+        return None
+
+    try:
+        claim = store.get_redirect_lineage_claim(original_request_id)
+        if claim is None:
+            return None
+        if claim.get("lineage_status") != REDIRECT_LINEAGE_STATUS_VERIFIED:
+            return None
+        if claim.get("follow_up_request_id") != follow_up.request_id:
+            return None
+
+        playbook_id = follow_meta.get("redirect_playbook_id")
+        if not isinstance(playbook_id, str) or not playbook_id.strip():
+            return None
+        if claim.get("redirect_playbook_id") != playbook_id:
+            return None
+
+        scope = follow_meta.get("project_scope_fingerprint")
+        if not isinstance(scope, str) or not scope.strip():
+            return None
+        if claim.get("project_scope_fingerprint") != scope:
+            return None
+
+        original = store.get_pending(original_request_id)
+    except ApprovalEvidenceError:
+        return None
+
+    if original is None:
+        return None
+    if not redirect_automation_link_valid(original, follow_up):
+        return None
+    if not redirect_original_record_valid(original, redirect_playbook_id=playbook_id):
+        return None
+
+    original_meta = parse_redirect_automation_metadata(original) or {}
+    if not _native_hook_redirect_origin_valid(original, original_meta):
+        return None
+    original_label = _redirect_original_action_label(original)
+    controlled_label = _redirect_controlled_route_label(follow_up)
+    intent_label = _redirect_intent_binding_label(follow_meta.get("intent_relationship"))
+    if original_label is None or controlled_label is None or intent_label is None:
+        return None
+
+    return (
+        ("Original action", original_label),
+        ("Hook decision", _REDIRECT_HOOK_DECISION_LABEL),
+        ("Controlled route", controlled_label),
+        ("Intent binding", intent_label),
+        ("Target reached", _redirect_target_reached_label(original_meta)),
+    )
+
+
 def event_record_dict(
     record: PendingApproval,
     *,
