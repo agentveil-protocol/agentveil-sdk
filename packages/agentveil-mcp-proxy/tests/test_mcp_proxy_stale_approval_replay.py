@@ -165,6 +165,40 @@ def test_process_held_owner_claim_survives_locked_read(
         clear_owner_claim(lease)
 
 
+def test_process_held_owner_claim_survives_partial_locked_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A same-process live claim remains actionable if a locked read is partial."""
+
+    claim_dir = tmp_path / "owner_claims"
+    token = "partial-read-token"
+    session_id = "session-partial-read"
+    lease = publish_owner_claim(
+        claim_dir,
+        pid=os.getpid(),
+        instance_token=token,
+        session_id=session_id,
+    )
+    original_read_text = Path.read_text
+
+    def _partial_claim_read(path: Path, *args, **kwargs):
+        if path == lease.path:
+            return "{"
+        return original_read_text(path, *args, **kwargs)
+
+    try:
+        monkeypatch.setattr(Path, "read_text", _partial_claim_read)
+        assert read_owner_claim(claim_dir, os.getpid(), instance_token=token) is not None
+        assert approval_owner_is_actionable(
+            build_owner_client_id("filesystem", instance_token=token),
+            session_id=session_id,
+            claim_dir=claim_dir,
+        ) is True
+    finally:
+        clear_owner_claim(lease)
+
+
 def test_owner_claim_cleared_on_clean_stop(tmp_path: Path) -> None:
     """Normal stop releases the live claim lease and removes the claim file."""
 

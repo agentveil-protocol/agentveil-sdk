@@ -271,12 +271,10 @@ def read_owner_claim(
     try:
         raw = path.read_text(encoding="utf-8")
         payload = json.loads(raw)
-    except OSError:
+    except (OSError, json.JSONDecodeError):
         payload = _PROCESS_HELD_OWNER_CLAIMS.get(_owner_claim_registry_key(path))
         if payload is None:
             return None
-    except json.JSONDecodeError:
-        return None
     if not isinstance(payload, dict):
         return None
     token = payload.get("instance_token")
