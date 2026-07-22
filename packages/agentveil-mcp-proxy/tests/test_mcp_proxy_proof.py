@@ -16,6 +16,7 @@ from nacl.signing import SigningKey
 
 from agentveil.delegation import _public_key_to_did
 from agentveil_mcp_proxy.evidence import (
+    EVIDENCE_SCHEMA_VERSION,
     GENESIS_PREV_EVENT_HASH,
     ApprovalEvidenceSchemaError,
     ApprovalEvidenceStore,
@@ -225,7 +226,7 @@ def test_chain_integrity_breaks_if_record_field_tampered(tmp_path):
         ApprovalEvidenceStore(db_path)
 
 
-def test_schema_v1_migrates_to_v4_atomically_with_chain_backfill(tmp_path):
+def test_schema_v1_migrates_to_current_atomically_with_chain_backfill(tmp_path):
     db_path = tmp_path / "evidence.sqlite"
     conn = sqlite3.connect(str(db_path))
     try:
@@ -263,7 +264,7 @@ def test_schema_v1_migrates_to_v4_atomically_with_chain_backfill(tmp_path):
         version = conn.execute("SELECT version FROM evidence_schema_version").fetchone()[0]
     finally:
         conn.close()
-    assert version == 5
+    assert version == EVIDENCE_SCHEMA_VERSION
 
 
 def test_schema_rejects_forward_incompatible_version(tmp_path):
@@ -271,7 +272,10 @@ def test_schema_rejects_forward_incompatible_version(tmp_path):
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute("CREATE TABLE evidence_schema_version (version INTEGER NOT NULL)")
-        conn.execute("INSERT INTO evidence_schema_version (version) VALUES (6)")
+        conn.execute(
+            "INSERT INTO evidence_schema_version (version) VALUES (?)",
+            (EVIDENCE_SCHEMA_VERSION + 1,),
+        )
         conn.commit()
     finally:
         conn.close()

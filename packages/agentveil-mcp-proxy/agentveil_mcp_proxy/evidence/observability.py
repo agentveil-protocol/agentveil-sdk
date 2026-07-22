@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import time
 from typing import Any
 
 from agentveil_mcp_proxy.authority_boundary import parse_authority_from_metadata
@@ -807,6 +808,8 @@ def redirect_original_record_valid(
 ) -> bool:
     """Return True when one evidence record is an acceptable redirect original."""
 
+    from agentveil_mcp_proxy.role_doctor import redirect_status_eligible
+
     metadata = parse_redirect_automation_metadata(record)
     if metadata is None:
         return False
@@ -816,7 +819,335 @@ def redirect_original_record_valid(
         return False
     if metadata.get("target_reached") is not False:
         return False
-    return True
+    return redirect_status_eligible(
+        original_status=record.status,
+        redirect_playbook_id=redirect_playbook_id,
+    )
+
+
+def build_verified_redirect_lineage_fields(
+    *,
+    original_request_id: str,
+    redirect_playbook_id: str,
+    original_action_family: str | None,
+    follow_up_action_family: str | None,
+    project_scope_fingerprint: str,
+    intent_relationship: str,
+    verified_at: int,
+    freshness_ok: bool,
+) -> dict[str, Any]:
+    """Return bounded public evidence fields for a verified redirect lineage."""
+
+    fields: dict[str, Any] = {
+        "lineage_status": "verified",
+        "original_request_id": original_request_id,
+        "redirect_parent_request_id": original_request_id,
+        "redirect_playbook_id": redirect_playbook_id,
+        "project_scope_fingerprint": project_scope_fingerprint,
+        "intent_relationship": intent_relationship,
+        "lineage_verified_at": verified_at,
+        "lineage_freshness_ok": freshness_ok,
+    }
+    if original_action_family is not None:
+        fields["original_action_family"] = original_action_family
+    if follow_up_action_family is not None:
+        fields["follow_up_action_family"] = follow_up_action_family
+    return fields
+
+
+_REDIRECT_INTENT_RELATIONSHIP_LABELS = {
+    "resource_identity_preserved": "Same target and requested change",
+    "explicit_playbook_transition": "Confirmed playbook follow-up",
+}
+
+_REDIRECT_ORIGINAL_ACTION_LABEL = "Native Write"
+_REDIRECT_CONTROLLED_ROUTE_LABEL = "AgentVeil MCP / write_file"
+_REDIRECT_HOOK_DECISION_LABEL = "Stopped before mutation"
+_CANONICAL_NATIVE_WRITE_ACTION_FAMILIES = frozenset({"write", "create", "update"})
+
+
+def _native_hook_redirect_origin_valid(
+    original: PendingApproval,
+    original_meta: Mapping[str, Any],
+) -> bool:
+    from agentveil_mcp_proxy.client_guidance import (
+        NATIVE_REDIRECT_ORIGIN_REASON,
+        native_write_redirect_supported,
+    )
+
+    if original.error_class != NATIVE_REDIRECT_ORIGIN_REASON:
+        return False
+    if original_meta.get("native_hook_denied") is not True:
+        return False
+    if not native_write_redirect_supported(native_tool=original.tool_name):
+        return False
+    family = original_meta.get("action_family")
+    if not isinstance(family, str) or not family.strip():
+        return False
+    return family.strip().lower() in _CANONICAL_NATIVE_WRITE_ACTION_FAMILIES
+
+
+def _redirect_original_action_label(original: PendingApproval) -> str | None:
+    from agentveil_mcp_proxy.client_guidance import native_write_redirect_supported
+
+    if not native_write_redirect_supported(native_tool=original.tool_name):
+        return None
+    return _REDIRECT_ORIGINAL_ACTION_LABEL
+
+
+def _redirect_controlled_route_label(follow_up: PendingApproval) -> str | None:
+    from agentveil_mcp_proxy.client_guidance import NATIVE_REDIRECT_FOLLOW_UP_TOOL
+
+    if follow_up.tool_name != NATIVE_REDIRECT_FOLLOW_UP_TOOL:
+        return None
+    return _REDIRECT_CONTROLLED_ROUTE_LABEL
+
+
+def _redirect_intent_binding_label(intent_relationship: Any) -> str | None:
+    if not isinstance(intent_relationship, str) or not intent_relationship.strip():
+        return None
+    return _REDIRECT_INTENT_RELATIONSHIP_LABELS.get(intent_relationship.strip())
+
+
+def _redirect_target_reached_label(original_meta: Mapping[str, Any]) -> str:
+    return "Yes" if original_meta.get("target_reached") is True else "No"
+
+
+def verified_redirect_projection_rows(
+    follow_up: PendingApproval,
+    *,
+    store: Any,
+) -> tuple[tuple[str, str], ...] | None:
+    """Return bounded Redirect context rows when durable lineage correlation succeeds.
+
+    Correlates follow-up evidence, verified metadata, the original record, and the
+    atomic ``redirect_lineage_claims`` row. Returns ``None`` when correlation
+    fails so callers omit forged or inconsistent redirect context.
+    """
+
+    from agentveil_mcp_proxy.role_doctor import (
+        REDIRECT_LINEAGE_STATUS_VERIFIED,
+        REDIRECT_ROLE_FOLLOW_UP,
+    )
+    from agentveil_mcp_proxy.evidence.store import ApprovalEvidenceError
+
+    follow_meta = parse_redirect_automation_metadata(follow_up)
+    if follow_meta is None:
+        return None
+    if follow_meta.get("redirect_role") != REDIRECT_ROLE_FOLLOW_UP:
+        return None
+    if follow_meta.get("lineage_status") != REDIRECT_LINEAGE_STATUS_VERIFIED:
+        return None
+    if follow_up.status != ApprovalStatus.PENDING.value:
+        return None
+
+    original_request_id = follow_meta.get("original_request_id")
+    if not isinstance(original_request_id, str) or not original_request_id.strip():
+        return None
+
+    try:
+        claim = store.get_redirect_lineage_claim(original_request_id)
+        if claim is None:
+            return None
+        if claim.get("lineage_status") != REDIRECT_LINEAGE_STATUS_VERIFIED:
+            return None
+        if claim.get("follow_up_request_id") != follow_up.request_id:
+            return None
+
+        playbook_id = follow_meta.get("redirect_playbook_id")
+        if not isinstance(playbook_id, str) or not playbook_id.strip():
+            return None
+        if claim.get("redirect_playbook_id") != playbook_id:
+            return None
+
+        scope = follow_meta.get("project_scope_fingerprint")
+        if not isinstance(scope, str) or not scope.strip():
+            return None
+        if claim.get("project_scope_fingerprint") != scope:
+            return None
+
+        original = store.get_pending(original_request_id)
+    except ApprovalEvidenceError:
+        return None
+
+    if original is None:
+        return None
+    if not redirect_automation_link_valid(original, follow_up):
+        return None
+    if not redirect_original_record_valid(original, redirect_playbook_id=playbook_id):
+        return None
+
+    original_meta = parse_redirect_automation_metadata(original) or {}
+    if not _native_hook_redirect_origin_valid(original, original_meta):
+        return None
+    original_label = _redirect_original_action_label(original)
+    controlled_label = _redirect_controlled_route_label(follow_up)
+    intent_label = _redirect_intent_binding_label(follow_meta.get("intent_relationship"))
+    if original_label is None or controlled_label is None or intent_label is None:
+        return None
+
+    return (
+        ("Original action", original_label),
+        ("Hook decision", _REDIRECT_HOOK_DECISION_LABEL),
+        ("Controlled route", controlled_label),
+        ("Intent", intent_label),
+        ("Target reached", _redirect_target_reached_label(original_meta)),
+    )
+
+
+RICH_REDIRECT_CARD_TITLE = "Review redirected action"
+RICH_REDIRECT_CARD_SUMMARY = (
+    "A native write action was stopped and redirected to the controlled write path. "
+    "Needs your approval before it can run."
+)
+_BOUNDED_PREVIEW_MAX_LEN = 80
+_FORBIDDEN_PREVIEW_FRAGMENTS = (
+    "/users/",
+    "/home/",
+    "sha256:",
+    "csrf",
+    "token",
+    "manifest.json",
+    '"arguments"',
+    "internal_register",
+)
+
+
+def rich_ordinary_card_title(tool_name: str) -> str:
+    """Return the default Approval Center detail title for ordinary cards."""
+
+    return f"Review: {tool_name}"
+
+
+def rich_redirect_card_title() -> str:
+    """Return the detail title for verified redirected cards."""
+
+    return RICH_REDIRECT_CARD_TITLE
+
+
+def rich_redirect_card_summary() -> str:
+    """Return the bounded summary shown on verified redirected cards."""
+
+    return RICH_REDIRECT_CARD_SUMMARY
+
+
+def rich_approval_controlled_tool_label(tool_name: str) -> str:
+    """Return the controlled-tool label for rich action summaries."""
+
+    normalized = tool_name.strip()
+    return normalized or "unknown"
+
+
+def rich_approval_target_label(resource_display: str | None) -> str:
+    """Return the bounded target label for rich action summaries."""
+
+    if resource_display in (None, "", "none"):
+        return "none"
+    return resource_display
+
+
+def rich_approval_action_semantics_label(tool_name: str) -> str:
+    """Return a bounded action label derived only from tool semantics."""
+
+    normalized = tool_name.strip().lower()
+    explicit = {
+        "delete_file": "Delete file",
+        "remove_file": "Delete file",
+        "move_file": "Move file",
+        "copy_file": "Copy file",
+        "create_symlink": "Create symlink",
+        "rmdir_tree": "Remove directory",
+        "write_file": "File change",
+    }
+    if normalized in explicit:
+        return explicit[normalized]
+    if "symlink" in normalized:
+        return "Create symlink"
+    if "delete" in normalized or normalized.startswith("remove_"):
+        if any(token in normalized for token in ("dir", "tree", "folder")):
+            return "Remove directory"
+        return "Delete file"
+    if "move" in normalized or "rename" in normalized:
+        return "Move file"
+    if "copy" in normalized:
+        return "Copy file"
+    return "Tool action"
+
+
+def _bounded_preview_value(value: str | None) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if len(text) > _BOUNDED_PREVIEW_MAX_LEN:
+        text = text[:_BOUNDED_PREVIEW_MAX_LEN]
+    lowered = text.lower()
+    if text.startswith(("/", "\\")) or "://" in text:
+        return None
+    for fragment in _FORBIDDEN_PREVIEW_FRAGMENTS:
+        if fragment in lowered:
+            return None
+    return text
+
+
+def rich_approval_requested_change_label(
+    *,
+    tool_name: str,
+    action_details: str | None,
+) -> str:
+    """Return a bounded requested-change preview without guessing create/update."""
+
+    preview = _bounded_preview_value(action_details)
+    if preview is not None:
+        return preview
+    semantics = rich_approval_action_semantics_label(tool_name)
+    if semantics != "Tool action":
+        return semantics
+    return "Change details unavailable"
+
+
+def rich_approval_action_summary_rows(
+    *,
+    is_redirected: bool,
+    tool_name: str,
+    resource_display: str | None,
+    risk_class: str,
+    action_details: str | None,
+) -> tuple[tuple[str, str], ...]:
+    """Return bounded action-summary rows for rich Approval Center cards."""
+
+    tool_label = "Controlled tool" if is_redirected else "Tool"
+    return (
+        (tool_label, rich_approval_controlled_tool_label(tool_name)),
+        ("Target", rich_approval_target_label(resource_display)),
+        (
+            "Requested change",
+            rich_approval_requested_change_label(
+                tool_name=tool_name,
+                action_details=action_details,
+            ),
+        ),
+        ("Risk", risk_class_plain_label(risk_class)),
+    )
+
+
+def approval_remaining_seconds(expires_at: int, *, now: int | None = None) -> int:
+    """Return bounded remaining approval seconds for client countdown rendering."""
+
+    current = int(time.time()) if now is None else now
+    return max(0, int(expires_at) - current)
+
+
+def format_approval_remaining_time(remaining_seconds: int) -> str:
+    """Return a human-readable remaining approval time label."""
+
+    if remaining_seconds <= 0:
+        return "Approval time expired"
+    minutes, seconds = divmod(remaining_seconds, 60)
+    if minutes:
+        return f"{minutes}m {seconds:02d}s remaining"
+    return f"{seconds}s remaining"
 
 
 def event_record_dict(

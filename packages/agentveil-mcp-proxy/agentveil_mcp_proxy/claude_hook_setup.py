@@ -58,32 +58,48 @@ def project_evidence_path(project_dir: Path) -> Path:
     return project_claude_dir(project_dir) / "agentveil" / "evidence.jsonl"
 
 
+def setup_home(project_dir: Path) -> Path:
+    """Project-local proxy home for the Claude Code connector."""
+
+    return Path(project_dir).resolve() / ".avp"
+
+
 # ----- managed hook entry ---------------------------------------------------
 
 
-def build_hook_command(*, python: str, evidence_path: Path) -> str:
+def build_hook_command(*, python: str, home: Path, evidence_path: Path) -> str:
     """Build the PreToolUse command string that runs the installed module.
 
-    The interpreter path and the evidence path are shell-quoted with
+    The interpreter path, proxy home, and evidence path are shell-quoted with
     ``shlex.quote`` so paths containing spaces or quotes do not break the
     command Claude Code runs via the shell. The ``-m <module>`` token stays
     literal so status detection (`-m agentveil_mcp_proxy.claude_hook`) and the
-    ``--evidence-path`` marker remain matchable.
+    ``--home`` / ``--evidence-path`` markers remain matchable.
     """
     return (
         f"{shlex.quote(python)} -m {AGENTVEIL_HOOK_MARKER} "
+        f"--home {shlex.quote(str(home))} "
         f"--evidence-path {shlex.quote(str(evidence_path))}"
     )
 
 
-def build_managed_hook_entry(*, python: str, evidence_path: Path) -> dict[str, Any]:
+def build_managed_hook_entry(
+    *,
+    python: str,
+    home: Path,
+    evidence_path: Path,
+) -> dict[str, Any]:
     """Build the AgentVeil-managed PreToolUse group entry."""
     return {
         "matcher": HOOK_MATCHER,
         "hooks": [
             {
                 "type": "command",
-                "command": build_hook_command(python=python, evidence_path=evidence_path),
+                "command": build_hook_command(
+                    python=python,
+                    home=home,
+                    evidence_path=evidence_path,
+                ),
             }
         ],
     }
@@ -252,6 +268,7 @@ def install_hook(
     project_dir = Path(project_dir)
     settings_path = project_settings_path(project_dir)
     resolved_python = python or sys.executable
+    resolved_home = setup_home(project_dir)
     resolved_evidence = evidence_path or project_evidence_path(project_dir)
 
     created = not settings_path.exists()
@@ -275,7 +292,11 @@ def install_hook(
             cleaned.append(new_group)
     replaced = removed_total > 0
 
-    cleaned.append(build_managed_hook_entry(python=resolved_python, evidence_path=resolved_evidence))
+    cleaned.append(build_managed_hook_entry(
+        python=resolved_python,
+        home=resolved_home,
+        evidence_path=resolved_evidence,
+    ))
     hooks["PreToolUse"] = cleaned
     settings["hooks"] = hooks
 
@@ -592,5 +613,6 @@ __all__ = [
     "project_settings_path",
     "remove_mcp_route",
     "status_hook",
+    "setup_home",
     "uninstall_hook",
 ]

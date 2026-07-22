@@ -741,3 +741,64 @@ def test_ask_backend_is_fail_closed_in_s1() -> None:
     decision = decide(payload, engine)
     assert decision.evaluation.decision is PolicyDecision.ASK_BACKEND
     assert decision.hook_action == "deny"
+
+
+# ----- Verified redirect connector contract -----------------------------------
+
+
+from agentveil_mcp_proxy.client_guidance import parse_redirect_context_from_claude_hook_output
+from redirect_hook_contract_fixtures import (
+    durable_original_metadata,
+    init_redirect_contract_home,
+    publish_live_hook_binding,
+)
+
+
+def test_claude_native_write_registers_durable_origin_and_agent_surface_context(tmp_path: Path) -> None:
+    home, _sandbox, downstream = init_redirect_contract_home(tmp_path)
+    fixture = publish_live_hook_binding(home, downstream=downstream)
+    try:
+        out = io.StringIO()
+        claude_hook.process_hook(
+            _payload("Write", {"file_path": "note.txt", "content": "hello"}),
+            home=home,
+            out=out,
+        )
+        payload = json.loads(out.getvalue())
+        redirect_context = parse_redirect_context_from_claude_hook_output(payload)
+        assert redirect_context is not None
+        meta = durable_original_metadata(home, redirect_context["original_request_id"])
+        assert meta is not None
+        assert meta["redirect_role"] == "original"
+        assert meta["redirect_playbook_id"] == "request_approval"
+        assert "hello" not in json.dumps(payload)
+    finally:
+        fixture.lease.close()
+
+
+def test_claude_native_edit_has_no_verified_redirect_context(tmp_path: Path) -> None:
+    home, _sandbox, downstream = init_redirect_contract_home(tmp_path)
+    fixture = publish_live_hook_binding(home, downstream=downstream)
+    try:
+        out = io.StringIO()
+        claude_hook.process_hook(
+            _payload("Edit", {"file_path": "note.txt", "old_string": "a", "new_string": "b"}),
+            home=home,
+            out=out,
+        )
+        payload = json.loads(out.getvalue())
+        assert parse_redirect_context_from_claude_hook_output(payload) is None
+    finally:
+        fixture.lease.close()
+
+
+def test_claude_native_write_without_live_binding_has_no_verified_context(tmp_path: Path) -> None:
+    home, _sandbox, _downstream = init_redirect_contract_home(tmp_path)
+    out = io.StringIO()
+    claude_hook.process_hook(
+        _payload("Write", {"file_path": "note.txt", "content": "hello"}),
+        home=home,
+        out=out,
+    )
+    payload = json.loads(out.getvalue())
+    assert parse_redirect_context_from_claude_hook_output(payload) is None

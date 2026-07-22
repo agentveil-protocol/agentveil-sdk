@@ -36,6 +36,9 @@ from typing import Any, Mapping, MutableMapping
 from agentveil_mcp_proxy.classification import infer_action_family, infer_risk_class
 from agentveil_mcp_proxy.client_guidance import (
     NATIVE_CONTROLLED_MCP_REDIRECT_INSTRUCTION as NATIVE_REDIRECT_INSTRUCTION,
+    NativeRedirectOrigin,
+    format_native_redirect_agent_surface,
+    maybe_register_native_redirect_for_hook_deny,
 )
 from agentveil_mcp_proxy.policy import (
     PolicyConfig,
@@ -477,7 +480,11 @@ def decide(payload: Mapping[str, Any], engine: PolicyEngine) -> HookDecision:
     )
 
 
-def format_hook_output(decision: HookDecision) -> str | None:
+def format_hook_output(
+    decision: HookDecision,
+    *,
+    redirect_origin: NativeRedirectOrigin | None = None,
+) -> str | None:
     """Format Claude-compatible PreToolUse JSON, or ``None`` to allow silently.
 
     For native Claude tools (Write/Edit/MultiEdit/NotebookEdit/Bash), the deny
@@ -495,12 +502,14 @@ def format_hook_output(decision: HookDecision) -> str | None:
     )
     if decision.context.server == CLAUDE_SERVER_LABEL:
         reason = f"{reason}. {NATIVE_REDIRECT_INSTRUCTION}"
+    reason = format_native_redirect_agent_surface(reason, redirect_origin)
+    hook_specific: dict[str, Any] = {
+        "hookEventName": HOOK_EVENT_DEFAULT,
+        "permissionDecision": "deny",
+        "permissionDecisionReason": reason,
+    }
     return json.dumps({
-        "hookSpecificOutput": {
-            "hookEventName": HOOK_EVENT_DEFAULT,
-            "permissionDecision": "deny",
-            "permissionDecisionReason": reason,
-        }
+        "hookSpecificOutput": hook_specific,
     })
 
 
@@ -589,6 +598,7 @@ def process_hook(
     *,
     config: ProxyConfig | None = None,
     evidence_path: Path | None = None,
+    home: Path | None = None,
     out: Any = None,
 ) -> HookDecision:
     """Process one PreToolUse payload end-to-end.
@@ -604,7 +614,17 @@ def process_hook(
     if evidence_path is not None:
         record = build_evidence_record(payload, decision)
         write_evidence(record, evidence_path)
-    output = format_hook_output(decision)
+    tool_input = payload.get("tool_input")
+    redirect_origin = maybe_register_native_redirect_for_hook_deny(
+        hook_action=decision.hook_action,
+        native_server=decision.context.server,
+        native_tool=decision.context.tool,
+        action_family=decision.context.action_family or "",
+        risk_class=decision.evaluation.risk_class.value,
+        tool_input=tool_input if isinstance(tool_input, Mapping) else {},
+        home=home,
+    )
+    output = format_hook_output(decision, redirect_origin=redirect_origin)
     if output is not None:
         if out is None:
             out = sys.stdout
@@ -632,6 +652,7 @@ def main(argv: list[str] | None = None, *, stdin: Any = None, stdout: Any = None
 
     parser = argparse.ArgumentParser(prog="agentveil-claude-hook", add_help=True)
     parser.add_argument("--evidence-path", default=None)
+    parser.add_argument("--home", default=None)
     args = parser.parse_args(argv if argv is not None else [])
 
     in_stream = stdin if stdin is not None else sys.stdin
@@ -647,7 +668,9 @@ def main(argv: list[str] | None = None, *, stdin: Any = None, stdout: Any = None
 
     evidence_arg = args.evidence_path or os.environ.get("AGENTVEIL_HOOK_EVIDENCE_PATH")
     evidence_path = Path(evidence_arg) if evidence_arg else None
-    process_hook(payload, evidence_path=evidence_path, out=out_stream)
+    home_arg = args.home or os.environ.get("AGENTVEIL_HOME")
+    home = Path(home_arg).expanduser() if isinstance(home_arg, str) and home_arg.strip() else None
+    process_hook(payload, evidence_path=evidence_path, home=home, out=out_stream)
     return 0
 
 

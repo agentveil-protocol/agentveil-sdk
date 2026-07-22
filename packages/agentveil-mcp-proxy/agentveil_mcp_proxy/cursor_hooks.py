@@ -18,6 +18,9 @@ from typing import Any, Mapping, MutableMapping
 from agentveil_mcp_proxy.classification import infer_action_family, infer_risk_class
 from agentveil_mcp_proxy.client_guidance import (
     NATIVE_CONTROLLED_MCP_REDIRECT_INSTRUCTION as NATIVE_REDIRECT_INSTRUCTION,
+    NativeRedirectOrigin,
+    format_native_redirect_agent_surface,
+    maybe_register_native_redirect_for_hook_deny,
 )
 from agentveil_mcp_proxy.policy import (
     PolicyConfig,
@@ -333,7 +336,11 @@ def decide(payload: Mapping[str, Any], engine: PolicyEngine, *, workspace: Path)
     return HookDecision("deny", "risky_blocked", context, evaluation)
 
 
-def format_cursor_hook_response(decision: HookDecision) -> dict[str, str]:
+def format_cursor_hook_response(
+    decision: HookDecision,
+    *,
+    redirect_origin: NativeRedirectOrigin | None = None,
+) -> dict[str, Any]:
     if decision.hook_action == "allow":
         return {"permission": "allow"}
     agent_message = NATIVE_REDIRECT_INSTRUCTION
@@ -343,11 +350,12 @@ def format_cursor_hook_response(decision: HookDecision) -> dict[str, str]:
             f"(reason_code={decision.reason_code}). "
             f"{NATIVE_REDIRECT_INSTRUCTION}"
         )
-    return {
+    response: dict[str, Any] = {
         "permission": "deny",
         "user_message": "AgentVeil denied this native action before it ran.",
-        "agent_message": agent_message,
+        "agent_message": format_native_redirect_agent_surface(agent_message, redirect_origin),
     }
+    return response
 
 
 def _bounded_input_ref(tool_input: Any) -> dict[str, Any]:
@@ -396,6 +404,7 @@ def process_hook(
     workspace: Path,
     config: ProxyConfig | None = None,
     evidence_path: Path | None = None,
+    home: Path | None = None,
     out: Any = None,
 ) -> HookDecision:
     config = config or default_proxy_config_for_hook()
@@ -403,7 +412,17 @@ def process_hook(
     decision = decide(payload, engine, workspace=workspace)
     if evidence_path is not None:
         write_evidence(build_evidence_record(payload, decision), evidence_path)
-    response = format_cursor_hook_response(decision)
+    tool_input = payload.get("tool_input") or payload.get("arguments") or {}
+    redirect_origin = maybe_register_native_redirect_for_hook_deny(
+        hook_action=decision.hook_action,
+        native_server=decision.context.server,
+        native_tool=decision.context.tool,
+        action_family=decision.context.action_family or "",
+        risk_class=decision.evaluation.risk_class.value,
+        tool_input=tool_input if isinstance(tool_input, Mapping) else {},
+        home=home,
+    )
+    response = format_cursor_hook_response(decision, redirect_origin=redirect_origin)
     if out is None:
         out = sys.stdout
     out.write(json.dumps(response) + "\n")
@@ -435,7 +454,14 @@ def main(argv: list[str] | None = None, *, stdin: Any = None, stdout: Any = None
     normalized = normalize_hook_payload(payload, hook_event_hint=str(hook_event) if hook_event else None)
     workspace = Path(args.workspace).resolve()
     evidence_path = Path(args.evidence_path) if args.evidence_path else None
-    process_hook(normalized, workspace=workspace, evidence_path=evidence_path, out=out_stream)
+    home = Path(args.home).resolve() if args.home else None
+    process_hook(
+        normalized,
+        workspace=workspace,
+        evidence_path=evidence_path,
+        home=home,
+        out=out_stream,
+    )
     return 0
 
 

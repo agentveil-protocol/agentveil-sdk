@@ -30,14 +30,21 @@ from agentveil_mcp_proxy.evidence.events_show import (
 from agentveil_mcp_proxy.evidence.observability import (
     approval_proof_detail_rows,
     approval_raw_evidence_rows,
+    approval_remaining_seconds,
     bounded_action_display,
     bounded_reason_for_record,
     bounded_resource_display,
+    format_approval_remaining_time,
     human_approval_reason_label,
     human_approval_summary,
     pending_approval_dict,
+    rich_approval_action_summary_rows,
+    rich_ordinary_card_title,
+    rich_redirect_card_summary,
+    rich_redirect_card_title,
     risk_class_plain_label,
     terminal_state_for_record_status,
+    verified_redirect_projection_rows,
 )
 from agentveil_mcp_proxy.evidence.store import ApprovalStatus
 
@@ -115,6 +122,18 @@ def _owner_claim_path(claim_dir: Path, pid: int, instance_token: str) -> Path:
     return claim_dir / f"{int(pid)}-{safe_token}.claim"
 
 
+_PROCESS_HELD_OWNER_CLAIMS: dict[str, dict[str, Any]] = {}
+_WINDOWS_OWNER_CLAIM_LOCK_OFFSET = 1024 * 1024
+
+
+def _owner_claim_registry_key(path: Path) -> str:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    return os.path.normcase(str(resolved))
+
+
 def _try_exclusive_claim_lock(fh: Any) -> bool:
     """Return True when an exclusive non-blocking lock was acquired."""
 
@@ -122,7 +141,9 @@ def _try_exclusive_claim_lock(fh: Any) -> bool:
         import msvcrt
 
         try:
-            fh.seek(0)
+            # Keep the byte-range lease outside the bounded JSON payload so a
+            # separate hook process can read the claim while the owner is live.
+            fh.seek(_WINDOWS_OWNER_CLAIM_LOCK_OFFSET)
             msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
             return True
         except OSError:
@@ -143,7 +164,7 @@ def _release_claim_lock(fh: Any) -> None:
         import msvcrt
 
         try:
-            fh.seek(0)
+            fh.seek(_WINDOWS_OWNER_CLAIM_LOCK_OFFSET)
             msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
         except OSError:
             pass
@@ -177,6 +198,7 @@ class OwnerClaimLease:
                 fh.close()
             except OSError:
                 pass
+        _PROCESS_HELD_OWNER_CLAIMS.pop(_owner_claim_registry_key(self.path), None)
         try:
             self.path.unlink()
         except OSError:
@@ -222,6 +244,7 @@ def publish_owner_claim(
         except OSError:
             pass
         raise
+    _PROCESS_HELD_OWNER_CLAIMS[_owner_claim_registry_key(path)] = dict(payload)
     return OwnerClaimLease(path=path, _fh=fh)
 
 
@@ -252,21 +275,33 @@ def read_owner_claim(
         raw = path.read_text(encoding="utf-8")
         payload = json.loads(raw)
     except (OSError, json.JSONDecodeError):
-        return None
+        payload = _PROCESS_HELD_OWNER_CLAIMS.get(_owner_claim_registry_key(path))
+        if payload is None:
+            return None
     if not isinstance(payload, dict):
         return None
+    claim_pid = payload.get("pid")
     token = payload.get("instance_token")
     session_id = payload.get("session_id")
+    if not isinstance(claim_pid, int) or claim_pid != int(pid):
+        return None
     if not isinstance(token, str) or not token:
         return None
     if not isinstance(session_id, str) or not session_id:
         return None
-    return {"instance_token": token, "session_id": session_id, "path": path}
+    return {
+        "pid": claim_pid,
+        "instance_token": token,
+        "session_id": session_id,
+        "path": path,
+    }
 
 
 def owner_claim_lease_is_held(path: Path) -> bool:
     """Return True only when another process currently holds the claim lock."""
 
+    if _owner_claim_registry_key(path) in _PROCESS_HELD_OWNER_CLAIMS:
+        return True
     try:
         fh = path.open("a+", encoding="utf-8")
     except OSError:
@@ -1230,10 +1265,12 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
             self._send_html(HTTPStatus.GONE, self._render_terminal(snapshot))
             return
         if prompt is not None:
+            script_nonce = generate_approval_script_nonce()
             self._send_html(
                 HTTPStatus.OK,
-                self._render_prompt(prompt),
+                self._render_prompt(prompt, script_nonce=script_nonce),
                 extra_headers={"Set-Cookie": self._session_cookie_header()},
+                script_nonce=script_nonce,
             )
             store = self.server_owner.evidence_store
             if store is not None:
@@ -1480,19 +1517,124 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
             "</article>"
         )
 
-    def _render_prompt(self, prompt: ApprovalPrompt) -> str:
-        token = self.server_owner.session_token
-        summary = human_approval_summary(
-            tool_name=prompt.tool_name,
-            resource_display=prompt.resource_display,
+    def _verified_redirect_projection_rows(
+        self,
+        prompt: ApprovalPrompt,
+    ) -> tuple[tuple[str, str], ...] | None:
+        from agentveil_mcp_proxy.evidence.store import ApprovalEvidenceError
+
+        store = self.server_owner.evidence_store
+        if store is None:
+            return None
+        try:
+            record = store.get_pending(prompt.request_id)
+            if record is None:
+                return None
+            return verified_redirect_projection_rows(record, store=store)
+        except ApprovalEvidenceError:
+            return None
+
+    @staticmethod
+    def _render_definition_list(
+        rows: tuple[tuple[str, str], ...],
+        *,
+        css_class: str = "approval-detail",
+    ) -> str:
+        items = "".join(
+            f"<dt>{escape(label)}</dt><dd>{escape(value)}</dd>"
+            for label, value in rows
         )
-        risk_label = risk_class_plain_label(prompt.risk_class)
+        return f'<dl class="{css_class}">{items}</dl>'
+
+    def _render_verified_redirect_context_section(
+        self,
+        rows: tuple[tuple[str, str], ...],
+    ) -> str:
+        return (
+            '<section class="approval-redirect-context">'
+            "<h2>Redirect context</h2>"
+            f'{self._render_definition_list(rows)}'
+            "</section>"
+        )
+
+    @staticmethod
+    def _approval_countdown_script(script_nonce: str) -> str:
+        return (
+            f'<script nonce="{escape(script_nonce)}">\n'
+            "(function () {\n"
+            "  var root = document.getElementById('approval-countdown');\n"
+            "  if (!root) return;\n"
+            "  var expiresAt = parseInt(root.getAttribute('data-expires-at'), 10);\n"
+            "  var form = document.querySelector('.approval-decision-form');\n"
+            "  function disableControls() {\n"
+            "    if (!form) return;\n"
+            "    form.querySelectorAll('button').forEach(function (button) {\n"
+            "      button.disabled = true;\n"
+            "    });\n"
+            "  }\n"
+            "  function formatRemaining(seconds) {\n"
+            "    if (seconds <= 0) return 'Approval time expired';\n"
+            "    var minutes = Math.floor(seconds / 60);\n"
+            "    var remainder = seconds % 60;\n"
+            "    if (minutes) return minutes + 'm ' + String(remainder).padStart(2, '0') + 's remaining';\n"
+            "    return remainder + 's remaining';\n"
+            "  }\n"
+            "  function tick() {\n"
+            "    var remaining = expiresAt - Math.floor(Date.now() / 1000);\n"
+            "    root.textContent = formatRemaining(remaining);\n"
+            "    if (remaining <= 0) {\n"
+            "      root.classList.add('approval-countdown--expired');\n"
+            "      disableControls();\n"
+            "      return;\n"
+            "    }\n"
+            "  }\n"
+            "  tick();\n"
+            "  window.setInterval(tick, 1000);\n"
+            "})();\n"
+            "</script>"
+        )
+
+    def _render_prompt(self, prompt: ApprovalPrompt, *, script_nonce: str) -> str:
+        redirect_rows = self._verified_redirect_projection_rows(prompt)
+        is_redirected = redirect_rows is not None
+        if is_redirected:
+            title = rich_redirect_card_title()
+            summary = rich_redirect_card_summary()
+        else:
+            title = rich_ordinary_card_title(prompt.tool_name)
+            summary = human_approval_summary(
+                tool_name=prompt.tool_name,
+                resource_display=prompt.resource_display,
+            )
         reason_label = human_approval_reason_label(prompt.reason)
-        title = f"Review: {prompt.tool_name}"
+        token = self.server_owner.session_token
         back_link = (
             f'<p class="approval-back"><a href="/approval/{escape(token)}">'
             "&larr; Back to pending list</a></p>"
         )
+        action_rows = rich_approval_action_summary_rows(
+            is_redirected=is_redirected,
+            tool_name=prompt.tool_name,
+            resource_display=prompt.resource_display,
+            risk_class=prompt.risk_class,
+            action_details=prompt.action_details,
+        )
+        action_summary = (
+            '<section class="approval-action-summary">'
+            "<h2>Action summary</h2>"
+            f'{self._render_definition_list(action_rows)}'
+            "</section>"
+        )
+        redirect_context = ""
+        if is_redirected and redirect_rows is not None:
+            redirect_context = self._render_verified_redirect_context_section(redirect_rows)
+        remaining_seconds = approval_remaining_seconds(prompt.expires_at)
+        countdown_label = format_approval_remaining_time(remaining_seconds)
+        countdown = (
+            f'<p id="approval-countdown" class="approval-countdown" '
+            f'data-expires-at="{prompt.expires_at}">{escape(countdown_label)}</p>'
+        )
+        approve_label = "Approve exact action" if is_redirected else "Approve"
         detail = ""
         if prompt.action_details or prompt.resource_details:
             detail_items = []
@@ -1542,20 +1684,32 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
             f"<dt>{escape(label)}</dt><dd>{escape(value)}</dd>"
             for label, value in raw_rows
         )
+        detail_class = "approval-rich-detail approval-rich-detail--redirected" if is_redirected else "approval-rich-detail"
+        reason_html = (
+            f'<p class="approval-reason">{escape(reason_label)}</p>'
+            if not is_redirected
+            else ""
+        )
         body = f"""
+<div class="{detail_class}">
 {back_link}
-<p class="approval-summary">{escape(summary)}</p>
-<p class="approval-reason">{escape(reason_label)}</p>
-<dl class="approval-detail">
-<dt>Tool</dt><dd>{escape(prompt.tool_name)}</dd>
-<dt>Target</dt><dd>{escape(prompt.resource_display or "none")}</dd>
-<dt>Risk</dt><dd>{escape(risk_label)}</dd>
-</dl>
-<form method=\"post\">
-<input type=\"hidden\" name=\"csrf_token\" value=\"{escape(prompt.csrf_token)}\">
-<input type=\"hidden\" name=\"approval_scope\" value=\"exact\">
-<button type=\"submit\" name=\"decision\" value=\"approve\">Approve</button>
-<button type=\"submit\" name=\"decision\" value=\"deny\">Deny</button>
+<div class="approval-rich-header">
+  <div class="approval-rich-header-main">
+    <h1>{escape(title)}</h1>
+    <p class="approval-summary">{escape(summary)}</p>
+    {reason_html}
+  </div>
+</div>
+<div class="approval-rich-grid">
+{action_summary}
+{redirect_context}
+</div>
+{countdown}
+<form class="approval-decision-form" method="post">
+<input type="hidden" name="csrf_token" value="{escape(prompt.csrf_token)}">
+<input type="hidden" name="approval_scope" value="exact">
+<button type="submit" name="decision" value="approve">{escape(approve_label)}</button>
+<button type="submit" name="decision" value="deny" class="approval-deny">Deny</button>
 </form>
 <p class="approval-decision-note">{escape(LOCAL_PROOF_PENDING_QUIET_LINE)}</p>
 {similar}
@@ -1572,8 +1726,16 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
 {detail}
 </details>
 </details>
+</div>
+{self._approval_countdown_script(script_nonce)}
 """
-        return self._page(title, body, page_kind="detail")
+        return self._page(
+            title,
+            body,
+            page_kind="detail",
+            include_page_title=False,
+            include_rich_detail_styles=True,
+        )
 
     def _security_notice_html(self) -> str:
         return (
@@ -1587,6 +1749,7 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
         *,
         include_card_styles: bool = True,
         include_local_proof_styles: bool = False,
+        include_rich_detail_styles: bool = False,
     ) -> str:
         card_styles = """
 .approval-cards { display: flex; flex-direction: column; gap: 8px; }
@@ -1620,6 +1783,21 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
   color: var(--muted);
   word-break: break-word;
   overflow-wrap: anywhere;
+}
+.approval-redirect-context {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid rgba(46, 160, 67, 0.35);
+  border-radius: 8px;
+  background: rgba(46, 160, 67, 0.08);
+}
+.approval-redirect-context h2 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: none;
+  color: #2ea043;
 }
 .approval-meta {
   margin: 0 0 8px;
@@ -1660,6 +1838,71 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
 }
 .approval-button:hover { background: var(--button-bg-hover); }
 """ if include_card_styles else ""
+        rich_detail_styles = """
+.approval-rich-detail { max-width: 960px; }
+.approval-rich-header {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  margin: 0 0 16px;
+}
+.approval-rich-header-main { flex: 1 1 280px; min-width: 0; }
+.approval-rich-header h1 {
+  margin: 0 0 8px;
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1.25;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+.approval-rich-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 16px;
+  margin: 0 0 16px;
+}
+.approval-rich-detail:not(.approval-rich-detail--redirected) .approval-rich-grid {
+  grid-template-columns: minmax(0, 1fr);
+}
+.approval-action-summary,
+.approval-redirect-context {
+  min-width: 0;
+}
+.approval-action-summary h2 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: none;
+  color: var(--text);
+}
+.approval-countdown {
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.approval-countdown--expired {
+  color: #cf222e;
+  font-weight: 600;
+}
+.approval-decision-form { margin: 0 0 12px; }
+button.approval-deny {
+  border-color: rgba(207, 34, 46, 0.35);
+  background: rgba(207, 34, 46, 0.12);
+  color: #cf222e;
+}
+@media (max-width: 720px) {
+  .approval-rich-grid { grid-template-columns: minmax(0, 1fr); }
+}
+@media (prefers-color-scheme: light) {
+  button.approval-deny {
+    border-color: rgba(207, 34, 46, 0.35);
+    background: rgba(207, 34, 46, 0.08);
+  }
+}
+""" if include_rich_detail_styles else ""
         return f"""
 <style>
 :root {{
@@ -1727,7 +1970,7 @@ h1 {{ font-size: 16px; font-weight: 600; margin: 0 0 12px; color: var(--text); }
   font-size: 12px;
   line-height: 1.4;
 }}
-{self._local_proof_block_styles() if include_local_proof_styles else ""}{card_styles}.approval-back {{ margin: 0 0 12px; font-size: 12px; }}
+{self._local_proof_block_styles() if include_local_proof_styles else ""}{card_styles}{rich_detail_styles}.approval-back {{ margin: 0 0 12px; font-size: 12px; }}
 .approval-back a {{ color: var(--link); text-decoration: none; }}
 dl {{ margin: 0 0 12px; }}
 dt {{ color: var(--label); font-size: 11px; text-transform: uppercase; }}
@@ -1818,11 +2061,14 @@ details {{ margin: 8px 0 12px; }}
         page_kind: str = "plain",
         include_card_styles: bool = True,
         include_local_proof_styles: bool = False,
+        include_rich_detail_styles: bool = False,
+        include_page_title: bool = True,
     ) -> str:
         styles = (
             self._approval_page_styles(
                 include_card_styles=include_card_styles,
                 include_local_proof_styles=include_local_proof_styles,
+                include_rich_detail_styles=include_rich_detail_styles,
             )
             if page_kind in {"dashboard", "detail"}
             else ""
@@ -1832,10 +2078,11 @@ details {{ margin: 8px 0 12px; }}
             if page_kind in {"dashboard", "detail"}
             else ""
         )
+        heading = f"<h1>{escape(title)}</h1>" if include_page_title else ""
         return (
             "<!doctype html><html><head><meta charset=\"utf-8\">"
             f"<title>{escape(title)}</title>{styles}</head>"
-            f"<body>{notice}<h1>{escape(title)}</h1>{body}</body></html>"
+            f"<body>{notice}{heading}{body}</body></html>"
         )
 
     def _send_redirect(

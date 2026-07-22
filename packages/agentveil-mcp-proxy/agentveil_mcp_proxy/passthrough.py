@@ -49,7 +49,12 @@ from agentveil_mcp_proxy.classification import (
     infer_risk_class,
     sha256_jcs,
 )
-from agentveil_mcp_proxy.evidence import ApprovalEvidenceError, ApprovalStatus
+from agentveil_mcp_proxy.evidence import (
+    ApprovalEvidenceDuplicateError,
+    ApprovalEvidenceError,
+    ApprovalEvidenceTransitionError,
+    ApprovalStatus,
+)
 from agentveil_mcp_proxy.evidence.events_show import (
     DEFAULT_SHOW_LAST,
     LOCAL_PROOF_AGENT_INSPECTION_HINT,
@@ -58,9 +63,18 @@ from agentveil_mcp_proxy.evidence.events_show import (
     render_local_proof_mcp_content,
 )
 from agentveil_mcp_proxy.client_config import downstream_startup_fingerprint
+from agentveil_mcp_proxy.client_guidance import (
+    build_hook_runtime_binding,
+    clear_hook_runtime_binding,
+    resolve_proxy_home,
+    trusted_project_workspace_root_from_downstream,
+    write_hook_runtime_binding,
+)
 from agentveil_mcp_proxy.evidence.observability import (
+    build_verified_redirect_lineage_fields,
     classify_downstream_response,
     parse_action_gate_metadata,
+    parse_redirect_automation_metadata,
     redirect_original_record_valid,
 )
 from agentveil_mcp_proxy.instruction_file_guard import (
@@ -74,6 +88,9 @@ from agentveil_mcp_proxy.instruction_file_guard import (
 from agentveil_mcp_proxy.package_manager_guard import package_manager_action_reason
 from agentveil_mcp_proxy.role_doctor import (
     INVALID_REDIRECT_CONTEXT,
+    REDIRECT_LINEAGE_MAX_AGE_SECONDS,
+    canonical_project_workspace_root_hash,
+    REDIRECT_LINEAGE_STATUS_VERIFIED,
     REDIRECT_ROLE_FOLLOW_UP,
     REDIRECT_ROLE_ORIGINAL,
     UNSUPPORTED_REDIRECT_PLAYBOOK,
@@ -83,9 +100,13 @@ from agentveil_mcp_proxy.role_doctor import (
     build_deny_guidance,
     enrich_error_data,
     parse_redirect_context,
+    playbook_spec,
+    project_scope_fingerprint,
+    redirect_original_is_fresh,
     redirect_playbook_id_for_classification,
     strip_redirect_context,
     validate_follow_up_redirect,
+    verify_redirect_lineage_facts,
 )
 from agentveil_mcp_proxy.persistence_path_guard import (
     is_filesystem_mutation_tool,
@@ -1293,6 +1314,7 @@ class McpPassthrough:
                     close()
                 except Exception:
                     pass
+        self._clear_hook_runtime_binding()
         self._stopping = True
         proc = self.process
         if proc is None:
@@ -1351,6 +1373,23 @@ class McpPassthrough:
         self._request_local.redirect_context = value
 
     @property
+    def _active_redirect_lineage_proof(self) -> dict[str, Any] | None:
+        value = getattr(self._request_local, "redirect_lineage_proof", None)
+        return value if isinstance(value, dict) else None
+
+    @_active_redirect_lineage_proof.setter
+    def _active_redirect_lineage_proof(self, value: dict[str, Any] | None) -> None:
+        self._request_local.redirect_lineage_proof = value
+
+    @property
+    def _active_redirect_lineage_claimed(self) -> bool:
+        return bool(getattr(self._request_local, "redirect_lineage_claimed", False))
+
+    @_active_redirect_lineage_claimed.setter
+    def _active_redirect_lineage_claimed(self, value: bool) -> None:
+        self._request_local.redirect_lineage_claimed = bool(value)
+
+    @property
     def _bound_downstream_generation(self) -> int | None:
         value = getattr(self._request_local, "downstream_generation", None)
         return value if isinstance(value, int) else None
@@ -1373,6 +1412,7 @@ class McpPassthrough:
 
         self._notification_writer = lambda message: self._write_client(client_out, message)
         self.start()
+        self._publish_hook_runtime_binding()
         worker_count = max(2, int(self._stdio_worker_count))
         queue_maxsize = max(1, int(self._stdio_queue_maxsize))
         diagnostic_queue: queue.Queue[str | None] = queue.Queue(maxsize=queue_maxsize)
@@ -1637,6 +1677,12 @@ class McpPassthrough:
                 return cancelled_responses
             if policy_error is not None:
                 return [policy_error] if has_id else []
+            claim_error = self._finalize_redirect_lineage_claim(
+                request_id,
+                classification,
+            )
+            if claim_error is not None:
+                return [claim_error] if has_id else []
             if (
                 approval_outcome is not None
                 and approval_outcome.approved
@@ -1745,6 +1791,8 @@ class McpPassthrough:
             return [_downstream_unavailable_error(request_id)]
         finally:
             self._active_redirect_context = None
+            self._active_redirect_lineage_proof = None
+            self._active_redirect_lineage_claimed = False
             self._current_tool_arguments = None
             self._bound_downstream_generation = None
 
@@ -2104,9 +2152,16 @@ class McpPassthrough:
         message: Mapping[str, Any],
         request_id: Any,
     ) -> dict[str, Any] | None:
-        """Validate redirect_context on follow-up tools/call requests."""
+        """Candidate-validate redirect_context without consuming the lineage.
+
+        Final atomic claim happens later via ``_finalize_redirect_lineage_claim``
+        only after schema/path/control/downstream/instruction/persistence/package
+        and local policy gates have passed.
+        """
 
         self._active_redirect_context = None
+        self._active_redirect_lineage_proof = None
+        self._active_redirect_lineage_claimed = False
         if message.get("method") != "tools/call":
             return None
         params = message.get("params")
@@ -2151,7 +2206,295 @@ class McpPassthrough:
                 reason=INVALID_REDIRECT_CONTEXT,
                 message="invalid redirect_context",
             )
+        manager = self.approval_manager
+        follow_up_session_id = getattr(manager, "session_id", None)
+        follow_up_client_id = getattr(manager, "client_id", None)
+        if not isinstance(follow_up_session_id, str) or not follow_up_session_id:
+            return self._redirect_context_error_response(
+                request_id,
+                reason=INVALID_REDIRECT_CONTEXT,
+                message="invalid redirect_context",
+            )
+        stripped_args = strip_redirect_context(arguments)
+        follow_classification = None
+        if self.classifier is not None:
+            follow_classification = self.classifier.classify(
+                tool=tool,
+                arguments=stripped_args,
+            )
+        follow_resource_hash = (
+            follow_classification.resource_hash if follow_classification is not None else None
+        )
+        follow_downstream = (
+            follow_classification.server
+            if follow_classification is not None
+            else getattr(self.downstream, "name", "")
+        )
+        follow_action_family = (
+            follow_classification.action_family if follow_classification is not None else None
+        )
+        spec = playbook_spec(context.redirect_playbook_id)
+        original_meta = parse_redirect_automation_metadata(original) or {}
+        now_timestamp = int(time.time())
+        already_claimed = store.get_redirect_lineage_claim(context.original_request_id) is not None
+        follow_scope = self._current_project_scope_fingerprint(
+            downstream_server=str(follow_downstream or ""),
+        )
+        original_scope = self._project_scope_from_record(original, original_meta)
+        lineage_error = verify_redirect_lineage_facts(
+            original_redirect_role=original_meta.get("redirect_role"),
+            original_playbook_id=original_meta.get("redirect_playbook_id"),
+            claimed_playbook_id=context.redirect_playbook_id,
+            target_reached=original_meta.get("target_reached"),
+            original_status=original.status,
+            original_client_id=original.client_id,
+            follow_up_client_id=follow_up_client_id if isinstance(follow_up_client_id, str) else None,
+            original_session_id=original.session_id,
+            follow_up_session_id=follow_up_session_id,
+            original_downstream_server=original.downstream_server,
+            follow_up_downstream_server=str(follow_downstream or ""),
+            original_project_scope=original_scope,
+            follow_up_project_scope=follow_scope,
+            original_resource_hash=original.resource_hash,
+            follow_up_resource_hash=follow_resource_hash,
+            playbook_target_bound=bool(spec.target_bound) if spec is not None else True,
+            created_at=original.created_at,
+            expires_at=original.expires_at,
+            now_timestamp=now_timestamp,
+            already_claimed=already_claimed,
+        )
+        if lineage_error is not None:
+            return self._redirect_context_error_response(
+                request_id,
+                reason=lineage_error,
+                message="invalid redirect_context",
+            )
+        assert follow_scope is not None
+        original_action_family = original_meta.get("action_family")
+        if not isinstance(original_action_family, str):
+            original_action_family = original.action_class
+        intent_relationship = (
+            "resource_identity_preserved"
+            if spec is not None and spec.target_bound
+            else "explicit_playbook_transition"
+        )
+        lineage_proof = build_verified_redirect_lineage_fields(
+            original_request_id=context.original_request_id,
+            redirect_playbook_id=context.redirect_playbook_id,
+            original_action_family=original_action_family,
+            follow_up_action_family=follow_action_family,
+            project_scope_fingerprint=follow_scope,
+            intent_relationship=intent_relationship,
+            verified_at=now_timestamp,
+            freshness_ok=redirect_original_is_fresh(
+                created_at=original.created_at,
+                expires_at=original.expires_at,
+                now_timestamp=now_timestamp,
+            ),
+        )
+        lineage_proof["_expected_prev_event_hash"] = original.prev_event_hash
+        lineage_proof["_expected_resource_hash"] = follow_resource_hash
+        lineage_proof["_expected_downstream_server"] = str(follow_downstream or "")
+        lineage_proof["_playbook_target_bound"] = bool(spec.target_bound) if spec is not None else True
         self._active_redirect_context = context
+        self._active_redirect_lineage_proof = lineage_proof
+        return None
+
+    def _trusted_project_workspace_root(self) -> Path | None:
+        """Return a provable project workspace root, or None when unknown."""
+
+        downstream = dict(self._downstream_config_mapping())
+        if not downstream:
+            downstream = {
+                "name": self.downstream.name,
+                "command": self.downstream.command,
+                "args": list(self.downstream.args),
+            }
+        else:
+            downstream.setdefault("name", self.downstream.name)
+            downstream.setdefault("command", self.downstream.command)
+            downstream.setdefault("args", list(self.downstream.args))
+        env = getattr(self.downstream, "env", None)
+        if isinstance(env, Mapping) and "env" not in downstream:
+            downstream["env"] = dict(env)
+        return trusted_project_workspace_root_from_downstream(downstream)
+
+    def _publish_hook_runtime_binding(self) -> None:
+        """Publish bounded runtime facts for one live proxy owner claim."""
+
+        manager = self.approval_manager
+        if manager is None:
+            return
+        store = self._controlled_path_store()
+        if store is None:
+            return
+        session_id = getattr(manager, "session_id", None)
+        client_id = getattr(manager, "client_id", None)
+        instance_token = getattr(manager, "_instance_token", None)
+        if not isinstance(session_id, str) or not session_id.strip():
+            return
+        if not isinstance(client_id, str) or not client_id.strip():
+            return
+        if not isinstance(instance_token, str) or not instance_token.strip():
+            return
+        downstream = self._downstream_config_mapping()
+        if not downstream:
+            downstream = {
+                "name": self.downstream.name,
+                "command": self.downstream.command,
+                "args": list(self.downstream.args),
+            }
+        else:
+            downstream = dict(downstream)
+            downstream.setdefault("name", self.downstream.name)
+            downstream.setdefault("command", self.downstream.command)
+            downstream.setdefault("args", list(self.downstream.args))
+        env = getattr(self.downstream, "env", None)
+        if isinstance(env, Mapping) and "env" not in downstream:
+            downstream["env"] = dict(env)
+        binding = build_hook_runtime_binding(
+            owner_pid=os.getpid(),
+            instance_token=instance_token,
+            session_id=session_id,
+            client_id=client_id,
+            downstream=downstream,
+        )
+        if binding is None:
+            return
+        proxy_home = resolve_proxy_home(home=store.db_path.parent.parent)
+        if proxy_home is None:
+            return
+        write_hook_runtime_binding(proxy_home, binding)
+
+    def _clear_hook_runtime_binding(self) -> None:
+        manager = self.approval_manager
+        store = self._controlled_path_store()
+        if manager is None or store is None:
+            return
+        instance_token = getattr(manager, "_instance_token", None)
+        if not isinstance(instance_token, str) or not instance_token.strip():
+            return
+        proxy_home = resolve_proxy_home(home=store.db_path.parent.parent)
+        if proxy_home is None:
+            return
+        clear_hook_runtime_binding(
+            proxy_home,
+            owner_pid=os.getpid(),
+            instance_token=instance_token,
+        )
+
+    def _project_workspace_root_hash(self) -> str | None:
+        return canonical_project_workspace_root_hash(self._trusted_project_workspace_root())
+
+    def _current_project_scope_fingerprint(self, *, downstream_server: str) -> str | None:
+        return project_scope_fingerprint(
+            downstream_server=downstream_server,
+            downstream_startup_fingerprint=self._downstream_startup_fingerprint(),
+            project_workspace_root_hash=self._project_workspace_root_hash(),
+        )
+
+    def _project_scope_from_record(
+        self,
+        record: Any,
+        metadata: Mapping[str, Any] | None,
+    ) -> str | None:
+        if isinstance(metadata, Mapping):
+            explicit = metadata.get("project_scope_fingerprint")
+            if isinstance(explicit, str) and explicit:
+                return explicit
+            facts = metadata.get("session_bound_facts")
+            if isinstance(facts, dict):
+                startup = facts.get("downstream_startup_fingerprint")
+                workspace_root_hash = facts.get("project_workspace_root_hash")
+                server = getattr(record, "downstream_server", None)
+                if (
+                    isinstance(server, str)
+                    and isinstance(startup, str)
+                    and isinstance(workspace_root_hash, str)
+                ):
+                    return project_scope_fingerprint(
+                        downstream_server=server,
+                        downstream_startup_fingerprint=startup,
+                        project_workspace_root_hash=workspace_root_hash,
+                    )
+        return None
+
+    def _finalize_redirect_lineage_claim(
+        self,
+        request_id: Any,
+        classification: ClassifiedToolCall | None,
+    ) -> dict[str, Any] | None:
+        """Atomically consume redirect lineage after pre-approval gates pass."""
+
+        context = self._active_redirect_context
+        proof = self._active_redirect_lineage_proof
+        if context is None or proof is None:
+            return None
+        if self._active_redirect_lineage_claimed:
+            return None
+        store = self._controlled_path_store()
+        manager = self.approval_manager
+        if store is None or manager is None:
+            return self._redirect_context_error_response(
+                request_id,
+                reason=INVALID_REDIRECT_CONTEXT,
+                message="invalid redirect_context",
+            )
+        follow_up_request_id = (
+            str(request_id) if request_id is not None else f"redirect-follow-{uuid.uuid4()}"
+        )
+        scope_fp = proof.get("project_scope_fingerprint")
+        if not isinstance(scope_fp, str) or not scope_fp:
+            return self._redirect_context_error_response(
+                request_id,
+                reason=INVALID_REDIRECT_CONTEXT,
+                message="invalid redirect_context",
+            )
+        resource_hash = proof.get("_expected_resource_hash")
+        if classification is not None and classification.resource_hash is not None:
+            resource_hash = classification.resource_hash
+        downstream_server = proof.get("_expected_downstream_server")
+        if classification is not None:
+            downstream_server = classification.server
+        try:
+            store.claim_redirect_lineage(
+                context.original_request_id,
+                follow_up_request_id=follow_up_request_id,
+                claimed_at=int(time.time()),
+                redirect_playbook_id=context.redirect_playbook_id,
+                project_scope_fingerprint=scope_fp,
+                expected_session_id=str(manager.session_id),
+                expected_client_id=manager.client_id if isinstance(manager.client_id, str) else None,
+                expected_downstream_server=str(downstream_server or ""),
+                expected_resource_hash=resource_hash if isinstance(resource_hash, str) else None,
+                expected_prev_event_hash=proof.get("_expected_prev_event_hash"),
+                playbook_target_bound=bool(proof.get("_playbook_target_bound", True)),
+                max_age_seconds=REDIRECT_LINEAGE_MAX_AGE_SECONDS,
+            )
+        except ApprovalEvidenceDuplicateError:
+            return self._redirect_context_error_response(
+                request_id,
+                reason=INVALID_REDIRECT_CONTEXT,
+                message="invalid redirect_context",
+            )
+        except (ApprovalEvidenceTransitionError, ApprovalEvidenceError):
+            return self._redirect_context_error_response(
+                request_id,
+                reason=INVALID_REDIRECT_CONTEXT,
+                message="invalid redirect_context",
+            )
+        self._active_redirect_lineage_claimed = True
+        # Drop internal CAS helpers from the public evidence surface.
+        for key in (
+            "_expected_prev_event_hash",
+            "_expected_resource_hash",
+            "_expected_downstream_server",
+            "_playbook_target_bound",
+        ):
+            proof.pop(key, None)
+        proof["lineage_status"] = REDIRECT_LINEAGE_STATUS_VERIFIED
+        proof["lineage_verified_at"] = int(time.time())
+        self._active_redirect_lineage_proof = proof
         return None
 
     def _tool_surface_error_response(
@@ -3574,6 +3917,12 @@ class McpPassthrough:
                 classification=classification,
                 enrich_guidance=enrich_guidance,
             )), None
+        claim_error = self._finalize_redirect_lineage_claim(
+            request_id,
+            classification,
+        )
+        if claim_error is not None:
+            return _with_risk_metadata(claim_error), None
         try:
             outcome = self.approval_manager.request_approval(
                 classification,
@@ -3794,6 +4143,7 @@ class McpPassthrough:
             risk_class=classification.risk_class.value,
             tool_schema_fingerprint=self._tool_schemas.fingerprint(classification.tool),
             downstream_startup_fingerprint=self._downstream_startup_fingerprint(),
+            project_workspace_root_hash=self._project_workspace_root_hash(),
             approval_id=approval_id,
             expires_at=expires_at,
             approval_actor_ref=self._approval_actor_ref(),
@@ -4027,6 +4377,31 @@ class McpPassthrough:
             },
         )
 
+    def _apply_verified_lineage_metadata(self, metadata: dict[str, Any]) -> dict[str, Any]:
+        """Attach bounded verified lineage facts to follow-up evidence metadata."""
+
+        if not self._active_redirect_lineage_claimed:
+            return metadata
+        proof = self._active_redirect_lineage_proof
+        if not proof:
+            return metadata
+        for key in (
+            "lineage_status",
+            "original_request_id",
+            "redirect_parent_request_id",
+            "redirect_playbook_id",
+            "original_action_family",
+            "follow_up_action_family",
+            "project_scope_fingerprint",
+            "intent_relationship",
+            "lineage_verified_at",
+            "lineage_freshness_ok",
+        ):
+            if key in proof:
+                metadata[key] = proof[key]
+        metadata.setdefault("lineage_status", REDIRECT_LINEAGE_STATUS_VERIFIED)
+        return metadata
+
     def _annotate_pending_controlled_path(
         self,
         classification: ClassifiedToolCall,
@@ -4054,6 +4429,7 @@ class McpPassthrough:
                 original_request_id=redirect_context.original_request_id,
                 **self._least_agency_metadata_fields(classification),
             )
+            metadata = self._apply_verified_lineage_metadata(metadata)
         else:
             metadata = build_redirect_automation_metadata(
                 fixture_id=self._controlled_path_fixture_id(classification),
@@ -4083,6 +4459,11 @@ class McpPassthrough:
             approval_id=outcome.request_id,
             expires_at=expires_at,
         )
+        scope_fp = self._current_project_scope_fingerprint(
+            downstream_server=classification.server,
+        )
+        if scope_fp is not None:
+            metadata["project_scope_fingerprint"] = scope_fp
         try:
             store.annotate_controlled_path_metadata(
                 outcome.request_id,
@@ -4139,6 +4520,7 @@ class McpPassthrough:
                 original_request_id=redirect_context.original_request_id,
                 **least_agency_fields,
             )
+            metadata = self._apply_verified_lineage_metadata(metadata)
         elif redirect_fields.get("redirect_role"):
             request_chain = redirect_fields.get("request_chain")
             if not isinstance(request_chain, list):
@@ -4231,6 +4613,7 @@ class McpPassthrough:
                 original_request_id=redirect_context.original_request_id,
                 **self._least_agency_metadata_fields(classification),
             )
+            metadata = self._apply_verified_lineage_metadata(metadata)
         else:
             metadata = build_redirect_automation_metadata(
                 fixture_id=self._controlled_path_fixture_id(classification),
@@ -4252,6 +4635,16 @@ class McpPassthrough:
                 **self._least_agency_metadata_fields(classification),
             )
         metadata["block_reason"] = block_reason
+        scope_fp = self._current_project_scope_fingerprint(
+            downstream_server=classification.server,
+        )
+        if scope_fp is not None:
+            metadata["project_scope_fingerprint"] = scope_fp
+        metadata["session_bound_facts"] = self._build_session_bound_facts(
+            classification,
+            approval_id=request_id_text,
+            expires_at=None,
+        )
         try:
             store.record_terminal_deny(
                 request_id=request_id_text,
@@ -4314,6 +4707,7 @@ class McpPassthrough:
                 original_request_id=redirect_context.original_request_id,
                 **self._least_agency_metadata_fields(classification),
             )
+            metadata = self._apply_verified_lineage_metadata(metadata)
         else:
             metadata = build_controlled_path_metadata(
                 fixture_id=self._controlled_path_fixture_id(classification),

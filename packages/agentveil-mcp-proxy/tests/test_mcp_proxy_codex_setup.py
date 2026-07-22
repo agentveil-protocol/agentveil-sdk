@@ -109,6 +109,7 @@ def test_setup_codex_writes_merge_safe_toml_and_is_idempotent(
     assert pre[0]["matcher"] == "Bash|apply_patch|Edit|Write|mcp__.*"
     command = pre[0]["hooks"][0]["command"]
     assert "-m agentveil_mcp_proxy.codex_hook" in command
+    assert "--home" in command
     assert "--evidence-path" in command
 
 
@@ -324,7 +325,8 @@ def test_command_ownership_requires_exact_module_invocation():
     from agentveil_mcp_proxy import codex_setup
 
     assert codex_setup.command_invokes_managed_hook(
-        "/usr/bin/python3 -m agentveil_mcp_proxy.codex_hook --evidence-path /tmp/e.jsonl"
+        "/usr/bin/python3 -m agentveil_mcp_proxy.codex_hook "
+        "--home /proj/.avp --evidence-path /tmp/e.jsonl"
     )
     assert not codex_setup.command_invokes_managed_hook(
         "echo mentions agentveil_mcp_proxy.codex_hook but is user-owned"

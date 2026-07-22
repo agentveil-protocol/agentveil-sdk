@@ -130,3 +130,61 @@ def test_codex_hook_accepts_camel_case_payload_shape():
     assert "SECRET_CONTENT" not in reason
     # claim-check: allow hook unit test asserts bounded local deny output.
     assert "Direct native tool use was blocked before mutation" in reason
+
+
+from agentveil_mcp_proxy.client_guidance import parse_redirect_context_from_codex_hook_output
+from redirect_hook_contract_fixtures import (
+    durable_original_metadata,
+    init_redirect_contract_home,
+    publish_live_hook_binding,
+)
+
+
+def test_codex_native_write_registers_durable_origin_and_agent_surface_context(tmp_path):
+    home, _sandbox, downstream = init_redirect_contract_home(tmp_path)
+    fixture = publish_live_hook_binding(home, downstream=downstream)
+    try:
+        out = io.StringIO()
+        codex_hook.process_hook(
+            _payload("Write", {"file_path": "note.txt", "content": "hello"}),
+            home=home,
+            out=out,
+        )
+        payload = json.loads(out.getvalue())
+        redirect_context = parse_redirect_context_from_codex_hook_output(payload)
+        assert redirect_context is not None
+        meta = durable_original_metadata(home, redirect_context["original_request_id"])
+        assert meta is not None
+        assert meta["redirect_role"] == "original"
+        assert meta["redirect_playbook_id"] == "request_approval"
+        assert "hello" not in json.dumps(payload)
+    finally:
+        fixture.lease.close()
+
+
+def test_codex_apply_patch_has_no_verified_redirect_context(tmp_path):
+    home, _sandbox, downstream = init_redirect_contract_home(tmp_path)
+    fixture = publish_live_hook_binding(home, downstream=downstream)
+    try:
+        out = io.StringIO()
+        codex_hook.process_hook(
+            _payload("apply_patch", {"patch": "*** Begin Patch\n*** End Patch"}),
+            home=home,
+            out=out,
+        )
+        payload = json.loads(out.getvalue())
+        assert parse_redirect_context_from_codex_hook_output(payload) is None
+    finally:
+        fixture.lease.close()
+
+
+def test_codex_native_write_without_live_binding_has_no_verified_context(tmp_path):
+    home, _sandbox, _downstream = init_redirect_contract_home(tmp_path)
+    out = io.StringIO()
+    codex_hook.process_hook(
+        _payload("Write", {"file_path": "note.txt", "content": "hello"}),
+        home=home,
+        out=out,
+    )
+    payload = json.loads(out.getvalue())
+    assert parse_redirect_context_from_codex_hook_output(payload) is None

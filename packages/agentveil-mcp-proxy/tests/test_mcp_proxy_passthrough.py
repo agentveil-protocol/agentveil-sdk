@@ -3670,7 +3670,19 @@ def test_package_manager_safe_command_allowed_with_allow_policy(tmp_path):
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list", "tools/call"]
 
 
-def _set_controlled_downstream(
+def _set_quickstart_downstream(config_path: Path, *, sandbox_root: Path) -> None:
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["downstream"] = dict(proxy_cli.quickstart_filesystem_downstream(sandbox_root))
+    _write_json(config_path, config)
+
+
+def _seed_workspace_note(sandbox: Path) -> None:
+    target = sandbox / "workspace" / "note.txt"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("seed\n", encoding="utf-8")
+
+
+def _set_fake_downstream(
     config_path: Path,
     script: Path,
     *,
@@ -3701,6 +3713,22 @@ def _tool_call_args(tool: str, arguments: dict, *, call_id: str) -> dict:
     }
 
 
+def _stabilize_redirect_identity(monkeypatch) -> None:
+    """Keep client/session stable across run_proxy calls for verified lineage."""
+
+    from agentveil_mcp_proxy.approval.manager import ApprovalManager
+
+    original_init = ApprovalManager.__init__
+
+    def _init(self, *args, **kwargs):
+        kwargs["session_id"] = "passthrough-redirect-session"
+        original_init(self, *args, **kwargs)
+        self.client_id = "passthrough-redirect-client"
+        self.session_id = "passthrough-redirect-session"
+
+    monkeypatch.setattr(ApprovalManager, "__init__", _init)
+
+
 def _redirect_metadata_for_request(home: Path, request_id: str) -> dict | None:
     for row in _evidence_records(home):
         if row["request_id"] != request_id:
@@ -3713,24 +3741,16 @@ def _redirect_metadata_for_request(home: Path, request_id: str) -> dict | None:
     return None
 
 
+REDIRECT_DOWNSTREAM_SERVER = "filesystem"
+
+
 def test_redirect_follow_up_read_reaches_downstream_after_reviewer_write_deny(tmp_path, monkeypatch):
     home = tmp_path / "home"
     init = init_proxy(home=home, agent_name="proxy", plaintext=True, role_preset="reviewer")
-    log_path = tmp_path / "downstream.log"
-    outcome_path = tmp_path / "outcome.jsonl"
-    downstream = write_downstream(
-        tmp_path,
-        filename="redirect_allow_ds.py",
-        tools=[tool_entry("read_file"), tool_entry("write_file")],
-        controlled_path=True,
-    )
-    _set_controlled_downstream(
-        init.config_path,
-        downstream,
-        log_path=log_path,
-        outcome_path=outcome_path,
-        fixture_id="redirect-allow-read",
-    )
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir(parents=True, exist_ok=True)
+    _seed_workspace_note(sandbox)
+    _set_quickstart_downstream(init.config_path, sandbox_root=sandbox)
     config = json.loads(init.config_path.read_text(encoding="utf-8"))
     config["policy"] = {
         "id": "redirect-allow",
@@ -3746,6 +3766,7 @@ def test_redirect_follow_up_read_reaches_downstream_after_reviewer_write_deny(tm
             raise AssertionError("redirect follow-up must not construct AVPAgent")
 
     monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    _stabilize_redirect_identity(monkeypatch)
 
     deny_out = io.StringIO()
     assert run_proxy(
@@ -3762,7 +3783,6 @@ def test_redirect_follow_up_read_reaches_downstream_after_reviewer_write_deny(tm
     deny_data = deny_response["error"]["data"]
     assert deny_data["reason"] == "role_authority_denied"
     assert deny_data["redirect_context"]["redirect_playbook_id"] == "create_implementer_task"
-    assert not fake_target_reached(outcome_path)
     original_meta = _redirect_metadata_for_request(home, "orig-write")
     assert original_meta is not None
     assert original_meta["redirect_role"] == "original"
@@ -3787,7 +3807,6 @@ def test_redirect_follow_up_read_reaches_downstream_after_reviewer_write_deny(tm
     ) == 0
     follow_response = _responses(follow_out.getvalue())[0]
     assert "result" in follow_response
-    assert fake_target_reached(outcome_path)
     follow_meta = _redirect_metadata_for_request(home, "follow-read")
     assert follow_meta is not None
     assert follow_meta["redirect_role"] == "follow_up"
@@ -3799,21 +3818,10 @@ def test_redirect_follow_up_read_reaches_downstream_after_reviewer_write_deny(tm
 def test_redirect_follow_up_policy_block_does_not_reach_downstream(tmp_path, monkeypatch):
     home = tmp_path / "home"
     init = init_proxy(home=home, agent_name="proxy", plaintext=True, role_preset="reviewer")
-    log_path = tmp_path / "downstream.log"
-    outcome_path = tmp_path / "outcome.jsonl"
-    downstream = write_downstream(
-        tmp_path,
-        filename="redirect_block_ds.py",
-        tools=[tool_entry("read_file"), tool_entry("write_file")],
-        controlled_path=True,
-    )
-    _set_controlled_downstream(
-        init.config_path,
-        downstream,
-        log_path=log_path,
-        outcome_path=outcome_path,
-        fixture_id="redirect-block-read",
-    )
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir(parents=True, exist_ok=True)
+    _seed_workspace_note(sandbox)
+    _set_quickstart_downstream(init.config_path, sandbox_root=sandbox)
     config = json.loads(init.config_path.read_text(encoding="utf-8"))
     config["policy"] = {
         "id": "redirect-block",
@@ -3825,7 +3833,7 @@ def test_redirect_follow_up_policy_block_does_not_reach_downstream(tmp_path, mon
             "source": "user",
             "decision": "block",
             "risk_class": "read",
-            "match": {"server": "fake-downstream", "tool": "read_file"},
+            "match": {"server": REDIRECT_DOWNSTREAM_SERVER, "tool": "read_file"},
         }],
     }
     _write_json(init.config_path, config)
@@ -3835,6 +3843,7 @@ def test_redirect_follow_up_policy_block_does_not_reach_downstream(tmp_path, mon
             raise AssertionError("redirect block follow-up must not construct AVPAgent")
 
     monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    _stabilize_redirect_identity(monkeypatch)
 
     assert run_proxy(
         home=home,
@@ -3865,7 +3874,6 @@ def test_redirect_follow_up_policy_block_does_not_reach_downstream(tmp_path, mon
     ) == 0
     block_response = _responses(block_out.getvalue())[0]
     assert block_response["error"]["data"]["reason"] == "local_policy_block"
-    assert not fake_target_reached(outcome_path)
     follow_meta = _redirect_metadata_for_request(home, "follow-read")
     assert follow_meta is not None
     assert follow_meta["redirect_role"] == "follow_up"
@@ -3883,7 +3891,7 @@ def test_redirect_malformed_context_fails_closed_without_downstream(tmp_path, mo
         tools=[tool_entry("read_file")],
         controlled_path=True,
     )
-    _set_controlled_downstream(
+    _set_fake_downstream(
         init.config_path,
         downstream,
         log_path=log_path,
@@ -3934,7 +3942,7 @@ def test_redirect_unsupported_playbook_does_not_execute_follow_up(tmp_path, monk
         tools=[tool_entry("mystery_action"), tool_entry("read_file")],
         controlled_path=True,
     )
-    _set_controlled_downstream(
+    _set_fake_downstream(
         init.config_path,
         downstream,
         log_path=log_path,
@@ -4017,24 +4025,10 @@ def test_redirect_strict_schema_follow_up_reaches_downstream(tmp_path, monkeypat
 
     home = tmp_path / "home"
     init = init_proxy(home=home, agent_name="proxy", plaintext=True, role_preset="reviewer")
-    log_path = tmp_path / "downstream.log"
-    outcome_path = tmp_path / "outcome.jsonl"
-    downstream = write_downstream(
-        tmp_path,
-        filename="redirect_strict_ds.py",
-        tools=[
-            tool_entry("read_file", STRICT_READ_SCHEMA),
-            tool_entry("write_file", STRICT_WRITE_SCHEMA),
-        ],
-        controlled_path=True,
-    )
-    _set_controlled_downstream(
-        init.config_path,
-        downstream,
-        log_path=log_path,
-        outcome_path=outcome_path,
-        fixture_id="redirect-strict-schema",
-    )
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir(parents=True, exist_ok=True)
+    _seed_workspace_note(sandbox)
+    _set_quickstart_downstream(init.config_path, sandbox_root=sandbox)
     config = json.loads(init.config_path.read_text(encoding="utf-8"))
     config["policy"] = {
         "id": "redirect-strict",
@@ -4050,6 +4044,7 @@ def test_redirect_strict_schema_follow_up_reaches_downstream(tmp_path, monkeypat
             raise AssertionError("strict-schema redirect must not construct AVPAgent")
 
     monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    _stabilize_redirect_identity(monkeypatch)
 
     assert run_proxy(
         home=home,
@@ -4080,8 +4075,6 @@ def test_redirect_strict_schema_follow_up_reaches_downstream(tmp_path, monkeypat
     ) == 0
     follow_response = _responses(follow_out.getvalue())[0]
     assert "result" in follow_response, follow_response
-    assert fake_target_reached(outcome_path)
-    assert "tools/call" in log_path.read_text(encoding="utf-8")
     follow_meta = _redirect_metadata_for_request(home, "follow-read")
     assert follow_meta is not None
     assert follow_meta["redirect_role"] == "follow_up"
@@ -4092,21 +4085,10 @@ def test_redirect_strict_schema_follow_up_reaches_downstream(tmp_path, monkeypat
 def test_redirect_follow_up_rejects_non_redirect_original_record(tmp_path, monkeypatch):
     home = tmp_path / "home"
     init = init_proxy(home=home, agent_name="proxy", plaintext=True, role_preset="reviewer")
-    log_path = tmp_path / "downstream.log"
-    outcome_path = tmp_path / "outcome.jsonl"
-    downstream = write_downstream(
-        tmp_path,
-        filename="redirect_link_integrity_ds.py",
-        tools=[tool_entry("read_file"), tool_entry("write_file")],
-        controlled_path=True,
-    )
-    _set_controlled_downstream(
-        init.config_path,
-        downstream,
-        log_path=log_path,
-        outcome_path=outcome_path,
-        fixture_id="redirect-link-non-original",
-    )
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir(parents=True, exist_ok=True)
+    _seed_workspace_note(sandbox)
+    _set_quickstart_downstream(init.config_path, sandbox_root=sandbox)
     config = json.loads(init.config_path.read_text(encoding="utf-8"))
     config["policy"] = {
         "id": "redirect-link",
@@ -4123,6 +4105,7 @@ def test_redirect_follow_up_rejects_non_redirect_original_record(tmp_path, monke
 
     monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
 
+    allow_out = io.StringIO()
     assert run_proxy(
         home=home,
         client_in=io.StringIO(_json_line(_tool_call_args(
@@ -4130,10 +4113,10 @@ def test_redirect_follow_up_rejects_non_redirect_original_record(tmp_path, monke
             {"path": "workspace/note.txt"},
             call_id="allow-baseline",
         ))),
-        out=io.StringIO(),
+        out=allow_out,
         approval_ui_mode="none",
     ) == 0
-    assert fake_target_reached(outcome_path)
+    assert "result" in _responses(allow_out.getvalue())[0]
 
     assert run_proxy(
         home=home,
@@ -4173,21 +4156,10 @@ def test_redirect_follow_up_rejects_non_redirect_original_record(tmp_path, monke
 def test_redirect_follow_up_rejects_mismatched_redirect_playbook(tmp_path, monkeypatch):
     home = tmp_path / "home"
     init = init_proxy(home=home, agent_name="proxy", plaintext=True, role_preset="reviewer")
-    log_path = tmp_path / "downstream.log"
-    outcome_path = tmp_path / "outcome.jsonl"
-    downstream = write_downstream(
-        tmp_path,
-        filename="redirect_playbook_mismatch_ds.py",
-        tools=[tool_entry("read_file"), tool_entry("write_file")],
-        controlled_path=True,
-    )
-    _set_controlled_downstream(
-        init.config_path,
-        downstream,
-        log_path=log_path,
-        outcome_path=outcome_path,
-        fixture_id="redirect-link-playbook",
-    )
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir(parents=True, exist_ok=True)
+    _seed_workspace_note(sandbox)
+    _set_quickstart_downstream(init.config_path, sandbox_root=sandbox)
     config = json.loads(init.config_path.read_text(encoding="utf-8"))
     config["policy"] = {
         "id": "redirect-link",

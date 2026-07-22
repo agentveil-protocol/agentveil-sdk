@@ -103,6 +103,7 @@ def test_setup_gemini_cli_writes_merge_safe_settings_and_is_idempotent(
     )
     command = before[0]["hooks"][0]["command"]
     assert "-m agentveil_mcp_proxy.gemini_hook" in command
+    assert "--home" in command
     assert "--evidence-path" in command
     assert data["hooks"]["AfterTool"][0]["hooks"][0]["command"] == "echo after"
 
@@ -304,7 +305,8 @@ def test_command_ownership_requires_exact_module_invocation():
     from agentveil_mcp_proxy import gemini_setup
 
     assert gemini_setup.command_invokes_managed_hook(
-        "/usr/bin/python3 -m agentveil_mcp_proxy.gemini_hook --evidence-path /tmp/e.jsonl"
+        "/usr/bin/python3 -m agentveil_mcp_proxy.gemini_hook "
+        "--home /proj/.avp --evidence-path /tmp/e.jsonl"
     )
     assert not gemini_setup.command_invokes_managed_hook(
         "echo mentions agentveil_mcp_proxy.gemini_hook but is user-owned"

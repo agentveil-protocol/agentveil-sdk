@@ -70,20 +70,21 @@ def evidence_path(project_dir: Path) -> Path:
     return project_gemini_dir(project_dir) / "agentveil" / "evidence.jsonl"
 
 
-def build_hook_command(*, python: str, evidence: Path) -> str:
+def build_hook_command(*, python: str, home: Path, evidence: Path) -> str:
     return (
         f"{shlex.quote(python)} -m {AGENTVEIL_GEMINI_HOOK_MARKER} "
+        f"--home {shlex.quote(str(home))} "
         f"--evidence-path {shlex.quote(str(evidence))}"
     )
 
 
-def build_managed_hook_entry(*, python: str, evidence: Path) -> dict[str, Any]:
+def build_managed_hook_entry(*, python: str, home: Path, evidence: Path) -> dict[str, Any]:
     return {
         "matcher": HOOK_MATCHER,
         "hooks": [
             {
                 "type": "command",
-                "command": build_hook_command(python=python, evidence=evidence),
+                "command": build_hook_command(python=python, home=home, evidence=evidence),
                 "name": "AgentVeil Gemini BeforeTool hook",
             }
         ],
@@ -177,7 +178,11 @@ def install_hook(*, project_dir: Path, python: str) -> dict[str, Any]:
         raise GeminiSetupError(".gemini/settings.json hooks must be an object")
     existing_before = hooks.get("BeforeTool")
     cleaned, removed = _strip_managed_groups(existing_before)
-    cleaned.append(build_managed_hook_entry(python=python, evidence=evidence_path(target)))
+    cleaned.append(build_managed_hook_entry(
+        python=python,
+        home=setup_home(target),
+        evidence=evidence_path(target),
+    ))
     updated_hooks = dict(hooks)
     updated_hooks["BeforeTool"] = cleaned
     updated_payload = dict(payload)

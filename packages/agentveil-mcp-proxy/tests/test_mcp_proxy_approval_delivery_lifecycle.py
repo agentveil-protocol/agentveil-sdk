@@ -26,6 +26,7 @@ from agentveil_mcp_proxy.approval.notification import (
 )
 from agentveil_mcp_proxy.approval.persistent import (
     ApprovalCenterManifest,
+    _approval_center_code_fingerprint,
     current_approval_center_runtime_identity,
     load_manifest,
     manifest_runtime_matches_current,
@@ -458,6 +459,25 @@ def test_runtime_identity_changes_when_version_or_code_drifts(monkeypatch):
     assert code_drifted.startswith("sha256:")
     assert len(code_drifted) == len("sha256:") + 64
     assert not any(marker in code_drifted for marker in ("/", "\\", "Users", "home"))
+
+
+def test_runtime_fingerprint_changes_when_evidence_dependency_drifts(tmp_path):
+    """A detached center must not survive an in-place evidence contract update."""
+
+    package_root = tmp_path / "agentveil_mcp_proxy"
+    approval = package_root / "approval"
+    evidence = package_root / "evidence"
+    approval.mkdir(parents=True)
+    evidence.mkdir(parents=True)
+    (approval / "server.py").write_text("SERVER = 1\n", encoding="utf-8")
+    store = evidence / "store.py"
+    store.write_text("SCHEMA = 5\n", encoding="utf-8")
+
+    before = _approval_center_code_fingerprint(package_root)
+    store.write_text("SCHEMA = 6\n", encoding="utf-8")
+    after = _approval_center_code_fingerprint(package_root)
+
+    assert before != after
 
 
 def test_lifecycle_lock_serializes_concurrent_processes(tmp_path):

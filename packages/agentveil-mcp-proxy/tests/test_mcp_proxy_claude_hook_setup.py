@@ -23,6 +23,7 @@ from agentveil_mcp_proxy.claude_hook_setup import (
     load_settings,
     project_evidence_path,
     project_settings_path,
+    setup_home,
     status_hook,
     uninstall_hook,
 )
@@ -43,9 +44,16 @@ def _managed_entries(settings: dict) -> list:
 # ----- build helpers ---------------------------------------------------------
 
 
-def test_build_hook_command_invokes_module_with_evidence_path() -> None:
-    cmd = build_hook_command(python="/usr/bin/python3", evidence_path=Path("/proj/.claude/agentveil/evidence.jsonl"))
+def test_build_hook_command_invokes_module_with_home_and_evidence_path() -> None:
+    home = Path("/proj/.avp")
+    cmd = build_hook_command(
+        python="/usr/bin/python3",
+        home=home,
+        evidence_path=Path("/proj/.claude/agentveil/evidence.jsonl"),
+    )
     assert "-m agentveil_mcp_proxy.claude_hook" in cmd
+    assert "--home" in cmd
+    assert str(home) in cmd
     assert "--evidence-path" in cmd
     assert ".claude" in cmd
     assert "agentveil" in cmd
@@ -53,7 +61,11 @@ def test_build_hook_command_invokes_module_with_evidence_path() -> None:
 
 
 def test_managed_entry_uses_combined_matcher() -> None:
-    entry = build_managed_hook_entry(python="/usr/bin/python3", evidence_path=Path("/x/e.jsonl"))
+    entry = build_managed_hook_entry(
+        python="/usr/bin/python3",
+        home=Path("/proj/.avp"),
+        evidence_path=Path("/x/e.jsonl"),
+    )
     assert entry["matcher"] == HOOK_MATCHER
     assert "Bash" in entry["matcher"]
     assert "mcp__" in entry["matcher"]
@@ -77,6 +89,7 @@ def test_install_creates_settings_with_managed_entry(tmp_path: Path) -> None:
     assert len(managed) == 1
     command = managed[0]["hooks"][0]["command"]
     assert "-m agentveil_mcp_proxy.claude_hook" in command
+    assert "--home" in command
     assert "--evidence-path" in command
 
 
@@ -297,6 +310,7 @@ def test_install_command_shell_quotes_paths_with_spaces(tmp_path: Path) -> None:
     assert "/opt/py thon/bin/python3" in tokens
     assert "-m" in tokens
     assert "agentveil_mcp_proxy.claude_hook" in tokens
+    assert "--home" in tokens
     # The evidence path (with spaces) round-trips as a single token.
     ev_index = tokens.index("--evidence-path") + 1
     assert "dir with spaces" in tokens[ev_index]

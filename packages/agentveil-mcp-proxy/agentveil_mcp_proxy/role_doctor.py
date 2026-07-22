@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from typing import Any, Literal, Mapping
 
 from agentveil_mcp_proxy.classification import ClassifiedToolCall
@@ -62,6 +63,7 @@ class RedirectPlaybookSpec:
     redirect_playbook_id: str
     supports_follow_up: bool
     allowed_follow_up_tools: tuple[str, ...] = ()
+    target_bound: bool = True
 
 
 @dataclass(frozen=True)
@@ -72,21 +74,42 @@ class RedirectContext:
     redirect_playbook_id: str
 
 
+REDIRECT_CONTEXT_ALLOWED_KEYS = frozenset({"original_request_id", "redirect_playbook_id"})
+REDIRECT_LINEAGE_MAX_AGE_SECONDS = 3600
+REDIRECT_LINEAGE_STATUS_VERIFIED = "verified"
+# Deny-style originals that established a controlled redirect.
+REDIRECT_LINEAGE_DENIED_STATUSES = frozenset({"blocked", "denied"})
+# Approval-required originals may remain pending until the operator decides.
+REDIRECT_LINEAGE_APPROVAL_REQUIRED_STATUSES = frozenset({"pending"})
+REDIRECT_LINEAGE_FORBIDDEN_STATUSES = frozenset({
+    "cancelled",
+    "error",
+    "invalidated",
+    "executed",
+    "expired",
+    "approved",
+})
+_REDIRECT_REQUEST_APPROVAL_PLAYBOOK = "request_approval"
+
+
 REDIRECT_PLAYBOOKS: dict[str, RedirectPlaybookSpec] = {
     _REDIRECT_CREATE_IMPLEMENTER_TASK: RedirectPlaybookSpec(
         redirect_playbook_id=_REDIRECT_CREATE_IMPLEMENTER_TASK,
         supports_follow_up=True,
         allowed_follow_up_tools=("read_file",),
+        target_bound=True,
     ),
     _REDIRECT_USE_READ_ONLY_TOOL: RedirectPlaybookSpec(
         redirect_playbook_id=_REDIRECT_USE_READ_ONLY_TOOL,
         supports_follow_up=True,
         allowed_follow_up_tools=("read_file",),
+        target_bound=True,
     ),
     _REDIRECT_REQUEST_APPROVAL: RedirectPlaybookSpec(
         redirect_playbook_id=_REDIRECT_REQUEST_APPROVAL,
         supports_follow_up=True,
         allowed_follow_up_tools=("write_file",),
+        target_bound=True,
     ),
     _REDIRECT_STOP_AND_CLASSIFY: RedirectPlaybookSpec(
         redirect_playbook_id=_REDIRECT_STOP_AND_CLASSIFY,
@@ -96,6 +119,7 @@ REDIRECT_PLAYBOOKS: dict[str, RedirectPlaybookSpec] = {
         redirect_playbook_id=_REDIRECT_SWITCH_TO_BUILD_AGENT,
         supports_follow_up=True,
         allowed_follow_up_tools=("read_file",),
+        target_bound=True,
     ),
 }
 
@@ -292,6 +316,10 @@ def parse_redirect_context(arguments: Any) -> tuple[RedirectContext | None, str 
         return None, None
     if not isinstance(raw, Mapping):
         return None, INVALID_REDIRECT_CONTEXT
+    # Reject client-forged lineage authorization fields; only the two linkage keys
+    # are accepted on the wire. Server-side evidence proves the rest.
+    if set(raw.keys()) - REDIRECT_CONTEXT_ALLOWED_KEYS:
+        return None, INVALID_REDIRECT_CONTEXT
     original_request_id = raw.get("original_request_id")
     redirect_playbook_id = raw.get("redirect_playbook_id")
     if not isinstance(original_request_id, str) or not original_request_id.strip():
@@ -316,6 +344,145 @@ def validate_follow_up_redirect(context: RedirectContext, tool_name: str) -> str
         return UNSUPPORTED_REDIRECT_PLAYBOOK
     if spec.allowed_follow_up_tools and tool_name not in spec.allowed_follow_up_tools:
         return UNSUPPORTED_REDIRECT_PLAYBOOK
+    return None
+
+
+def project_scope_fingerprint(
+    *,
+    downstream_server: str,
+    downstream_startup_fingerprint: str | None,
+    project_workspace_root_hash: str | None,
+) -> str | None:
+    """Return a bounded project/runtime scope fingerprint, or None if unknown.
+
+    Combines downstream server identity, privacy-bounded startup preview, and an
+    internal SHA-256 of the canonical effective workspace root. The returned
+    fingerprint contains no raw workspace path.
+    """
+
+    if not isinstance(downstream_server, str) or not downstream_server.strip():
+        return None
+    if not isinstance(downstream_startup_fingerprint, str) or not downstream_startup_fingerprint.strip():
+        return None
+    if not isinstance(project_workspace_root_hash, str) or not project_workspace_root_hash.strip():
+        return None
+    material = (
+        f"{downstream_server.strip()}\n"
+        f"{downstream_startup_fingerprint.strip()}\n"
+        f"{project_workspace_root_hash.strip()}"
+    )
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
+
+def canonical_project_workspace_root_hash(resolved_root: Any) -> str | None:
+    """Return a bounded hash for one canonical workspace root path."""
+
+    if resolved_root is None:
+        return None
+    try:
+        canonical = str(resolved_root)
+    except Exception:
+        return None
+    if not canonical:
+        return None
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
+
+def redirect_original_is_fresh(
+    *,
+    created_at: int,
+    expires_at: int | None,
+    now_timestamp: int,
+) -> bool:
+    """Return True when an original remains within durable freshness bounds."""
+
+    if expires_at is not None:
+        return now_timestamp < expires_at
+    return now_timestamp <= created_at + REDIRECT_LINEAGE_MAX_AGE_SECONDS
+
+
+def redirect_status_eligible(
+    *,
+    original_status: str,
+    redirect_playbook_id: str,
+) -> bool:
+    """Return True when the original evidence status may authorize a follow-up."""
+
+    if original_status in REDIRECT_LINEAGE_FORBIDDEN_STATUSES:
+        return False
+    if original_status in REDIRECT_LINEAGE_DENIED_STATUSES:
+        return True
+    if (
+        original_status in REDIRECT_LINEAGE_APPROVAL_REQUIRED_STATUSES
+        and redirect_playbook_id == _REDIRECT_REQUEST_APPROVAL_PLAYBOOK
+    ):
+        return True
+    return False
+
+
+def verify_redirect_lineage_facts(
+    *,
+    original_redirect_role: str | None,
+    original_playbook_id: str | None,
+    claimed_playbook_id: str,
+    target_reached: Any,
+    original_status: str,
+    original_client_id: str | None,
+    follow_up_client_id: str | None,
+    original_session_id: str,
+    follow_up_session_id: str,
+    original_downstream_server: str,
+    follow_up_downstream_server: str,
+    original_project_scope: str | None,
+    follow_up_project_scope: str | None,
+    original_resource_hash: str | None,
+    follow_up_resource_hash: str | None,
+    playbook_target_bound: bool,
+    created_at: int,
+    expires_at: int | None,
+    now_timestamp: int,
+    already_claimed: bool,
+) -> str | None:
+    """Return ``INVALID_REDIRECT_CONTEXT`` when durable lineage checks fail."""
+
+    if original_redirect_role != REDIRECT_ROLE_ORIGINAL:
+        return INVALID_REDIRECT_CONTEXT
+    if original_playbook_id != claimed_playbook_id:
+        return INVALID_REDIRECT_CONTEXT
+    if target_reached is not False:
+        return INVALID_REDIRECT_CONTEXT
+    if not redirect_status_eligible(
+        original_status=original_status,
+        redirect_playbook_id=claimed_playbook_id,
+    ):
+        return INVALID_REDIRECT_CONTEXT
+    if already_claimed:
+        return INVALID_REDIRECT_CONTEXT
+    if not redirect_original_is_fresh(
+        created_at=created_at,
+        expires_at=expires_at,
+        now_timestamp=now_timestamp,
+    ):
+        return INVALID_REDIRECT_CONTEXT
+    if original_session_id != follow_up_session_id:
+        return INVALID_REDIRECT_CONTEXT
+    if original_client_id is not None and original_client_id != follow_up_client_id:
+        return INVALID_REDIRECT_CONTEXT
+    if original_downstream_server != follow_up_downstream_server:
+        return INVALID_REDIRECT_CONTEXT
+    if not original_project_scope or not follow_up_project_scope:
+        return INVALID_REDIRECT_CONTEXT
+    if original_project_scope != follow_up_project_scope:
+        return INVALID_REDIRECT_CONTEXT
+    if playbook_target_bound:
+        if not isinstance(original_resource_hash, str) or not original_resource_hash:
+            return INVALID_REDIRECT_CONTEXT
+        if not isinstance(follow_up_resource_hash, str) or not follow_up_resource_hash:
+            return INVALID_REDIRECT_CONTEXT
+        if original_resource_hash != follow_up_resource_hash:
+            return INVALID_REDIRECT_CONTEXT
     return None
 
 
@@ -490,7 +657,13 @@ __all__ = [
     "INVALID_REDIRECT_CONTEXT",
     "MUTATION_ACTION_FAMILIES",
     "READ_ACTION_FAMILIES",
+    "REDIRECT_CONTEXT_ALLOWED_KEYS",
     "REDIRECT_CONTEXT_ARG",
+    "REDIRECT_LINEAGE_APPROVAL_REQUIRED_STATUSES",
+    "REDIRECT_LINEAGE_DENIED_STATUSES",
+    "REDIRECT_LINEAGE_FORBIDDEN_STATUSES",
+    "REDIRECT_LINEAGE_MAX_AGE_SECONDS",
+    "REDIRECT_LINEAGE_STATUS_VERIFIED",
     "REDIRECT_PLAYBOOKS",
     "REDIRECT_ROLE_FOLLOW_UP",
     "REDIRECT_ROLE_ORIGINAL",
@@ -506,13 +679,18 @@ __all__ = [
     "build_role_preset_guide",
     "enrich_error_data",
     "format_role_doctor_report",
+    "canonical_project_workspace_root_hash",
     "parse_redirect_context",
     "playbook_spec",
     "playbook_supports_follow_up",
+    "project_scope_fingerprint",
     "redirect_automation_status_fields",
     "redirect_context_stub",
     "redirect_fields",
+    "redirect_original_is_fresh",
     "redirect_playbook_id_for_classification",
+    "redirect_status_eligible",
     "strip_redirect_context",
     "validate_follow_up_redirect",
+    "verify_redirect_lineage_facts",
 ]
