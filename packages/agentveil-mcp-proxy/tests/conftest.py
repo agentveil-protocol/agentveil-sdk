@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import site
 import subprocess
 import sys
 from pathlib import Path
@@ -256,6 +257,13 @@ def _block_approval_browser_and_detached_spawn(
 def _isolated_cursor_connect_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Isolate Cursor global MCP config and legacy settings cleanup paths."""
 
+    parent_pythonpath = os.environ.get("PYTHONPATH")
+    user_site = site.getusersitepackages()
+    if Path(user_site).is_dir():
+        monkeypatch.setenv(
+            "PYTHONPATH",
+            os.pathsep.join(filter(None, (parent_pythonpath, user_site))),
+        )
     home = tmp_path / "user-home"
     home.mkdir()
     (home / ".cursor").mkdir(parents=True, exist_ok=True)
