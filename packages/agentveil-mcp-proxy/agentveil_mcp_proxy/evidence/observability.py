@@ -807,6 +807,8 @@ def redirect_original_record_valid(
 ) -> bool:
     """Return True when one evidence record is an acceptable redirect original."""
 
+    from agentveil_mcp_proxy.role_doctor import redirect_status_eligible
+
     metadata = parse_redirect_automation_metadata(record)
     if metadata is None:
         return False
@@ -816,7 +818,40 @@ def redirect_original_record_valid(
         return False
     if metadata.get("target_reached") is not False:
         return False
-    return True
+    return redirect_status_eligible(
+        original_status=record.status,
+        redirect_playbook_id=redirect_playbook_id,
+    )
+
+
+def build_verified_redirect_lineage_fields(
+    *,
+    original_request_id: str,
+    redirect_playbook_id: str,
+    original_action_family: str | None,
+    follow_up_action_family: str | None,
+    project_scope_fingerprint: str,
+    intent_relationship: str,
+    verified_at: int,
+    freshness_ok: bool,
+) -> dict[str, Any]:
+    """Return bounded public evidence fields for a verified redirect lineage."""
+
+    fields: dict[str, Any] = {
+        "lineage_status": "verified",
+        "original_request_id": original_request_id,
+        "redirect_parent_request_id": original_request_id,
+        "redirect_playbook_id": redirect_playbook_id,
+        "project_scope_fingerprint": project_scope_fingerprint,
+        "intent_relationship": intent_relationship,
+        "lineage_verified_at": verified_at,
+        "lineage_freshness_ok": freshness_ok,
+    }
+    if original_action_family is not None:
+        fields["original_action_family"] = original_action_family
+    if follow_up_action_family is not None:
+        fields["follow_up_action_family"] = follow_up_action_family
+    return fields
 
 
 def event_record_dict(

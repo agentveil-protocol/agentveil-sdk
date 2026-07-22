@@ -840,6 +840,7 @@ def build_session_bound_facts(
     risk_class: str,
     tool_schema_fingerprint: str | None,
     downstream_startup_fingerprint: str | None,
+    project_workspace_root_hash: str | None = None,
     approval_id: str,
     expires_at: int | None,
     approval_actor_ref: str | None = None,
@@ -859,6 +860,8 @@ def build_session_bound_facts(
         "tool_schema_fingerprint": tool_schema_fingerprint,
         "downstream_startup_fingerprint": downstream_startup_fingerprint,
     }
+    if project_workspace_root_hash is not None:
+        facts["project_workspace_root_hash"] = project_workspace_root_hash
     if expires_at is not None:
         facts["expires_at"] = expires_at
     if approval_actor_ref is not None:
@@ -1007,6 +1010,13 @@ def build_redirect_automation_metadata(
     redirect_playbook_id: str | None = None,
     redirect_parent_request_id: str | None = None,
     original_request_id: str | None = None,
+    lineage_status: str | None = None,
+    project_scope_fingerprint: str | None = None,
+    intent_relationship: str | None = None,
+    original_action_family: str | None = None,
+    follow_up_action_family: str | None = None,
+    lineage_verified_at: int | None = None,
+    lineage_freshness_ok: bool | None = None,
 ) -> dict[str, Any]:
     """Build bounded redirect-automation metadata linked to controlled-path evidence."""
 
@@ -1033,6 +1043,20 @@ def build_redirect_automation_metadata(
         metadata["redirect_parent_request_id"] = redirect_parent_request_id
     if original_request_id is not None:
         metadata["original_request_id"] = original_request_id
+    if lineage_status is not None:
+        metadata["lineage_status"] = lineage_status
+    if project_scope_fingerprint is not None:
+        metadata["project_scope_fingerprint"] = project_scope_fingerprint
+    if intent_relationship is not None:
+        metadata["intent_relationship"] = intent_relationship
+    if original_action_family is not None:
+        metadata["original_action_family"] = original_action_family
+    if follow_up_action_family is not None:
+        metadata["follow_up_action_family"] = follow_up_action_family
+    if lineage_verified_at is not None:
+        metadata["lineage_verified_at"] = lineage_verified_at
+    if lineage_freshness_ok is not None:
+        metadata["lineage_freshness_ok"] = lineage_freshness_ok
     return metadata
 
 

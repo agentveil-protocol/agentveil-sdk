@@ -25,6 +25,11 @@ from agentveil_mcp_proxy.claude_hook import (
     _classify_bash,
     _split_mcp_tool_name,
 )
+from agentveil_mcp_proxy.client_guidance import (
+    NativeRedirectOrigin,
+    format_native_redirect_agent_surface,
+    maybe_register_native_redirect_for_hook_deny,
+)
 from agentveil_mcp_proxy.policy import (
     PolicyDecision,
     PolicyEngine,
@@ -217,7 +222,11 @@ def decide(payload: Mapping[str, Any], engine: PolicyEngine) -> HookDecision:
     )
 
 
-def format_hook_output(decision: HookDecision) -> str | None:
+def format_hook_output(
+    decision: HookDecision,
+    *,
+    redirect_origin: NativeRedirectOrigin | None = None,
+) -> str | None:
     if decision.hook_action == "allow":
         return None
     reason = (
@@ -228,13 +237,13 @@ def format_hook_output(decision: HookDecision) -> str | None:
     )
     if decision.context.server == CODEX_SERVER_LABEL:
         reason = f"{reason}. {NATIVE_REDIRECT_INSTRUCTION}"
-    return json.dumps({
-        "hookSpecificOutput": {
-            "hookEventName": HOOK_EVENT_DEFAULT,
-            "permissionDecision": "deny",
-            "permissionDecisionReason": reason,
-        }
-    })
+    reason = format_native_redirect_agent_surface(reason, redirect_origin)
+    hook_specific: dict[str, Any] = {
+        "hookEventName": HOOK_EVENT_DEFAULT,
+        "permissionDecision": "deny",
+        "permissionDecisionReason": reason,
+    }
+    return json.dumps({"hookSpecificOutput": hook_specific})
 
 
 def _bounded_cwd_ref(cwd: str) -> str:
@@ -284,21 +293,34 @@ def process_hook(
     *,
     config: ProxyConfig | None = None,
     evidence_path: Path | None = None,
+    home: Path | None = None,
     out: Any = None,
 ) -> HookDecision:
     engine = PolicyEngine(config or default_proxy_config_for_hook())
     decision = decide(payload, engine)
     if evidence_path is not None:
         write_evidence(build_evidence_record(payload, decision), evidence_path)
-    output = format_hook_output(decision)
+    redirect_origin = maybe_register_native_redirect_for_hook_deny(
+        hook_action=decision.hook_action,
+        native_server=decision.context.server,
+        native_tool=decision.context.tool,
+        action_family=decision.context.action_family or "",
+        risk_class=decision.evaluation.risk_class.value,
+        tool_input=_tool_input(payload),
+        home=home,
+    )
+    output = format_hook_output(decision, redirect_origin=redirect_origin)
     if output is not None:
         (out or sys.stdout).write(output + "\n")
     return decision
 
 
 def main(argv: list[str] | None = None, *, stdin: Any = None, stdout: Any = None) -> int:
+    import os
+
     parser = argparse.ArgumentParser(prog="agentveil-codex-hook", add_help=True)
     parser.add_argument("--evidence-path", default=None)
+    parser.add_argument("--home", default=None)
     args = parser.parse_args(argv if argv is not None else [])
     in_stream = stdin if stdin is not None else sys.stdin
     try:
@@ -310,7 +332,9 @@ def main(argv: list[str] | None = None, *, stdin: Any = None, stdout: Any = None
         sys.stderr.write("codex_hook: PreToolUse payload must be a JSON object\n")
         return 1
     evidence_path = Path(args.evidence_path) if args.evidence_path else None
-    process_hook(payload, evidence_path=evidence_path, out=stdout if stdout is not None else sys.stdout)
+    home_arg = args.home or os.environ.get("AGENTVEIL_HOME")
+    home = Path(home_arg).expanduser() if isinstance(home_arg, str) and home_arg.strip() else None
+    process_hook(payload, evidence_path=evidence_path, home=home, out=stdout if stdout is not None else sys.stdout)
     return 0
 
 

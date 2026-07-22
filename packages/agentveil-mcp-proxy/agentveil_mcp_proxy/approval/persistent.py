@@ -27,17 +27,6 @@ class PersistentApprovalCenterError(RuntimeError):
     """Raised when the stable Approval Center cannot start or be reused."""
 
 
-_APPROVAL_CENTER_CODE_FILES = (
-    "approval/__init__.py",
-    "approval/client.py",
-    "approval/headless.py",
-    "approval/manager.py",
-    "approval/notification.py",
-    "approval/persistent.py",
-    "approval/server.py",
-)
-
-
 def _package_version_token() -> str:
     try:
         from agentveil_mcp_proxy import __version__
@@ -48,13 +37,24 @@ def _package_version_token() -> str:
 
 
 def _approval_center_code_fingerprint(package_root: Path) -> str:
-    """Hash bounded Approval Center module contents (relative names only)."""
+    """Hash the package code that the detached Approval Center may import.
+
+    The managed center is a long-lived subprocess. Its decision path imports
+    evidence, CLI, policy, and presentation helpers in addition to
+    ``approval/*``. Hashing only the approval directory can therefore reuse a
+    process whose durable-evidence contract is older than the active proxy.
+    """
 
     hasher = hashlib.sha256()
-    for relative in _APPROVAL_CENTER_CODE_FILES:
+    code_files = sorted(
+        path
+        for path in package_root.rglob("*.py")
+        if "__pycache__" not in path.parts
+    )
+    for path in code_files:
+        relative = path.relative_to(package_root).as_posix()
         hasher.update(relative.encode("utf-8"))
         hasher.update(b"\0")
-        path = package_root / relative
         try:
             hasher.update(path.read_bytes())
         except OSError:

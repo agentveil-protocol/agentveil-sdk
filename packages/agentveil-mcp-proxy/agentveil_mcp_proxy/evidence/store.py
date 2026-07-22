@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, fields, replace
 from enum import Enum
 import hashlib
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -25,11 +26,22 @@ from typing import Any, Iterable, Mapping
 import jcs
 
 
-EVIDENCE_SCHEMA_VERSION = 5
+EVIDENCE_SCHEMA_VERSION = 6
 DEFAULT_MAX_RECORDS = 10_000
 GENESIS_PREV_EVENT_HASH = "sha256:" + hashlib.sha256(
     b"agentveil_mcp_proxy/evidence/genesis-v1"
 ).hexdigest()
+
+_CREATE_REDIRECT_LINEAGE_CLAIMS_SQL = """
+CREATE TABLE IF NOT EXISTS redirect_lineage_claims (
+    original_request_id TEXT PRIMARY KEY,
+    follow_up_request_id TEXT NOT NULL,
+    claimed_at INTEGER NOT NULL,
+    lineage_status TEXT NOT NULL,
+    redirect_playbook_id TEXT NULL,
+    project_scope_fingerprint TEXT NULL
+)
+"""
 
 # Per-request Approval Center browser delivery lifecycle (not a decision/outcome).
 DELIVERY_STATUS_QUEUED = "queued"
@@ -80,6 +92,38 @@ class ApprovalStatus(str, Enum):
     BLOCKED = "blocked"
     ERROR = "error"
     CANCELLED = "cancelled"
+
+
+_REDIRECT_LINEAGE_STORE_FORBIDDEN_STATUSES = frozenset({
+    ApprovalStatus.CANCELLED.value,
+    ApprovalStatus.ERROR.value,
+    ApprovalStatus.INVALIDATED.value,
+    ApprovalStatus.EXECUTED.value,
+    ApprovalStatus.EXPIRED.value,
+    ApprovalStatus.APPROVED.value,
+})
+_REDIRECT_LINEAGE_STORE_DENIED_STATUSES = frozenset({
+    # claim-check: allow evidence enum values in the explicit eligibility set.
+    ApprovalStatus.BLOCKED.value,
+    ApprovalStatus.DENIED.value,
+})
+_REDIRECT_LINEAGE_REQUEST_APPROVAL_PLAYBOOK = "request_approval"
+
+
+def _redirect_lineage_store_status_allowed(
+    original_status: str,
+    redirect_playbook_id: str,
+) -> bool:
+    if original_status in _REDIRECT_LINEAGE_STORE_FORBIDDEN_STATUSES:
+        return False
+    if original_status in _REDIRECT_LINEAGE_STORE_DENIED_STATUSES:
+        return True
+    if (
+        original_status == ApprovalStatus.PENDING.value
+        and redirect_playbook_id == _REDIRECT_LINEAGE_REQUEST_APPROVAL_PLAYBOOK
+    ):
+        return True
+    return False
 
 
 TERMINAL_STATUSES = frozenset({
@@ -560,6 +604,212 @@ class ApprovalEvidenceStore:
         if updated is None:
             raise ApprovalEvidenceNotFoundError(f"approval record not found: {request_id}")
         return updated
+
+    def claim_redirect_lineage(
+        self,
+        original_request_id: str,
+        *,
+        follow_up_request_id: str,
+        claimed_at: int,
+        redirect_playbook_id: str,
+        project_scope_fingerprint: str,
+        expected_session_id: str,
+        expected_client_id: str | None,
+        expected_downstream_server: str,
+        expected_resource_hash: str | None,
+        expected_prev_event_hash: str | None = None,
+        playbook_target_bound: bool = True,
+        max_age_seconds: int = 3600,
+    ) -> dict[str, Any]:
+        """Atomically re-check eligibility and reserve one original lineage.
+
+        Concurrent callers racing the same ``original_request_id`` resolve to
+        exactly one winner. The loser raises ``ApprovalEvidenceDuplicateError``.
+        Eligibility (status/freshness/playbook/target/identity/scope) is verified
+        under the same SQLite lock/transaction as the INSERT — not a prior
+        read-then-write race.
+        """
+
+        if not original_request_id or not follow_up_request_id:
+            raise ApprovalEvidenceTransitionError(
+                "redirect lineage claim requires original and follow-up request ids"
+            )
+        if not redirect_playbook_id or not project_scope_fingerprint:
+            raise ApprovalEvidenceTransitionError(
+                "redirect lineage claim requires playbook and project scope"
+            )
+
+        with self._lock:
+            self._begin()
+            try:
+                row = self._conn.execute(
+                    f"SELECT {', '.join(_COLUMNS)} FROM pending_approvals "  # nosec B608
+                    "WHERE request_id = ?",
+                    (original_request_id,),
+                ).fetchone()
+                if row is None:
+                    raise ApprovalEvidenceNotFoundError(
+                        f"approval record not found: {original_request_id}"
+                    )
+                original = _row_to_record(row)
+                existing = self._conn.execute(
+                    "SELECT 1 FROM redirect_lineage_claims WHERE original_request_id = ?",
+                    (original_request_id,),
+                ).fetchone()
+                if existing is not None:
+                    raise ApprovalEvidenceDuplicateError(
+                        f"redirect lineage already claimed for {original_request_id}"
+                    )
+                if expected_prev_event_hash is not None:
+                    if original.prev_event_hash != expected_prev_event_hash:
+                        raise ApprovalEvidenceTransitionError(
+                            "redirect lineage original evidence hash changed"
+                        )
+                metadata = None
+                raw_meta = original.action_gate_metadata_jcs
+                if isinstance(raw_meta, str) and raw_meta:
+                    try:
+                        parsed = json.loads(raw_meta)
+                    except json.JSONDecodeError:
+                        parsed = None
+                    if isinstance(parsed, dict):
+                        metadata = parsed
+                if metadata is None:
+                    raise ApprovalEvidenceTransitionError(
+                        "redirect lineage original metadata missing"
+                    )
+                if metadata.get("redirect_role") != "original":
+                    raise ApprovalEvidenceTransitionError(
+                        "redirect lineage original role mismatch"
+                    )
+                if metadata.get("redirect_playbook_id") != redirect_playbook_id:
+                    raise ApprovalEvidenceTransitionError(
+                        "redirect lineage playbook mismatch"
+                    )
+                if metadata.get("target_reached") is not False:
+                    raise ApprovalEvidenceTransitionError(
+                        "redirect lineage original already reached target"
+                    )
+                if not _redirect_lineage_store_status_allowed(
+                    original.status,
+                    redirect_playbook_id,
+                ):
+                    raise ApprovalEvidenceTransitionError(
+                        f"redirect lineage original status not eligible: {original.status}"
+                    )
+                if original.expires_at is not None:
+                    if claimed_at >= original.expires_at:
+                        raise ApprovalEvidenceTransitionError(
+                            "redirect lineage original expired"
+                        )
+                elif claimed_at > original.created_at + max_age_seconds:
+                    raise ApprovalEvidenceTransitionError(
+                        "redirect lineage original stale"
+                    )
+                if original.session_id != expected_session_id:
+                    raise ApprovalEvidenceTransitionError(
+                        "redirect lineage session mismatch"
+                    )
+                if original.client_id is not None:
+                    if not isinstance(expected_client_id, str) or not expected_client_id:
+                        raise ApprovalEvidenceTransitionError(
+                            "redirect lineage expected client required"
+                        )
+                    if original.client_id != expected_client_id:
+                        raise ApprovalEvidenceTransitionError(
+                            "redirect lineage client mismatch"
+                        )
+                if original.downstream_server != expected_downstream_server:
+                    raise ApprovalEvidenceTransitionError(
+                        "redirect lineage downstream mismatch"
+                    )
+                stored_scope = metadata.get("project_scope_fingerprint")
+                if not isinstance(stored_scope, str) or not stored_scope:
+                    facts = metadata.get("session_bound_facts")
+                    if isinstance(facts, dict):
+                        startup = facts.get("downstream_startup_fingerprint")
+                        workspace_root_hash = facts.get("project_workspace_root_hash")
+                        server = original.downstream_server
+                        if (
+                            isinstance(server, str)
+                            and isinstance(startup, str)
+                            and isinstance(workspace_root_hash, str)
+                        ):
+                            from agentveil_mcp_proxy.role_doctor import project_scope_fingerprint
+
+                            stored_scope = project_scope_fingerprint(
+                                downstream_server=server,
+                                downstream_startup_fingerprint=startup,
+                                project_workspace_root_hash=workspace_root_hash,
+                            )
+                    if not isinstance(stored_scope, str) or not stored_scope:
+                        raise ApprovalEvidenceTransitionError(
+                            "redirect lineage project scope missing"
+                        )
+                if stored_scope != project_scope_fingerprint:
+                    raise ApprovalEvidenceTransitionError(
+                        "redirect lineage project scope mismatch"
+                    )
+                if playbook_target_bound:
+                    if not isinstance(original.resource_hash, str) or not original.resource_hash:
+                        raise ApprovalEvidenceTransitionError(
+                            "redirect lineage original resource hash missing"
+                        )
+                    if original.resource_hash != expected_resource_hash:
+                        raise ApprovalEvidenceTransitionError(
+                            "redirect lineage resource hash mismatch"
+                        )
+                try:
+                    self._conn.execute(
+                        "INSERT INTO redirect_lineage_claims ("
+                        "original_request_id, follow_up_request_id, claimed_at, "
+                        "lineage_status, redirect_playbook_id, project_scope_fingerprint"
+                        ") VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            original_request_id,
+                            follow_up_request_id,
+                            claimed_at,
+                            "verified",
+                            redirect_playbook_id,
+                            project_scope_fingerprint,
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise ApprovalEvidenceDuplicateError(
+                        f"redirect lineage already claimed for {original_request_id}"
+                    ) from exc
+                self._conn.commit()
+                self._secure_auxiliary_files()
+            except Exception:
+                self._conn.rollback()
+                raise
+        claim = self.get_redirect_lineage_claim(original_request_id)
+        if claim is None:
+            raise ApprovalEvidenceNotFoundError(
+                f"redirect lineage claim missing after insert: {original_request_id}"
+            )
+        return claim
+
+    def get_redirect_lineage_claim(self, original_request_id: str) -> dict[str, Any] | None:
+        """Return the durable redirect lineage claim for one original, if any."""
+
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT original_request_id, follow_up_request_id, claimed_at, "
+                "lineage_status, redirect_playbook_id, project_scope_fingerprint "
+                "FROM redirect_lineage_claims WHERE original_request_id = ?",
+                (original_request_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "original_request_id": row["original_request_id"],
+            "follow_up_request_id": row["follow_up_request_id"],
+            "claimed_at": int(row["claimed_at"]),
+            "lineage_status": row["lineage_status"],
+            "redirect_playbook_id": row["redirect_playbook_id"],
+            "project_scope_fingerprint": row["project_scope_fingerprint"],
+        }
 
     def annotate_delivery_status(
         self,
@@ -1054,6 +1304,7 @@ class ApprovalEvidenceStore:
                     "CREATE TABLE IF NOT EXISTS evidence_schema_version (version INTEGER NOT NULL)"
                 )
                 self._conn.execute(_CREATE_PENDING_APPROVALS_SQL)
+                self._conn.execute(_CREATE_REDIRECT_LINEAGE_CLAIMS_SQL)
                 self._ensure_optional_columns()
                 rows = self._conn.execute(
                     "SELECT version FROM evidence_schema_version"
@@ -1112,6 +1363,9 @@ class ApprovalEvidenceStore:
             version = 4
         if version == 4:
             self._migrate_v4_to_v5_locked()
+            version = 5
+        if version == 5:
+            self._migrate_v5_to_v6_locked()
             return
         raise ApprovalEvidenceSchemaError(f"evidence schema version {version} is unsupported")
 
@@ -1133,6 +1387,12 @@ class ApprovalEvidenceStore:
 
         self._ensure_optional_columns()
         self._rebuild_chain_locked()
+        self._set_schema_version_locked(5)
+
+    def _migrate_v5_to_v6_locked(self) -> None:
+        """Add durable redirect lineage claim table for verified follow-ups."""
+
+        self._conn.execute(_CREATE_REDIRECT_LINEAGE_CLAIMS_SQL)
         self._set_schema_version_locked(EVIDENCE_SCHEMA_VERSION)
 
     def _set_schema_version_locked(self, version: int) -> None:

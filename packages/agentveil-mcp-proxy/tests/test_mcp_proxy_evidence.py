@@ -1233,7 +1233,7 @@ def test_schema_version_mismatch_refuses_to_open_for_forward_incompatible(tmp_pa
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute("CREATE TABLE evidence_schema_version (version INTEGER NOT NULL)")
-        conn.execute("INSERT INTO evidence_schema_version (version) VALUES (6)")
+        conn.execute("INSERT INTO evidence_schema_version (version) VALUES (7)")
         conn.commit()
     finally:
         conn.close()
@@ -1265,7 +1265,7 @@ def test_schema_v3_migrates_to_v4_preserving_records_and_chain(tmp_path):
         count = conn.execute("SELECT COUNT(*) FROM pending_approvals").fetchone()[0]
     finally:
         conn.close()
-    assert version == 5
+    assert version == 6
     assert expires_at_notnull == 0
     assert count == 2
 
@@ -1296,7 +1296,7 @@ def test_fresh_schema_allows_null_expires_at(tmp_path):
         ).fetchone()[0]
     finally:
         conn.close()
-    assert version == 5
+    assert version == 6
     assert expires_at is None
 
 
@@ -1342,9 +1342,175 @@ def test_schema_v2_migrates_to_v4_with_new_nullable_columns_without_data_loss(tm
         columns = {row[1] for row in conn.execute("PRAGMA table_info(pending_approvals)")}
     finally:
         conn.close()
-    assert version == 5
+    assert version == 6
     assert "granted_by_request_id" in columns
     assert "approval_grant_jcs" in columns
+
+
+def test_schema_v5_migrates_to_v6_with_redirect_lineage_claims_and_reopen(tmp_path):
+    db_path = tmp_path / "evidence.sqlite"
+    first, second = _chain_records(
+        _record("req-v5-a", created_at=10, expires_at=310),
+        _record("req-v5-b", created_at=20, expires_at=320),
+    )
+    with ApprovalEvidenceStore(db_path) as store:
+        store.write_pending(first)
+        store.write_pending(second)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("DELETE FROM evidence_schema_version")
+        conn.execute("INSERT INTO evidence_schema_version (version) VALUES (5)")
+        conn.execute("DROP TABLE IF EXISTS redirect_lineage_claims")
+        conn.commit()
+        version_before = conn.execute(
+            "SELECT version FROM evidence_schema_version"
+        ).fetchone()[0]
+        tables_before = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+    assert version_before == 5
+    assert "redirect_lineage_claims" not in tables_before
+
+    with ApprovalEvidenceStore(db_path) as store:
+        assert store.get_pending("req-v5-a") is not None
+        assert store.get_pending("req-v5-b") is not None
+        assert store.get_redirect_lineage_claim("missing") is None
+
+    with ApprovalEvidenceStore(db_path) as reopened:
+        records = reopened.list_records()
+        assert [row.request_id for row in records] == ["req-v5-a", "req-v5-b"]
+        assert records[0].prev_event_hash == GENESIS_PREV_EVENT_HASH
+        assert records[1].prev_event_hash == record_hash(records[0])
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        version = conn.execute("SELECT version FROM evidence_schema_version").fetchone()[0]
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        claim_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(redirect_lineage_claims)")
+        }
+    finally:
+        conn.close()
+    assert version == 6
+    assert "redirect_lineage_claims" in tables
+    assert {
+        "original_request_id",
+        "follow_up_request_id",
+        "claimed_at",
+        "lineage_status",
+        "redirect_playbook_id",
+        "project_scope_fingerprint",
+    } <= claim_cols
+
+
+def _redirect_lineage_blocked_record(
+    store: ApprovalEvidenceStore,
+    *,
+    request_id: str = "orig-store",
+    status: str = ApprovalStatus.BLOCKED.value,
+    redirect_playbook_id: str = "create_implementer_task",
+    client_id: str | None = "client-a",
+    scope_fp: str = "sha256:" + "d" * 64,
+) -> None:
+    meta_jcs = json.dumps(
+        {
+            "redirect_role": "original",
+            "redirect_playbook_id": redirect_playbook_id,
+            "target_reached": False,
+            "original_request_id": request_id,
+            "project_scope_fingerprint": scope_fp,
+        },
+        separators=(",", ":"),
+    )
+    store.record_terminal_deny(
+        request_id=request_id,
+        session_id="session-store",
+        client_id=client_id,
+        downstream_server="fake-downstream",
+        tool_name="write_file",
+        risk_class="write",
+        resource_hash=RESOURCE_HASH,
+        payload_hash=PAYLOAD_HASH,
+        policy_id="redirect-lineage",
+        policy_rule_id=None,
+        policy_context_hash=POLICY_CONTEXT_HASH,
+        created_at=int(time.time()),
+        reason="role_authority_denied",
+        action_gate_metadata_jcs=meta_jcs,
+    )
+    # claim-check: allow evidence enum comparison in a negative transition fixture.
+    if status != ApprovalStatus.BLOCKED.value:
+        with sqlite3.connect(str(store.db_path)) as conn:
+            conn.execute(
+                "UPDATE pending_approvals SET status = ? WHERE request_id = ?",
+                (status, request_id),
+            )
+            conn.commit()
+
+
+def test_claim_redirect_lineage_rejects_pending_for_non_request_approval_playbook(tmp_path):
+    with _store(tmp_path) as store:
+        _redirect_lineage_blocked_record(
+            store,
+            status=ApprovalStatus.PENDING.value,
+            redirect_playbook_id="create_implementer_task",
+        )
+        with pytest.raises(ApprovalEvidenceTransitionError, match="status not eligible"):
+            store.claim_redirect_lineage(
+                "orig-store",
+                follow_up_request_id="follow-store",
+                claimed_at=int(time.time()),
+                redirect_playbook_id="create_implementer_task",
+                project_scope_fingerprint="sha256:" + "d" * 64,
+                expected_session_id="session-store",
+                expected_client_id="client-a",
+                expected_downstream_server="fake-downstream",
+                expected_resource_hash=RESOURCE_HASH,
+            )
+
+
+def test_claim_redirect_lineage_requires_expected_client_when_original_has_client(tmp_path):
+    with _store(tmp_path) as store:
+        _redirect_lineage_blocked_record(store, client_id="client-a")
+        with pytest.raises(ApprovalEvidenceTransitionError, match="expected client required"):
+            store.claim_redirect_lineage(
+                "orig-store",
+                follow_up_request_id="follow-store",
+                claimed_at=int(time.time()),
+                redirect_playbook_id="create_implementer_task",
+                project_scope_fingerprint="sha256:" + "d" * 64,
+                expected_session_id="session-store",
+                expected_client_id=None,
+                expected_downstream_server="fake-downstream",
+                expected_resource_hash=RESOURCE_HASH,
+            )
+
+
+def test_claim_redirect_lineage_rejects_terminal_statuses_at_store(tmp_path):
+    with _store(tmp_path) as store:
+        _redirect_lineage_blocked_record(store, status=ApprovalStatus.APPROVED.value)
+        with pytest.raises(ApprovalEvidenceTransitionError, match="status not eligible"):
+            store.claim_redirect_lineage(
+                "orig-store",
+                follow_up_request_id="follow-store",
+                claimed_at=int(time.time()),
+                redirect_playbook_id="create_implementer_task",
+                project_scope_fingerprint="sha256:" + "d" * 64,
+                expected_session_id="session-store",
+                expected_client_id="client-a",
+                expected_downstream_server="fake-downstream",
+                expected_resource_hash=RESOURCE_HASH,
+            )
 
 
 def test_no_backend_construction_during_evidence_operations(tmp_path, monkeypatch):
