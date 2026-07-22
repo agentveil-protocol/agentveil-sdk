@@ -122,7 +122,7 @@ def _owner_claim_path(claim_dir: Path, pid: int, instance_token: str) -> Path:
     return claim_dir / f"{int(pid)}-{safe_token}.claim"
 
 
-_PROCESS_HELD_OWNER_CLAIMS: set[str] = set()
+_PROCESS_HELD_OWNER_CLAIMS: dict[str, dict[str, Any]] = {}
 
 
 def _owner_claim_registry_key(path: Path) -> str:
@@ -195,7 +195,7 @@ class OwnerClaimLease:
                 fh.close()
             except OSError:
                 pass
-        _PROCESS_HELD_OWNER_CLAIMS.discard(_owner_claim_registry_key(self.path))
+        _PROCESS_HELD_OWNER_CLAIMS.pop(_owner_claim_registry_key(self.path), None)
         try:
             self.path.unlink()
         except OSError:
@@ -241,7 +241,7 @@ def publish_owner_claim(
         except OSError:
             pass
         raise
-    _PROCESS_HELD_OWNER_CLAIMS.add(_owner_claim_registry_key(path))
+    _PROCESS_HELD_OWNER_CLAIMS[_owner_claim_registry_key(path)] = dict(payload)
     return OwnerClaimLease(path=path, _fh=fh)
 
 
@@ -271,7 +271,11 @@ def read_owner_claim(
     try:
         raw = path.read_text(encoding="utf-8")
         payload = json.loads(raw)
-    except (OSError, json.JSONDecodeError):
+    except OSError:
+        payload = _PROCESS_HELD_OWNER_CLAIMS.get(_owner_claim_registry_key(path))
+        if payload is None:
+            return None
+    except json.JSONDecodeError:
         return None
     if not isinstance(payload, dict):
         return None

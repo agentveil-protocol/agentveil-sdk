@@ -27,6 +27,7 @@ from agentveil_mcp_proxy.approval.server import (
     owner_pid_from_client_id,
     publish_owner_claim,
     clear_owner_claim,
+    read_owner_claim,
     redact_owner_client_id_for_display,
 )
 from agentveil_mcp_proxy.classification import ToolCallClassifier
@@ -125,6 +126,43 @@ def test_stale_claim_with_reused_pid_is_not_actionable(
         session_id=session_id,
         claim_dir=claim_dir,
     ) is False
+
+
+def test_process_held_owner_claim_survives_locked_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows byte locks can make same-process claim files unreadable."""
+
+    claim_dir = tmp_path / "owner_claims"
+    token = "locked-read-token"
+    session_id = "session-locked-read"
+    lease = publish_owner_claim(
+        claim_dir,
+        pid=os.getpid(),
+        instance_token=token,
+        session_id=session_id,
+    )
+    original_read_text = Path.read_text
+
+    def _locked_claim_read(path: Path, *args, **kwargs):
+        if path == lease.path:
+            raise PermissionError("simulated locked owner claim")
+        return original_read_text(path, *args, **kwargs)
+
+    try:
+        monkeypatch.setattr(Path, "read_text", _locked_claim_read)
+        claim = read_owner_claim(claim_dir, os.getpid(), instance_token=token)
+        assert claim is not None
+        assert claim["instance_token"] == token
+        assert claim["session_id"] == session_id
+        assert approval_owner_is_actionable(
+            build_owner_client_id("filesystem", instance_token=token),
+            session_id=session_id,
+            claim_dir=claim_dir,
+        ) is True
+    finally:
+        clear_owner_claim(lease)
 
 
 def test_owner_claim_cleared_on_clean_stop(tmp_path: Path) -> None:
