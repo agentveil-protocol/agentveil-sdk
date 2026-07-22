@@ -123,6 +123,7 @@ def _owner_claim_path(claim_dir: Path, pid: int, instance_token: str) -> Path:
 
 
 _PROCESS_HELD_OWNER_CLAIMS: dict[str, dict[str, Any]] = {}
+_WINDOWS_OWNER_CLAIM_LOCK_OFFSET = 1024 * 1024
 
 
 def _owner_claim_registry_key(path: Path) -> str:
@@ -140,7 +141,9 @@ def _try_exclusive_claim_lock(fh: Any) -> bool:
         import msvcrt
 
         try:
-            fh.seek(0)
+            # Keep the byte-range lease outside the bounded JSON payload so a
+            # separate hook process can read the claim while the owner is live.
+            fh.seek(_WINDOWS_OWNER_CLAIM_LOCK_OFFSET)
             msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
             return True
         except OSError:
@@ -161,7 +164,7 @@ def _release_claim_lock(fh: Any) -> None:
         import msvcrt
 
         try:
-            fh.seek(0)
+            fh.seek(_WINDOWS_OWNER_CLAIM_LOCK_OFFSET)
             msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
         except OSError:
             pass
@@ -277,13 +280,21 @@ def read_owner_claim(
             return None
     if not isinstance(payload, dict):
         return None
+    claim_pid = payload.get("pid")
     token = payload.get("instance_token")
     session_id = payload.get("session_id")
+    if not isinstance(claim_pid, int) or claim_pid != int(pid):
+        return None
     if not isinstance(token, str) or not token:
         return None
     if not isinstance(session_id, str) or not session_id:
         return None
-    return {"instance_token": token, "session_id": session_id, "path": path}
+    return {
+        "pid": claim_pid,
+        "instance_token": token,
+        "session_id": session_id,
+        "path": path,
+    }
 
 
 def owner_claim_lease_is_held(path: Path) -> bool:

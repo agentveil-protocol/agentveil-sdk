@@ -11,7 +11,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from agentveil_mcp_proxy.approval.server import owner_claim_lease_is_held
+from agentveil_mcp_proxy.approval.server import (
+    owner_claim_lease_is_held,
+    read_owner_claim,
+)
 from agentveil_mcp_proxy.classification import extract_resource, sha256_jcs, sha256_text
 from agentveil_mcp_proxy.client_config import (
     assert_proxy_cli_json_is_privacy_safe,
@@ -418,12 +421,6 @@ def resolve_live_hook_runtime_binding(
     for claim_path in sorted(claims_root.glob("*.claim")):
         if not owner_claim_lease_is_held(claim_path):
             continue
-        try:
-            claim_payload = json.loads(claim_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(claim_payload, Mapping):
-            continue
         stem = claim_path.name[: -len(".claim")]
         binding_path = hook_runtime_bindings_dir(proxy_home) / f"{stem}.json"
         if not binding_path.is_file():
@@ -436,6 +433,20 @@ def resolve_live_hook_runtime_binding(
             continue
         binding = _parse_hook_runtime_binding_payload(binding_payload)
         if binding is None:
+            continue
+        claim_payload = read_owner_claim(
+            claims_root,
+            binding.owner_pid,
+            instance_token=binding.instance_token,
+        )
+        if claim_payload is None:
+            continue
+        claim_payload_path = claim_payload.get("path")
+        if not isinstance(claim_payload_path, Path):
+            continue
+        payload_path_key = os.path.normcase(str(claim_payload_path.resolve()))
+        scanned_path_key = os.path.normcase(str(claim_path.resolve()))
+        if payload_path_key != scanned_path_key:
             continue
         if not _binding_matches_claim(binding, claim_payload):
             continue

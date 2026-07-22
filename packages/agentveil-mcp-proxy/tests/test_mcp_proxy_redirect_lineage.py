@@ -1681,6 +1681,33 @@ def test_live_binding_survives_past_max_age_while_owner_lease_held(
         fixture.lease.close()
 
 
+def test_live_binding_resolves_when_owner_claim_read_is_locked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows can deny direct reads while the process owns the byte lock."""
+
+    from redirect_hook_contract_fixtures import init_redirect_contract_home, publish_live_hook_binding
+
+    home, _sandbox, downstream = init_redirect_contract_home(tmp_path)
+    fixture = publish_live_hook_binding(home, downstream=downstream)
+    original_read_text = Path.read_text
+
+    def _locked_claim_read(path: Path, *args, **kwargs):
+        if path == fixture.lease.path:
+            raise PermissionError("simulated locked owner claim")
+        return original_read_text(path, *args, **kwargs)
+
+    try:
+        monkeypatch.setattr(Path, "read_text", _locked_claim_read)
+        binding = resolve_live_hook_runtime_binding(home)
+        assert binding is not None
+        assert binding.owner_pid == fixture.owner_pid
+        assert binding.instance_token == fixture.instance_token
+    finally:
+        fixture.lease.close()
+
+
 def test_stale_unheld_binding_is_not_actionable(tmp_path: Path) -> None:
     from redirect_hook_contract_fixtures import init_redirect_contract_home, publish_live_hook_binding
 
