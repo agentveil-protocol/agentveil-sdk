@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, Optional
+from typing import Any
 
 import base58
 import jcs
@@ -84,7 +84,7 @@ def sign_eddsa_jcs_2022(
     signing_seed: bytes,
     *,
     proof_purpose: str = DEFAULT_PROOF_PURPOSE,
-    created: Optional[str] = None,
+    created: str | None = None,
 ) -> str:
     """Secure ``unsecured_document`` with an eddsa-jcs-2022 DataIntegrityProof.
 
@@ -124,16 +124,32 @@ def sign_eddsa_jcs_2022(
     return jcs.canonicalize(secured).decode("utf-8")
 
 
+def _require_expected_signer_did(expected_signer_did: object) -> str:
+    if expected_signer_did is None:
+        raise DataIntegrityError("expected signer DID is required")
+    if not isinstance(expected_signer_did, str) or not expected_signer_did:
+        raise DataIntegrityError("expected signer DID is required")
+    try:
+        _did_to_public_key(expected_signer_did)
+    except DataIntegrityError as exc:
+        raise DataIntegrityError("expected signer DID is invalid") from exc
+    return expected_signer_did
+
+
 def verify_eddsa_jcs_2022(
     secured_jcs: str,
     *,
-    expected_signer_did: Optional[str] = None,
+    expected_signer_did: str,
 ) -> dict[str, Any]:
     """Verify one eddsa-jcs-2022 DataIntegrityProof via the W3C hashData rule.
+
+    ``expected_signer_did`` must be supplied by the caller. The document's own
+    verificationMethod is not used as trust authority.
 
     Returns the unsecured document and signer DID on success. Raises
     ``DataIntegrityError`` on any structural or signature failure (fail closed).
     """
+    expected_signer_did = _require_expected_signer_did(expected_signer_did)
     if not isinstance(secured_jcs, str) or not secured_jcs:
         raise DataIntegrityError("secured_jcs must be a non-empty string")
     try:
@@ -157,7 +173,7 @@ def verify_eddsa_jcs_2022(
     if not isinstance(verification_method, str) or "#" not in verification_method:
         raise DataIntegrityError("proof.verificationMethod is invalid")
     signer_did = verification_method.split("#", 1)[0]
-    if expected_signer_did is not None and signer_did != expected_signer_did:
+    if signer_did != expected_signer_did:
         raise DataIntegrityError("receipt signer does not match expected signer")
 
     proof_value = proof.get("proofValue")

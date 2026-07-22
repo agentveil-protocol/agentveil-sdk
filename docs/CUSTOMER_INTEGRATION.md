@@ -322,11 +322,12 @@ schemas.
 
 The Runtime Gate DecisionReceipt is now `decision_receipt/3`, a W3C Data
 Integrity `DataIntegrityProof` / `eddsa-jcs-2022` artifact. Verify a `/3`
-receipt with `verify_eddsa_jcs_2022(...)`, or — when embedded in an evidence
-bundle — through the strict bundle verifier with an externally pinned signer
-DID. The raw `verify_signed_jcs(...)` and `verify_proof_packet(...)` paths above
-cover the legacy `/1`,`/2` raw-JCS decision-receipt schema and do not accept
-`/3`. `verify_eddsa_jcs_2022(...)` is the SDK's own first-party Data Integrity
-verifier; it is not a third-party standard-conformance certification, and only
-the decision receipt uses Data Integrity — the other receipt families remain
-legacy raw-JCS.
+receipt with `verify_eddsa_jcs_2022(..., expected_signer_did=...)`, or — when
+embedded in an evidence bundle — through the strict bundle verifier with an
+externally pinned signer DID. The raw `verify_signed_jcs(...)` and
+`verify_proof_packet(...)` paths above cover the legacy `/1`,`/2` raw-JCS
+decision-receipt schema and do not accept `/3`. `verify_eddsa_jcs_2022(...)`
+requires an externally pinned signer DID; the document's own verificationMethod
+is not trust authority. It is the SDK's own first-party Data Integrity verifier;
+it is not a third-party standard-conformance certification, and only the decision
+receipt uses Data Integrity — the other receipt families remain legacy raw-JCS.

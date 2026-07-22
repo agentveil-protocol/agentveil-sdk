@@ -97,7 +97,7 @@ def test_v2_raw_receipt_fails_under_v3_verifier():
         "payload_hash": PAYLOAD_HASH,
     })
     with pytest.raises(DataIntegrityError):
-        verify_eddsa_jcs_2022(v2)
+        verify_eddsa_jcs_2022(v2, expected_signer_did=DID_A)
 
 
 # 3. A /3 receipt must FAIL under the legacy raw /2 verifier.
@@ -112,7 +112,7 @@ def test_body_tamper_fails():
     secured = json.loads(sign_eddsa_jcs_2022(_v3_doc(), SEED_A, created=CREATED))
     secured["decision"] = "ALLOW"
     with pytest.raises(DataIntegrityError):
-        verify_eddsa_jcs_2022(jcs.canonicalize(secured).decode("utf-8"))
+        verify_eddsa_jcs_2022(jcs.canonicalize(secured).decode("utf-8"), expected_signer_did=DID_A)
 
 
 # 5. proofConfig tamper (verificationMethod is part of the hashed config) fails.
@@ -120,7 +120,7 @@ def test_proof_config_tamper_fails():
     secured = json.loads(sign_eddsa_jcs_2022(_v3_doc(), SEED_A, created=CREATED))
     secured["proof"]["verificationMethod"] = f"{DID_B}#{DID_B[len('did:key:'):]}"
     with pytest.raises(DataIntegrityError):
-        verify_eddsa_jcs_2022(jcs.canonicalize(secured).decode("utf-8"))
+        verify_eddsa_jcs_2022(jcs.canonicalize(secured).decode("utf-8"), expected_signer_did=DID_A)
 
 
 # 6. Wrong key fails: (a) expected-signer mismatch and (b) vm claims A but B signed.
@@ -148,7 +148,7 @@ def test_wrong_key_fails():
     ).decode("ascii")
     forged = jcs.canonicalize({**doc, "proof": proof_options}).decode("utf-8")
     with pytest.raises(DataIntegrityError):
-        verify_eddsa_jcs_2022(forged)  # vm says A, signature by B
+        verify_eddsa_jcs_2022(forged, expected_signer_did=DID_A)  # vm says A, signature by B
 
 
 # 7. proofValue tamper fails.
@@ -157,7 +157,7 @@ def test_proof_value_tamper_fails():
     pv = secured["proof"]["proofValue"]
     secured["proof"]["proofValue"] = pv[:-1] + ("A" if pv[-1] != "A" else "B")
     with pytest.raises(DataIntegrityError):
-        verify_eddsa_jcs_2022(jcs.canonicalize(secured).decode("utf-8"))
+        verify_eddsa_jcs_2022(jcs.canonicalize(secured).decode("utf-8"), expected_signer_did=DID_A)
 
 
 # 8. created is part of proofConfig: tampering it fails.
@@ -166,7 +166,7 @@ def test_created_tamper_fails():
     assert secured["proof"]["created"] == CREATED
     secured["proof"]["created"] = "2026-01-01T00:00:00Z"
     with pytest.raises(DataIntegrityError):
-        verify_eddsa_jcs_2022(jcs.canonicalize(secured).decode("utf-8"))
+        verify_eddsa_jcs_2022(jcs.canonicalize(secured).decode("utf-8"), expected_signer_did=DID_A)
 
 
 # 9. Independent construction-A: recompute hashData and verify with raw nacl,
@@ -205,7 +205,7 @@ def test_truncated_signature_fails_closed():
     assert len(full) == 64
     secured["proof"]["proofValue"] = "z" + base58.b58encode(full[:32]).decode("ascii")
     with pytest.raises(DataIntegrityError):
-        verify_eddsa_jcs_2022(jcs.canonicalize(secured).decode("utf-8"))
+        verify_eddsa_jcs_2022(jcs.canonicalize(secured).decode("utf-8"), expected_signer_did=DID_A)
 
 
 # 11. A short (10-byte) proofValue signature must raise the project's
@@ -214,7 +214,32 @@ def test_short_signature_raises_data_integrity_error_not_raw_valueerror():
     secured = json.loads(sign_eddsa_jcs_2022(_v3_doc(), SEED_A, created=CREATED))
     secured["proof"]["proofValue"] = "z" + base58.b58encode(b"\x00" * 10).decode("ascii")
     with pytest.raises(DataIntegrityError) as excinfo:
-        verify_eddsa_jcs_2022(jcs.canonicalize(secured).decode("utf-8"))
+        verify_eddsa_jcs_2022(jcs.canonicalize(secured).decode("utf-8"), expected_signer_did=DID_A)
     # A raw leak would be type nacl.exceptions.ValueError; assert it is exactly the
     # project's DataIntegrityError type instead.
     assert type(excinfo.value) is DataIntegrityError
+
+
+def test_verify_requires_expected_signer_did_argument():
+    secured = sign_eddsa_jcs_2022(_v3_doc(), SEED_A, created=CREATED)
+    with pytest.raises(TypeError):
+        verify_eddsa_jcs_2022(secured)  # type: ignore[call-arg]
+
+
+@pytest.mark.parametrize(
+    "expected_signer_did",
+    [None, "", "not-a-did", "did:key:zinvalid"],
+)
+def test_invalid_expected_signer_did_fails_closed(expected_signer_did):
+    secured = sign_eddsa_jcs_2022(_v3_doc(), SEED_A, created=CREATED)
+    with pytest.raises(DataIntegrityError) as exc_info:
+        verify_eddsa_jcs_2022(secured, expected_signer_did=expected_signer_did)  # type: ignore[arg-type]
+    message = str(exc_info.value)
+    if isinstance(expected_signer_did, str) and expected_signer_did:
+        assert expected_signer_did not in message
+
+
+def test_attacker_signed_document_fails_with_trusted_pin():
+    secured = sign_eddsa_jcs_2022(_v3_doc(), SEED_B, created=CREATED)
+    with pytest.raises(DataIntegrityError):
+        verify_eddsa_jcs_2022(secured, expected_signer_did=DID_A)

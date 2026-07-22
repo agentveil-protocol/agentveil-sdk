@@ -10,9 +10,14 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from agentveil_mcp_proxy.classification import ClassifiedToolCall
+from agentveil_mcp_proxy.runtime_gate import (
+    CANONICAL_RUNTIME_ENVIRONMENTS,
+    DEFAULT_RUNTIME_ENVIRONMENT,
+)
 
 
 HEADLESS_POLICY_SCHEMA_VERSION = 1
+_LEGACY_HEADLESS_ENVIRONMENT = "mcp_proxy"
 _HIGH_RISK = {"destructive", "production", "financial"}
 
 
@@ -30,7 +35,7 @@ class HeadlessPreApproval:
     expires_at: int
     resource_hash: str | None = None
     resource: str | None = None
-    environment: str = "mcp_proxy"
+    environment: str = DEFAULT_RUNTIME_ENVIRONMENT
     max_payload_hash: str | None = None
     allow_narrow_match: bool = False
 
@@ -79,7 +84,9 @@ class HeadlessPreApproval:
             expires_at=expires_at,
             resource_hash=resource_hash,
             resource=resource,
-            environment=_optional_str(data.get("environment"), "environment") or "mcp_proxy",
+            environment=_normalize_headless_environment(
+                _optional_str(data.get("environment"), "environment")
+            ),
             max_payload_hash=max_payload_hash,
             allow_narrow_match=allow_narrow_match,
         )
@@ -153,16 +160,31 @@ class HeadlessPolicy:
         self,
         classification: ClassifiedToolCall,
         *,
-        environment: str = "mcp_proxy",
+        environment: str = DEFAULT_RUNTIME_ENVIRONMENT,
         now_timestamp: int | None = None,
     ) -> HeadlessPreApproval | None:
         """Return the first matching pre-approval rule, if any."""
 
+        normalized_environment = _normalize_headless_environment(environment)
         now = int(datetime.now(timezone.utc).timestamp()) if now_timestamp is None else now_timestamp
         for rule in self.pre_approvals:
-            if rule.matches(classification, environment=environment, now_timestamp=now):
+            if rule.matches(
+                classification,
+                environment=normalized_environment,
+                now_timestamp=now,
+            ):
                 return rule
         return None
+
+
+def _normalize_headless_environment(value: str | None) -> str:
+    if value is None:
+        return DEFAULT_RUNTIME_ENVIRONMENT
+    if value == _LEGACY_HEADLESS_ENVIRONMENT:
+        return DEFAULT_RUNTIME_ENVIRONMENT
+    if value not in CANONICAL_RUNTIME_ENVIRONMENTS:
+        raise HeadlessPolicyError("environment invalid")
+    return value
 
 
 def _required_str(value: Any, field: str) -> str:

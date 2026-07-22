@@ -464,8 +464,14 @@ def test_verify_proof_packet_decision_receipt_v3_passes():
 
 
 def test_verify_proof_packet_decision_receipt_v3_untrusted_signer_fails():
-    with pytest.raises(ProofVerificationError, match="DecisionReceipt signer"):
+    with pytest.raises(ProofVerificationError, match="DecisionReceipt signature verification failed"):
         verify_proof_packet(_v3_packet(), trusted_backend_signer_dids=[OTHER_BACKEND_DID])
+
+
+def test_verify_proof_packet_decision_receipt_v3_attacker_self_signed_fails():
+    packet = _v3_packet(decision_seed=OTHER_BACKEND_SEED)
+    with pytest.raises(ProofVerificationError, match="DecisionReceipt signature verification failed"):
+        verify_proof_packet(packet, trusted_backend_signer_dids=[BACKEND_DID])
 
 
 def test_verify_proof_packet_decision_receipt_v3_tamper_fails():

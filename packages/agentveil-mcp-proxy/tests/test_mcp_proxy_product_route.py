@@ -339,6 +339,15 @@ def test_product_route_tools_list_includes_read_only_filesystem_tools(
     assert "get_file_info" in tool_names
 
 
+def test_product_route_package_tool_schema_matches_runtime_validator() -> None:
+    entries = {entry["name"]: entry for entry in build_product_route_tool_entries()}
+    for tool in PACKAGE_PRODUCT_TOOLS:
+        package_name = entries[tool]["inputSchema"]["properties"]["package_name"]
+        assert package_name["pattern"] == "^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$"
+        assert package_name["minLength"] == 1
+        assert package_name["maxLength"] == 128
+
+
 def test_product_route_read_file_succeeds_without_approval(tmp_path, monkeypatch) -> None:
     home = tmp_path / "home"
     profile_root = tmp_path / "profile"

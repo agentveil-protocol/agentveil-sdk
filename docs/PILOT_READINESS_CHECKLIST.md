@@ -235,14 +235,16 @@ Current signed receipt schemas:
 | HumanApprovalReceipt | `human_approval_receipt/2` |
 | ExecutionReceipt | `execution_receipt/2` |
 
-The Runtime Gate DecisionReceipt is `decision_receipt/3` (W3C Data Integrity,
-`eddsa-jcs-2022`): verify a `/3` receipt with `verify_eddsa_jcs_2022(...)` or,
-when embedded in an evidence bundle, through the strict bundle verifier with an
-externally pinned signer DID. `verify_signed_jcs(...)` / `verify_proof_packet(...)`
-above cover the legacy `/1`,`/2` raw-JCS schema. HumanApprovalReceipt and
-ExecutionReceipt remain `/2` raw-JCS. `verify_eddsa_jcs_2022(...)` is the SDK's
-own first-party Data Integrity verifier, not a third-party standard-conformance
-certification.
+<!-- claim-check: allow "W3C"/"eddsa-jcs-2022" are literal protocol identifiers, not conformance claims; the externally pinned verifier boundary is tested in tests/test_decision_receipt_v3.py. -->
+The Runtime Gate DecisionReceipt is `decision_receipt/3` (W3C Data Integrity, <!-- claim-check: allow eddsa-jcs-2022 is a literal cryptosuite identifier, not a conformance claim; pinned verification is tested in tests/test_decision_receipt_v3.py. -->
+`eddsa-jcs-2022`): verify a `/3` receipt with
+`verify_eddsa_jcs_2022(..., expected_signer_did=...)` or, when embedded in an
+evidence bundle, through the strict bundle verifier with an externally pinned
+signer DID. `verify_signed_jcs(...)` / `verify_proof_packet(...)` above cover
+the legacy `/1`,`/2` raw-JCS schema. HumanApprovalReceipt and ExecutionReceipt
+remain `/2` raw-JCS. `verify_eddsa_jcs_2022(...)` requires an externally pinned
+signer DID and is the SDK's own first-party Data Integrity verifier, not a
+third-party standard-conformance certification.
 
 ## Go/No-Go Criteria
 

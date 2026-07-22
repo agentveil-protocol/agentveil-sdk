@@ -69,7 +69,7 @@ def test_round_trip_sign_and_verify():
 
 def test_wrong_expected_signer_rejected():
     grant = build_approval_grant(_valid_body(), SEED)
-    with pytest.raises(ApprovalGrantError, match="signer is not in the pinned"):
+    with pytest.raises(ApprovalGrantError, match="signature invalid"):
         verify_approval_grant(grant, expected_signer_dids=[OTHER_DID])
 
 
@@ -158,7 +158,7 @@ def test_embedded_self_declared_trust_is_ignored():
     ok = verify_approval_grant(grant, expected_signer_dids=[PROXY_DID])
     assert ok["agent_did"] == PROXY_DID
     # Pinning only to the embedded "trusted" DID (not the actual signer) rejects.
-    with pytest.raises(ApprovalGrantError, match="signer is not in the pinned"):
+    with pytest.raises(ApprovalGrantError, match="signature invalid"):
         verify_approval_grant(grant, expected_signer_dids=[OTHER_DID])
 
 

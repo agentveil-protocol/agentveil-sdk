@@ -67,6 +67,7 @@ from agentveil_mcp_proxy.evidence.approval_grant import (
 )
 from agentveil_mcp_proxy.passthrough import DownstreamConfig, McpPassthrough
 from agentveil_mcp_proxy.policy import ProxyConfig, ProxyConfigError
+from agentveil_mcp_proxy.runtime_gate import DEFAULT_RUNTIME_ENVIRONMENT
 
 from mcp_fake_downstream import tool_entry, write_downstream
 
@@ -882,6 +883,96 @@ def test_headless_policy_missing_match_denies_by_default(tmp_path):
     finally:
         server.stop()
         store.close()
+
+
+def _destructive_headless_policy_dict(
+    classification,
+    *,
+    environment: str | None = "unset",
+) -> dict:
+    expires = (datetime.now(timezone.utc) + timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    entry = {
+        "server": "github",
+        "tool": "create_issue",
+        "risk_class": "destructive",
+        "resource_hash": classification.resource_hash,
+        "max_payload_hash": classification.payload_hash,
+        "expires_at": expires,
+    }
+    if environment != "unset":
+        entry["environment"] = environment
+    return {
+        "headless_policy_schema_version": 1,
+        "pre_approvals": [entry],
+    }
+
+
+def test_headless_default_environment_matches_approval_manager_default(tmp_path):
+    config = _config(policy_rule=_write_rule(risk_class="destructive"))
+    classification = _classification(config)
+    policy = HeadlessPolicy.from_dict(_destructive_headless_policy_dict(classification))
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        headless=True,
+        headless_policy=policy,
+    )
+    try:
+        outcome = manager.request_approval(classification, reason="local_approval_required")
+        record = store.get_pending(outcome.request_id)
+
+        assert outcome.approved
+        assert record.status == ApprovalStatus.APPROVED.value
+        assert policy.pre_approvals[0].environment == DEFAULT_RUNTIME_ENVIRONMENT
+        assert manager.environment == DEFAULT_RUNTIME_ENVIRONMENT
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_headless_legacy_mcp_proxy_environment_normalizes_to_unknown(tmp_path):
+    config = _config(policy_rule=_write_rule(risk_class="destructive"))
+    classification = _classification(config)
+    policy = HeadlessPolicy.from_dict(
+        _destructive_headless_policy_dict(classification, environment="mcp_proxy")
+    )
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        headless=True,
+        headless_policy=policy,
+    )
+    try:
+        outcome = manager.request_approval(classification, reason="local_approval_required")
+        record = store.get_pending(outcome.request_id)
+
+        assert outcome.approved
+        assert record.status == ApprovalStatus.APPROVED.value
+        assert policy.pre_approvals[0].environment == "unknown"
+        assert policy.pre_approvals[0].environment != "mcp_proxy"
+    finally:
+        server.stop()
+        store.close()
+
+
+@pytest.mark.parametrize("invalid_environment", ["prod", "staging\n", "x" * 256])
+def test_headless_rejects_invalid_environment_without_raw_echo(invalid_environment):
+    expires = (datetime.now(timezone.utc) + timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    payload = {
+        "headless_policy_schema_version": 1,
+        "pre_approvals": [{
+            "server": "github",
+            "tool": "create_issue",
+            "risk_class": "write",
+            "environment": invalid_environment,
+            "expires_at": expires,
+        }],
+    }
+
+    with pytest.raises(HeadlessPolicyError, match="environment invalid") as exc_info:
+        HeadlessPolicy.from_dict(payload)
+
+    assert invalid_environment not in str(exc_info.value)
 
 
 def test_nonblocking_approval_returns_pending_url_and_records_later_decision(tmp_path):

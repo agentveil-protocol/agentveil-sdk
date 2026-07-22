@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -30,6 +31,29 @@ CI_REPO_RISK_MESSAGE = (
 )
 CI_MANIFEST_NAME = ".ci_repo_trust_manifest.json"
 _GIT_BASENAME_LIMIT = 8
+DEFAULT_PRODUCT_ROUTE_PACKAGE_NAME = "agentveil-route-test-pkg"
+_PACKAGE_NAME_INVALID = "package_name invalid"
+_PACKAGE_NAME_PATTERN = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$"
+)
+
+
+def validate_product_route_package_name(value: object) -> str:
+    """Accept only bounded ASCII distribution names for product-route pip tools."""
+
+    if not isinstance(value, str):
+        raise ValueError(_PACKAGE_NAME_INVALID)
+    if not _PACKAGE_NAME_PATTERN.fullmatch(value):
+        raise ValueError(_PACKAGE_NAME_INVALID)
+    return value
+
+
+def resolve_product_route_package_name(arguments: Mapping[str, Any]) -> str:
+    """Return the configured default or validate an explicit package_name argument."""
+
+    if "package_name" not in arguments:
+        return DEFAULT_PRODUCT_ROUTE_PACKAGE_NAME
+    return validate_product_route_package_name(arguments["package_name"])
 
 
 def _path_to_basename(path: str) -> str:
@@ -301,7 +325,7 @@ class PackageInstallPackHandler:
 
     def handle(self, name: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
         project_path = self._project_path(arguments)
-        package_name = str(arguments.get("package_name") or "agentveil-route-test-pkg")
+        package_name = resolve_product_route_package_name(arguments)
         before = self._bounded_snapshot(package_name)
         reached = False
         payload: dict[str, Any] = {"ok": True, "tool": name}
@@ -766,7 +790,10 @@ class GitHubCiPackHandler:
 
 
 __all__ = [
+    "DEFAULT_PRODUCT_ROUTE_PACKAGE_NAME",
     "GitHubCiPackHandler",
     "GitRepoPackHandler",
     "PackageInstallPackHandler",
+    "resolve_product_route_package_name",
+    "validate_product_route_package_name",
 ]
