@@ -22,6 +22,7 @@ from agentveil_mcp_proxy.approval.server import (
     approval_owner_process_alive,
     build_owner_client_id,
     enrich_owner_client_id,
+    owner_claim_lease_is_held,
     owner_instance_from_client_id,
     owner_pid_from_client_id,
     publish_owner_claim,
@@ -64,6 +65,7 @@ def test_owner_pid_helpers(tmp_path: Path) -> None:
         session_id=session_id,
     )
     try:
+        assert owner_claim_lease_is_held(lease.path) is True
         assert approval_owner_is_actionable(
             client_id,
             session_id=session_id,

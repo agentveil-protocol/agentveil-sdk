@@ -122,6 +122,17 @@ def _owner_claim_path(claim_dir: Path, pid: int, instance_token: str) -> Path:
     return claim_dir / f"{int(pid)}-{safe_token}.claim"
 
 
+_PROCESS_HELD_OWNER_CLAIMS: set[str] = set()
+
+
+def _owner_claim_registry_key(path: Path) -> str:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    return os.path.normcase(str(resolved))
+
+
 def _try_exclusive_claim_lock(fh: Any) -> bool:
     """Return True when an exclusive non-blocking lock was acquired."""
 
@@ -184,6 +195,7 @@ class OwnerClaimLease:
                 fh.close()
             except OSError:
                 pass
+        _PROCESS_HELD_OWNER_CLAIMS.discard(_owner_claim_registry_key(self.path))
         try:
             self.path.unlink()
         except OSError:
@@ -229,6 +241,7 @@ def publish_owner_claim(
         except OSError:
             pass
         raise
+    _PROCESS_HELD_OWNER_CLAIMS.add(_owner_claim_registry_key(path))
     return OwnerClaimLease(path=path, _fh=fh)
 
 
@@ -274,6 +287,8 @@ def read_owner_claim(
 def owner_claim_lease_is_held(path: Path) -> bool:
     """Return True only when another process currently holds the claim lock."""
 
+    if _owner_claim_registry_key(path) in _PROCESS_HELD_OWNER_CLAIMS:
+        return True
     try:
         fh = path.open("a+", encoding="utf-8")
     except OSError:
