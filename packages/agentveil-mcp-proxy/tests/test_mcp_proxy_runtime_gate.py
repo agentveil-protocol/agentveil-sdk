@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+from copy import deepcopy
 from pathlib import Path
 import sys
 import time
@@ -59,6 +60,33 @@ BACKEND_DID = _public_key_to_did(bytes(SigningKey(BACKEND_SEED).verify_key))
 AGENT_DID = _public_key_to_did(bytes(SigningKey(AGENT_SEED).verify_key))
 SECRET = "SECRET_PROJECT_ALPHA"
 AUDIT_ID = "urn:uuid:11111111-1111-4111-8111-111111111111"
+_PUBLIC_WIRE_CONTRACT_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "tests"
+    / "fixtures"
+    / "runtime_gate_public_wire_contract.json"
+)
+_FORBIDDEN_PRIVATE_MARKERS = (
+    "source_truth",
+    "entitlement",
+    "billing",
+    "hosted_accounting",
+    "kms",
+    "s3",
+    "team_context",
+    "enterprise",
+    "customer",
+    "license_id",
+    "workspace_id",
+    "database",
+    "db_",
+    "resolver",
+    "threshold",
+)
+
+
+def _public_wire_contract() -> dict:
+    return json.loads(_PUBLIC_WIRE_CONTRACT_PATH.read_text(encoding="utf-8"))
 
 
 def _json_line(message: dict) -> str:
@@ -1429,3 +1457,147 @@ def test_waiting_immediate_retry_after_approve_post(tmp_path):
         finally:
             passthrough.stop()
             server.stop()
+
+
+def test_public_wire_contract_fixture_is_public_safe_and_matches_runtime_gate_client():
+    data = _public_wire_contract()
+    env = data["request"]["environment"]
+
+    assert data["schema_version"] == "avp.runtime_gate.public_wire_contract.v1"
+    # claim-check: allow production is a finite public wire enum value.
+    assert env["allowed_values"] == [
+        "production",  # claim-check: allow canonical transport enum, not a readiness claim.
+        "staging",
+        "development",
+        "unknown",
+    ]
+    assert env["default_client_value"] == "unknown"
+    assert DEFAULT_RUNTIME_ENVIRONMENT == env["default_client_value"]
+    assert CANONICAL_RUNTIME_ENVIRONMENTS == frozenset(env["allowed_values"])
+    serialized = json.dumps(data, sort_keys=True)
+    for marker in _FORBIDDEN_PRIVATE_MARKERS:
+        assert marker not in serialized
+
+
+def test_package_install_outbound_body_matches_public_wire_contract():
+    config = _package_ask_backend_config()
+    agent = AVPAgent("https://agentveil.dev", AGENT_SEED, name="wire-contract", timeout=2.0)
+    client = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+    contract = _public_wire_contract()
+    top_level = contract["request"]["top_level_fields"]
+    allowed_top_level = set(top_level["required"]) | set(top_level["optional"])
+    context_spec = contract["request"]["install_clone_context"]
+    allowed_context = set(context_spec["required"]) | set(context_spec["optional"])
+    slots = context_spec["metadata_evidence_slots"]
+    allowed_slots = set(slots["allowed_slot_names"])
+    allowed_slot_keys = set(slots["allowed_payload_keys"])
+    captured: dict[str, object] = {}
+
+    def mock_post(url, **kwargs):
+        body = json.loads(kwargs["content"])
+        captured["body"] = body
+        receipt_request = {
+            key: body[key]
+            for key in (
+                "action",
+                "resource",
+                "environment",
+                "payload_hash",
+                "risk_class",
+                "policy_context_hash",
+            )
+        }
+        receipt_jcs = _decision_receipt(receipt_request, decision="ALLOW")
+        response = MagicMock(spec=httpx.Response)
+        response.status_code = 200
+        response.json.return_value = {
+            "audit_id": AUDIT_ID,
+            "decision": "ALLOW",
+            "decision_receipt_jcs": receipt_jcs,
+        }
+        return response
+
+    with patch.object(httpx.Client, "post", side_effect=mock_post):
+        result = client.evaluate(_package_classification(config))
+
+    assert result.decision == "ALLOW"
+    body = captured["body"]
+    assert body["environment"] == "unknown"
+    assert set(body) <= allowed_top_level
+    assert set(top_level["required"]).issubset(set(body))
+    context = body["install_clone_context"]
+    assert set(context) <= allowed_context
+    for slot_name in allowed_slots:
+        if slot_name not in context:
+            continue
+        assert set(context[slot_name]) <= allowed_slot_keys
+    body_text = json.dumps(body, sort_keys=True)
+    for forbidden in (
+        "raw-secret-package-name",
+        "/Users/secret",
+        "https://",
+        "sk_live",
+        "mcp_proxy",
+    ):
+        assert forbidden not in body_text
+
+
+@pytest.mark.parametrize(
+    "environment",
+    _public_wire_contract()["request"]["environment"]["allowed_values"],
+)
+def test_runtime_gate_accepts_contract_environment_values(environment):
+    config = _config()
+    agent = RecordingAgent()
+    client = RuntimeGateClient(
+        agent=agent,
+        config=config,
+        control_grant={"id": "grant"},
+        environment=environment,
+    )
+
+    result = client.evaluate(_classification(config))
+
+    assert result.decision == "ALLOW"
+    assert agent.calls[0]["environment"] == environment
+
+
+def test_runtime_gate_rejects_contract_invalid_mcp_proxy_environment_before_http():
+    config = _config()
+    agent = RecordingAgent()
+    invalid = deepcopy(
+        _public_wire_contract()["invalid_request_fixtures"][0]["body_patch"]
+    )
+
+    with pytest.raises(ValueError, match="environment invalid") as exc_info:
+        RuntimeGateClient(
+            agent=agent,
+            config=config,
+            control_grant={"id": "grant"},
+            environment=invalid["environment"],
+        )
+
+    assert invalid["environment"] == "mcp_proxy"
+    assert "mcp_proxy" not in str(exc_info.value)
+    assert agent.calls == []
+
+
+def test_package_install_rejects_unknown_metadata_slot_name_before_post():
+    config = _package_ask_backend_config()
+    agent = RecordingAgent()
+    client = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+    classification = _package_classification(config)
+    metadata = classification.backend_metadata()
+    context = dict(metadata["install_clone_context"])
+    context["raw_readme"] = {"signal_code": "install_hint"}
+
+    class _MutableClassification:
+        def backend_metadata(self):
+            return {
+                **metadata,
+                "install_clone_context": context,
+            }
+
+    with pytest.raises(RuntimeGateUnavailableError, match="install_clone_context invalid"):
+        client.evaluate(_MutableClassification())  # type: ignore[arg-type]
+    assert agent.calls == []

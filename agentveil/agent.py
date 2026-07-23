@@ -46,6 +46,24 @@ AGENTS_DIR = os.path.expanduser("~/.avp/agents")
 ED25519_MULTICODEC = bytes([0xED, 0x01])
 SUCCESS_STATUS_CODES = {200, 201}
 
+# claim-check: allow production is a finite public Runtime Gate wire enum value.
+_CANONICAL_RUNTIME_ENVIRONMENTS = frozenset(
+    {
+        "production",  # claim-check: allow canonical transport enum, not a readiness claim.
+        "staging",
+        "development",
+        "unknown",
+    }
+)
+
+
+def _validate_runtime_environment(environment: Any) -> str:
+    """Reject non-canonical Runtime Gate environments before HTTP."""
+
+    if not isinstance(environment, str) or environment not in _CANONICAL_RUNTIME_ENVIRONMENTS:
+        raise AVPValidationError("environment invalid")
+    return environment
+
 
 def _public_key_to_did(public_key: bytes) -> str:
     """Convert Ed25519 public key to did:key."""
@@ -1348,7 +1366,12 @@ class AVPAgent:
         Optional ``install_clone_context`` is bounded advisory metadata for
         package install/clone tools. It must not contain raw paths, URLs,
         prompts, secrets, or package-manager command payloads.
+
+        ``environment`` must be a canonical public Runtime Gate wire value
+        (``production``, ``staging``, ``development``, or ``unknown``).
+        claim-check: allow production is a finite public wire enum value.
         """
+        environment = _validate_runtime_environment(environment)
         body_data = {
             "agent_did": self._did,
             "action": action,
