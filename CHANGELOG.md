@@ -6,6 +6,32 @@ All notable changes to the `agentveil` SDK.
 
 No unreleased changes.
 
+## [0.7.35-mcp-proxy] - 2026-07-23
+
+Verified redirect lineage and Approval Center action-review release.
+
+### MCP Proxy changed
+- Added durable lineage with an atomic single-use claim between a
+  connector-native write stopped
+  before mutation and the matching controlled MCP `write_file` follow-up.
+- Added a bounded Redirect context section to Approval Center cards only when
+  the original native denial, client/session/project scope, target, intent,
+  freshness, and atomic claim are verified.
+- Added a responsive action-review layout with bounded action summaries,
+  requested-change previews, approval countdown, and terminal expired state.
+- Kept ordinary direct MCP approvals unchanged when no verified redirect
+  context is present.
+- Corrected Windows owner-claim locking so a separate hook process can verify
+  the live proxy binding while the exclusive liveness lease remains held.
+
+### MCP Proxy verification
+- The combined local public SDK gate completed with 2044 passing tests; two
+  wheel-install checks unable to build under local sandbox permissions were
+  rerun outside the sandbox and both passed.
+- GitHub Actions passed on Ubuntu Python 3.10-3.13, Windows, macOS, managed
+  Approval Center E2E jobs, and the bounded Windows symlink job before release
+  preparation.
+
 ## [0.7.34-mcp-proxy] - 2026-07-22
 
 Public Runtime Gate interoperability and package trust-boundary corrective.
