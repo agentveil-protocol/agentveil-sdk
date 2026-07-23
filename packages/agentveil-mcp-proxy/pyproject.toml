@@ -1,6 +1,6 @@
 [project]
 name = "agentveil-mcp-proxy"
-version = "0.7.35"
+version = "0.7.36"
 description = "Source-available MCP route for approval and local evidence on routed MCP tool calls"
 readme = {file = "README.md", content-type = "text/markdown"}
 requires-python = ">=3.10"
