@@ -1,0 +1,191 @@
+{
+  "schema_version": "avp.runtime_gate.public_wire_contract.v1",
+  "endpoint": {
+    "method": "POST",
+    "path": "/v1/runtime/evaluate"
+  },
+  "request": {
+    "top_level_fields": {
+      "required": ["agent_did", "action", "resource", "environment", "receipt"],
+      "optional": [
+        "amount",
+        "currency",
+        "payload_hash",
+        "risk_class",
+        "policy_context_hash",
+        "install_clone_context"
+      ]
+    },
+    "environment": {"claim_check": "claim-check: allow production is a finite public wire enum value.", "allowed_values": ["production", "staging", "development", "unknown"], "default_client_value": "unknown"},
+    "hash_formats": {
+      "payload_hash": "sha256:<64 lowercase hex>",
+      "policy_context_hash": "<64 lowercase hex>"
+    },
+    "install_clone_context": {
+      "required": [
+        "operation",
+        "source_ref",
+        "source_ref_kind",
+        "user_pinned_source",
+        "intent_source",
+        "target_source",
+        "tool_source",
+        "metadata_influence"
+      ],
+      "optional": [
+        "package_namespace",
+        "requested_package",
+        "expected_package",
+        "expected_hash",
+        "resource_hash",
+        "payload_hash",
+        "readme",
+        "tool_output",
+        "mcp_schema",
+        "file_metadata"
+      ],
+      "operation_allowed_values": ["install", "clone"],
+      "source_ref_pattern": "^src_[a-z0-9_-]{1,58}$",
+      "package_namespace_pattern": "^ns_[a-z0-9_-]{1,58}$",
+      "package_ref_pattern": "^pkg_[a-z0-9_-]{1,58}$",
+      "hash_pattern": "^sha256:[0-9a-f]{64}$",
+      "source_ref_kind_allowed_values": [
+        "approved_namespace",
+        "internal_registry",
+        "metadata_suggested",
+        "model_suggested",
+        "tool_output_suggested",
+        "unknown",
+        "user_pinned",
+        "workspace_registry"
+      ],
+      "intent_source_allowed_values": [
+        "agent_plan",
+        "metadata",
+        "remote_context",
+        "tool_output",
+        "unknown",
+        "user_direct",
+        "user_pinned",
+        "workspace_policy"
+      ],
+      "target_source_allowed_values": [
+        "internal_registry",
+        "metadata",
+        "model_suggested",
+        "remote_context",
+        "tool_output",
+        "unknown",
+        "user_pinned",
+        "workspace_registry"
+      ],
+      "tool_source_allowed_values": [
+        "approved_registry",
+        "local_manifest",
+        "mcp_server_schema",
+        "model_suggested",
+        "unknown",
+        "workspace_registry"
+      ],
+      "metadata_influence_allowed_values": ["high", "low", "medium", "none", "unknown"],
+      "metadata_evidence_slots": {
+        "allowed_slot_names": ["readme", "tool_output", "mcp_schema", "file_metadata"],
+        "allowed_payload_keys": ["signal_code", "evidence_ref", "content_hash"],
+        "evidence_ref_pattern": "^ev_[a-z0-9_-]{1,58}$",
+        "content_hash_pattern": "^sha256:[0-9a-f]{64}$",
+        "signal_codes_by_slot": {
+          "readme": ["clone_hint", "dependency_hint", "install_hint", "no_signal", "package_name_hint"],
+          "tool_output": ["clone_command", "install_command", "no_signal", "package_reference", "repo_reference"],
+          "mcp_schema": ["no_signal", "resource_binding", "tool_declares_fetch", "tool_declares_install"],
+          "file_metadata": ["config_package_ref", "lockfile_dependency", "manifest_install_target", "no_signal"]
+        }
+      }
+    }
+  },
+  "response": {
+    "public_fields": [
+      "decision",
+      "reason",
+      "risk_class",
+      "audit_id",
+      "decided_at",
+      "evaluator_version",
+      "assumptions",
+      "policy_environment",
+      "policy_version",
+      "policy_context_hash",
+      "decision_receipt_hash",
+      "rules_fired",
+      "install_clone_advisory",
+      "paid_policy_receipt_evidence"
+    ],
+    "decision_allowed_values": ["ALLOW", "BLOCK", "WAITING_FOR_HUMAN_APPROVAL"],
+    "risk_class_allowed_values": ["read", "write", "destructive", "irreversible", "financial", "unknown"]
+  },
+  "valid_request_fixtures": [
+    {
+      "name": "minimal_unknown_environment",
+      "body": {
+        "agent_did": "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
+        "action": "github.read_file",
+        "resource": "repo_ref_001",
+        "environment": "unknown",
+        "receipt": {"schema_version": "delegation_receipt_fixture"}
+      }
+    },
+    {
+      "name": "package_install_with_bounded_metadata_evidence",
+      "body": {
+        "agent_did": "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
+        "action": "package.pip_install",
+        "resource": "pkg_ref_001",
+        "environment": "unknown",
+        "receipt": {"schema_version": "delegation_receipt_fixture"},
+        "payload_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "risk_class": "write",
+        "policy_context_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "install_clone_context": {
+          "operation": "install",
+          "source_ref": "src_package_route_builtin",
+          "source_ref_kind": "workspace_registry",
+          "user_pinned_source": false,
+          "intent_source": "user_direct",
+          "target_source": "workspace_registry",
+          "tool_source": "approved_registry",
+          "metadata_influence": "none",
+          "package_namespace": "ns_python_package",
+          "requested_package": "pkg_agentveil_route_test",
+          "expected_package": "pkg_agentveil_route_test",
+          "expected_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "resource_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "payload_hash": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "readme": {
+            "signal_code": "install_hint",
+            "evidence_ref": "ev_readme_install_hint",
+            "content_hash": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+          },
+          "tool_output": {
+            "signal_code": "install_command",
+            "evidence_ref": "ev_tool_output_install",
+            "content_hash": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+          },
+          "mcp_schema": {
+            "signal_code": "tool_declares_install",
+            "evidence_ref": "ev_mcp_schema_package_route"
+          },
+          "file_metadata": {
+            "signal_code": "lockfile_dependency",
+            "evidence_ref": "ev_file_metadata_lockfile"
+          }
+        }
+      }
+    }
+  ],
+  "invalid_request_fixtures": [
+    {
+      "name": "legacy_mcp_proxy_environment",
+      "body_patch": {"environment": "mcp_proxy"},
+      "expected_error": "environment"
+    }
+  ]
+}
