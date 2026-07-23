@@ -1,4 +1,4 @@
-"""Zero-config paid activation bridge compatibility with private Runtime Gate."""
+"""Zero-config paid activation bridge + public contract fixture tests."""
 
 from __future__ import annotations
 
@@ -13,11 +13,11 @@ import pytest
 from agentveil_mcp_proxy.paid_activation import (
     ACTIVATION_FILENAME,
     BOUNDED_ACTIVATION_KEYS,
+    ERROR_ACTIVATION_STATE_UNREADABLE,
     STATUS_ACTIVE,
-    STATUS_DISABLED,
+    STATUS_ERROR,
     STATUS_EXPIRED,
     STATUS_MISSING,
-    STATUS_REVOKED,
     activation_path,
     build_paid_deactivate_payload,
     build_paid_status_payload,
@@ -25,14 +25,17 @@ from agentveil_mcp_proxy.paid_activation import (
     map_public_paid_enablement,
     public_install_hints,
     run_paid_activate_cli,
+    run_paid_status_cli,
     write_activation_state,
 )
 from agentveil_mcp_proxy.paid_install import (
     BOUNDED_INSTALL_KEYS,
+    DEFAULT_PAID_API_BASE_URL,
     INSTALL_FILENAME,
     PROVIDER_ID,
     ActivationValidateResult,
     EntitlementResult,
+    HttpPaidBackendClient,
     InstallSafetyResult,
     PackageAuthorizeResult,
     install_state_path,
@@ -47,6 +50,12 @@ PACKAGE_NAME = "agentveil-private-policy"
 PACKAGE_VERSION = "0.1.0"
 RAW_LICENSE_KEY = "avp_live_bridge_secret_key_do_not_leak_abcdef"
 ENTITLEMENT_TOKEN = "avp_ent_bridge.token.secret.do.not.leak"
+_CONTRACT_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "tests"
+    / "fixtures"
+    / "paid_activation_public_contract.json"
+)
 FORBIDDEN_MARKERS = (
     RAW_LICENSE_KEY,
     ENTITLEMENT_TOKEN,
@@ -62,6 +71,10 @@ FORBIDDEN_MARKERS = (
     "X-Amz-",
     "backend_url",
 )
+
+
+def _public_paid_contract() -> dict:
+    return json.loads(_CONTRACT_PATH.read_text(encoding="utf-8"))
 
 
 @dataclass
@@ -162,12 +175,27 @@ def _assert_privacy(text: str) -> None:
         assert marker not in text
 
 
-def test_unset_paid_api_base_url_keeps_safer_no_network_default(monkeypatch):
+def test_public_paid_contract_fixture_is_stable_and_privacy_safe():
+    contract = _public_paid_contract()
+    assert contract["schema_version"] == "avp.paid_activation.public_contract.v1"
+    assert contract["default_paid_api_base_url"] == DEFAULT_PAID_API_BASE_URL
+    activation_keys = set(contract["durable_files"]["activation_json"]["allowed_keys"])
+    install_keys = set(contract["durable_files"]["install_json"]["allowed_keys"])
+    assert activation_keys == set(BOUNDED_ACTIVATION_KEYS)
+    assert install_keys == set(BOUNDED_INSTALL_KEYS)
+    assert contract["durable_files"]["install_json"]["active_example"]["provider_id"] == PROVIDER_ID
+    assert "private_consumer" in contract["notes"]
+
+
+def test_unset_paid_api_base_url_uses_packaged_default(monkeypatch):
     monkeypatch.delenv("AVP_PAID_API_BASE_URL", raising=False)
-    assert resolve_paid_backend_client() is None
+    client = resolve_paid_backend_client()
+    assert isinstance(client, HttpPaidBackendClient)
+    assert client._base_url == DEFAULT_PAID_API_BASE_URL
+    assert client._base_url == _public_paid_contract()["default_paid_api_base_url"]
 
 
-def test_blank_paid_api_base_url_keeps_safer_no_network_default(monkeypatch):
+def test_blank_paid_api_base_url_disables_network(monkeypatch):
     monkeypatch.setenv("AVP_PAID_API_BASE_URL", "")
     assert resolve_paid_backend_client() is None
 
@@ -194,8 +222,11 @@ def test_activate_writes_compatible_activation_and_install(tmp_path):
     ]
     saved_activation = json.loads(activation_file.read_text(encoding="utf-8"))
     saved_install = json.loads(install_file.read_text(encoding="utf-8"))
-    assert set(saved_activation) <= BOUNDED_ACTIVATION_KEYS
-    assert set(saved_install) <= BOUNDED_INSTALL_KEYS
+    contract = _public_paid_contract()
+    assert set(saved_activation) <= set(
+        contract["durable_files"]["activation_json"]["allowed_keys"]
+    )
+    assert set(saved_install) <= set(contract["durable_files"]["install_json"]["allowed_keys"])
     assert saved_activation["status"] == STATUS_ACTIVE
     assert saved_install["status"] == STATUS_ACTIVE
     assert saved_install["provider_id"] == "private_v1"
@@ -240,27 +271,34 @@ def test_stdin_activate_cli_writes_bridge_files(tmp_path):
     assert "package_name=" not in text
 
 
-@pytest.mark.parametrize(
-    ("activation_status", "install_status", "expected_status", "enabled"),
-    [
-        (STATUS_ACTIVE, STATUS_ACTIVE, STATUS_ACTIVE, True),
-        (STATUS_EXPIRED, STATUS_ACTIVE, STATUS_EXPIRED, False),
-        (STATUS_REVOKED, STATUS_ACTIVE, STATUS_REVOKED, False),
-        (STATUS_DISABLED, STATUS_ACTIVE, STATUS_DISABLED, False),
-        (STATUS_ACTIVE, STATUS_MISSING, STATUS_MISSING, False),
-        (STATUS_MISSING, STATUS_MISSING, STATUS_MISSING, False),
-        (STATUS_ACTIVE, "error", "error", False),
-    ],
-)
-def test_enablement_matrix_matches_private_core_fallback(
-    activation_status,
-    install_status,
-    expected_status,
-    enabled,
-):
+def test_backend_unavailable_activate_is_non_zero_and_not_active(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_PAID_API_BASE_URL", "http://127.0.0.1:1")
+    out = io.StringIO()
+    from agentveil_mcp_proxy.paid_activation import PaidActivationError
+
+    with pytest.raises(PaidActivationError) as exc_info:
+        run_paid_activate_cli(
+            license_key=RAW_LICENSE_KEY,
+            home=home,
+            out=out,
+        )
+    assert exc_info.value.exit_code != 0
+    assert not (home / "paid" / INSTALL_FILENAME).exists()
+    if (home / "paid" / ACTIVATION_FILENAME).exists():
+        saved = json.loads((home / "paid" / ACTIVATION_FILENAME).read_text(encoding="utf-8"))
+        assert saved.get("status") != STATUS_ACTIVE
+    combined = out.getvalue() + str(exc_info.value)
+    assert "Traceback" not in combined
+    assert "/Users/" not in combined
+    assert RAW_LICENSE_KEY not in combined
+
+
+@pytest.mark.parametrize("row", _public_paid_contract()["enablement"]["core_fallback_matrix"])
+def test_enablement_matrix_matches_public_contract_fixture(row):
     activation = {
-        "status": activation_status,
-        "provider_present": activation_status == STATUS_ACTIVE,
+        "status": row["activation_status"],
+        "provider_present": row["activation_status"] == STATUS_ACTIVE,
         "license_id": "lic_x",
         "customer_id": None,
         "expires_at": None,
@@ -269,7 +307,7 @@ def test_enablement_matrix_matches_private_core_fallback(
         "error_code": None,
     }
     install = {
-        "status": install_status,
+        "status": row["install_status"],
         "provider_id": "private_v1",
         "package_name": PACKAGE_NAME,
         "package_version": PACKAGE_VERSION,
@@ -279,7 +317,10 @@ def test_enablement_matrix_matches_private_core_fallback(
         "install_safety_state": "verified",
         "install_safety_reason": None,
     }
-    assert map_public_paid_enablement(activation, install) == (expected_status, enabled)
+    assert map_public_paid_enablement(activation, install) == (
+        row["entitlement_status"],
+        row["provider_enabled"],
+    )
 
 
 def test_status_preserves_expired_activation_for_core_fallback(tmp_path):
@@ -388,8 +429,6 @@ def test_package_mismatch_stays_core_fallback_compatible():
         "install_safety_state": "verified",
         "install_safety_reason": None,
     }
-    # Public enablement is status-only; package mismatch is selected against at
-    # private discovery. Bridge still exposes hints without secrets.
     status, enabled = map_public_paid_enablement(activation, install)
     assert status == STATUS_ACTIVE and enabled is True
     hints = public_install_hints(install)
@@ -404,3 +443,68 @@ def test_malformed_missing_files_are_core_fallback():
         STATUS_MISSING,
         False,
     )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"{not-json",
+        b'["array"]',
+        b'{"status":"active","extra":true}',
+        b"",
+    ],
+)
+def test_malformed_activation_bytes_status_cli_no_traceback(tmp_path, raw):
+    home = tmp_path / "avp-home"
+    path = activation_path(home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(raw)
+    out = io.StringIO()
+    code = run_paid_status_cli(home=home, output_json=True, out=out)
+    assert code == 0
+    payload = json.loads(out.getvalue())
+    assert payload["paid_activation_available"] is False
+    assert payload["public_fallback_active"] is True
+    assert payload["activation"]["status"] in {STATUS_ERROR, STATUS_MISSING}
+    if payload["activation"]["status"] == STATUS_ERROR:
+        assert payload["activation"]["error_code"] == ERROR_ACTIVATION_STATE_UNREADABLE
+    text = out.getvalue()
+    assert "Traceback" not in text
+    assert str(home) not in text
+    assert "/Users/" not in text
+    assert RAW_LICENSE_KEY not in text
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"{not-json",
+        b'{"status":"active","provider_id":"x","extra":1}',
+        b"",
+    ],
+)
+def test_malformed_install_bytes_are_ignored_for_enablement(tmp_path, raw):
+    home = tmp_path / "avp-home"
+    write_activation_state(
+        activation_path(home),
+        {
+            "status": STATUS_ACTIVE,
+            "provider_present": True,
+            "license_id": "lic_x",
+            "customer_id": None,
+            "expires_at": None,
+            "last_checked_at": "2026-07-23T00:00:00+00:00",
+            "public_fallback_available": True,
+            "error_code": None,
+        },
+    )
+    install_path = install_state_path(home)
+    install_path.parent.mkdir(parents=True, exist_ok=True)
+    install_path.write_bytes(raw)
+    assert load_install_state(install_path) is None
+    payload = build_paid_status_payload(home=home)
+    assert payload["paid_activation_available"] is False
+    assert map_public_paid_enablement(
+        load_activation_state(activation_path(home)),
+        load_install_state(install_path),
+    )[1] is False

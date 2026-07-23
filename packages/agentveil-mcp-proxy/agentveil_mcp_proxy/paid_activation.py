@@ -59,6 +59,7 @@ TERMINAL_INACTIVE_ACTIVATION_STATUSES = frozenset(
     }
 )
 ERROR_PROVIDER_ABSENT = "provider_absent"
+ERROR_ACTIVATION_STATE_UNREADABLE = "activation_state_unreadable"
 FORBIDDEN_OVERCLAIM_MARKERS = (
     "activation succeeded",
     "paid activation successful",
@@ -119,14 +120,38 @@ def assert_license_key_redacted(*, text: str, license_key: str) -> None:
 
 
 def load_activation_state(path: Path) -> dict[str, Any] | None:
+    """Load bounded activation.json.
+
+    Missing file → ``None``. Unreadable / malformed / unexpected keys → bounded
+    ``error`` Core-fallback state (no traceback, no host path in the result).
+    """
+
     if not path.is_file():
         return None
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return _unreadable_activation_state()
     if not isinstance(payload, dict):
-        raise PaidActivationError(f"{path} must contain a JSON object")
-    assert_activation_metadata_bounded(payload)
+        return _unreadable_activation_state()
+    try:
+        assert_activation_metadata_bounded(payload)
+    except PaidActivationError:
+        return _unreadable_activation_state()
     return dict(payload)
 
+
+def _unreadable_activation_state(*, checked_at: str | None = None) -> dict[str, Any]:
+    return {
+        "status": STATUS_ERROR,
+        "provider_present": False,
+        "license_id": None,
+        "customer_id": None,
+        "expires_at": None,
+        "last_checked_at": checked_at or utc_now_iso(),
+        "public_fallback_available": True,
+        "error_code": ERROR_ACTIVATION_STATE_UNREADABLE,
+    }
 
 def _mkdir_private(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
@@ -514,6 +539,10 @@ def run_paid_activate_cli(
     )
     payload = build_paid_activate_payload(license_key=resolved, home=home)
     _emit_paid_payload(payload, output_json=output_json, out=out or sys.stdout)
+    # Offline / provider-absent path is an explicit unavailable result, not
+    # success. Backend install success returns paid_activation_available=True.
+    if not payload.get("paid_activation_available"):
+        return 1
     return 0
 
 

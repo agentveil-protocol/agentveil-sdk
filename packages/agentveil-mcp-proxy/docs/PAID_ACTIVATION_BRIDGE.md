@@ -20,6 +20,18 @@ agentveil-mcp-proxy paid deactivate
 No manual `provider_id`, `package_name`, `package_version`, artifact id,
 entitlement JSON paste, or `private=true` is required for the normal path.
 
+## Backend resolution (zero-config)
+
+| `AVP_PAID_API_BASE_URL` | Behavior |
+|-------------------------|----------|
+| unset | Packaged default `https://agentveil.dev` |
+| `""` (explicit blank) | Offline / no network (tests + local fallback) |
+| non-empty URL | That base URL |
+
+Successful activation through the backend writes both durable files below.
+Unavailable/failed activation returns non-zero (or explicit unavailable
+output) and omits `active` claims and paid-active-looking `install.json`.
+
 ## Durable files
 
 Under `{AVP_HOME:-~/.avp}/paid/`:
@@ -30,21 +42,18 @@ Under `{AVP_HOME:-~/.avp}/paid/`:
 | `install.json` | Bounded installed provider bridge (`provider_id=private_v1`, package name/version) |
 
 Private Runtime Gate B1/B2/B3 reads these filenames/shapes for zero-config
-enablement. Both must be `active` for paid enablement; otherwise Core fallback.
+enablement. Both are `active` for paid enablement; otherwise Core fallback.
 
-## Backend resolution (safer default)
+Cross-repo contract artifact (public + private consume this shape):
 
-When `AVP_PAID_API_BASE_URL` is unset or blank, the CLI does **not** open a
-network backend. Activate then persists public-fallback / provider-absent
-state. A packaged default host (`https://agentveil.dev`) is deferred until
-Product Guard accepts live endpoint proof.
+`tests/fixtures/paid_activation_public_contract.json`
 
-For local/integration proof, set `AVP_PAID_API_BASE_URL` or inject an
-in-process backend client (tests).
+Public tests validate outputs against that fixture. Private repo gates should
+consume the same artifact; public tests do not import private code.
 
 ## Privacy
 
-Persisted files and CLI output must not include:
+Persisted files and CLI output omit:
 
 - raw license keys
 - entitlement / install tokens
@@ -52,9 +61,12 @@ Persisted files and CLI output must not include:
 - artifact internals / host absolute paths
 - private rule graphs
 
+Malformed or unreadable on-disk JSON maps to Core fallback (bounded CLI /
+status result, no Python traceback, no host path leak).
+
 ## Core fallback compatibility
 
-| Durable state | Expected private outcome |
+| Durable state | Expected enablement |
 |---|---|
 | active + compatible Builder install | paid enabled (`private_v1`) |
 | expired / revoked / disabled | Core fallback |
@@ -62,6 +74,6 @@ Persisted files and CLI output must not include:
 | malformed JSON | Core fallback |
 | package name/version mismatch | Core fallback at private selection |
 
-Public `paid status` must not promote terminal inactive activation statuses
+Public `paid status` keeps terminal inactive activation statuses
 (`expired` / `revoked` / `disabled` / `invalid` / `error`) back to `active`
-just because `install.json` is still active.
+when `install.json` is still active.

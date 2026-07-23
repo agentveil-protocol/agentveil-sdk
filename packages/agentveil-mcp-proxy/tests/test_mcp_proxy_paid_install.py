@@ -438,7 +438,7 @@ def test_paid_activate_without_backend_keeps_provider_absent_path(tmp_path):
             os.environ.pop("AVP_PAID_API_BASE_URL", None)
         else:
             os.environ["AVP_PAID_API_BASE_URL"] = previous_base or ""
-    assert code == 0
+    assert code == 1
     out = stdout.getvalue()
     assert "Paid provider: absent" in out
     assert "Paid activation: unavailable" in out
