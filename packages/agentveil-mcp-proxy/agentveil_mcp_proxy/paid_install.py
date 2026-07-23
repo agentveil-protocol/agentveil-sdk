@@ -20,7 +20,6 @@ from agentveil_mcp_proxy.evidence.proof import _fsync_parent_directory
 from agentveil_mcp_proxy.paid_provider import (
     PUBLIC_PAID_PROVIDER_CONTRACT_VERSION,
     STATUS_ACTIVE,
-    STATUS_ERROR,
     PaidProviderSnapshot,
 )
 
@@ -29,6 +28,9 @@ PROVIDER_ID = "private_v1"
 DEFAULT_PACKAGE_NAME = "agentveil-private-policy"
 DEFAULT_PACKAGE_VERSION = "0.1.0"
 DEFAULT_ARTIFACT_ID = "art_pkg_private_policy_001"
+# Packaged zero-config paid backend. Explicit blank AVP_PAID_API_BASE_URL
+# disables network (offline/test). Unset env uses this default.
+DEFAULT_PAID_API_BASE_URL = "https://agentveil.dev"
 ALLOWED_PACKAGE_NAMES = frozenset({DEFAULT_PACKAGE_NAME})
 _BOUNDED_PACKAGE_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[a-zA-Z0-9.-]{0,16})?$")
 
@@ -220,13 +222,22 @@ def set_paid_backend_client(client: PaidBackendClient | None) -> None:
 
 
 def resolve_paid_backend_client() -> PaidBackendClient | None:
+    """Resolve paid backend client for activation/install.
+
+    - Injected in-process client (tests) wins.
+    - ``AVP_PAID_API_BASE_URL`` unset → packaged ``DEFAULT_PAID_API_BASE_URL``.
+    - ``AVP_PAID_API_BASE_URL=""`` → offline / no network.
+    - Non-empty env → that base URL.
+    """
+
     if _backend_client is not None:
         return _backend_client
-    base_url = os.environ.get("AVP_PAID_API_BASE_URL", "").strip()
-    if base_url:
+    if "AVP_PAID_API_BASE_URL" in os.environ:
+        base_url = os.environ.get("AVP_PAID_API_BASE_URL", "").strip()
+        if not base_url:
+            return None
         return HttpPaidBackendClient(base_url=base_url.rstrip("/"))
-    return None
-
+    return HttpPaidBackendClient(base_url=DEFAULT_PAID_API_BASE_URL)
 
 def install_state_path(home: Path) -> Path:
     return home.expanduser() / "paid" / INSTALL_FILENAME
@@ -335,14 +346,28 @@ def assert_install_metadata_bounded(data: Mapping[str, Any]) -> None:
 
 
 def load_install_state(path: Path) -> dict[str, Any] | None:
+    """Load bounded install.json, or None when missing/unreadable/malformed.
+
+    Corrupt on-disk state returns None. Callers treat None as Core-fallback /
+    no active install and do not include host paths in the returned state.
+    """
+
     if not path.is_file():
         return None
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
     if not isinstance(payload, dict):
-        raise PaidInstallError(f"{path} must contain a JSON object")
-    assert_install_metadata_bounded(payload)
+        return None
+    try:
+        assert_install_metadata_bounded(payload)
+    except PaidInstallError:
+        return None
+    status = payload.get("status")
+    if not isinstance(status, str) or not status:
+        return None
     return dict(payload)
-
 
 def write_install_state(path: Path, data: Mapping[str, Any]) -> None:
     assert_install_metadata_bounded(data)

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
+import re
 import threading
 import time
 from typing import Any, Callable, Mapping
@@ -88,6 +89,7 @@ class RuntimeGateDecision:
     approval_id: str | None
     receipt_digest: str
     receipt_body: Mapping[str, Any]
+    paid_approval_center_projection: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -236,12 +238,18 @@ class RuntimeGateClient:
             raise RuntimeGateUnavailableError("runtime gate request failed") from exc
 
         self.circuit_breaker.record_success()
+        # Trust boundary: only accept paid projection from the verified receipt
+        # body. Unsigned top-level response wrappers must never drive AC UI.
+        projection = normalize_paid_approval_center_projection(
+            body.get("paid_approval_center_projection")
+        )
         return RuntimeGateDecision(
             decision=body["decision"],
             audit_id=_optional_str(body.get("audit_id")),
             approval_id=_optional_str(body.get("approval_id")),
             receipt_digest=verified["digest"],
             receipt_body=body,
+            paid_approval_center_projection=projection,
         )
 
     def drain_circuit_events(self) -> tuple[Mapping[str, Any], ...]:
@@ -432,6 +440,191 @@ def _assert_required_receipt_field(body: Mapping[str, Any], field: str, expected
         raise RuntimeGateUntrustedError(f"runtime decision {field} mismatch")
 
 
+PAID_APPROVAL_PROJECTION_SCHEMA_VERSION = "paid_approval_center_projection/1"
+PAID_APPROVAL_PROJECTION_KIND_ACTIVE = "paid_active"
+PAID_APPROVAL_PROJECTION_KIND_CORE_FALLBACK = "core_fallback"
+_PAID_APPROVAL_PROJECTION_KINDS = frozenset(
+    {
+        PAID_APPROVAL_PROJECTION_KIND_ACTIVE,
+        PAID_APPROVAL_PROJECTION_KIND_CORE_FALLBACK,
+    }
+)
+_PAID_APPROVAL_PROJECTION_KEYS = frozenset(
+    {
+        "schema_version",
+        "projection_kind",
+        "provider_status",
+        "plan_family",
+        "private_provider_enabled",
+        "core_fallback_active",
+        "decision",
+        "reason_code",
+        "selection_reason",
+        "summary",
+        "capability_labels",
+        "activation_source",
+        "paid_policy_tightened",
+    }
+)
+# Allow "/" so schema_version values like paid_approval_center_projection/1 pass.
+_PAID_APPROVAL_PROJECTION_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$")
+_PAID_APPROVAL_PROJECTION_FORBIDDEN_MARKERS = (
+    "entitlement_token",
+    "signed-entitlement-jws",
+    "license_key",
+    "avp_live_",
+    "avp_ent_",
+    "install_token",
+    "did:key:",
+    "password=",
+    "bearer ",
+    "akia",
+    "asia",
+    "/users/",
+    "/home/",
+    "/private/",
+    "/tmp/",
+    "http://",
+    "https://",
+    "file://",
+    "raw_payload",
+    "tool_payload",
+    "rule_graph",
+    "aws_secret_access_key",
+    "artifact_id",
+    "art_pkg_",
+    "backend_url",
+    "private=true",
+    "customer_id",
+    "license_id",
+)
+
+
+def normalize_paid_approval_center_projection(raw: Any) -> dict[str, Any] | None:
+    """Return a bounded paid Approval Center projection, or None.
+
+    Accepts only the private B2 public wire shape. Malformed, oversized, or
+    privacy-unsafe payloads are omitted so Approval Center keeps working.
+    """
+
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        return None
+    if set(raw) - _PAID_APPROVAL_PROJECTION_KEYS:
+        return None
+    try:
+        schema_version = _paid_projection_required_token(
+            raw.get("schema_version"),
+            max_len=64,
+        )
+        if schema_version != PAID_APPROVAL_PROJECTION_SCHEMA_VERSION:
+            return None
+        projection_kind = _paid_projection_required_token(
+            raw.get("projection_kind"),
+            max_len=32,
+        )
+        if projection_kind not in _PAID_APPROVAL_PROJECTION_KINDS:
+            return None
+        provider_status = _paid_projection_required_token(
+            raw.get("provider_status"),
+            max_len=32,
+        )
+        reason_code = _paid_projection_required_token(raw.get("reason_code"), max_len=64)
+        selection_reason = _paid_projection_required_token(
+            raw.get("selection_reason"),
+            max_len=64,
+        )
+        summary = _paid_projection_bound_summary(raw.get("summary"))
+        plan_family = _paid_projection_optional_token(raw.get("plan_family"), max_len=32)
+        decision = _paid_projection_optional_token(raw.get("decision"), max_len=32)
+        activation_source = _paid_projection_optional_token(
+            raw.get("activation_source"),
+            max_len=64,
+        )
+        private_provider_enabled = raw.get("private_provider_enabled")
+        core_fallback_active = raw.get("core_fallback_active")
+        paid_policy_tightened = raw.get("paid_policy_tightened")
+        if not isinstance(private_provider_enabled, bool):
+            return None
+        if not isinstance(core_fallback_active, bool):
+            return None
+        if not isinstance(paid_policy_tightened, bool):
+            return None
+        labels_raw = raw.get("capability_labels", [])
+        if not isinstance(labels_raw, list) or len(labels_raw) > 8:
+            return None
+        capability_labels: list[str] = []
+        for item in labels_raw:
+            if not isinstance(item, str):
+                return None
+            label = " ".join(item.split())
+            if not label or len(label) > 64:
+                return None
+            capability_labels.append(label)
+    except ValueError:
+        return None
+
+    if projection_kind == PAID_APPROVAL_PROJECTION_KIND_ACTIVE:
+        if not private_provider_enabled or core_fallback_active:
+            return None
+    else:
+        # Boundary: core_fallback is omitted if it also claims paid provider active.
+        if private_provider_enabled or not core_fallback_active:
+            return None
+        paid_policy_tightened = False
+
+    payload = {
+        "schema_version": schema_version,
+        "projection_kind": projection_kind,
+        "provider_status": provider_status,
+        "plan_family": plan_family,
+        "private_provider_enabled": private_provider_enabled,
+        "core_fallback_active": core_fallback_active,
+        "decision": decision,
+        "reason_code": reason_code,
+        "selection_reason": selection_reason,
+        "summary": summary,
+        "capability_labels": capability_labels,
+        "activation_source": activation_source,
+        "paid_policy_tightened": paid_policy_tightened,
+    }
+    if _paid_projection_contains_forbidden_marker(payload):
+        return None
+    return payload
+
+
+def _paid_projection_required_token(value: Any, *, max_len: int) -> str:
+    if not isinstance(value, str):
+        raise ValueError("token_invalid")
+    text = value.strip()
+    if not text or len(text) > max_len or not _PAID_APPROVAL_PROJECTION_TOKEN_RE.fullmatch(text):
+        raise ValueError("token_invalid")
+    return text
+
+
+def _paid_projection_optional_token(value: Any, *, max_len: int) -> str | None:
+    if value is None:
+        return None
+    return _paid_projection_required_token(value, max_len=max_len)
+
+
+def _paid_projection_bound_summary(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("summary_invalid")
+    text = " ".join(value.split())
+    if not text:
+        raise ValueError("summary_invalid")
+    if len(text) > 240:
+        text = text[:239].rstrip() + "…"
+    return text
+
+
+def _paid_projection_contains_forbidden_marker(payload: Mapping[str, Any]) -> bool:
+    serialized = json.dumps(payload, sort_keys=True).lower()
+    return any(marker in serialized for marker in _PAID_APPROVAL_PROJECTION_FORBIDDEN_MARKERS)
+
+
 __all__ = [
     "DECISION_ALLOW",
     "DECISION_BLOCK",
@@ -441,9 +634,13 @@ __all__ = [
     "DEFAULT_RUNTIME_GATE_TIMEOUT_SECONDS",
     "CANONICAL_RUNTIME_ENVIRONMENTS",
     "DEFAULT_RUNTIME_ENVIRONMENT",
+    "PAID_APPROVAL_PROJECTION_KIND_ACTIVE",
+    "PAID_APPROVAL_PROJECTION_KIND_CORE_FALLBACK",
+    "PAID_APPROVAL_PROJECTION_SCHEMA_VERSION",
     "RuntimeGateClient",
     "RuntimeGateDecision",
     "RuntimeGateError",
     "RuntimeGateUnavailableError",
     "RuntimeGateUntrustedError",
+    "normalize_paid_approval_center_projection",
 ]

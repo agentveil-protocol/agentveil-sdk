@@ -1,0 +1,88 @@
+{
+  "schema_version": "avp.paid_activation.public_contract.v1",
+  "default_paid_api_base_url": "https://agentveil.dev",
+  "env": {
+    "AVP_PAID_API_BASE_URL": {
+      "unset": "use_packaged_default",
+      "blank": "offline_no_network",
+      "set_nonempty": "override_base_url"
+    }
+  },
+  "durable_files": {
+    "directory": "{AVP_HOME}/paid",
+    "activation_json": {
+      "filename": "activation.json",
+      "allowed_keys": [
+        "status",
+        "provider_present",
+        "license_id",
+        "customer_id",
+        "expires_at",
+        "last_checked_at",
+        "public_fallback_available",
+        "error_code"
+      ],
+      "active_example": {
+        "status": "active",
+        "provider_present": true,
+        "license_id": "lic_example",
+        "customer_id": null,
+        "expires_at": null,
+        "last_checked_at": "2026-07-23T00:00:00+00:00",
+        "public_fallback_available": true,
+        "error_code": null
+      }
+    },
+    "install_json": {
+      "filename": "install.json",
+      "allowed_keys": [
+        "status",
+        "provider_id",
+        "package_name",
+        "package_version",
+        "public_fallback_available",
+        "error_code",
+        "last_installed_at",
+        "install_safety_state",
+        "install_safety_reason"
+      ],
+      "active_example": {
+        "status": "active",
+        "provider_id": "private_v1",
+        "package_name": "agentveil-private-policy",
+        "package_version": "0.1.0",
+        "public_fallback_available": true,
+        "error_code": null,
+        "last_installed_at": "2026-07-23T00:00:00+00:00",
+        "install_safety_state": "verified",
+        "install_safety_reason": null
+      }
+    }
+  },
+  "enablement": {
+    "paid_enabled_when": {
+      "activation_status": "active",
+      "install_status": "active"
+    },
+    "core_fallback_matrix": [
+      {"activation_status": "active", "install_status": "active", "entitlement_status": "active", "provider_enabled": true},
+      {"activation_status": "expired", "install_status": "active", "entitlement_status": "expired", "provider_enabled": false},
+      {"activation_status": "revoked", "install_status": "active", "entitlement_status": "revoked", "provider_enabled": false},
+      {"activation_status": "disabled", "install_status": "active", "entitlement_status": "disabled", "provider_enabled": false},
+      {"activation_status": "active", "install_status": "missing", "entitlement_status": "missing", "provider_enabled": false},
+      {"activation_status": "missing", "install_status": "missing", "entitlement_status": "missing", "provider_enabled": false},
+      {"activation_status": "active", "install_status": "error", "entitlement_status": "error", "provider_enabled": false}
+    ]
+  },
+  "privacy_forbidden_markers": [
+    "license_key",
+    "entitlement_token",
+    "install_token",
+    "presigned_url",
+    "backend_url",
+    "artifact_id"
+  ],
+  "notes": {
+    "private_consumer": "Private Runtime Gate is expected to consume the same durable filenames, allowed keys, and enablement matrix from this fixture in its own gate. Public tests validate public outputs against this artifact only; they do not import private code or claim private selection internals."
+  }
+}

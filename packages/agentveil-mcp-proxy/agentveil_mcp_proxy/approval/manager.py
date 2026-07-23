@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import atexit
-import hashlib
 import json
 import os
 import secrets
@@ -262,6 +261,7 @@ class ApprovalManager:
             expires_at=prompt_expires_at,
             scope_expansion_allowed=scope_allowed,
             reason=reason,
+            runtime_decision=None if active_grant is not None else runtime_decision,
         )
         record = self._pending_record(
             classification,
@@ -1410,6 +1410,7 @@ class ApprovalManager:
         expires_at: int,
         scope_expansion_allowed: bool,
         reason: str,
+        runtime_decision: RuntimeGateDecision | None = None,
     ) -> ApprovalPrompt:
         action_details = None
         resource_details = None
@@ -1437,6 +1438,11 @@ class ApprovalManager:
             action_gate_metadata["role"] = classification.role
         if classification.authority is not None:
             action_gate_metadata["authority"] = classification.authority
+        if runtime_decision is not None:
+            projection = runtime_decision.paid_approval_center_projection
+            if isinstance(projection, Mapping) and projection:
+                # Store only already-normalized bounded projection from Runtime Gate.
+                action_gate_metadata["paid_approval_center_projection"] = dict(projection)
         return ApprovalPrompt(
             request_id=request_id,
             client_id=self.client_id,

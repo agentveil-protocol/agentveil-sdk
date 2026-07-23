@@ -17,7 +17,6 @@ from agentveil_mcp_proxy.paid_activation import (
     BOUNDED_ACTIVATION_KEYS,
     ERROR_PROVIDER_ABSENT,
     PaidActivationError,
-    STATUS_ACTIVE,
     STATUS_MISSING,
     activation_path,
     assert_activation_metadata_bounded,
@@ -39,8 +38,10 @@ RAW_LICENSE_KEY = "avp_live_test_secret_key_do_not_leak_123456789"
 
 
 @pytest.fixture(autouse=True)
-def _reset_paid_backend_client():
+def _reset_paid_backend_client(monkeypatch):
     set_paid_backend_client(None)
+    # Offline/public-fallback path: explicit empty disables zero-config default URL.
+    monkeypatch.setenv("AVP_PAID_API_BASE_URL", "")
     yield
     set_paid_backend_client(None)
 
@@ -48,7 +49,8 @@ def _reset_paid_backend_client():
 def _home_env(home: Path) -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
     env["AVP_HOME"] = str(home)
-    env.pop("AVP_PAID_API_BASE_URL", None)
+    # Explicit empty disables paid backend (offline/public-fallback path).
+    env["AVP_PAID_API_BASE_URL"] = ""
     return env
 
 
@@ -57,8 +59,9 @@ def _run_main(argv: list[str], *, home: Path, stdin_text: str | None = None) -> 
     stderr = io.StringIO()
     previous_home = os.environ.get("AVP_HOME")
     previous_base = os.environ.get("AVP_PAID_API_BASE_URL")
+    previous_base_present = "AVP_PAID_API_BASE_URL" in os.environ
     os.environ["AVP_HOME"] = str(home)
-    os.environ.pop("AVP_PAID_API_BASE_URL", None)
+    os.environ["AVP_PAID_API_BASE_URL"] = ""
     previous_stdout = sys.stdout
     previous_stderr = sys.stderr
     previous_stdin = sys.stdin
@@ -76,10 +79,10 @@ def _run_main(argv: list[str], *, home: Path, stdin_text: str | None = None) -> 
             os.environ.pop("AVP_HOME", None)
         else:
             os.environ["AVP_HOME"] = previous_home
-        if previous_base is None:
+        if not previous_base_present:
             os.environ.pop("AVP_PAID_API_BASE_URL", None)
         else:
-            os.environ["AVP_PAID_API_BASE_URL"] = previous_base
+            os.environ["AVP_PAID_API_BASE_URL"] = previous_base or ""
     return code, stdout.getvalue(), stderr.getvalue()
 
 
@@ -98,7 +101,7 @@ def test_paid_activate_status_deactivate_cli_contract(tmp_path):
         ["paid", "activate", RAW_LICENSE_KEY, "--home", str(home)],
         home=home,
     )
-    assert code == 0
+    assert code == 1
     assert "Paid provider: absent" in out
     assert "Public fallback: active" in out
     assert "Paid activation: unavailable" in out
@@ -151,7 +154,7 @@ def test_license_key_redacted_from_stdout_stderr_and_status_file(tmp_path):
         ["paid", "activate", RAW_LICENSE_KEY, "--home", str(home)],
         home=home,
     )
-    assert code == 0
+    assert code == 1
     combined = out + err
     assert_license_key_redacted(text=combined, license_key=RAW_LICENSE_KEY)
     file_text = activation_path(home).read_text(encoding="utf-8")
@@ -191,7 +194,7 @@ def test_paid_json_output_is_privacy_safe(tmp_path):
         ["paid", "activate", RAW_LICENSE_KEY, "--home", str(home), "--json"],
         home=home,
     )
-    assert code == 0
+    assert code == 1
     payload = json.loads(out)
     assert payload["paid_provider_present"] is False
     assert payload["paid_activation_available"] is False
@@ -204,14 +207,39 @@ def test_paid_subprocess_entrypoint_contract(tmp_path):
     repo_root = PACKAGE_ROOT.parents[1]
     env = _home_env(home)
     env["PYTHONPATH"] = os.pathsep.join((str(repo_root), str(PACKAGE_ROOT)))
-    commands = (
-        [sys.executable, "-m", "agentveil_mcp_proxy.cli", "paid", "activate", RAW_LICENSE_KEY, "--home", str(home)],
-        [sys.executable, "-m", "agentveil_mcp_proxy.cli", "paid", "status", "--home", str(home)],
-        [sys.executable, "-m", "agentveil_mcp_proxy.cli", "paid", "deactivate", "--home", str(home)],
+    activate = [
+        sys.executable,
+        "-m",
+        "agentveil_mcp_proxy.cli",
+        "paid",
+        "activate",
+        RAW_LICENSE_KEY,
+        "--home",
+        str(home),
+    ]
+    result = subprocess.run(
+        activate,
+        cwd=PACKAGE_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
     )
-    for cmd in commands:
+    assert result.returncode == 1, result.stderr
+    assert "unavailable" in result.stdout.lower() or "absent" in result.stdout.lower()
+    assert RAW_LICENSE_KEY not in result.stdout
+    assert RAW_LICENSE_KEY not in result.stderr
+    for action in ("status", "deactivate"):
         result = subprocess.run(
-            cmd,
+            [
+                sys.executable,
+                "-m",
+                "agentveil_mcp_proxy.cli",
+                "paid",
+                action,
+                "--home",
+                str(home),
+            ],
             cwd=PACKAGE_ROOT,
             env=env,
             capture_output=True,
@@ -237,7 +265,7 @@ def test_stdin_activation_works(tmp_path):
         home=home,
         stdin_text=f"  {RAW_LICENSE_KEY}  \n",
     )
-    assert code == 0
+    assert code == 1
     assert "Paid provider: absent" in out
     assert RAW_LICENSE_KEY not in out
     assert RAW_LICENSE_KEY not in err

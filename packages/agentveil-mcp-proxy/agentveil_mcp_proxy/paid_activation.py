@@ -21,7 +21,12 @@ from agentveil_mcp_proxy.paid_install import (
 )
 from agentveil_mcp_proxy.paid_provider import (
     STATUS_ACTIVE,
+    STATUS_DISABLED,
+    STATUS_ERROR,
+    STATUS_EXPIRED,
+    STATUS_INVALID,
     STATUS_MISSING,
+    STATUS_REVOKED,
     PaidProviderSnapshot,
     absent_provider_snapshot,
     activate_with_paid_provider,
@@ -42,7 +47,19 @@ BOUNDED_ACTIVATION_KEYS = frozenset(
         "error_code",
     }
 )
+# Terminal activation statuses that must not be promoted back to active by
+# install.json alone (private Runtime Gate Core-fallback contract).
+TERMINAL_INACTIVE_ACTIVATION_STATUSES = frozenset(
+    {
+        STATUS_EXPIRED,
+        STATUS_REVOKED,
+        STATUS_DISABLED,
+        STATUS_INVALID,
+        STATUS_ERROR,
+    }
+)
 ERROR_PROVIDER_ABSENT = "provider_absent"
+ERROR_ACTIVATION_STATE_UNREADABLE = "activation_state_unreadable"
 FORBIDDEN_OVERCLAIM_MARKERS = (
     "activation succeeded",
     "paid activation successful",
@@ -103,14 +120,38 @@ def assert_license_key_redacted(*, text: str, license_key: str) -> None:
 
 
 def load_activation_state(path: Path) -> dict[str, Any] | None:
+    """Load bounded activation.json.
+
+    Missing file → ``None``. Unreadable / malformed / unexpected keys → bounded
+    ``error`` Core-fallback state (no traceback, no host path in the result).
+    """
+
     if not path.is_file():
         return None
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return _unreadable_activation_state()
     if not isinstance(payload, dict):
-        raise PaidActivationError(f"{path} must contain a JSON object")
-    assert_activation_metadata_bounded(payload)
+        return _unreadable_activation_state()
+    try:
+        assert_activation_metadata_bounded(payload)
+    except PaidActivationError:
+        return _unreadable_activation_state()
     return dict(payload)
 
+
+def _unreadable_activation_state(*, checked_at: str | None = None) -> dict[str, Any]:
+    return {
+        "status": STATUS_ERROR,
+        "provider_present": False,
+        "license_id": None,
+        "customer_id": None,
+        "expires_at": None,
+        "last_checked_at": checked_at or utc_now_iso(),
+        "public_fallback_available": True,
+        "error_code": ERROR_ACTIVATION_STATE_UNREADABLE,
+    }
 
 def _mkdir_private(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
@@ -196,6 +237,56 @@ def _activation_state_from_install(
 
 def _paid_activation_available(provider: PaidProviderSnapshot) -> bool:
     return provider.provider_present and provider.status == STATUS_ACTIVE and provider.error_code is None
+
+
+def map_public_paid_enablement(
+    activation: Mapping[str, Any] | None,
+    install: Mapping[str, Any] | None,
+) -> tuple[str, bool]:
+    """Map durable public files to enablement (private B1-compatible).
+
+    Returns ``(entitlement_status, provider_enabled)``. Private Runtime Gate
+    enables paid only when both activation and install are ``active``.
+    """
+
+    activation_status = str((activation or {}).get("status") or STATUS_MISSING)
+    install_status = str((install or {}).get("status") or STATUS_MISSING)
+
+    if activation_status == STATUS_REVOKED or install_status == STATUS_REVOKED:
+        return STATUS_REVOKED, False
+    if activation_status == STATUS_EXPIRED or install_status == STATUS_EXPIRED:
+        return STATUS_EXPIRED, False
+    if activation_status == STATUS_DISABLED or install_status == STATUS_DISABLED:
+        return STATUS_DISABLED, False
+    if activation_status == "within_grace":
+        return "within_grace", install_status == STATUS_ACTIVE
+    if activation_status == STATUS_ACTIVE and install_status == STATUS_ACTIVE:
+        return STATUS_ACTIVE, True
+    if activation_status in {STATUS_INVALID, STATUS_ERROR} or install_status in {
+        STATUS_INVALID,
+        STATUS_ERROR,
+    }:
+        return STATUS_ERROR, False
+    return STATUS_MISSING, False
+
+
+def public_install_hints(install: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Bounded package/provider hints private Runtime Gate reads from install.json."""
+
+    if install is None:
+        return None
+    package_name = install.get("package_name")
+    package_version = install.get("package_version")
+    provider_id = install.get("provider_id")
+    if not isinstance(package_name, str) or not package_name:
+        return None
+    hints: dict[str, Any] = {
+        "package_name": package_name,
+        "package_version": package_version if isinstance(package_version, str) else "",
+    }
+    if isinstance(provider_id, str) and provider_id:
+        hints["provider_id"] = provider_id
+    return hints
 
 
 def _envelope(
@@ -342,7 +433,35 @@ def build_paid_status_payload(*, home: Path | None) -> dict[str, Any]:
     provider = discover_paid_provider()
     path = activation_path(resolved_home)
     activation = load_activation_state(path)
+    checked_at = utc_now_iso()
+
     if install_state and install_state.get("status") == STATUS_ACTIVE:
+        existing_status = str((activation or {}).get("status") or STATUS_MISSING)
+        if existing_status in TERMINAL_INACTIVE_ACTIVATION_STATUSES:
+            # Keep terminal activation for private Core-fallback compatibility.
+            preserved = dict(activation or inactive_activation_state(checked_at=checked_at))
+            preserved["last_checked_at"] = checked_at
+            preserved["public_fallback_available"] = True
+            if preserved.get("provider_present") is not False:
+                preserved["provider_present"] = bool(preserved.get("provider_present"))
+            write_activation_state(path, preserved)
+            provider = PaidProviderSnapshot(
+                provider_present=True,
+                provider_id=install_state.get("provider_id"),
+                provider_contract_version="1",
+                status=existing_status,
+                private_provider_enabled=False,
+                public_fallback_available=True,
+                summary=f"Paid state {existing_status}; public Core fallback active.",
+                error_code=preserved.get("error_code") or existing_status,
+            )
+            return _envelope(
+                action="status",
+                activation=preserved,
+                provider=provider,
+                install_state=install_state,
+            )
+
         provider = PaidProviderSnapshot(
             provider_present=True,
             provider_id=install_state.get("provider_id"),
@@ -359,7 +478,7 @@ def build_paid_status_payload(*, home: Path | None) -> dict[str, Any]:
         activation = _activation_state_from_install(
             install_state=install_state,
             license_id=(activation or {}).get("license_id") or synthetic_license_id("status-only"),
-            checked_at=utc_now_iso(),
+            checked_at=checked_at,
         )
         write_activation_state(path, activation)
         return _envelope(
@@ -373,9 +492,14 @@ def build_paid_status_payload(*, home: Path | None) -> dict[str, Any]:
         activation = _activation_state_from_provider(provider)
     else:
         activation = dict(activation)
-        activation["last_checked_at"] = utc_now_iso()
+        activation["last_checked_at"] = checked_at
         write_activation_state(path, activation)
-    return _envelope(action="status", activation=activation, provider=provider)
+    return _envelope(
+        action="status",
+        activation=activation,
+        provider=provider,
+        install_state=install_state,
+    )
 
 
 def build_paid_deactivate_payload(*, home: Path | None) -> dict[str, Any]:
@@ -415,6 +539,10 @@ def run_paid_activate_cli(
     )
     payload = build_paid_activate_payload(license_key=resolved, home=home)
     _emit_paid_payload(payload, output_json=output_json, out=out or sys.stdout)
+    # Offline / provider-absent path is an explicit unavailable result, not
+    # success. Backend install success returns paid_activation_available=True.
+    if not payload.get("paid_activation_available"):
+        return 1
     return 0
 
 
