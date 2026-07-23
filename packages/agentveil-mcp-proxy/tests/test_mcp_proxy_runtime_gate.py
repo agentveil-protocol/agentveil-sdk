@@ -186,6 +186,7 @@ def _decision_receipt(
     backend_risk_class: str = "unknown",
     backend_policy_context_hash: str = "b" * 64,
     omit_fields: tuple[str, ...] = (),
+    paid_approval_center_projection: dict | None = None,
 ) -> str:
     body = {
         "schema_version": "decision_receipt/2",
@@ -203,6 +204,8 @@ def _decision_receipt(
     }
     if approval_id is not None:
         body["approval_id"] = approval_id
+    if paid_approval_center_projection is not None:
+        body["paid_approval_center_projection"] = paid_approval_center_projection
     for field in omit_fields:
         body.pop(field, None)
     return _sign_jcs(body, seed=seed)
@@ -1601,3 +1604,120 @@ def test_package_install_rejects_unknown_metadata_slot_name_before_post():
     with pytest.raises(RuntimeGateUnavailableError, match="install_clone_context invalid"):
         client.evaluate(_MutableClassification())  # type: ignore[arg-type]
     assert agent.calls == []
+
+
+def _paid_approval_projection(**overrides) -> dict:
+    payload = {
+        "schema_version": "paid_approval_center_projection/1",
+        "projection_kind": "paid_active",
+        "provider_status": "active",
+        "plan_family": "builder",
+        "private_provider_enabled": True,
+        "core_fallback_active": False,
+        "decision": "allow",
+        "reason_code": "paid_provider_active",
+        "selection_reason": "deterministic_precedence",
+        "summary": "Paid policy reviewed this tool call.",
+        "capability_labels": ["Tools call routing"],
+        "activation_source": "public_activation_install",
+        "paid_policy_tightened": False,
+    }
+    payload.update(overrides)
+    return payload
+
+
+class _PaidProjectionRecordingAgent(RecordingAgent):
+    def __init__(
+        self,
+        *,
+        projection: dict | None,
+        inject_top_level: bool = False,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.projection = projection
+        self.inject_top_level = inject_top_level
+
+    def runtime_evaluate(self, **kwargs):
+        self.calls.append(kwargs)
+        signed_projection = None if self.inject_top_level else self.projection
+        response = {
+            "audit_id": AUDIT_ID,
+            "decision": self.decision,
+            "decision_receipt_jcs": _decision_receipt(
+                kwargs,
+                decision=self.decision,
+                approval_id=(
+                    "urn:uuid:approval"
+                    if self.decision == "WAITING_FOR_HUMAN_APPROVAL"
+                    else None
+                ),
+                seed=self.seed,
+                omit_fields=self.omit_receipt_fields,
+                paid_approval_center_projection=signed_projection,
+            ),
+        }
+        if self.inject_top_level and self.projection is not None:
+            response["paid_approval_center_projection"] = self.projection
+        return response
+
+
+def test_runtime_gate_decision_carries_paid_approval_center_projection():
+    config = _config()
+    agent = _PaidProjectionRecordingAgent(
+        decision="WAITING_FOR_HUMAN_APPROVAL",
+        projection=_paid_approval_projection(),
+    )
+    client = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+
+    result = client.evaluate(_classification(config))
+
+    assert result.decision == "WAITING_FOR_HUMAN_APPROVAL"
+    assert result.paid_approval_center_projection is not None
+    assert result.paid_approval_center_projection["projection_kind"] == "paid_active"
+    assert result.paid_approval_center_projection["private_provider_enabled"] is True
+
+
+def test_runtime_gate_ignores_unsigned_top_level_paid_approval_projection():
+    config = _config()
+    agent = _PaidProjectionRecordingAgent(
+        decision="WAITING_FOR_HUMAN_APPROVAL",
+        projection=_paid_approval_projection(),
+        inject_top_level=True,
+    )
+    client = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+
+    result = client.evaluate(_classification(config))
+
+    assert result.decision == "WAITING_FOR_HUMAN_APPROVAL"
+    assert result.paid_approval_center_projection is None
+
+
+def test_runtime_gate_omits_unsupported_paid_approval_projection_before_metadata():
+    config = _config()
+    agent = _PaidProjectionRecordingAgent(
+        decision="WAITING_FOR_HUMAN_APPROVAL",
+        projection=_paid_approval_projection(
+            schema_version="paid_approval_center_projection/99",
+        ),
+    )
+    client = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+
+    result = client.evaluate(_classification(config))
+
+    assert result.decision == "WAITING_FOR_HUMAN_APPROVAL"
+    assert result.paid_approval_center_projection is None
+
+
+def test_runtime_gate_omits_malformed_paid_approval_projection_before_metadata():
+    config = _config()
+    agent = _PaidProjectionRecordingAgent(
+        decision="WAITING_FOR_HUMAN_APPROVAL",
+        projection=_paid_approval_projection(**{"customer_id": "cust_123"}),
+    )
+    client = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+
+    result = client.evaluate(_classification(config))
+
+    assert result.decision == "WAITING_FOR_HUMAN_APPROVAL"
+    assert result.paid_approval_center_projection is None

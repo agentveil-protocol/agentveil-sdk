@@ -1557,6 +1557,56 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
             "</section>"
         )
 
+    def _render_paid_approval_projection_section(self, prompt: ApprovalPrompt) -> str:
+        """Render bounded paid review context only for active paid projections."""
+
+        metadata = prompt.action_gate_metadata
+        if not isinstance(metadata, Mapping):
+            return ""
+        raw = metadata.get("paid_approval_center_projection")
+        if not isinstance(raw, Mapping):
+            return ""
+        # Re-normalize at render time so malformed persisted metadata cannot
+        # invent an active paid panel.
+        from agentveil_mcp_proxy.runtime_gate import (
+            PAID_APPROVAL_PROJECTION_KIND_ACTIVE,
+            normalize_paid_approval_center_projection,
+        )
+
+        projection = normalize_paid_approval_center_projection(raw)
+        if projection is None:
+            return ""
+        if projection.get("projection_kind") != PAID_APPROVAL_PROJECTION_KIND_ACTIVE:
+            # core_fallback / non-active kinds: omit panel (do not look paid-active).
+            return ""
+        if projection.get("private_provider_enabled") is not True:
+            return ""
+
+        rows: list[tuple[str, str]] = [
+            ("Review status", "Paid policy reviewed this action"),
+            ("Summary", str(projection.get("summary") or "")),
+        ]
+        plan_family = projection.get("plan_family")
+        if isinstance(plan_family, str) and plan_family:
+            rows.append(("Plan", plan_family))
+        reason_code = projection.get("reason_code")
+        if isinstance(reason_code, str) and reason_code:
+            rows.append(("Reason", reason_code))
+        labels = projection.get("capability_labels")
+        if isinstance(labels, list) and labels:
+            safe_labels = [str(item) for item in labels if isinstance(item, str) and item]
+            if safe_labels:
+                rows.append(("Capabilities", ", ".join(safe_labels)))
+        if projection.get("paid_policy_tightened") is True:
+            rows.append(("Policy effect", "Tightened by paid policy overlay"))
+        return (
+            '<section class="approval-paid-context" data-paid-projection="paid_active">'
+            "<h2>Paid policy review</h2>"
+            "<p>A paid policy provider reviewed this action. It still needs your approval.</p>"
+            f"{self._render_definition_list(tuple(rows), css_class='approval-detail')}"
+            "</section>"
+        )
+
     @staticmethod
     def _approval_countdown_script(script_nonce: str) -> str:
         return (
@@ -1628,6 +1678,7 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
         redirect_context = ""
         if is_redirected and redirect_rows is not None:
             redirect_context = self._render_verified_redirect_context_section(redirect_rows)
+        paid_context = self._render_paid_approval_projection_section(prompt)
         remaining_seconds = approval_remaining_seconds(prompt.expires_at)
         countdown_label = format_approval_remaining_time(remaining_seconds)
         countdown = (
@@ -1703,6 +1754,7 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
 <div class="approval-rich-grid">
 {action_summary}
 {redirect_context}
+{paid_context}
 </div>
 {countdown}
 <form class="approval-decision-form" method="post">
@@ -1799,6 +1851,26 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
   text-transform: none;
   color: #2ea043;
 }
+.approval-paid-context {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid rgba(88, 166, 255, 0.35);
+  border-radius: 8px;
+  background: rgba(88, 166, 255, 0.08);
+}
+.approval-paid-context h2 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: none;
+  color: #58a6ff;
+}
+.approval-paid-context p {
+  margin: 0 0 8px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
 .approval-meta {
   margin: 0 0 8px;
   display: grid;
@@ -1867,7 +1939,8 @@ class _ApprovalRequestHandler(BaseHTTPRequestHandler):
   grid-template-columns: minmax(0, 1fr);
 }
 .approval-action-summary,
-.approval-redirect-context {
+.approval-redirect-context,
+.approval-paid-context {
   min-width: 0;
 }
 .approval-action-summary h2 {
