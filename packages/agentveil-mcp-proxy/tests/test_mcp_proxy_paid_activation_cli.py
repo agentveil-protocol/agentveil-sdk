@@ -17,7 +17,6 @@ from agentveil_mcp_proxy.paid_activation import (
     BOUNDED_ACTIVATION_KEYS,
     ERROR_PROVIDER_ABSENT,
     PaidActivationError,
-    STATUS_ACTIVE,
     STATUS_MISSING,
     activation_path,
     assert_activation_metadata_bounded,
@@ -39,8 +38,10 @@ RAW_LICENSE_KEY = "avp_live_test_secret_key_do_not_leak_123456789"
 
 
 @pytest.fixture(autouse=True)
-def _reset_paid_backend_client():
+def _reset_paid_backend_client(monkeypatch):
     set_paid_backend_client(None)
+    # Offline/public-fallback path: explicit empty disables zero-config default URL.
+    monkeypatch.setenv("AVP_PAID_API_BASE_URL", "")
     yield
     set_paid_backend_client(None)
 
@@ -48,7 +49,8 @@ def _reset_paid_backend_client():
 def _home_env(home: Path) -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
     env["AVP_HOME"] = str(home)
-    env.pop("AVP_PAID_API_BASE_URL", None)
+    # Explicit empty disables paid backend (offline/public-fallback path).
+    env["AVP_PAID_API_BASE_URL"] = ""
     return env
 
 
@@ -57,8 +59,9 @@ def _run_main(argv: list[str], *, home: Path, stdin_text: str | None = None) -> 
     stderr = io.StringIO()
     previous_home = os.environ.get("AVP_HOME")
     previous_base = os.environ.get("AVP_PAID_API_BASE_URL")
+    previous_base_present = "AVP_PAID_API_BASE_URL" in os.environ
     os.environ["AVP_HOME"] = str(home)
-    os.environ.pop("AVP_PAID_API_BASE_URL", None)
+    os.environ["AVP_PAID_API_BASE_URL"] = ""
     previous_stdout = sys.stdout
     previous_stderr = sys.stderr
     previous_stdin = sys.stdin
@@ -76,10 +79,10 @@ def _run_main(argv: list[str], *, home: Path, stdin_text: str | None = None) -> 
             os.environ.pop("AVP_HOME", None)
         else:
             os.environ["AVP_HOME"] = previous_home
-        if previous_base is None:
+        if not previous_base_present:
             os.environ.pop("AVP_PAID_API_BASE_URL", None)
         else:
-            os.environ["AVP_PAID_API_BASE_URL"] = previous_base
+            os.environ["AVP_PAID_API_BASE_URL"] = previous_base or ""
     return code, stdout.getvalue(), stderr.getvalue()
 
 

@@ -20,7 +20,6 @@ from agentveil_mcp_proxy.evidence.proof import _fsync_parent_directory
 from agentveil_mcp_proxy.paid_provider import (
     PUBLIC_PAID_PROVIDER_CONTRACT_VERSION,
     STATUS_ACTIVE,
-    STATUS_ERROR,
     PaidProviderSnapshot,
 )
 
@@ -220,6 +219,14 @@ def set_paid_backend_client(client: PaidBackendClient | None) -> None:
 
 
 def resolve_paid_backend_client() -> PaidBackendClient | None:
+    """Resolve optional paid backend.
+
+    Safer default: no network unless ``AVP_PAID_API_BASE_URL`` is set (or an
+    in-process client is injected for tests). A packaged default host to
+    ``https://agentveil.dev`` remains a Product Guard follow-up after live
+    endpoint proof.
+    """
+
     if _backend_client is not None:
         return _backend_client
     base_url = os.environ.get("AVP_PAID_API_BASE_URL", "").strip()

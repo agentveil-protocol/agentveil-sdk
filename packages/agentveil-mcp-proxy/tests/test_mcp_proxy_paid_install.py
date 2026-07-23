@@ -337,7 +337,7 @@ def _run_main_with_backend(
         else:
             os.environ["AVP_HOME"] = previous_home
         if previous_base is None:
-            os.environ.pop("AVP_PAID_API_BASE_URL", None)
+            os.environ["AVP_PAID_API_BASE_URL"] = ""
         else:
             os.environ["AVP_PAID_API_BASE_URL"] = previous_base
         set_paid_backend_client(None)
@@ -417,8 +417,10 @@ def test_paid_activate_without_backend_keeps_provider_absent_path(tmp_path):
     stdout = io.StringIO()
     stderr = io.StringIO()
     previous_home = os.environ.get("AVP_HOME")
+    previous_base = os.environ.get("AVP_PAID_API_BASE_URL")
+    previous_base_present = "AVP_PAID_API_BASE_URL" in os.environ
     os.environ["AVP_HOME"] = str(home)
-    os.environ.pop("AVP_PAID_API_BASE_URL", None)
+    os.environ["AVP_PAID_API_BASE_URL"] = ""
     previous_stdout = sys.stdout
     previous_stderr = sys.stderr
     sys.stdout = stdout
@@ -432,6 +434,10 @@ def test_paid_activate_without_backend_keeps_provider_absent_path(tmp_path):
             os.environ.pop("AVP_HOME", None)
         else:
             os.environ["AVP_HOME"] = previous_home
+        if not previous_base_present:
+            os.environ.pop("AVP_PAID_API_BASE_URL", None)
+        else:
+            os.environ["AVP_PAID_API_BASE_URL"] = previous_base or ""
     assert code == 0
     out = stdout.getvalue()
     assert "Paid provider: absent" in out

@@ -21,7 +21,12 @@ from agentveil_mcp_proxy.paid_install import (
 )
 from agentveil_mcp_proxy.paid_provider import (
     STATUS_ACTIVE,
+    STATUS_DISABLED,
+    STATUS_ERROR,
+    STATUS_EXPIRED,
+    STATUS_INVALID,
     STATUS_MISSING,
+    STATUS_REVOKED,
     PaidProviderSnapshot,
     absent_provider_snapshot,
     activate_with_paid_provider,
@@ -40,6 +45,17 @@ BOUNDED_ACTIVATION_KEYS = frozenset(
         "last_checked_at",
         "public_fallback_available",
         "error_code",
+    }
+)
+# Terminal activation statuses that must not be promoted back to active by
+# install.json alone (private Runtime Gate Core-fallback contract).
+TERMINAL_INACTIVE_ACTIVATION_STATUSES = frozenset(
+    {
+        STATUS_EXPIRED,
+        STATUS_REVOKED,
+        STATUS_DISABLED,
+        STATUS_INVALID,
+        STATUS_ERROR,
     }
 )
 ERROR_PROVIDER_ABSENT = "provider_absent"
@@ -198,6 +214,56 @@ def _paid_activation_available(provider: PaidProviderSnapshot) -> bool:
     return provider.provider_present and provider.status == STATUS_ACTIVE and provider.error_code is None
 
 
+def map_public_paid_enablement(
+    activation: Mapping[str, Any] | None,
+    install: Mapping[str, Any] | None,
+) -> tuple[str, bool]:
+    """Map durable public files to enablement (private B1-compatible).
+
+    Returns ``(entitlement_status, provider_enabled)``. Private Runtime Gate
+    enables paid only when both activation and install are ``active``.
+    """
+
+    activation_status = str((activation or {}).get("status") or STATUS_MISSING)
+    install_status = str((install or {}).get("status") or STATUS_MISSING)
+
+    if activation_status == STATUS_REVOKED or install_status == STATUS_REVOKED:
+        return STATUS_REVOKED, False
+    if activation_status == STATUS_EXPIRED or install_status == STATUS_EXPIRED:
+        return STATUS_EXPIRED, False
+    if activation_status == STATUS_DISABLED or install_status == STATUS_DISABLED:
+        return STATUS_DISABLED, False
+    if activation_status == "within_grace":
+        return "within_grace", install_status == STATUS_ACTIVE
+    if activation_status == STATUS_ACTIVE and install_status == STATUS_ACTIVE:
+        return STATUS_ACTIVE, True
+    if activation_status in {STATUS_INVALID, STATUS_ERROR} or install_status in {
+        STATUS_INVALID,
+        STATUS_ERROR,
+    }:
+        return STATUS_ERROR, False
+    return STATUS_MISSING, False
+
+
+def public_install_hints(install: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Bounded package/provider hints private Runtime Gate reads from install.json."""
+
+    if install is None:
+        return None
+    package_name = install.get("package_name")
+    package_version = install.get("package_version")
+    provider_id = install.get("provider_id")
+    if not isinstance(package_name, str) or not package_name:
+        return None
+    hints: dict[str, Any] = {
+        "package_name": package_name,
+        "package_version": package_version if isinstance(package_version, str) else "",
+    }
+    if isinstance(provider_id, str) and provider_id:
+        hints["provider_id"] = provider_id
+    return hints
+
+
 def _envelope(
     *,
     action: str,
@@ -342,7 +408,35 @@ def build_paid_status_payload(*, home: Path | None) -> dict[str, Any]:
     provider = discover_paid_provider()
     path = activation_path(resolved_home)
     activation = load_activation_state(path)
+    checked_at = utc_now_iso()
+
     if install_state and install_state.get("status") == STATUS_ACTIVE:
+        existing_status = str((activation or {}).get("status") or STATUS_MISSING)
+        if existing_status in TERMINAL_INACTIVE_ACTIVATION_STATUSES:
+            # Keep terminal activation for private Core-fallback compatibility.
+            preserved = dict(activation or inactive_activation_state(checked_at=checked_at))
+            preserved["last_checked_at"] = checked_at
+            preserved["public_fallback_available"] = True
+            if preserved.get("provider_present") is not False:
+                preserved["provider_present"] = bool(preserved.get("provider_present"))
+            write_activation_state(path, preserved)
+            provider = PaidProviderSnapshot(
+                provider_present=True,
+                provider_id=install_state.get("provider_id"),
+                provider_contract_version="1",
+                status=existing_status,
+                private_provider_enabled=False,
+                public_fallback_available=True,
+                summary=f"Paid state {existing_status}; public Core fallback active.",
+                error_code=preserved.get("error_code") or existing_status,
+            )
+            return _envelope(
+                action="status",
+                activation=preserved,
+                provider=provider,
+                install_state=install_state,
+            )
+
         provider = PaidProviderSnapshot(
             provider_present=True,
             provider_id=install_state.get("provider_id"),
@@ -359,7 +453,7 @@ def build_paid_status_payload(*, home: Path | None) -> dict[str, Any]:
         activation = _activation_state_from_install(
             install_state=install_state,
             license_id=(activation or {}).get("license_id") or synthetic_license_id("status-only"),
-            checked_at=utc_now_iso(),
+            checked_at=checked_at,
         )
         write_activation_state(path, activation)
         return _envelope(
@@ -373,9 +467,14 @@ def build_paid_status_payload(*, home: Path | None) -> dict[str, Any]:
         activation = _activation_state_from_provider(provider)
     else:
         activation = dict(activation)
-        activation["last_checked_at"] = utc_now_iso()
+        activation["last_checked_at"] = checked_at
         write_activation_state(path, activation)
-    return _envelope(action="status", activation=activation, provider=provider)
+    return _envelope(
+        action="status",
+        activation=activation,
+        provider=provider,
+        install_state=install_state,
+    )
 
 
 def build_paid_deactivate_payload(*, home: Path | None) -> dict[str, Any]:
