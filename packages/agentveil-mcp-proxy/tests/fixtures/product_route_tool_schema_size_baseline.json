@@ -1,0 +1,21 @@
+{
+  "schema_version": "avp.product_route.tool_schema_size.v1",
+  "notes": "Baseline sizes from shared GitHub _GITHUB_REPO_SCHEMA before per-tool compaction (HEAD 097b62f).",
+  "tool_count": 71,
+  "tools_list_bytes": 47369,
+  "schema_bytes": 40004,
+  "github_schema_bytes": 29640,
+  "shared_github_fields": [
+    "owner",
+    "repo",
+    "repo_root",
+    "issue_number",
+    "pull_number",
+    "comment_body",
+    "branch",
+    "secret_name",
+    "visibility",
+    "tag_name",
+    "workflow_run_id"
+  ]
+}
