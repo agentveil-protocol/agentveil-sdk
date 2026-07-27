@@ -64,42 +64,75 @@ _PACKAGE_PROJECT_SCHEMA: dict[str, Any] = {
     "additionalProperties": True,
 }
 
-_GITHUB_REPO_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "owner": {
-            "type": "string",
-            "description": (
-                "Optional repository owner. Defaults to the configured "
-                "product profile GitHub target when omitted."
-            ),
-        },
-        "repo": {
-            "type": "string",
-            "description": (
-                "Optional repository name. Defaults to the configured "
-                "product profile GitHub target when omitted."
-            ),
-        },
-        "repo_root": {
-            "type": "string",
-            "description": (
-                "Optional local content root. Defaults to the configured "
-                "product profile GitHub content root when omitted."
-            ),
-        },
-        "issue_number": {"type": "integer"},
-        "pull_number": {"type": "integer"},
-        "comment_body": {"type": "string"},
-        "branch": {"type": "string"},
-        "secret_name": {"type": "string"},
-        "visibility": {"type": "string"},
-        "tag_name": {"type": "string"},
-        "workflow_run_id": {"type": "integer"},
-    },
-    "required": [],
-    "additionalProperties": True,
+# Compact shared GitHub property fragments (product profile supplies defaults).
+# Omit verbose descriptions: tools/list size is dominated by repeating them.
+_GH_OWNER: dict[str, Any] = {"type": "string"}
+_GH_REPO: dict[str, Any] = {"type": "string"}
+_GH_REPO_ROOT: dict[str, Any] = {"type": "string"}
+_GH_ISSUE_NUMBER: dict[str, Any] = {"type": "integer"}
+_GH_PULL_NUMBER: dict[str, Any] = {"type": "integer"}
+_GH_COMMENT_BODY: dict[str, Any] = {"type": "string"}
+_GH_BRANCH: dict[str, Any] = {"type": "string"}
+_GH_SECRET_NAME: dict[str, Any] = {"type": "string"}
+_GH_VISIBILITY: dict[str, Any] = {"type": "string"}
+_GH_TAG_NAME: dict[str, Any] = {"type": "string"}
+_GH_WORKFLOW_RUN_ID: dict[str, Any] = {"type": "integer"}
+
+# Extra advertised properties beyond owner/repo/repo_root, keyed by tool.
+# Keep additionalProperties=true and stay within the legacy shared field set.
+_GITHUB_TOOL_EXTRA_PROPERTIES: dict[str, tuple[str, ...]] = {
+    "get_issue": ("issue_number",),
+    "get_pull_request": ("pull_number",),
+    "list_comments": ("issue_number", "pull_number"),
+    "create_comment": ("issue_number", "pull_number", "comment_body"),
+    "update_issue": ("issue_number",),
+    "add_labels": ("issue_number",),
+    "remove_labels": ("issue_number",),
+    "request_review": ("pull_number",),
+    "merge_pull_request": ("pull_number",),
+    "close_issue": ("issue_number",),
+    "delete_branch": ("branch",),
+    "create_release": ("tag_name",),
+    "update_repository_settings": ("visibility",),
+    "manage_secret": ("secret_name",),
+    "rerun_workflow": ("workflow_run_id",),
+    "cancel_workflow": ("workflow_run_id",),
+    "dispatch_workflow": ("branch",),
+    "get_secret": ("secret_name",),
+    "get_env_secret": ("secret_name",),
 }
+
+_GITHUB_PROPERTY_DEFS: dict[str, dict[str, Any]] = {
+    "owner": _GH_OWNER,
+    "repo": _GH_REPO,
+    "repo_root": _GH_REPO_ROOT,
+    "issue_number": _GH_ISSUE_NUMBER,
+    "pull_number": _GH_PULL_NUMBER,
+    "comment_body": _GH_COMMENT_BODY,
+    "branch": _GH_BRANCH,
+    "secret_name": _GH_SECRET_NAME,
+    "visibility": _GH_VISIBILITY,
+    "tag_name": _GH_TAG_NAME,
+    "workflow_run_id": _GH_WORKFLOW_RUN_ID,
+}
+
+
+def _github_object_schema(*property_names: str) -> dict[str, Any]:
+    properties = {
+        name: dict(_GITHUB_PROPERTY_DEFS[name])
+        for name in property_names
+    }
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": [],
+        "additionalProperties": True,
+    }
+
+
+def _github_tool_schema(name: str) -> dict[str, Any]:
+    extras = _GITHUB_TOOL_EXTRA_PROPERTIES.get(name, ())
+    return _github_object_schema("owner", "repo", "repo_root", *extras)
 
 
 def _filesystem_tool_entries() -> dict[str, dict[str, Any]]:
@@ -126,7 +159,7 @@ def _github_tool_entry(name: str) -> dict[str, Any]:
     return {
         "name": name,
         "description": f"{name} (product route github/ci pack)",
-        "inputSchema": dict(_GITHUB_REPO_SCHEMA),
+        "inputSchema": _github_tool_schema(name),
     }
 
 
@@ -158,7 +191,31 @@ def product_route_tool_catalog_hash() -> str:
     ).hexdigest()
 
 
+def measure_product_route_tools_list_size() -> dict[str, int]:
+    """Return compact byte sizes for product-route ``tools/list`` advertising."""
+
+    entries = build_product_route_tool_entries()
+    tools_list = {"jsonrpc": "2.0", "id": 1, "result": {"tools": entries}}
+    tools_list_bytes = len(json.dumps(tools_list, separators=(",", ":"), ensure_ascii=True).encode("utf-8"))
+    schema_bytes = sum(
+        len(json.dumps(entry["inputSchema"], separators=(",", ":"), ensure_ascii=True).encode("utf-8"))
+        for entry in entries
+    )
+    github_schema_bytes = sum(
+        len(json.dumps(entry["inputSchema"], separators=(",", ":"), ensure_ascii=True).encode("utf-8"))
+        for entry in entries
+        if entry["name"] in GITHUB_PRODUCT_TOOLS
+    )
+    return {
+        "tool_count": len(entries),
+        "tools_list_bytes": tools_list_bytes,
+        "schema_bytes": schema_bytes,
+        "github_schema_bytes": github_schema_bytes,
+    }
+
+
 __all__ = [
     "build_product_route_tool_entries",
+    "measure_product_route_tools_list_size",
     "product_route_tool_catalog_hash",
 ]

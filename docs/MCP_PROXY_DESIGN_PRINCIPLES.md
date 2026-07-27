@@ -200,6 +200,43 @@ The intended customer experience is constrained but not obscure: users can see
 what is being requested, why a policy decision happened, where evidence is
 stored, and how to export proof for offline verification.
 
+## Tool Catalog Growth Boundary
+
+The product-route tool catalog and the policy/provider system are separate
+architecture layers:
+
+- A tool represents one executable action that an MCP client can discover and
+  call.
+- Policy evaluates whether that action is relevant, allowed, approval-required,
+  redirected, or rejected in the current context.
+- Optional paid providers may enrich the bounded decision, Approval Center
+  projection, and evidence metadata. They do not publish plan-specific copies
+  of existing MCP tools.
+
+Adding Builder, Team, Enterprise, partner, role, risk, or approval variants
+must therefore not create variants such as `builder_write_file`,
+`enterprise_write_file`, or `write_file_with_approval`. Those variants use the
+existing `write_file` action and differ only in server-side evaluation and
+bounded review context.
+
+`PRODUCT_ROUTE_TOOL_CATALOG` may grow only when AgentVeil supports a genuinely
+new executable action that cannot be represented by an existing tool. Such a
+change requires a dedicated catalog-change review covering the tool schema,
+pack ownership, policy, approval behavior, evidence, visibility, and catalog
+footprint. Policy/provider-only changes must leave the advertised catalog
+unchanged.
+
+The committed product-route catalog contract is enforced by the MCP Proxy test
+suite in CI. Updating that snapshot is an explicit architecture change, not
+routine cleanup in a policy or provider slice. Schema compaction may proceed
+without changing the snapshot as long as tool names, order, and pack ownership
+remain stable.
+
+This boundary preserves zero-config provider activation: installed providers
+are discovered from trusted local activation state and the generic provider
+contract. Customers do not select plan-specific MCP catalogs or configure
+provider-specific tool names.
+
 ## Capability References
 
 The proxy's capability-token framing aligns with Mark Miller's
