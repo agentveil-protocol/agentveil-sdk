@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Project-local Codex connector setup helpers.
 
 This module does not implement a new control path. It wraps the existing Codex

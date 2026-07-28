@@ -46,10 +46,24 @@ def test_proxy_package_uses_separate_license_file():
         pyproject = tomllib.load(f)
 
     assert pyproject["project"]["license"] == "BUSL-1.1"
-    assert pyproject["project"]["license-files"] == ["LICENSE"]
+    assert pyproject["project"]["license-files"] == ["LICENSE", "NOTICE"]
     license_text = (PACKAGE_ROOT / "LICENSE").read_text(encoding="utf-8")
     assert "Business Source License 1.1" in license_text
     assert "AgentVeil MCP Proxy" in license_text
+    notice_text = (PACKAGE_ROOT / "NOTICE").read_text(encoding="utf-8")
+    assert "Copyright (c) 2026 Oleg Boiko" in notice_text
+    assert "BUSL-1.1" in notice_text
+
+
+def test_proxy_source_files_have_busl_spdx_headers():
+    source_root = PACKAGE_ROOT / "agentveil_mcp_proxy"
+    expected_header = "# SPDX-License-Identifier: BUSL-1.1"
+    missing = [
+        path.relative_to(PACKAGE_ROOT).as_posix()
+        for path in sorted(source_root.rglob("*.py"))
+        if expected_header not in path.read_text(encoding="utf-8").splitlines()[:8]
+    ]
+    assert missing == []
 
 
 def test_proxy_package_depends_on_public_sdk():

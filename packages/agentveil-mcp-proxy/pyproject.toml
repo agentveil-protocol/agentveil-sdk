@@ -5,7 +5,7 @@ description = "Source-available MCP route for approval and local evidence on rou
 readme = {file = "README.md", content-type = "text/markdown"}
 requires-python = ">=3.10"
 license = "BUSL-1.1"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "NOTICE"]
 authors = [{name = "Oleg Boiko", email = "ob@agentveil.dev"}]
 maintainers = [{name = "Oleg Boiko", email = "ob@agentveil.dev"}]
 keywords = ["ai", "agents", "agent-control", "runtime-gate", "mcp", "mcp-proxy", "approval", "evidence", "routed-actions"]

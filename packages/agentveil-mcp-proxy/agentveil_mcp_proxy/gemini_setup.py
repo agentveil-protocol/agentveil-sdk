@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Project-local Gemini CLI connector setup helpers.
 
 Wraps existing client-config/connect primitives with project-local proxy home,

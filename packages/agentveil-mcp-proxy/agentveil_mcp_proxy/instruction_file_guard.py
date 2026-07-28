@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """TrapDoor T2/T3 guards for agent instruction-file writes."""
 
 from __future__ import annotations

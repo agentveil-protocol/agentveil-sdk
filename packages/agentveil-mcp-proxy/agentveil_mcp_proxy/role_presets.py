@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Least Agency role presets for MCP proxy init without hand-edited JSON."""
 
 from __future__ import annotations

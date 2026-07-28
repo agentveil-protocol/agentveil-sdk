@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Proxy-signed local approval grant primitive (schema ``proxy_approval_grant/1``).
 
 This artifact binds one local MCP-proxy approval decision to the proxy identity

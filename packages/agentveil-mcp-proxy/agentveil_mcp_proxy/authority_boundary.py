@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Metadata-only authority boundary contract for MCP Proxy autonomy control.
 
 Defines bounded authority records and privacy guards for local MCP Proxy runtime

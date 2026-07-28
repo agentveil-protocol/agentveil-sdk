@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Bounded explain/redirect guidance and role doctor output for MCP proxy presets."""
 
 from __future__ import annotations

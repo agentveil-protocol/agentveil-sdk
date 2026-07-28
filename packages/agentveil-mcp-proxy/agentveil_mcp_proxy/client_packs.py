@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Client compatibility pack metadata for Cursor, Claude Code, Codex, and Gemini CLI."""
 
 from __future__ import annotations

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Project-local Cursor one-command setup (hooks, MCP route, Approval Center).
 
 Public SDK surface for ``agentveil-mcp-proxy setup cursor --yes``. Writes merge-

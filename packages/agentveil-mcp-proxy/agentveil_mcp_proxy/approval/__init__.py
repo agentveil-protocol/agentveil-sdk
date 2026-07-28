@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Local approval surface primitives for MCP Proxy."""
 
 from agentveil_mcp_proxy.approval.headless import (

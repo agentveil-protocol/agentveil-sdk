@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Claude Code PreToolUse hook adapter for AgentVeil MCP Proxy.
 
 Productizes the P10D.11-C/C2 probe surface into a reusable module that maps

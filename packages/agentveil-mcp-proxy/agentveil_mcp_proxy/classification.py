@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Tool-call classification and privacy hashing for MCP Proxy v0.1.
 
 P4 builds local metadata for later Runtime Gate and evidence slices. It does

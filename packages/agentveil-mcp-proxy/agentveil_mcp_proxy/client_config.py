@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Dry-run MCP client config rendering for AgentVeil MCP Proxy onboarding."""
 
 from __future__ import annotations

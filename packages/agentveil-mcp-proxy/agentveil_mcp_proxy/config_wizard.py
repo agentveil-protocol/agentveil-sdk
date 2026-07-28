@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Proxy-routed MCP client config wizard for configured MCP client entries."""
 
 from __future__ import annotations

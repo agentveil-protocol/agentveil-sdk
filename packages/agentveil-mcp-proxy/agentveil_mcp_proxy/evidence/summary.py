@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Bounded evidence-summary output for default CLI artifacts."""
 
 from __future__ import annotations

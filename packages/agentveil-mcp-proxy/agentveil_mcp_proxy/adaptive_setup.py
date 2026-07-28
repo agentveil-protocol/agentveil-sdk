@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Deterministic adaptive setup planning for AgentVeil Safe Mode. claim-check: allow "Safe Mode" is the literal product surface name, not a safety claim.
 
 Pure local functions only: no LLM, network, AVP token use, or hidden policy

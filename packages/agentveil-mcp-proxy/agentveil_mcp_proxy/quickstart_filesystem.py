@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Tiny stdio MCP server for `agentveil-mcp-proxy --quickstart-filesystem`.
 
 This server is intentionally small and sandbox-rooted. It exists so a fresh
