@@ -126,6 +126,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+      attestations: write
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -146,6 +147,30 @@ jobs:
 
       - name: Check distributions
         run: twine check dist/sdk/* dist/mcp-proxy/*
+
+      - name: Write release evidence
+        run: >-
+          python scripts/release_evidence.py
+          --artifact dist/sdk/*
+          --artifact dist/mcp-proxy/*
+          --project-file pyproject.toml
+          --project-file packages/agentveil-mcp-proxy/pyproject.toml
+          --output-dir dist/evidence
+          --repository "${{ github.server_url }}/${{ github.repository }}"
+          --commit "${{ github.sha }}"
+          --ref "${{ github.ref }}"
+
+      - name: Attest built distributions
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-checksums: dist/evidence/SHA256SUMS
+
+      - name: Upload release evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-evidence-${{ github.ref_name }}
+          path: dist/evidence
+          if-no-files-found: error
 
       - name: Publish SDK to PyPI
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b  # v1.14.0

@@ -64,6 +64,16 @@ def test_publish_uses_bounded_python_os_and_approval_center_jobs() -> None:
     )
 
 
+def test_publish_generates_and_attests_release_evidence() -> None:
+    text = _workflow_text()
+    assert "attestations: write" in text
+    assert "python scripts/release_evidence.py" in text
+    assert "--output-dir dist/evidence" in text
+    assert "actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be" in text
+    assert "subject-checksums: dist/evidence/SHA256SUMS" in text
+    assert "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02" in text
+
+
 def test_process_tests_do_not_block_on_live_child_stderr_eof() -> None:
     offenders = [
         path.relative_to(ROOT).as_posix()
