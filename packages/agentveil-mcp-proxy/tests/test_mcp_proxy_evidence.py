@@ -6,10 +6,10 @@ from dataclasses import asdict
 import json
 import os
 from pathlib import Path
-import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -22,6 +22,7 @@ from agentveil_mcp_proxy.evidence import (
     ApprovalEvidenceStore,
     ApprovalEvidenceTransitionError,
     ApprovalStatus,
+    EVIDENCE_SCHEMA_VERSION,
     GENESIS_PREV_EVENT_HASH,
     PendingApproval,
     record_hash,
@@ -1233,7 +1234,10 @@ def test_schema_version_mismatch_refuses_to_open_for_forward_incompatible(tmp_pa
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute("CREATE TABLE evidence_schema_version (version INTEGER NOT NULL)")
-        conn.execute("INSERT INTO evidence_schema_version (version) VALUES (7)")
+        conn.execute(
+            "INSERT INTO evidence_schema_version (version) VALUES (?)",
+            (EVIDENCE_SCHEMA_VERSION + 1,),
+        )
         conn.commit()
     finally:
         conn.close()
@@ -1265,7 +1269,7 @@ def test_schema_v3_migrates_to_v4_preserving_records_and_chain(tmp_path):
         count = conn.execute("SELECT COUNT(*) FROM pending_approvals").fetchone()[0]
     finally:
         conn.close()
-    assert version == 6
+    assert version == EVIDENCE_SCHEMA_VERSION
     assert expires_at_notnull == 0
     assert count == 2
 
@@ -1296,7 +1300,7 @@ def test_fresh_schema_allows_null_expires_at(tmp_path):
         ).fetchone()[0]
     finally:
         conn.close()
-    assert version == 6
+    assert version == EVIDENCE_SCHEMA_VERSION
     assert expires_at is None
 
 
@@ -1342,7 +1346,7 @@ def test_schema_v2_migrates_to_v4_with_new_nullable_columns_without_data_loss(tm
         columns = {row[1] for row in conn.execute("PRAGMA table_info(pending_approvals)")}
     finally:
         conn.close()
-    assert version == 6
+    assert version == EVIDENCE_SCHEMA_VERSION
     assert "granted_by_request_id" in columns
     assert "approval_grant_jcs" in columns
 
@@ -1401,7 +1405,7 @@ def test_schema_v5_migrates_to_v6_with_redirect_lineage_claims_and_reopen(tmp_pa
         }
     finally:
         conn.close()
-    assert version == 6
+    assert version == EVIDENCE_SCHEMA_VERSION
     assert "redirect_lineage_claims" in tables
     assert {
         "original_request_id",
@@ -1983,3 +1987,284 @@ def test_control_surface_summarize_evidence_uses_redirect_observability_parsers(
     summary = summarize_evidence([record])
     assert summary["redirect_original_count"] == 1
     assert summary["target_reached_false_count"] == 1
+
+
+def _exact_grant_lookup(**overrides):
+    payload = dict(
+        downstream_server="github-mcp",
+        tool_name="github.create_issue",
+        policy_rule_id="rule-write",
+        risk_class="write",
+        policy_context_hash=POLICY_CONTEXT_HASH,
+        resource_hash=RESOURCE_HASH,
+        payload_hash=PAYLOAD_HASH,
+        now_timestamp=1_700_000_010,
+    )
+    payload.update(overrides)
+    return payload
+
+
+def test_schema_v6_migrates_to_v7_exact_grant_claims_with_legacy_duplicate_children(tmp_path):
+    """v7 backfill must tolerate historical multi-child exact grants without unique index."""
+
+    db_path = tmp_path / "evidence.sqlite"
+    parent = _record("grant-legacy")
+    child_a = PendingApproval(
+        **{
+            **asdict(_record("child-legacy-a", created_at=1_700_000_100)),
+            "granted_by_request_id": "grant-legacy",
+        }
+    )
+    child_b = PendingApproval(
+        **{
+            **asdict(_record("child-legacy-b", created_at=1_700_000_200)),
+            "granted_by_request_id": "grant-legacy",
+        }
+    )
+    with ApprovalEvidenceStore(db_path) as store:
+        store.write_pending(parent)
+        store.transition(
+            "grant-legacy",
+            ApprovalStatus.APPROVED.value,
+            approval_token_hash=APPROVAL_TOKEN_HASH,
+            approval_decided_by="local-user",
+            approval_scope="exact",
+            user_decision_timestamp=1_700_000_000,
+        )
+        store.write_pending(child_a)
+        store.write_pending(child_b)
+        store._conn.execute("DELETE FROM exact_grant_claims")
+        store._conn.execute("DELETE FROM evidence_schema_version")
+        store._conn.execute("INSERT INTO evidence_schema_version (version) VALUES (6)")
+        store._conn.commit()
+
+    with ApprovalEvidenceStore(db_path) as migrated:
+        claim = migrated.get_exact_grant_claim("grant-legacy")
+        assert claim is not None
+        assert claim["child_request_id"] == "child-legacy-a"
+        assert migrated.get_pending("grant-legacy") is not None
+        assert migrated.get_pending("child-legacy-a") is not None
+        assert migrated.get_pending("child-legacy-b") is not None
+        assert migrated.find_active_exact_grant(**_exact_grant_lookup()) is None
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        version = conn.execute("SELECT version FROM evidence_schema_version").fetchone()[0]
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        claim_count = conn.execute("SELECT COUNT(*) FROM exact_grant_claims").fetchone()[0]
+    finally:
+        conn.close()
+    assert version == EVIDENCE_SCHEMA_VERSION
+    assert "exact_grant_claims" in tables
+    assert claim_count == 1
+
+
+def test_consume_exact_grant_with_pending_is_single_use_across_connections(tmp_path):
+    db_path = tmp_path / "evidence.sqlite"
+    with ApprovalEvidenceStore(db_path) as bootstrap:
+        bootstrap.write_pending(_record("grant-parent"))
+        bootstrap.transition(
+            "grant-parent",
+            ApprovalStatus.APPROVED.value,
+            approval_token_hash=APPROVAL_TOKEN_HASH,
+            approval_decided_by="local-user",
+            approval_scope="exact",
+            user_decision_timestamp=1_700_000_000,
+        )
+
+    store_a = ApprovalEvidenceStore(db_path)
+    store_b = ApprovalEvidenceStore(db_path)
+    barrier = threading.Barrier(2)
+    results: dict[str, str | None] = {}
+    lock = threading.Lock()
+
+    def _contend(label: str, store: ApprovalEvidenceStore) -> None:
+        barrier.wait()
+        parent = store.consume_exact_grant_with_pending(
+            _record(f"child-{label}", created_at=1_700_000_010 + (0 if label == "a" else 1)),
+            **_exact_grant_lookup(),
+        )
+        with lock:
+            results[label] = None if parent is None else parent.request_id
+
+    try:
+        threads = [
+            threading.Thread(target=_contend, args=("a", store_a)),
+            threading.Thread(target=_contend, args=("b", store_b)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        winners = [label for label, value in results.items() if value == "grant-parent"]
+        losers = [label for label, value in results.items() if value is None]
+        assert len(winners) == 1
+        assert len(losers) == 1
+        with ApprovalEvidenceStore(db_path) as check:
+            children = [
+                row
+                for row in check.list_records()
+                if row.granted_by_request_id == "grant-parent"
+            ]
+            claim = check.get_exact_grant_claim("grant-parent")
+            assert len(children) == 1
+            assert claim is not None
+            assert claim["child_request_id"] == children[0].request_id
+            assert check.find_active_exact_grant(**_exact_grant_lookup()) is None
+    finally:
+        store_a.close()
+        store_b.close()
+
+
+def test_consume_exact_grant_read_write_boundary_hook_rolls_back_reservation(tmp_path):
+    """Deterministic read/write boundary: failure after read leaves no claim/child."""
+
+    with _store(tmp_path) as store:
+        store.write_pending(_record("grant-hook"))
+        store.transition(
+            "grant-hook",
+            ApprovalStatus.APPROVED.value,
+            approval_token_hash=APPROVAL_TOKEN_HASH,
+            approval_decided_by="local-user",
+            approval_scope="exact",
+            user_decision_timestamp=1_700_000_000,
+        )
+        seen = {"read": False}
+
+        def _hook() -> None:
+            seen["read"] = True
+            raise RuntimeError("forced failure at read/write boundary")
+
+        store._exact_grant_between_read_and_claim_hook = _hook
+        with pytest.raises(RuntimeError, match="forced failure"):
+            store.consume_exact_grant_with_pending(
+                _record("child-hook"),
+                **_exact_grant_lookup(),
+            )
+        assert seen["read"] is True
+        assert store.get_exact_grant_claim("grant-hook") is None
+        assert store.get_pending("child-hook") is None
+        assert store.find_active_exact_grant(**_exact_grant_lookup()) is not None
+
+
+def test_consume_exact_grant_insert_failure_rolls_back_claim(tmp_path, monkeypatch):
+    with _store(tmp_path) as store:
+        store.write_pending(_record("grant-rollback"))
+        store.transition(
+            "grant-rollback",
+            ApprovalStatus.APPROVED.value,
+            approval_token_hash=APPROVAL_TOKEN_HASH,
+            approval_decided_by="local-user",
+            approval_scope="exact",
+            user_decision_timestamp=1_700_000_000,
+        )
+
+        def fail_insert(_record):
+            raise ApprovalEvidenceCapacityError("forced capacity")
+
+        monkeypatch.setattr(store, "_insert_pending_locked", fail_insert)
+        with pytest.raises(ApprovalEvidenceCapacityError, match="forced capacity"):
+            store.consume_exact_grant_with_pending(
+                _record("child-rollback"),
+                **_exact_grant_lookup(),
+            )
+        assert store.get_exact_grant_claim("grant-rollback") is None
+        assert store.get_pending("child-rollback") is None
+        assert store.find_active_exact_grant(**_exact_grant_lookup()) is not None
+
+
+def test_process_level_exact_grant_consume_has_one_winner(tmp_path):
+    """Two OS processes sharing one SQLite DB: exactly one consume wins."""
+
+    db_path = tmp_path / "evidence.sqlite"
+    with ApprovalEvidenceStore(db_path) as bootstrap:
+        bootstrap.write_pending(_record("grant-proc"))
+        bootstrap.transition(
+            "grant-proc",
+            ApprovalStatus.APPROVED.value,
+            approval_token_hash=APPROVAL_TOKEN_HASH,
+            approval_decided_by="local-user",
+            approval_scope="exact",
+            user_decision_timestamp=1_700_000_000,
+        )
+
+    sync_dir = tmp_path / "sync"
+    sync_dir.mkdir()
+    ready_a = sync_dir / "ready-a"
+    ready_b = sync_dir / "ready-b"
+    go = sync_dir / "go"
+    result_a = sync_dir / "result-a"
+    result_b = sync_dir / "result-b"
+    repo_root = Path(__file__).resolve().parents[1]
+    script = tmp_path / "consume_contender.py"
+    script.write_text(
+        "\n".join(
+            [
+                "import json, sys, time",
+                "from pathlib import Path",
+                "from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore, PendingApproval, ApprovalStatus",
+                "db_path = Path(sys.argv[1])",
+                "ready = Path(sys.argv[2])",
+                "go = Path(sys.argv[3])",
+                "out = Path(sys.argv[4])",
+                "child_id = sys.argv[5]",
+                "record = PendingApproval(",
+                "  request_id=child_id, session_id='session-1', client_id='cursor:session-7',",
+                "  downstream_server='github-mcp', tool_name='github.create_issue',",
+                "  action_class='write', risk_class='write',",
+                f"  resource_hash={RESOURCE_HASH!r}, payload_hash={PAYLOAD_HASH!r},",
+                "  policy_id='github-default', policy_rule_id='rule-write',",
+                f"  policy_context_hash={POLICY_CONTEXT_HASH!r},",
+                "  status=ApprovalStatus.PENDING.value, created_at=1700000010, expires_at=1700000310,",
+                ")",
+                "store = ApprovalEvidenceStore(db_path)",
+                "ready.write_text('1', encoding='utf-8')",
+                "deadline = time.time() + 10",
+                "while not go.exists() and time.time() < deadline:",
+                "  time.sleep(0.01)",
+                "parent = store.consume_exact_grant_with_pending(",
+                "  record,",
+                "  downstream_server='github-mcp', tool_name='github.create_issue',",
+                "  policy_rule_id='rule-write', risk_class='write',",
+                f"  policy_context_hash={POLICY_CONTEXT_HASH!r}, resource_hash={RESOURCE_HASH!r},",
+                f"  payload_hash={PAYLOAD_HASH!r}, now_timestamp=1700000010,",
+                ")",
+                "out.write_text('win' if parent is not None else 'lose', encoding='utf-8')",
+                "store.close()",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{env.get('PYTHONPATH', '')}"
+    procs = [
+        subprocess.Popen(
+            [sys.executable, str(script), str(db_path), str(ready_a), str(go), str(result_a), "child-proc-a"],
+            env=env,
+        ),
+        subprocess.Popen(
+            [sys.executable, str(script), str(db_path), str(ready_b), str(go), str(result_b), "child-proc-b"],
+            env=env,
+        ),
+    ]
+    deadline = time.time() + 10
+    while (not ready_a.exists() or not ready_b.exists()) and time.time() < deadline:
+        time.sleep(0.01)
+    assert ready_a.exists() and ready_b.exists()
+    go.write_text("1", encoding="utf-8")
+    for proc in procs:
+        assert proc.wait(timeout=15) == 0
+    outcomes = {result_a.read_text(encoding="utf-8"), result_b.read_text(encoding="utf-8")}
+    assert outcomes == {"win", "lose"}
+    with ApprovalEvidenceStore(db_path) as check:
+        children = [
+            row for row in check.list_records() if row.granted_by_request_id == "grant-proc"
+        ]
+        assert len(children) == 1
+        assert check.get_exact_grant_claim("grant-proc") is not None
