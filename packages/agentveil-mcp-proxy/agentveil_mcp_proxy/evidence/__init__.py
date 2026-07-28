@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Durable local approval/evidence primitives for MCP adapter approval flows."""
 
 from agentveil_mcp_proxy.evidence.store import (

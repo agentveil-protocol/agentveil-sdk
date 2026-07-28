@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """MCP proxy config, policy, and Runtime Gate primitives.
 
 This package includes the local config/policy foundation, encrypted proxy

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """TrapDoor T4: persistence/backdoor filesystem paths require approval before write."""
 
 from __future__ import annotations

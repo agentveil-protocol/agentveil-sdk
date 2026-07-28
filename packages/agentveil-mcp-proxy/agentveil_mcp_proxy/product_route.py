@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Product route catalog and policy for one stable local AgentVeil MCP surface.
 
 Phase 1 defines the explicit accepted local tool catalog and a deterministic

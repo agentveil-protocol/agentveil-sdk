@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Pre-approval validation of MCP ``tools/call`` arguments against the
 tool's advertised ``inputSchema``.
 

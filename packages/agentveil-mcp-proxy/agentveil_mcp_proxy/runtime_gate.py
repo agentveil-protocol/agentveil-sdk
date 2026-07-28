@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """AVP Runtime Gate integration for the MCP proxy.
 
 P5 is intentionally narrow: it submits privacy-filtered metadata to Runtime

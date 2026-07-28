@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Approval orchestration for MCP Proxy risky tool calls."""
 
 from __future__ import annotations

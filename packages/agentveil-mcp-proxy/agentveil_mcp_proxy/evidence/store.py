@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Durable local approval evidence store for MCP adapter approval flows.
 
 P7a provides the gateway-agnostic storage primitive that P6 approval UI must

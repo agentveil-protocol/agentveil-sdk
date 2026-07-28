@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Project-local Claude Code hook install / status / uninstall (P10D.14 S2).
 
 Turns the S1 ``claude_hook`` adapter into a usable project-local install

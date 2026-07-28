@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Loopback approval server for the MCP Proxy approval surface."""
 
 from __future__ import annotations

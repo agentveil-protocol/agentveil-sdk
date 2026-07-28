@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Gateway-agnostic circuit breaker for bounded backend calls."""
 
 from __future__ import annotations

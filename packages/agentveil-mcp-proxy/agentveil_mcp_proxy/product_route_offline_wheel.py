@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Write a minimal offline wheel for the product route package fixture."""
 
 from __future__ import annotations

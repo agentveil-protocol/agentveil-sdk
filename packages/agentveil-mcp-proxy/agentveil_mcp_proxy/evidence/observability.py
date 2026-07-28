@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Redacted execution observability helpers for approval evidence."""
 
 from __future__ import annotations

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Managed runtime launch for agent runtime profiles.
 
 This module is a thin launcher adapter: it prepares project-local AVP home,

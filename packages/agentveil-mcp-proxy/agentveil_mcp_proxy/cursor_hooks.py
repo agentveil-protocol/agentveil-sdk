@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Cursor hook adapter for AgentVeil MCP Proxy (public one-command setup).
 
 Maps Cursor ``preToolUse``, ``beforeShellExecution``, and ``beforeMCPExecution``

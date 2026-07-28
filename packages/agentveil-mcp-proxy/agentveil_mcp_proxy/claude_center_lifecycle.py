@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Approval Center lifecycle for the one-command Claude Code connector.
 
 S5 added `setup claude-code --yes` to install the connector in one command, but

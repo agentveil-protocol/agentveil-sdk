@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Codex PreToolUse hook adapter for AgentVeil MCP Proxy.
 
 This adapter mirrors the Claude/Cursor containment pattern for Codex: native

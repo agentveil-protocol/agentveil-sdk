@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """MCP stdio pass-through for the MCP proxy.
 
 P6 applies local policy to MCP ``tools/call`` requests and, for

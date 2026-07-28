@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Bounded action-routing guidance for client compatibility packs."""
 
 from __future__ import annotations

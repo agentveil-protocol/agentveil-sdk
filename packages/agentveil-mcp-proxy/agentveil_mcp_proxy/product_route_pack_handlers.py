@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """In-process pack handlers reused by the composite product route downstream."""
 
 from __future__ import annotations

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Managed user-level Cursor MCP wrapper for Home / User settings activation.
 
 Cursor 3.6+ stores user-visible MCP servers in ``User/settings.json`` under

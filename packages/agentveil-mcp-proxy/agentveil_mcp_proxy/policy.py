@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Config schema and internal local policy engine for MCP Proxy v0.1.
 
 P1 intentionally stops at local config and policy evaluation. The engine sees

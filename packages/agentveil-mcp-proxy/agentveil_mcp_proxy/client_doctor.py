@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Optional client-pack health checks for generated MCP client config paths."""
 
 from __future__ import annotations

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Daily control surface: local-first status and timeline for routed MCP operators."""
 
 from __future__ import annotations

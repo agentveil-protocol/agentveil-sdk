@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Permission doctor and bounded blast-radius preview for MCP proxy operators."""
 
 from __future__ import annotations

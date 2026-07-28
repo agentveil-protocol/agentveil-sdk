@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Bounded metadata-influence evidence collectors for install/clone tools.
 
 Scans locally available MCP tool-argument surfaces for install/clone influence

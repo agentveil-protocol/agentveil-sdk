@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Gemini CLI BeforeTool hook adapter for AgentVeil MCP Proxy.
 
 Native Gemini mutators are denied before mutation with bounded redirect guidance;

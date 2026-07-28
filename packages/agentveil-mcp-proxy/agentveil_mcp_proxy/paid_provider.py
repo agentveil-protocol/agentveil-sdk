@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Oleg Boiko
+# SPDX-License-Identifier: BUSL-1.1
+
 """Public bounded paid provider discovery bridge for the MCP proxy CLI.
 
 Optional paid providers expose only a bounded public contract. This module does
