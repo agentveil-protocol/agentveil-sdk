@@ -79,6 +79,21 @@ class RuntimeGateUnavailableError(RuntimeGateError):
     """Raised when Runtime Gate cannot return a usable response in time."""
 
 
+class RuntimeGateRejectedError(RuntimeGateError):
+    """Raised when Runtime Gate reached the backend and returned a terminal HTTP 4xx.
+
+    A reached 4xx (400/401/403/404/409/429/other 4xx) is a bounded terminal
+    rejection, not an availability outage: it does not invoke local fallback
+    or count as circuit-breaker unavailability. This error
+    deliberately carries no backend body, URL, headers, DID, token, resource,
+    tool arguments, or request payload — only a bounded HTTP status code.
+    """
+
+    def __init__(self, status_code: int):
+        self.status_code = int(status_code)
+        super().__init__("runtime gate rejected the request")
+
+
 class RuntimeGateUntrustedError(RuntimeGateError):
     """Raised when a backend decision cannot be cryptographically trusted."""
 
@@ -222,7 +237,7 @@ class RuntimeGateClient:
                     )
                 response = self.agent.runtime_evaluate(**evaluate_kwargs)
             except Exception as exc:
-                raise RuntimeGateUnavailableError("runtime gate request failed") from exc
+                raise _classify_runtime_request_error(exc) from exc
             if not isinstance(response, Mapping):
                 raise RuntimeGateUnavailableError("runtime gate response invalid")
 
@@ -231,6 +246,10 @@ class RuntimeGateClient:
             self._record_seen_receipt_digest(verified["digest"])
             body = verified["body"]
             self._validate_decision_body(body, response=response, request=request)
+        except RuntimeGateRejectedError:
+            # Reached-backend 4xx is terminal, not an availability failure: it
+            # must not mark the circuit breaker or trigger local fallback.
+            raise
         except RuntimeGateUnavailableError:
             self.circuit_breaker.record_failure()
             raise
@@ -398,6 +417,22 @@ class RuntimeGateClient:
             "client_policy_context_hash",
             request.policy_context_hash,
         )
+
+
+def _classify_runtime_request_error(exc: Exception) -> RuntimeGateError:
+    """Map a ``runtime_evaluate()`` failure to the correct sanitized gate error.
+
+    A reached HTTP 4xx (client/policy rejection carried by an SDK exception with
+    ``status_code`` in the 400-499 range) becomes a terminal
+    ``RuntimeGateRejectedError``. Timeout, connection, and 5xx failures — plus
+    any error without a usable 4xx status — become ``RuntimeGateUnavailableError``
+    so the existing availability fallback path is preserved unchanged.
+    """
+
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int) and 400 <= status_code < 500:
+        return RuntimeGateRejectedError(status_code)
+    return RuntimeGateUnavailableError("runtime gate request failed")
 
 
 def _read_json_object(path: Path, label: str) -> dict[str, Any]:
@@ -643,6 +678,7 @@ __all__ = [
     "RuntimeGateClient",
     "RuntimeGateDecision",
     "RuntimeGateError",
+    "RuntimeGateRejectedError",
     "RuntimeGateUnavailableError",
     "RuntimeGateUntrustedError",
     "normalize_paid_approval_center_projection",

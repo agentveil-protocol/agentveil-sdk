@@ -162,6 +162,7 @@ from agentveil_mcp_proxy.runtime_gate import (
     DECISION_WAITING,
     RuntimeGateDecision,
     RuntimeGateError,
+    RuntimeGateRejectedError,
     RuntimeGateUnavailableError,
     RuntimeGateUntrustedError,
 )
@@ -230,6 +231,12 @@ def actionable_approval_required_message(approval_url: str) -> str:
 JSONRPC_RUNTIME_GATE_UNAVAILABLE = -32012
 JSONRPC_RUNTIME_GATE_UNTRUSTED = -32013
 JSONRPC_DOWNSTREAM_TIMEOUT = -32014
+JSONRPC_RUNTIME_GATE_REJECTED = -32015
+RUNTIME_GATE_REJECTED_USER_MESSAGE = (
+    # claim-check: allow "Stopped" as a terminal Runtime Gate outcome label; negative tests assert no downstream execution.
+    "Stopped by AVP Runtime Gate: this request was rejected before execution. "
+    "This is a terminal decision and local fallback does not apply."
+)
 DEFAULT_DOWNSTREAM_RESPONSE_TIMEOUT_SECONDS = 30.0
 MAX_DOWNSTREAM_MESSAGE_BYTES = 1 * 1024 * 1024
 MAX_CLIENT_MESSAGE_BYTES = 1 * 1024 * 1024
@@ -3654,6 +3661,22 @@ class McpPassthrough:
     ) -> tuple[dict[str, Any] | None, ApprovalOutcome | None]:
         try:
             decision = self._runtime_gate_client().evaluate(classification)
+        except RuntimeGateRejectedError:
+            # A reached Runtime Gate 4xx is a bounded terminal rejection. Return one
+            # bounded terminal JSON-RPC denial with no backend detail.
+            self._increment_runtime_gate_errors()
+            self._record_runtime_gate_events()
+            rejected_data: dict[str, Any] = {
+                "status": "blocked",  # claim-check: allow bounded JSON-RPC status vocabulary for a terminal runtime gate rejection.
+                "reason": "runtime_gate_rejected",
+            }
+            enrich_mcp_error_contract(rejected_data, tool_name=classification.tool)
+            return jsonrpc_error(
+                request_id,
+                JSONRPC_RUNTIME_GATE_REJECTED,
+                RUNTIME_GATE_REJECTED_USER_MESSAGE,
+                data=rejected_data,
+            ), None
         except RuntimeGateUntrustedError:
             self._increment_runtime_gate_errors()
             self._record_runtime_gate_events()
