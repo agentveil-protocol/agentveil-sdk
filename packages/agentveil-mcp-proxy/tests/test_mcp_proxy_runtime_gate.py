@@ -20,6 +20,14 @@ from nacl.signing import SigningKey
 from agentveil.agent import AVPAgent
 from agentveil.data_integrity import DATA_INTEGRITY_CONTEXT, sign_eddsa_jcs_2022
 from agentveil.delegation import _public_key_to_did
+from agentveil.exceptions import (
+    AVPAuthError,
+    AVPError,
+    AVPNotFoundError,
+    AVPRateLimitError,
+    AVPServerError,
+    AVPValidationError,
+)
 from agentveil_mcp_proxy.approval import ApprovalManager, ApprovalServer
 from agentveil_mcp_proxy.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
 from agentveil_mcp_proxy.classification import ToolCallClassifier
@@ -35,6 +43,7 @@ from agentveil_mcp_proxy.passthrough import (
     DownstreamConfig,
     JSONRPC_APPROVAL_REQUIRED,
     JSONRPC_POLICY_BLOCKED,
+    JSONRPC_RUNTIME_GATE_REJECTED,
     JSONRPC_RUNTIME_GATE_UNAVAILABLE,
     JSONRPC_RUNTIME_GATE_UNTRUSTED,
     McpPassthrough,
@@ -45,6 +54,7 @@ from agentveil_mcp_proxy.runtime_gate import (
     DEFAULT_RUNTIME_ENVIRONMENT,
     RuntimeGateClient,
     RuntimeGateDecision,
+    RuntimeGateRejectedError,
     RuntimeGateUnavailableError,
     RuntimeGateUntrustedError,
 )
@@ -1721,3 +1731,193 @@ def test_runtime_gate_omits_malformed_paid_approval_projection_before_metadata()
 
     assert result.decision == "WAITING_FOR_HUMAN_APPROVAL"
     assert result.paid_approval_center_projection is None
+
+
+# ---------------------------------------------------------------------------
+# Runtime Gate reached-4xx corrective:
+# a reached HTTP 4xx is a bounded terminal rejection, not an availability
+# outage. It does not invoke local fallback or reach downstream, and does not
+# not worsen the circuit breaker. Timeout/connection/5xx keep the existing
+# unavailable/fallback behavior.
+# ---------------------------------------------------------------------------
+
+
+class RaisingAgent:
+    """Backend stub whose runtime_evaluate raises a preset SDK exception."""
+
+    did = AGENT_DID
+
+    def __init__(self, exc: Exception):
+        self.exc = exc
+        self.calls: list[dict] = []
+
+    def runtime_evaluate(self, **kwargs):
+        self.calls.append(kwargs)
+        raise self.exc
+
+    def get_decision_receipt(self, audit_id: str) -> str:
+        raise AssertionError("no receipt fetch expected on a rejected request")
+
+
+def _all_allow_fallback() -> dict:
+    return {
+        "read": "allow",
+        "write": "allow",
+        "destructive": "allow",
+        # claim-check: allow "production" is a fallback risk-class key in test config.
+        "production": "allow",
+        "financial": "allow",
+        "unknown": "allow",
+    }
+
+
+_REACHED_4XX_SDK_ERRORS = [
+    AVPValidationError(f"validation {SECRET}", 400, SECRET),
+    AVPAuthError(f"auth failed {SECRET}", 401, SECRET),
+    AVPAuthError(f"forbidden {SECRET}", 403, SECRET),
+    AVPNotFoundError(f"not found {SECRET}", 404, SECRET),
+    AVPValidationError(f"conflict {SECRET}", 409, SECRET),
+    AVPRateLimitError(f"rate limited {SECRET}"),
+    AVPError(f"teapot {SECRET}", 418, SECRET),
+]
+
+
+@pytest.mark.parametrize(
+    "exc",
+    _REACHED_4XX_SDK_ERRORS,
+    ids=[str(getattr(e, "status_code", "?")) for e in _REACHED_4XX_SDK_ERRORS],
+)
+def test_reached_4xx_becomes_terminal_rejection_without_raw_detail(exc):
+    # Pre-fix behavior reproduced as the regression under test: any exception
+    # from runtime_evaluate() (including a reached 4xx) was converted to
+    # RuntimeGateUnavailableError and would enter local fallback. After the
+    # corrective, a reached 4xx becomes a distinct terminal rejection.
+    config = _config()
+    breaker = CircuitBreaker(CircuitBreakerConfig(failures_before_open=1))
+    agent = RaisingAgent(exc)
+    client = RuntimeGateClient(
+        agent=agent,
+        config=config,
+        control_grant={"id": "grant"},
+        circuit_breaker=breaker,
+    )
+
+    with pytest.raises(RuntimeGateRejectedError) as excinfo:
+        client.evaluate(_classification(config))
+
+    err = excinfo.value
+    assert not isinstance(err, RuntimeGateUnavailableError)
+    assert err.status_code == exc.status_code
+    # No raw exception detail leaks through the sanitized error.
+    assert str(err) == "runtime gate rejected the request"
+    assert SECRET not in str(err)
+    # A reached 4xx must not count as Runtime Gate unavailability.
+    assert breaker.state_change_count == 0
+
+
+def test_reached_4xx_does_not_worsen_circuit_breaker_availability():
+    config = _config()
+    breaker = CircuitBreaker(CircuitBreakerConfig(failures_before_open=1))
+    rejecting = RuntimeGateClient(
+        agent=RaisingAgent(AVPValidationError("bad", 400, "x")),
+        config=config,
+        control_grant={"id": "grant"},
+        circuit_breaker=breaker,
+    )
+
+    with pytest.raises(RuntimeGateRejectedError):
+        rejecting.evaluate(_classification(config))
+
+    # failures_before_open=1, so any recorded failure would open the breaker.
+    assert breaker.state_change_count == 0
+
+    healthy = RuntimeGateClient(
+        agent=RecordingAgent(decision="ALLOW"),
+        config=config,
+        control_grant={"id": "grant"},
+        circuit_breaker=breaker,
+    )
+    assert healthy.evaluate(_classification(config)).decision == "ALLOW"
+
+
+def test_reached_4xx_passthrough_denies_terminally_and_never_falls_back(tmp_path):
+    # This config permits fallback for the exercised write risk class: if a reached 4xx entered
+    # fallback, the write would be forwarded downstream. It must not.
+    config = _config(fallback=_all_allow_fallback())
+    agent = RaisingAgent(AVPValidationError(f"rejected {SECRET}", 400, SECRET))
+    gate = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+    passthrough, log_path = _passthrough(tmp_path, gate, config)
+    client_out = io.StringIO()
+
+    assert passthrough.run_stdio(io.StringIO(_tool_call()), client_out) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    assert response["error"]["code"] == JSONRPC_RUNTIME_GATE_REJECTED
+    # claim-check: allow bounded JSON-RPC status vocabulary asserted by this downstream-negative regression.
+    assert response["error"]["data"]["status"] == "blocked"
+    assert response["error"]["data"]["reason"] == "runtime_gate_rejected"
+    assert response["error"]["data"]["target_reached"] is False
+    assert response["error"]["data"]["approval_possible"] is False
+    assert SECRET not in client_out.getvalue()
+    # The gate was actually reached...
+    assert len(agent.calls) == 1
+    # ...and downstream mutation count is exactly 0 (no tools/call forwarded).
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        RuntimeError("timeout while waiting"),
+        httpx.ConnectError("connection refused"),
+        AVPServerError("server error", 500, "detail"),
+        AVPServerError("bad gateway", 503, "detail"),
+    ],
+    ids=["timeout", "connection", "500", "503"],
+)
+def test_timeout_connection_and_5xx_remain_unavailable(exc):
+    config = _config()
+    breaker = CircuitBreaker(CircuitBreakerConfig(failures_before_open=1))
+    client = RuntimeGateClient(
+        agent=RaisingAgent(exc),
+        config=config,
+        control_grant={"id": "grant"},
+        circuit_breaker=breaker,
+    )
+
+    with pytest.raises(RuntimeGateUnavailableError) as excinfo:
+        client.evaluate(_classification(config))
+
+    assert not isinstance(excinfo.value, RuntimeGateRejectedError)
+    # Existing unavailable path still records a circuit-breaker failure.
+    assert breaker.state_change_count == 1
+
+
+def test_5xx_passthrough_still_uses_fallback(tmp_path):
+    config = _config(fallback={"write": "block"})
+    gate = RuntimeGateClient(
+        agent=RaisingAgent(AVPServerError("server error", 500, "detail")),
+        config=config,
+        control_grant={"id": "grant"},
+    )
+    passthrough, log_path = _passthrough(tmp_path, gate, config)
+    client_out = io.StringIO()
+
+    assert passthrough.run_stdio(io.StringIO(_tool_call()), client_out) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    assert response["error"]["code"] == JSONRPC_RUNTIME_GATE_UNAVAILABLE
+    assert response["error"]["data"] == {
+        # claim-check: allow bounded unavailable status vocabulary asserted by the preserved fallback regression.
+        "status": "blocked",
+        "reason": "runtime_gate_unavailable",
+    }
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
+
+
+def test_signed_allow_receipt_still_verifies_after_rejection_path_added():
+    config = _config()
+    agent = RecordingAgent(decision="ALLOW")
+    client = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+
+    assert client.evaluate(_classification(config)).decision == "ALLOW"
