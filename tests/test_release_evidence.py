@@ -6,6 +6,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+RELEASE_PROVENANCE = ROOT / "docs" / "RELEASE_PROVENANCE.md"
+VERIFY_RELEASE_TAG = ROOT / "scripts" / "verify_release_tag.sh"
 
 
 def _release_evidence_module():
@@ -48,3 +50,14 @@ def test_release_evidence_records_hashes_provenance_and_declared_dependencies(tm
     assert "declared direct runtime dependencies" in sbom["comment"]
     assert any(package["name"] == "agentveil-mcp-proxy" for package in sbom["packages"])
     assert any(package["name"] == "agentveil" for package in sbom["packages"])
+
+
+def test_release_provenance_document_and_tag_preflight_are_present():
+    document = RELEASE_PROVENANCE.read_text(encoding="utf-8")
+    verifier = VERIFY_RELEASE_TAG.read_text(encoding="utf-8")
+
+    assert "Copyright holder: **Oleg Boiko**" in document
+    assert "git tag -s" in document
+    assert "gh attestation verify" in document
+    assert "declared direct runtime dependencies only" in document
+    assert 'git verify-tag "$tag_name"' in verifier
