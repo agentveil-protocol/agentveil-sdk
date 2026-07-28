@@ -16,8 +16,10 @@ It includes two public surfaces:
    AgentVeil policy to calls that pass through the proxy: allow,
    approval-required, redirect, hard-block, with bounded local evidence.
 
-This package is source-available under the Business Source License 1.1. See
-[`LICENSE`](LICENSE).
+This package is free to use in production for internal and non-competing use.
+The Business Source License 1.1 limits offering this package, or a modified
+version, as a competing hosted or embedded service. See [`LICENSE`](LICENSE)
+for the complete Additional Use Grant.
 
 ## Scope
 

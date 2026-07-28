@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 from pathlib import Path
+import tarfile
+import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -13,6 +16,16 @@ VERIFY_RELEASE_TAG = ROOT / "scripts" / "verify_release_tag.sh"
 def _release_evidence_module():
     script = ROOT / "scripts" / "release_evidence.py"
     spec = importlib.util.spec_from_file_location("release_evidence", script)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _distribution_license_module():
+    script = ROOT / "scripts" / "verify_proxy_distribution_licenses.py"
+    spec = importlib.util.spec_from_file_location("verify_proxy_distribution_licenses", script)
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -61,3 +74,25 @@ def test_release_provenance_document_and_tag_preflight_are_present():
     assert "gh attestation verify" in document
     assert "declared direct runtime dependencies only" in document
     assert 'git verify-tag "$tag_name"' in verifier
+
+
+def test_distribution_license_verifier_accepts_proxy_wheel_and_sdist(tmp_path):
+    verifier = _distribution_license_module()
+    wheel = tmp_path / "agentveil_mcp_proxy-0.7.36-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("agentveil_mcp_proxy-0.7.36.dist-info/licenses/LICENSE", "BUSL")
+        archive.writestr("agentveil_mcp_proxy-0.7.36.dist-info/licenses/NOTICE", "notice")
+        archive.writestr(
+            "agentveil_mcp_proxy-0.7.36.dist-info/METADATA",
+            "License-Expression: BUSL-1.1\nLicense-File: LICENSE\nLicense-File: NOTICE\n",
+        )
+
+    sdist = tmp_path / "agentveil_mcp_proxy-0.7.36.tar.gz"
+    with tarfile.open(sdist, "w:gz") as archive:
+        for name in ("LICENSE", "NOTICE"):
+            payload = b"license material"
+            member = tarfile.TarInfo(f"agentveil_mcp_proxy-0.7.36/{name}")
+            member.size = len(payload)
+            archive.addfile(member, io.BytesIO(payload))
+
+    verifier.verify_distribution_licenses([wheel, sdist])

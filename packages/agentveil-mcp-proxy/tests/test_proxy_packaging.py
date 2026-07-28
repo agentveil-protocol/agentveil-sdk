@@ -3,10 +3,6 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
-import subprocess
-import sys
-import tarfile
-import zipfile
 
 try:
     import tomllib
@@ -68,34 +64,6 @@ def test_proxy_source_files_have_busl_spdx_headers():
         if expected_header not in path.read_text(encoding="utf-8").splitlines()[:8]
     ]
     assert missing == []
-
-
-def test_proxy_wheel_and_sdist_include_license_and_notice(tmp_path):
-    dist = tmp_path / "dist"
-    completed = subprocess.run(
-        [sys.executable, "-m", "build", "--outdir", str(dist)],
-        cwd=PACKAGE_ROOT,
-        capture_output=True,
-        text=True,
-    )
-    assert completed.returncode == 0, completed.stdout + completed.stderr
-
-    wheel = next(dist.glob("agentveil_mcp_proxy-*.whl"))
-    with zipfile.ZipFile(wheel) as archive:
-        names = archive.namelist()
-        assert any(name.endswith(".dist-info/licenses/LICENSE") for name in names)
-        assert any(name.endswith(".dist-info/licenses/NOTICE") for name in names)
-        metadata = next(name for name in names if name.endswith(".dist-info/METADATA"))
-        metadata_text = archive.read(metadata).decode("utf-8")
-        assert "License-Expression: BUSL-1.1" in metadata_text
-        assert "License-File: LICENSE" in metadata_text
-        assert "License-File: NOTICE" in metadata_text
-
-    sdist = next(dist.glob("agentveil_mcp_proxy-*.tar.gz"))
-    with tarfile.open(sdist, "r:gz") as archive:
-        names = archive.getnames()
-        assert any(name.endswith("/LICENSE") for name in names)
-        assert any(name.endswith("/NOTICE") for name in names)
 
 
 def test_proxy_package_depends_on_public_sdk():

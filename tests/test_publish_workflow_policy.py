@@ -72,6 +72,7 @@ def test_publish_generates_and_attests_release_evidence() -> None:
     assert "actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be" in text
     assert "subject-checksums: dist/evidence/SHA256SUMS" in text
     assert "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02" in text
+    assert "python scripts/verify_proxy_distribution_licenses.py dist/mcp-proxy/*" in text
 
 
 def test_process_tests_do_not_block_on_live_child_stderr_eof() -> None:

@@ -145,6 +145,9 @@ jobs:
       - name: Build MCP Proxy package
         run: python -m build --outdir dist/mcp-proxy packages/agentveil-mcp-proxy
 
+      - name: Verify MCP Proxy distribution license files
+        run: python scripts/verify_proxy_distribution_licenses.py dist/mcp-proxy/*
+
       - name: Check distributions
         run: twine check dist/sdk/* dist/mcp-proxy/*
 
