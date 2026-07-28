@@ -59,6 +59,7 @@ from agentveil_mcp_proxy.evidence.observability import (
     event_record_dict,
     execution_record_id_by_parent,
     format_event_record,
+    parse_action_gate_metadata,
 )
 from agentveil_mcp_proxy.evidence.events_show import build_local_proof_mcp_payload
 from agentveil_mcp_proxy.evidence.approval_grant import (
@@ -644,6 +645,9 @@ def test_token_rotates_on_proxy_restart():
 def test_pending_approval_persisted_before_ui_render(tmp_path):
     class FailingStore:
         db_path = tmp_path / "evidence.sqlite"
+
+        def consume_exact_grant_with_pending(self, _record, **_kwargs):
+            return None
 
         def find_active_exact_grant(self, **_kwargs):
             return None
@@ -4243,3 +4247,291 @@ def test_g4_similar_grant_matching_is_payload_agnostic_by_design() -> None:
         "similar grant matching now references payload_hash; re-verify the G4 "
         "scope analysis before enabling similar_5m for filesystem writes"
     )
+
+
+def test_exact_grant_retry_persists_action_gate_metadata_on_child(tmp_path):
+    """Exact cache-hit child must keep bounded evidence metadata for Approval Center."""
+
+    config = _config(
+        policy_rule=_write_rule(),
+        role_authority={"mode": "enforce", "role": "implementer", "authority": "implement"},
+    )
+    manager, store, server, _cli = _manager(tmp_path, config=config)
+    classification = _classification(config)
+    try:
+        first_outcome, _prompt, response = _request_and_post(
+            manager,
+            server,
+            classification,
+            scope="exact",
+        )
+        assert response.status_code == 200
+        assert first_outcome.approved
+
+        retry = manager.request_approval(classification, reason="local_approval_required")
+        assert retry.approved
+        assert retry.reason == "scope_cache_hit"
+
+        child = store.get_pending(retry.request_id)
+        assert child is not None
+        assert child.granted_by_request_id == first_outcome.request_id
+        metadata = parse_action_gate_metadata(child)
+        assert metadata is not None
+        assert metadata["action_family"] == "create"
+        assert metadata["policy_decision"] == "approval"
+        assert metadata["execution_status"] == "not_reached"
+        assert metadata["target_reached"] is False
+        assert isinstance(metadata.get("blast_radius"), dict)
+        assert metadata.get("role") == "implementer"
+        assert metadata.get("authority") == "implement"
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_concurrent_exact_grant_retries_single_scope_cache_hit_separate_stores(tmp_path):
+    """Two managers/stores on one SQLite DB: exactly one exact grant consume wins."""
+
+    config = _config(policy_rule=_write_rule())
+    db_path = tmp_path / "shared-evidence.sqlite"
+    classification = _classification(config)
+
+    setup_store = ApprovalEvidenceStore(db_path)
+    setup_server = ApprovalServer()
+    setup_server.start()
+    setup_manager = ApprovalManager(
+        evidence_store=setup_store,
+        approval_server=setup_server,
+        config=config,
+        client_id=f"cursor:pid:{os.getpid()}",
+        session_id="session-setup",
+        browser_open=lambda _url: True,
+        notifier=NoopNotifier(),
+        wait_for_decision=True,
+    )
+    try:
+        _request_and_post(setup_manager, setup_server, classification, scope="exact")
+    finally:
+        setup_server.stop()
+        setup_store.close()
+
+    store_a = ApprovalEvidenceStore(db_path)
+    store_b = ApprovalEvidenceStore(db_path)
+    server_a = ApprovalServer()
+    server_b = ApprovalServer()
+    server_a.start()
+    server_b.start()
+    manager_a = ApprovalManager(
+        evidence_store=store_a,
+        approval_server=server_a,
+        config=config,
+        client_id="cursor:contender-a",
+        session_id="session-a",
+        browser_open=lambda _url: True,
+        notifier=NoopNotifier(),
+        wait_for_decision=False,
+    )
+    manager_b = ApprovalManager(
+        evidence_store=store_b,
+        approval_server=server_b,
+        config=config,
+        client_id="cursor:contender-b",
+        session_id="session-b",
+        browser_open=lambda _url: True,
+        notifier=NoopNotifier(),
+        wait_for_decision=False,
+    )
+    barrier = threading.Barrier(2)
+    outcomes: dict[str, Any] = {}
+    lock = threading.Lock()
+
+    def _contend(label: str, manager: ApprovalManager) -> None:
+        barrier.wait()
+        outcome = manager.request_approval(classification, reason="local_approval_required")
+        with lock:
+            outcomes[label] = outcome
+
+    try:
+        threads = [
+            threading.Thread(target=_contend, args=("a", manager_a)),
+            threading.Thread(target=_contend, args=("b", manager_b)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        hits = [
+            label
+            for label, outcome in outcomes.items()
+            if outcome.approved and outcome.reason == "scope_cache_hit"
+        ]
+        non_hits = [
+            label
+            for label, outcome in outcomes.items()
+            if not (outcome.approved and outcome.reason == "scope_cache_hit")
+        ]
+        assert len(hits) == 1, outcomes
+        assert len(non_hits) == 1, outcomes
+        loser = outcomes[non_hits[0]]
+        assert loser.approved is False
+        assert loser.reason != "scope_cache_hit"
+
+        with ApprovalEvidenceStore(db_path) as check:
+            parent_ids = [
+                row.request_id
+                for row in check.list_records()
+                if row.approval_scope == "exact"
+                and row.granted_by_request_id is None
+                and row.status == ApprovalStatus.APPROVED.value
+            ]
+            assert len(parent_ids) == 1
+            children = [
+                row
+                for row in check.list_records()
+                if row.granted_by_request_id == parent_ids[0]
+            ]
+            assert len(children) == 1
+            assert check.get_exact_grant_claim(parent_ids[0]) is not None
+    finally:
+        server_a.stop()
+        server_b.stop()
+        store_a.close()
+        store_b.close()
+
+
+def test_concurrent_exact_grant_passthrough_mutations_once(tmp_path):
+    """Separate stores/managers: identical retries yield one downstream mutation."""
+
+    config = _config(policy_rule=_write_rule())
+    db_path = tmp_path / "shared-evidence.sqlite"
+    log_path = tmp_path / "downstream.log"
+    downstream = _approval_downstream(tmp_path, log_path)
+
+    setup_store = ApprovalEvidenceStore(db_path)
+    setup_server = ApprovalServer()
+    setup_server.start()
+    setup_manager = ApprovalManager(
+        evidence_store=setup_store,
+        approval_server=setup_server,
+        config=config,
+        client_id=f"cursor:pid:{os.getpid()}",
+        session_id="session-setup",
+        browser_open=lambda _url: True,
+        notifier=NoopNotifier(),
+        wait_for_decision=False,
+    )
+    setup_pt = McpPassthrough(
+        DownstreamConfig(
+            command=sys.executable,
+            args=("-u", str(downstream)),
+            name="github",
+            env={"DOWNSTREAM_LOG": str(log_path)},
+        ),
+        classifier=ToolCallClassifier(config, server_name="github"),
+        approval_manager=setup_manager,
+    )
+    setup_pt.start()
+    try:
+        first = setup_pt.handle_client_line(_tool_call())
+        assert first[0]["error"]["data"]["status"] == "approval_required"
+        deadline = time.monotonic() + 2
+        while not setup_server.pending_prompts() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        parent_id = setup_server.pending_prompts()[0].request_id
+        with httpx.Client() as client:
+            csrf = _get_csrf(client, setup_server.approval_url(parent_id))
+            assert _post_decision(
+                client, setup_server.approval_url(parent_id), decision="approve", csrf=csrf
+            ).status_code == 200
+        deadline = time.monotonic() + 2
+        while setup_store.get_pending(parent_id).status != ApprovalStatus.APPROVED.value:
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+        assert setup_store.get_pending(parent_id).status == ApprovalStatus.APPROVED.value
+    finally:
+        setup_pt.stop()
+        setup_server.stop()
+        setup_store.close()
+
+    if log_path.exists():
+        log_path.write_text("", encoding="utf-8")
+
+    def _stack(label: str):
+        store = ApprovalEvidenceStore(db_path)
+        server = ApprovalServer()
+        server.start()
+        manager = ApprovalManager(
+            evidence_store=store,
+            approval_server=server,
+            config=config,
+            client_id=f"cursor:{label}",
+            session_id=f"session-{label}",
+            browser_open=lambda _url: True,
+            notifier=NoopNotifier(),
+            wait_for_decision=False,
+        )
+        passthrough = McpPassthrough(
+            DownstreamConfig(
+                command=sys.executable,
+                args=("-u", str(downstream)),
+                name="github",
+                env={"DOWNSTREAM_LOG": str(log_path)},
+            ),
+            classifier=ToolCallClassifier(config, server_name="github"),
+            approval_manager=manager,
+        )
+        passthrough.start()
+        return store, server, manager, passthrough
+
+    store_a, server_a, _manager_a, pt_a = _stack("a")
+    store_b, server_b, _manager_b, pt_b = _stack("b")
+    barrier = threading.Barrier(2)
+    responses: dict[str, Any] = {}
+    lock = threading.Lock()
+
+    def _race(label: str, passthrough: McpPassthrough) -> None:
+        barrier.wait()
+        result = passthrough.handle_client_line(_tool_call())
+        with lock:
+            responses[label] = result
+
+    try:
+        threads = [
+            threading.Thread(target=_race, args=("a", pt_a)),
+            threading.Thread(target=_race, args=("b", pt_b)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=15)
+
+        successes = [
+            label
+            for label, items in responses.items()
+            if items and "result" in items[0]
+        ]
+        denied_responses = [
+            label
+            for label, items in responses.items()
+            if items and "error" in items[0]
+        ]
+        assert len(successes) == 1, responses
+        assert len(denied_responses) == 1, responses
+        assert responses[denied_responses[0]][0]["error"]["data"]["status"] == "approval_required"
+        assert log_path.read_text(encoding="utf-8").splitlines().count("tools/call") == 1
+
+        with ApprovalEvidenceStore(db_path) as check:
+            children = [
+                row for row in check.list_records() if row.granted_by_request_id == parent_id
+            ]
+            assert len(children) == 1
+            assert check.get_exact_grant_claim(parent_id) is not None
+    finally:
+        pt_a.stop()
+        pt_b.stop()
+        server_a.stop()
+        server_b.stop()
+        store_a.close()
+        store_b.close()

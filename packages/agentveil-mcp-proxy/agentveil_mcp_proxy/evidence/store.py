@@ -24,12 +24,12 @@ from pathlib import Path
 import sqlite3
 import threading
 import time
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 import jcs
 
 
-EVIDENCE_SCHEMA_VERSION = 6
+EVIDENCE_SCHEMA_VERSION = 7
 DEFAULT_MAX_RECORDS = 10_000
 GENESIS_PREV_EVENT_HASH = "sha256:" + hashlib.sha256(
     b"agentveil_mcp_proxy/evidence/genesis-v1"
@@ -43,6 +43,14 @@ CREATE TABLE IF NOT EXISTS redirect_lineage_claims (
     lineage_status TEXT NOT NULL,
     redirect_playbook_id TEXT NULL,
     project_scope_fingerprint TEXT NULL
+)
+"""
+
+_CREATE_EXACT_GRANT_CLAIMS_SQL = """
+CREATE TABLE IF NOT EXISTS exact_grant_claims (
+    grant_request_id TEXT PRIMARY KEY,
+    child_request_id TEXT NOT NULL,
+    claimed_at INTEGER NOT NULL
 )
 """
 
@@ -267,6 +275,9 @@ class ApprovalEvidenceStore:
         self.db_path = db_path.expanduser()
         self.max_records = max_records
         self._lock = threading.RLock()
+        # Test-only hook invoked after selecting an exact grant and before the
+        # durable claim insert, still inside the BEGIN IMMEDIATE transaction.
+        self._exact_grant_between_read_and_claim_hook: Callable[[], None] | None = None
         self._ensure_db_file()
         self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -293,35 +304,98 @@ class ApprovalEvidenceStore:
         with self._lock:
             self._begin()
             try:
-                count = self._conn.execute("SELECT COUNT(*) FROM pending_approvals").fetchone()[0]
-                if count >= self.max_records:
-                    raise ApprovalEvidenceCapacityError(
-                        "approval evidence store record cap reached; operator pruning required"
-                    )
-                existing = self._conn.execute(
-                    "SELECT 1 FROM pending_approvals WHERE request_id = ?",
-                    (record.request_id,),
-                ).fetchone()
-                if existing is not None:
-                    raise ApprovalEvidenceDuplicateError(
-                        f"pending approval already exists: {record.request_id}"
-                    )
-                prev_event_hash, append_only = self._compute_chain_link_for_insert_locked(record)
-                record = replace(record, prev_event_hash=prev_event_hash)
-                values = _record_values(record)
-                placeholders = ", ".join("?" for _ in _COLUMNS)
-                # SQL is safe: _COLUMNS is static and values are bound.
-                self._conn.execute(
-                    f"INSERT INTO pending_approvals ({', '.join(_COLUMNS)}) VALUES ({placeholders})",  # nosec B608
-                    values,
-                )
-                if not append_only:
-                    self._rebuild_chain_locked()
+                self._insert_pending_locked(record)
                 self._conn.commit()
                 self._secure_auxiliary_files()
             except Exception:
                 self._conn.rollback()
                 raise
+
+    def consume_exact_grant_with_pending(
+        self,
+        record: PendingApproval,
+        *,
+        downstream_server: str,
+        tool_name: str,
+        policy_rule_id: str | None,
+        risk_class: str,
+        policy_context_hash: str,
+        resource_hash: str | None,
+        payload_hash: str,
+        now_timestamp: int,
+    ) -> PendingApproval | None:
+        """Atomically claim one exact grant and insert the child pending record.
+
+        Concurrent callers racing the same unconsumed exact grant resolve to
+        exactly one winner across independent SQLite connections/processes.
+        The loser receives ``None`` and must not treat the grant as reusable.
+        Reservation (exact_grant_claims) and the child pending insert share one
+        ``BEGIN IMMEDIATE`` transaction: any insert failure rolls back both.
+        """
+
+        if record.granted_by_request_id is not None:
+            raise ApprovalEvidenceTransitionError(
+                "consume_exact_grant_with_pending requires an unlinked pending record"
+            )
+        self._validate_pending_record(record)
+        with self._lock:
+            self._begin()
+            try:
+                parent = self._select_active_exact_grant_locked(
+                    downstream_server=downstream_server,
+                    tool_name=tool_name,
+                    policy_rule_id=policy_rule_id,
+                    risk_class=risk_class,
+                    policy_context_hash=policy_context_hash,
+                    resource_hash=resource_hash,
+                    payload_hash=payload_hash,
+                    now_timestamp=now_timestamp,
+                )
+                if parent is None:
+                    self._conn.rollback()
+                    return None
+                hook = self._exact_grant_between_read_and_claim_hook
+                if hook is not None:
+                    hook()
+                try:
+                    self._conn.execute(
+                        "INSERT INTO exact_grant_claims ("
+                        "grant_request_id, child_request_id, claimed_at"
+                        ") VALUES (?, ?, ?)",
+                        (
+                            parent.request_id,
+                            record.request_id,
+                            int(now_timestamp),
+                        ),
+                    )
+                except sqlite3.IntegrityError:
+                    self._conn.rollback()
+                    return None
+                child = replace(record, granted_by_request_id=parent.request_id)
+                self._insert_pending_locked(child)
+                self._conn.commit()
+                self._secure_auxiliary_files()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return parent
+
+    def get_exact_grant_claim(self, grant_request_id: str) -> dict[str, Any] | None:
+        """Return the durable exact-grant claim for one parent grant, if any."""
+
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT grant_request_id, child_request_id, claimed_at "
+                "FROM exact_grant_claims WHERE grant_request_id = ?",
+                (grant_request_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "grant_request_id": row["grant_request_id"],
+            "child_request_id": row["child_request_id"],
+            "claimed_at": int(row["claimed_at"]),
+        }
 
     def get_pending(self, request_id: str) -> PendingApproval | None:
         """Return the approval record for a request ID, if present."""
@@ -1156,41 +1230,16 @@ class ApprovalEvidenceStore:
         """
 
         with self._lock:
-            # SQL is safe: _COLUMNS is static and filters are bound.
-            row = self._conn.execute(
-                f"SELECT {', '.join('parent.' + column for column in _COLUMNS)} "  # nosec B608
-                "FROM pending_approvals parent "
-                "WHERE parent.status = ? "
-                "AND parent.approval_scope = ? "
-                "AND parent.granted_by_request_id IS NULL "
-                "AND (parent.expires_at IS NULL OR parent.expires_at > ?) "
-                "AND parent.downstream_server = ? "
-                "AND parent.tool_name = ? "
-                "AND parent.risk_class = ? "
-                "AND parent.policy_rule_id IS ? "
-                "AND parent.policy_context_hash = ? "
-                "AND parent.resource_hash IS ? "
-                "AND parent.payload_hash = ? "
-                "AND NOT EXISTS ("
-                "SELECT 1 FROM pending_approvals child "
-                "WHERE child.granted_by_request_id = parent.request_id"
-                ") "
-                "ORDER BY parent.created_at, parent.request_id "
-                "LIMIT 1",
-                (
-                    ApprovalStatus.APPROVED.value,
-                    "exact",
-                    int(now_timestamp),
-                    downstream_server,
-                    tool_name,
-                    risk_class,
-                    policy_rule_id,
-                    policy_context_hash,
-                    resource_hash,
-                    payload_hash,
-                ),
-            ).fetchone()
-        return None if row is None else _row_to_record(row)
+            return self._select_active_exact_grant_locked(
+                downstream_server=downstream_server,
+                tool_name=tool_name,
+                policy_rule_id=policy_rule_id,
+                risk_class=risk_class,
+                policy_context_hash=policy_context_hash,
+                resource_hash=resource_hash,
+                payload_hash=payload_hash,
+                now_timestamp=now_timestamp,
+            )
 
     def find_active_exact_deny(
         self,
@@ -1308,6 +1357,7 @@ class ApprovalEvidenceStore:
                 )
                 self._conn.execute(_CREATE_PENDING_APPROVALS_SQL)
                 self._conn.execute(_CREATE_REDIRECT_LINEAGE_CLAIMS_SQL)
+                self._conn.execute(_CREATE_EXACT_GRANT_CLAIMS_SQL)
                 self._ensure_optional_columns()
                 rows = self._conn.execute(
                     "SELECT version FROM evidence_schema_version"
@@ -1369,6 +1419,9 @@ class ApprovalEvidenceStore:
             version = 5
         if version == 5:
             self._migrate_v5_to_v6_locked()
+            version = 6
+        if version == 6:
+            self._migrate_v6_to_v7_locked()
             return
         raise ApprovalEvidenceSchemaError(f"evidence schema version {version} is unsupported")
 
@@ -1396,7 +1449,116 @@ class ApprovalEvidenceStore:
         """Add durable redirect lineage claim table for verified follow-ups."""
 
         self._conn.execute(_CREATE_REDIRECT_LINEAGE_CLAIMS_SQL)
+        self._set_schema_version_locked(6)
+
+    def _migrate_v6_to_v7_locked(self) -> None:
+        """Add durable exact-grant claims; backfill without failing on legacy races."""
+
+        self._conn.execute(_CREATE_EXACT_GRANT_CLAIMS_SQL)
+        # Historical races may leave multiple children for one exact grant.
+        # Prefer the earliest child and ignore extras via INSERT OR IGNORE on PK.
+        # Window functions keep selection deterministic without a unique index on
+        # pending_approvals.granted_by_request_id (unsafe over legacy duplicates).
+        self._conn.execute(
+            "INSERT OR IGNORE INTO exact_grant_claims ("
+            "grant_request_id, child_request_id, claimed_at"
+            ") "
+            "SELECT granted_by_request_id, request_id, created_at FROM ("
+            "SELECT child.granted_by_request_id AS granted_by_request_id, "
+            "child.request_id AS request_id, "
+            "child.created_at AS created_at, "
+            "ROW_NUMBER() OVER ("
+            "PARTITION BY child.granted_by_request_id "
+            "ORDER BY child.created_at ASC, child.request_id ASC"
+            ") AS rn "
+            "FROM pending_approvals child "
+            "INNER JOIN pending_approvals parent "
+            "ON parent.request_id = child.granted_by_request_id "
+            "WHERE child.granted_by_request_id IS NOT NULL "
+            "AND parent.approval_scope = 'exact' "
+            "AND parent.granted_by_request_id IS NULL"
+            ") ranked WHERE rn = 1"
+        )
         self._set_schema_version_locked(EVIDENCE_SCHEMA_VERSION)
+
+    def _select_active_exact_grant_locked(
+        self,
+        *,
+        downstream_server: str,
+        tool_name: str,
+        policy_rule_id: str | None,
+        risk_class: str,
+        policy_context_hash: str,
+        resource_hash: str | None,
+        payload_hash: str,
+        now_timestamp: int,
+    ) -> PendingApproval | None:
+        # SQL columns are static and filter values are bound. claim-check: allow SQL safety note.
+        row = self._conn.execute(
+            f"SELECT {', '.join('parent.' + column for column in _COLUMNS)} "  # nosec B608
+            "FROM pending_approvals parent "
+            "WHERE parent.status = ? "
+            "AND parent.approval_scope = ? "
+            "AND parent.granted_by_request_id IS NULL "
+            "AND (parent.expires_at IS NULL OR parent.expires_at > ?) "
+            "AND parent.downstream_server = ? "
+            "AND parent.tool_name = ? "
+            "AND parent.risk_class = ? "
+            "AND parent.policy_rule_id IS ? "
+            "AND parent.policy_context_hash = ? "
+            "AND parent.resource_hash IS ? "
+            "AND parent.payload_hash = ? "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM pending_approvals child "
+            "WHERE child.granted_by_request_id = parent.request_id"
+            ") "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM exact_grant_claims claim "
+            "WHERE claim.grant_request_id = parent.request_id"
+            ") "
+            "ORDER BY parent.created_at, parent.request_id "
+            "LIMIT 1",
+            (
+                ApprovalStatus.APPROVED.value,
+                "exact",
+                int(now_timestamp),
+                downstream_server,
+                tool_name,
+                risk_class,
+                policy_rule_id,
+                policy_context_hash,
+                resource_hash,
+                payload_hash,
+            ),
+        ).fetchone()
+        return None if row is None else _row_to_record(row)
+
+    def _insert_pending_locked(self, record: PendingApproval) -> PendingApproval:
+        count = self._conn.execute("SELECT COUNT(*) FROM pending_approvals").fetchone()[0]
+        if count >= self.max_records:
+            raise ApprovalEvidenceCapacityError(
+                "approval evidence store record cap reached; operator pruning required"
+            )
+        existing = self._conn.execute(
+            "SELECT 1 FROM pending_approvals WHERE request_id = ?",
+            (record.request_id,),
+        ).fetchone()
+        if existing is not None:
+            raise ApprovalEvidenceDuplicateError(
+                f"pending approval already exists: {record.request_id}"
+            )
+        prev_event_hash, append_only = self._compute_chain_link_for_insert_locked(record)
+        linked = replace(record, prev_event_hash=prev_event_hash)
+        values = _record_values(linked)
+        placeholders = ", ".join("?" for _ in _COLUMNS)
+        # SQL columns are static and values are bound. claim-check: allow SQL safety note.
+        self._conn.execute(
+            f"INSERT INTO pending_approvals ({', '.join(_COLUMNS)}) VALUES ({placeholders})",  # nosec B608
+            values,
+        )
+        if not append_only:
+            self._rebuild_chain_locked()
+        return linked
 
     def _set_schema_version_locked(self, version: int) -> None:
         self._conn.execute("DELETE FROM evidence_schema_version")

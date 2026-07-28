@@ -235,16 +235,46 @@ class ApprovalManager:
             )
         request_id = str(uuid.uuid4())
         scope_allowed = self._scope_expansion_allowed(classification)
-        active_exact_grant = self.evidence_store.find_active_exact_grant(
-            downstream_server=classification.server,
-            tool_name=classification.tool,
-            policy_rule_id=classification.policy_evaluation.policy_rule_id,
-            risk_class=classification.risk_class.value,
-            policy_context_hash=classification.policy_evaluation.policy_context_hash,
-            resource_hash=classification.resource_hash,
-            payload_hash=classification.payload_hash,
-            now_timestamp=now,
+        # Exact-reuse metadata matches the pre-consume prompt shape (no runtime
+        # decision embedded). Build it before the atomic claim so the child row
+        # keeps action_family / blast_radius / bounded facts for evidence.
+        grant_prompt = self._prompt_for(
+            classification,
+            request_id=request_id,
+            created_at=now,
+            expires_at=prompt_expires_at,
+            scope_expansion_allowed=scope_allowed,
+            reason=reason,
+            runtime_decision=None,
         )
+        # Exact grants are consumed atomically with the child pending insert so
+        # concurrent processes cannot both observe an unconsumed grant.
+        exact_child = self._pending_record(
+            classification,
+            request_id=request_id,
+            created_at=now,
+            expires_at=record_expires_at,
+            runtime_decision=None,
+            approval_token_hash=self.approval_server.token_hash,
+            granted_by_request_id=None,
+            action_gate_metadata=grant_prompt.action_gate_metadata,
+        )
+        active_exact_grant = None
+        try:
+            active_exact_grant = self.evidence_store.consume_exact_grant_with_pending(
+                exact_child,
+                downstream_server=classification.server,
+                tool_name=classification.tool,
+                policy_rule_id=classification.policy_evaluation.policy_rule_id,
+                risk_class=classification.risk_class.value,
+                policy_context_hash=classification.policy_evaluation.policy_context_hash,
+                resource_hash=classification.resource_hash,
+                payload_hash=classification.payload_hash,
+                now_timestamp=now,
+            )
+        except ApprovalEvidenceError as exc:
+            raise ApprovalFlowError("approval evidence persistence failed") from exc
+
         active_similar_grant = None
         if active_exact_grant is None and scope_allowed:
             active_similar_grant = self.evidence_store.find_active_similar_grant(
@@ -257,31 +287,36 @@ class ApprovalManager:
                 now_timestamp=now,
             )
         active_grant = active_exact_grant or active_similar_grant
-        prompt = self._prompt_for(
-            classification,
-            request_id=request_id,
-            created_at=now,
-            expires_at=prompt_expires_at,
-            scope_expansion_allowed=scope_allowed,
-            reason=reason,
-            runtime_decision=None if active_grant is not None else runtime_decision,
+        prompt = (
+            grant_prompt
+            if active_grant is not None
+            else self._prompt_for(
+                classification,
+                request_id=request_id,
+                created_at=now,
+                expires_at=prompt_expires_at,
+                scope_expansion_allowed=scope_allowed,
+                reason=reason,
+                runtime_decision=runtime_decision,
+            )
         )
-        record = self._pending_record(
-            classification,
-            request_id=request_id,
-            created_at=now,
-            expires_at=record_expires_at,
-            runtime_decision=None if active_grant is not None else runtime_decision,
-            approval_token_hash=self.approval_server.token_hash,
-            granted_by_request_id=(
-                None if active_grant is None else active_grant.request_id
-            ),
-            action_gate_metadata=prompt.action_gate_metadata,
-        )
-        try:
-            self.evidence_store.write_pending(record)
-        except ApprovalEvidenceError as exc:
-            raise ApprovalFlowError("approval evidence persistence failed") from exc
+        if active_exact_grant is None:
+            record = self._pending_record(
+                classification,
+                request_id=request_id,
+                created_at=now,
+                expires_at=record_expires_at,
+                runtime_decision=None if active_grant is not None else runtime_decision,
+                approval_token_hash=self.approval_server.token_hash,
+                granted_by_request_id=(
+                    None if active_grant is None else active_grant.request_id
+                ),
+                action_gate_metadata=prompt.action_gate_metadata,
+            )
+            try:
+                self.evidence_store.write_pending(record)
+            except ApprovalEvidenceError as exc:
+                raise ApprovalFlowError("approval evidence persistence failed") from exc
 
         if client_request_id is not None:
             self._bind_client_request(client_request_id, request_id)
