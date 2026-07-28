@@ -49,7 +49,6 @@ from agentveil_mcp_proxy.classification import (
     ClassifiedToolCall,
     ToolCallClassifier,
     infer_action_family,
-    infer_risk_class,
     sha256_jcs,
 )
 from agentveil_mcp_proxy.evidence import (
@@ -133,7 +132,6 @@ from agentveil_mcp_proxy.redirect_playbooks import (
     redirect_playbook_id_for_risk_family,
     uses_risk_family_redirects,
 )
-from agentveil_mcp_proxy.product_route import SANDBOX_READ_ONLY_MCP_TOOLS
 from agentveil_mcp_proxy.policy import (
     PolicyDecision,
     ProxyConfig,
@@ -3752,28 +3750,6 @@ class McpPassthrough:
             data=unsupported_data,
         ), None
 
-    def _read_only_sandbox_tool_allowed_when_gate_unavailable(
-        self,
-        classification: ClassifiedToolCall,
-    ) -> bool:
-        tool = classification.tool or ""
-        if tool not in SANDBOX_READ_ONLY_MCP_TOOLS:
-            return False
-        server = classification.server or ""
-        if server not in {"filesystem", "product"} and "filesystem" not in server:
-            return False
-        if classification.policy_evaluation.decision in {
-            PolicyDecision.ALLOW,
-            PolicyDecision.OBSERVE,
-        }:
-            return True
-        return infer_risk_class(
-            classification.action_plain,
-            tool=tool,
-            resource=classification.resource_plain,
-            arguments={},
-        ) is RiskClass.READ
-
     def _local_proof_tool_response(
         self,
         message: Mapping[str, Any],
@@ -3869,8 +3845,6 @@ class McpPassthrough:
         classification: ClassifiedToolCall,
         request_id: Any,
     ) -> tuple[dict[str, Any] | None, ApprovalOutcome | None]:
-        if self._read_only_sandbox_tool_allowed_when_gate_unavailable(classification):
-            return None, None
         config = self.config
         fallback = (
             config.fallback.for_risk(classification.risk_class)
