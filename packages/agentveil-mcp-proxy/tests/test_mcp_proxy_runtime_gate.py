@@ -1332,6 +1332,7 @@ def test_backend_timeout_error_is_sanitized_and_bounded(tmp_path):
     assert response["error"]["code"] == JSONRPC_RUNTIME_GATE_UNAVAILABLE
     assert response["error"]["message"] == "AVP Runtime Gate unavailable"
     assert response["error"]["data"] == {
+        # claim-check: allow bounded JSON-RPC status asserted by a downstream-negative outage regression.
         "status": "blocked",
         "reason": "runtime_gate_unavailable",
     }
@@ -1921,3 +1922,327 @@ def test_signed_allow_receipt_still_verifies_after_rejection_path_added():
     client = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
 
     assert client.evaluate(_classification(config)).decision == "ALLOW"
+
+
+# ---------------------------------------------------------------------------
+# Runtime Gate outage sandbox bypass corrective:
+# a true Runtime Gate outage must not silently forward read-only sandbox MCP
+# tools downstream. Only explicit operator-configured fallback may allow reads.
+# ---------------------------------------------------------------------------
+
+
+def _block_all_fallback() -> dict:
+    return {
+        "read": "block",
+        "write": "block",
+        "destructive": "block",
+        # claim-check: allow "production" is a fallback risk-class key in test config.
+        "production": "block",
+        "financial": "block",
+        "unknown": "block",
+    }
+
+
+def _sandbox_read_ask_backend_config(
+    *,
+    fallback: dict | None = None,
+    server: str = "filesystem",
+    tool: str = "read_file",
+) -> ProxyConfig:
+    payload = {
+        "proxy_config_schema_version": 1,
+        "avp": {
+            "base_url": "https://agentveil.dev",
+            "agent_name": "agentveil-mcp-proxy",
+            "trusted_signer_dids": [BACKEND_DID],
+        },
+        "mode": "protect",
+        "privacy": {
+            "action": "redacted",
+            "resource": "hash",
+            "payload": "hash_only",
+            "evidence_upload": False,
+        },
+        "approval": {},
+        "policy": {
+            "id": f"{server}-{tool}-ask-backend",
+            "policy_schema_version": 1,
+            "default_decision": "ask_backend",
+            "default_risk_class": "read",
+            "rules": [
+                {
+                    "id": f"ask-{server}-{tool}",
+                    "source": "user",
+                    "decision": "ask_backend",
+                    "match": {"server": [server], "tool": [tool]},
+                    "risk_class": "read",
+                }
+            ],
+        },
+        "downstream": {},
+    }
+    if fallback is not None:
+        payload["fallback"] = fallback
+    return ProxyConfig.from_dict(payload)
+
+
+def _filesystem_downstream(tmp_path: Path, log_path: Path, *, tool: str = "read_file") -> Path:
+    return write_downstream(
+        tmp_path,
+        filename="runtime_gate_filesystem_echo.py",
+        tools=[tool_entry(tool)],
+        call_result_text="forwarded",
+    )
+
+
+def _filesystem_passthrough(
+    tmp_path: Path,
+    gate: object,
+    config: ProxyConfig,
+    *,
+    server_name: str = "filesystem",
+    tool: str = "read_file",
+    approval_manager: ApprovalManager | None = None,
+) -> tuple[McpPassthrough, Path]:
+    log_path = tmp_path / "downstream.log"
+    passthrough = McpPassthrough(
+        DownstreamConfig(
+            command=sys.executable,
+            args=("-u", str(_filesystem_downstream(tmp_path, log_path, tool=tool))),
+            name=server_name,
+            env={"DOWNSTREAM_LOG": str(log_path)},
+        ),
+        classifier=ToolCallClassifier(config, server_name=server_name),
+        runtime_gate_factory=lambda: gate,
+        approval_manager=approval_manager,
+    )
+    return passthrough, log_path
+
+
+def _sandbox_read_tool_call(
+    *,
+    tool: str = "read_file",
+    path: str = "notes.txt",
+    arguments: dict | None = None,
+) -> str:
+    params_arguments = arguments if arguments is not None else {"path": path}
+    return _json_line({
+        "jsonrpc": "2.0",
+        "id": "call-1",
+        "method": "tools/call",
+        "params": {"name": tool, "arguments": params_arguments},
+    })
+
+
+def _downstream_call_count(log_path: Path) -> int:
+    if not log_path.exists():
+        return 0
+    return sum(1 for line in log_path.read_text(encoding="utf-8").splitlines() if line == "tools/call")
+
+
+def test_outage_sandbox_read_fallback_block_denies_without_downstream(tmp_path):
+    # Baseline before fix (confirmed this session): outage + sandbox read_file +
+    # fallback.read=block still reached downstream via the automatic bypass helper.
+    config = _sandbox_read_ask_backend_config(fallback=_block_all_fallback())
+    gate = StaticGate(RuntimeGateUnavailableError(f"timed out while handling {SECRET}"))
+    passthrough, log_path = _filesystem_passthrough(tmp_path, gate, config)
+    client_out = io.StringIO()
+
+    assert passthrough.run_stdio(io.StringIO(_sandbox_read_tool_call(path=SECRET)), client_out) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    assert response["error"]["code"] == JSONRPC_RUNTIME_GATE_UNAVAILABLE
+    assert response["error"]["message"] == "AVP Runtime Gate unavailable"
+    assert response["error"]["data"] == {
+        # claim-check: allow bounded JSON-RPC status asserted by a downstream-negative outage regression.
+        "status": "blocked",
+        "reason": "runtime_gate_unavailable",
+    }
+    assert SECRET not in client_out.getvalue()
+    assert _downstream_call_count(log_path) == 0
+
+
+def test_outage_sandbox_read_fallback_approval_requires_approval_without_downstream(tmp_path):
+    config = _sandbox_read_ask_backend_config(fallback={"read": "approval"})
+    gate = StaticGate(RuntimeGateUnavailableError("runtime gate outage"))
+    passthrough, log_path = _filesystem_passthrough(tmp_path, gate, config)
+    client_out = io.StringIO()
+
+    assert passthrough.run_stdio(io.StringIO(_sandbox_read_tool_call()), client_out) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    assert response["error"]["code"] == JSONRPC_APPROVAL_REQUIRED
+    data = response["error"]["data"]
+    assert data["status"] == "approval_required"
+    assert data["reason"] == "runtime_gate_unavailable"
+    assert data["approval_possible"] is True
+    assert data["retry_after_approval"] is True
+    assert _downstream_call_count(log_path) == 0
+
+
+def test_outage_sandbox_read_fallback_explicit_allow_forwards_once(tmp_path):
+    config = _sandbox_read_ask_backend_config(fallback={"read": "allow"})
+    gate = StaticGate(RuntimeGateUnavailableError("runtime gate outage"))
+    passthrough, log_path = _filesystem_passthrough(tmp_path, gate, config)
+    client_out = io.StringIO()
+
+    assert passthrough.run_stdio(io.StringIO(_sandbox_read_tool_call()), client_out) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    assert response["result"] == {
+        "content": [{"type": "text", "text": "forwarded"}],
+    }
+    assert _downstream_call_count(log_path) == 1
+
+
+def test_outage_product_sandbox_list_workspace_fallback_block_denies_without_downstream(tmp_path):
+    # Legacy bypass helper also matched exact server="product". Outage must not
+    # silently forward SANDBOX_READ_ONLY_MCP_TOOLS without explicit fallback.
+    config = _sandbox_read_ask_backend_config(
+        fallback=_block_all_fallback(),
+        server="product",
+        tool="list_workspace",
+    )
+    gate = StaticGate(RuntimeGateUnavailableError(f"timed out while handling {SECRET}"))
+    passthrough, log_path = _filesystem_passthrough(
+        tmp_path,
+        gate,
+        config,
+        server_name="product",
+        tool="list_workspace",
+    )
+    client_out = io.StringIO()
+
+    assert passthrough.run_stdio(
+        io.StringIO(_sandbox_read_tool_call(tool="list_workspace", arguments={})),
+        client_out,
+    ) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    assert response["error"]["code"] == JSONRPC_RUNTIME_GATE_UNAVAILABLE
+    assert response["error"]["message"] == "AVP Runtime Gate unavailable"
+    assert response["error"]["data"] == {
+        # claim-check: allow bounded JSON-RPC status asserted by a downstream-negative outage regression.
+        "status": "blocked",
+        "reason": "runtime_gate_unavailable",
+    }
+    assert SECRET not in client_out.getvalue()
+    assert _downstream_call_count(log_path) == 0
+
+
+def test_outage_product_sandbox_list_workspace_fallback_approval_without_downstream(tmp_path):
+    config = _sandbox_read_ask_backend_config(
+        fallback={"read": "approval"},
+        server="product",
+        tool="list_workspace",
+    )
+    gate = StaticGate(RuntimeGateUnavailableError("runtime gate outage"))
+    passthrough, log_path = _filesystem_passthrough(
+        tmp_path,
+        gate,
+        config,
+        server_name="product",
+        tool="list_workspace",
+    )
+    client_out = io.StringIO()
+
+    assert passthrough.run_stdio(
+        io.StringIO(_sandbox_read_tool_call(tool="list_workspace", arguments={})),
+        client_out,
+    ) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    assert response["error"]["code"] == JSONRPC_APPROVAL_REQUIRED
+    data = response["error"]["data"]
+    assert data["status"] == "approval_required"
+    assert data["reason"] == "runtime_gate_unavailable"
+    assert data["approval_possible"] is True
+    assert data["retry_after_approval"] is True
+    assert _downstream_call_count(log_path) == 0
+
+
+def test_outage_product_sandbox_list_workspace_fallback_explicit_allow_forwards_once(tmp_path):
+    config = _sandbox_read_ask_backend_config(
+        fallback={"read": "allow"},
+        server="product",
+        tool="list_workspace",
+    )
+    gate = StaticGate(RuntimeGateUnavailableError("runtime gate outage"))
+    passthrough, log_path = _filesystem_passthrough(
+        tmp_path,
+        gate,
+        config,
+        server_name="product",
+        tool="list_workspace",
+    )
+    client_out = io.StringIO()
+
+    assert passthrough.run_stdio(
+        io.StringIO(_sandbox_read_tool_call(tool="list_workspace", arguments={})),
+        client_out,
+    ) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    assert response["result"] == {
+        "content": [{"type": "text", "text": "forwarded"}],
+    }
+    assert _downstream_call_count(log_path) == 1
+
+
+def test_outage_non_sandbox_write_fallback_unchanged(tmp_path):
+    config = _config(fallback={"write": "block"})
+    gate = StaticGate(RuntimeGateUnavailableError(f"timed out while handling {SECRET}"))
+    passthrough, log_path = _passthrough(tmp_path, gate, config)
+    client_out = io.StringIO()
+
+    assert passthrough.run_stdio(io.StringIO(_tool_call()), client_out) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    assert response["error"]["code"] == JSONRPC_RUNTIME_GATE_UNAVAILABLE
+    assert response["error"]["data"] == {
+        # claim-check: allow bounded JSON-RPC status asserted by a downstream-negative outage regression.
+        "status": "blocked",
+        "reason": "runtime_gate_unavailable",
+    }
+    assert _downstream_call_count(log_path) == 0
+
+
+def test_reached_4xx_sandbox_read_still_terminal_without_downstream(tmp_path):
+    config = _sandbox_read_ask_backend_config(fallback={"read": "allow"})
+    agent = RaisingAgent(AVPValidationError(f"rejected {SECRET}", 400, SECRET))
+    gate = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+    passthrough, log_path = _filesystem_passthrough(tmp_path, gate, config)
+    client_out = io.StringIO()
+
+    assert passthrough.run_stdio(io.StringIO(_sandbox_read_tool_call(path=SECRET)), client_out) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    assert response["error"]["code"] == JSONRPC_RUNTIME_GATE_REJECTED
+    assert response["error"]["data"]["reason"] == "runtime_gate_rejected"
+    assert SECRET not in client_out.getvalue()
+    assert _downstream_call_count(log_path) == 0
+
+
+@pytest.mark.parametrize(
+    "server_name",
+    ["github", "fake-filesystem"],
+)
+def test_outage_fake_sandbox_labels_do_not_auto_bypass(tmp_path, server_name: str):
+    # Tool name alone must not reopen downstream during outage. Only explicit
+    # fallback.read=allow may forward a read-risk call.
+    config = _sandbox_read_ask_backend_config(fallback=_block_all_fallback())
+    gate = StaticGate(RuntimeGateUnavailableError("runtime gate outage"))
+    passthrough, log_path = _filesystem_passthrough(
+        tmp_path,
+        gate,
+        config,
+        server_name=server_name,
+    )
+    client_out = io.StringIO()
+
+    assert passthrough.run_stdio(io.StringIO(_sandbox_read_tool_call()), client_out) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    assert response["error"]["code"] == JSONRPC_RUNTIME_GATE_UNAVAILABLE
+    assert response["error"]["data"]["reason"] == "runtime_gate_unavailable"
+    assert _downstream_call_count(log_path) == 0

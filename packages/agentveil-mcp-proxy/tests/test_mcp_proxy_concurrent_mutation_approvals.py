@@ -390,19 +390,23 @@ def test_timeout_a_does_not_affect_pending_b(tmp_path):
         tmp_path,
         log_path=log_path,
         downstream_script=_path_logging_downstream(tmp_path),
-        approval_timeout_seconds=1,
+        approval_timeout_seconds=30,
     )
     b_waiting = threading.Event()
     release_b = threading.Event()
     await_calls = {"count": 0}
     original_await = manager._await_decision
 
-    def gated_await(*args, **kwargs):
+    def gated_await(request_id, timeout):
         await_calls["count"] += 1
+        if await_calls["count"] == 1:
+            # Expire A promptly while B retains the normal persisted deadline.
+            # The test intentionally holds B until after A has timed out.
+            timeout = 1
         if await_calls["count"] == 2:
             b_waiting.set()
             release_b.wait(timeout=5.0)
-        return original_await(*args, **kwargs)
+        return original_await(request_id, timeout)
 
     manager._await_decision = gated_await  # type: ignore[method-assign]
     try:
