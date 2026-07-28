@@ -19,7 +19,6 @@ from agentveil_mcp_proxy.approval.server import (
 )
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore, ApprovalStatus, PendingApproval
 from agentveil_mcp_proxy.evidence.observability import (
-    approval_remaining_seconds,
     format_approval_remaining_time,
     rich_approval_action_semantics_label,
     rich_approval_requested_change_label,
@@ -236,15 +235,23 @@ def test_long_values_wrap_safely(redirect_fixture):
     assert long_target in html
 
 
-def test_countdown_renders_from_expires_at(redirect_fixture):
+def test_countdown_renders_from_expires_at(redirect_fixture, monkeypatch):
     store, server = redirect_fixture
     _register_ordinary_prompt(server, store, request_id="countdown-card", tool_name="write_file")
     prompt = server.prompt_for("countdown-card")
     assert prompt is not None
-    remaining = approval_remaining_seconds(prompt.expires_at)
+
+    def fixed_remaining(expires_at: int) -> int:
+        assert expires_at == prompt.expires_at
+        return 300
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.approval.server.approval_remaining_seconds",
+        fixed_remaining,
+    )
     html = _detail_html(server, "countdown-card")
     assert f'data-expires-at="{prompt.expires_at}"' in html
-    assert format_approval_remaining_time(remaining) in html
+    assert format_approval_remaining_time(300) in html
     assert "approval-countdown" in html
 
 
