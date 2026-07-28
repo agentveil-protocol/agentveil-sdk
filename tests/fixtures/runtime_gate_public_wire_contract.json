@@ -117,7 +117,9 @@
       "decision_receipt_hash",
       "rules_fired",
       "install_clone_advisory",
-      "paid_policy_receipt_evidence"
+      "paid_policy_receipt_evidence",
+      "paid_policy_provider_decision",
+      "paid_approval_center_projection"
     ],
     "decision_allowed_values": ["ALLOW", "BLOCK", "WAITING_FOR_HUMAN_APPROVAL"],
     "risk_class_allowed_values": ["read", "write", "destructive", "irreversible", "financial", "unknown"]
