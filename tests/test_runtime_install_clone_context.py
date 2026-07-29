@@ -334,6 +334,24 @@ def test_public_wire_contract_fixture_is_public_safe():
         assert marker not in serialized
 
 
+def test_public_wire_contract_action_inventory_is_exact():
+    action = _public_wire_contract()["request"]["action"]
+    assert action == {
+        "plain_pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$",
+        "redacted_exact": "privacy.redacted",
+        "hash_pattern": "^privacy\\.h[0-9a-f]{64}$",
+    }
+    legacy = {
+        item["body_patch"]["action"]
+        for item in _public_wire_contract()["invalid_request_fixtures"]
+        if item["name"].startswith("legacy_") and item["name"].endswith("_action_token")
+    }
+    assert legacy == {
+        "redacted",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }
+
+
 def test_avp_agent_runtime_evaluate_rejects_unknown_metadata_slot_before_http():
     agent = AVPAgent("https://agentveil.dev", AGENT_SEED, name="slot-probe", timeout=2.0)
     posted = {"called": False}

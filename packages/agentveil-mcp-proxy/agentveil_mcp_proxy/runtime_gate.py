@@ -61,6 +61,10 @@ _DECISION_RECEIPT_SCHEMAS = {"decision_receipt/1", "decision_receipt/2", "decisi
 # verifier; /1 and /2 keep the legacy raw-JCS verifier.
 _W3C_DI_DECISION_SCHEMAS = {"decision_receipt/3"}
 _RUNTIME_DECISIONS = {DECISION_ALLOW, DECISION_BLOCK, DECISION_WAITING}
+_DOTTED_WIRE_ACTION_RE = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$")
+_PRIVACY_REDACTED_WIRE_ACTION = "privacy.redacted"
+_PRIVACY_HASH_WIRE_PREFIX = "privacy.h"
+_ACTION_HASH_SHA256_RE = re.compile(r"^sha256:([0-9a-f]{64})$")
 _REQUIRED_RECEIPT_FIELDS = {
     "action",
     "resource",
@@ -96,6 +100,17 @@ class RuntimeGateRejectedError(RuntimeGateError):
 
 class RuntimeGateUntrustedError(RuntimeGateError):
     """Raised when a backend decision cannot be cryptographically trusted."""
+
+
+class RuntimeGateWireContractError(RuntimeGateUntrustedError):
+    """Raised when privacy metadata cannot map to a schema-valid wire action.
+
+    Terminal contract error: passthrough must not treat this as an availability
+    outage or apply local fallback.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("runtime gate wire action contract invalid")
 
 
 @dataclass(frozen=True)
@@ -298,7 +313,7 @@ class RuntimeGateClient:
             except AVPValidationError as exc:
                 raise RuntimeGateUnavailableError("install_clone_context invalid") from exc
         return _RuntimeGateRequest(
-            action=_runtime_field(metadata.get("action")),
+            action=_wire_action_from_metadata(self.config.privacy.action, metadata),
             resource=_runtime_field(metadata.get("resource")),
             environment=self.environment,
             payload_hash=_required_str(metadata.get("payload_hash"), "payload_hash"),
@@ -450,6 +465,38 @@ def _validate_runtime_environment(environment: Any) -> str:
     if not isinstance(environment, str) or environment not in CANONICAL_RUNTIME_ENVIRONMENTS:
         raise ValueError("environment invalid")
     return environment
+
+
+def _wire_action_from_metadata(privacy_action_mode: str, metadata: Mapping[str, Any]) -> str:
+    """Map privacy-filtered local metadata to a schema-valid Runtime Gate action."""
+
+    action = metadata.get("action")
+    action_hash = metadata.get("action_hash")
+
+    if privacy_action_mode == "plain":
+        if action_hash is not None:
+            raise RuntimeGateWireContractError()
+        if not isinstance(action, str) or not action:
+            raise RuntimeGateWireContractError()
+        if not _DOTTED_WIRE_ACTION_RE.fullmatch(action):
+            raise RuntimeGateWireContractError()
+        return action
+    if privacy_action_mode == "redacted":
+        if action != "redacted":
+            raise RuntimeGateWireContractError()
+        if action_hash is not None:
+            raise RuntimeGateWireContractError()
+        return _PRIVACY_REDACTED_WIRE_ACTION
+    if privacy_action_mode == "hash":
+        if not isinstance(action_hash, str) or not action_hash:
+            raise RuntimeGateWireContractError()
+        hex_match = _ACTION_HASH_SHA256_RE.fullmatch(action_hash)
+        if hex_match is None:
+            raise RuntimeGateWireContractError()
+        if action != action_hash:
+            raise RuntimeGateWireContractError()
+        return f"{_PRIVACY_HASH_WIRE_PREFIX}{hex_match.group(1)}"
+    raise RuntimeGateWireContractError()
 
 
 def _runtime_field(value: Any) -> str:
@@ -681,5 +728,6 @@ __all__ = [
     "RuntimeGateRejectedError",
     "RuntimeGateUnavailableError",
     "RuntimeGateUntrustedError",
+    "RuntimeGateWireContractError",
     "normalize_paid_approval_center_projection",
 ]

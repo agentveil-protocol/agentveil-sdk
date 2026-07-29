@@ -172,6 +172,41 @@ def test_privacy_modes_control_action_and_resource_representation():
     assert metadata["payload_hash"].startswith(HASH_PREFIX)
 
 
+def test_privacy_action_local_values_remain_distinct_from_runtime_gate_wire_surrogates():
+    plain = ToolCallClassifier(_config(privacy={
+        "action": "plain",
+        "resource": "plain",
+        "payload": "hash_only",
+        "evidence_upload": False,
+    }), server_name="github").classify(
+        tool="create_issue",
+        arguments={"owner": "acme", "repo": "payments"},
+    )
+    redacted = ToolCallClassifier(_config(privacy={
+        "action": "redacted",
+        "resource": "hash",
+        "payload": "hash_only",
+        "evidence_upload": False,
+    }), server_name="github").classify(
+        tool="create_issue",
+        arguments={"owner": "acme", "repo": "payments"},
+    )
+    hashed = ToolCallClassifier(_config(privacy={
+        "action": "hash",
+        "resource": "redacted",
+        "payload": "hash_only",
+        "evidence_upload": False,
+    }), server_name="github").classify(
+        tool="create_issue",
+        arguments={"owner": "acme", "repo": "payments"},
+    )
+
+    assert plain.action == "github.create_issue"
+    assert redacted.action == REDACTED
+    assert hashed.action == hashed.action_hash
+    assert hashed.action.startswith(HASH_PREFIX)
+
+
 def test_extract_resource_priority_order_is_stable():
     cases = [
         ({"owner": "acme", "repo": "foo"}, "github:acme/foo"),
