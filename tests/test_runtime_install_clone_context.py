@@ -387,6 +387,35 @@ def test_avp_agent_runtime_evaluate_rejects_unknown_slot_key_before_http():
     assert posted["called"] is False
 
 
+def test_public_wire_contract_response_field_inventory_is_exact():
+    """Freeze the bounded Runtime Gate response field inventory (16 names)."""
+
+    data = _public_wire_contract()
+    expected = [
+        "decision",
+        "reason",
+        "risk_class",
+        "audit_id",
+        "decided_at",
+        "evaluator_version",
+        "assumptions",
+        "policy_environment",
+        "policy_version",
+        "policy_context_hash",
+        "decision_receipt_hash",
+        "rules_fired",
+        "install_clone_advisory",
+        "paid_policy_receipt_evidence",
+        "paid_policy_provider_decision",
+        "paid_approval_center_projection",
+    ]
+    assert data["response"]["public_fields"] == expected
+    assert len(data["response"]["public_fields"]) == 16
+    serialized = json.dumps(data, sort_keys=True)
+    for marker in _FORBIDDEN_PRIVATE_MARKERS:
+        assert marker not in serialized
+
+
 def test_contract_package_install_fixture_uses_only_allowed_evidence_slots():
     fixture = deepcopy(_public_wire_contract()["valid_request_fixtures"][1]["body"])
     context = fixture["install_clone_context"]
