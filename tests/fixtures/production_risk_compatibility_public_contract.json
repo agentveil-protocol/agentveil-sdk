@@ -1,0 +1,37 @@
+{
+  "contract_version": "avp.production.risk_compatibility.v1",
+  "vocabulary_version": "production_risk_vocabulary/1",
+  "vocabulary_hash": "sha256:114c77c3b4f61e517e06aa23e7e700eecb3abbfc828d9442aaf7f27d08bc8772",
+  "mapping_metadata": {
+    "legacy_values": [
+      "destructive",
+      "financial",
+      "production",
+      "read",
+      "unknown",
+      "write"
+    ],
+    "canonical_impact_values": [
+      "read",
+      "write",
+      "destructive",
+      "irreversible",
+      "financial",
+      "unknown"
+    ],
+    "canonical_environment_values": [
+      "production",
+      "staging",
+      "development",
+      "unknown"
+    ],
+    "production_legacy_kind": "environment_compatibility_check",
+    "impact_projection_values": [
+      "destructive",
+      "financial",
+      "read",
+      "unknown",
+      "write"
+    ]
+  }
+}
