@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 from copy import deepcopy
 from pathlib import Path
 import sys
@@ -57,6 +58,7 @@ from agentveil_mcp_proxy.runtime_gate import (
     RuntimeGateRejectedError,
     RuntimeGateUnavailableError,
     RuntimeGateUntrustedError,
+    RuntimeGateWireContractError,
 )
 import agentveil_mcp_proxy.runtime_gate as runtime_gate_module
 
@@ -427,7 +429,7 @@ def test_ask_backend_runtime_request_is_privacy_safe_metadata_only():
         "risk_class",
         "policy_context_hash",
     }
-    assert call["action"] == "redacted"
+    assert call["action"] == "privacy.redacted"
     assert call["resource"].startswith("sha256:")
     assert call["environment"] == "unknown"
     assert call["payload_hash"].startswith("sha256:")
@@ -685,7 +687,7 @@ def test_runtime_evaluate_wire_body_excludes_raw_mcp_args_and_secrets():
         "policy_context_hash",
     }
     assert body["agent_did"] == AGENT_DID
-    assert body["action"] == "redacted"
+    assert body["action"] == "privacy.redacted"
     assert body["resource"].startswith("sha256:")
     assert body["receipt"] == {"id": "grant"}
     body_text = json.dumps(body, sort_keys=True)
@@ -699,6 +701,317 @@ def test_runtime_evaluate_wire_body_excludes_raw_mcp_args_and_secrets():
         "create_issue",
     ):
         assert forbidden not in body_text
+
+
+def _privacy_config(*, action: str, resource: str = "hash") -> ProxyConfig:
+    return _config(privacy={
+        "action": action,
+        "resource": resource,
+        "payload": "hash_only",
+        "evidence_upload": False,
+    })
+
+
+def _metadata_classification(metadata: dict):
+    class _MetadataClassification:
+        def backend_metadata(self):
+            return metadata
+
+    return _MetadataClassification()
+
+
+def _contract_action_spec() -> dict:
+    return _public_wire_contract()["request"]["action"]
+
+
+@pytest.mark.parametrize(
+    "legacy_action",
+    [
+        "redacted",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ],
+)
+def test_legacy_local_action_tokens_fail_dotted_wire_pattern(legacy_action):
+    dotted = runtime_gate_module._DOTTED_WIRE_ACTION_RE
+    assert dotted.fullmatch(legacy_action) is None
+
+
+def test_plain_wire_action_is_byte_identical_dotted_action():
+    config = _privacy_config(action="plain", resource="plain")
+    agent = RecordingAgent()
+    client = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+    classification = _classification(config)
+
+    result = client.evaluate(classification)
+
+    assert result.decision == "ALLOW"
+    assert classification.action == "github.create_issue"
+    assert agent.calls[0]["action"] == "github.create_issue"
+
+
+def test_redacted_wire_action_is_exact_privacy_redacted():
+    config = _privacy_config(action="redacted")
+    agent = RecordingAgent()
+    client = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+
+    result = client.evaluate(_classification(config))
+
+    assert result.decision == "ALLOW"
+    assert agent.calls[0]["action"] == _contract_action_spec()["redacted_exact"]
+
+
+def test_hash_wire_action_is_privacy_h_plus_action_hash_hex():
+    config = _privacy_config(action="hash", resource="redacted")
+    agent = RecordingAgent()
+    client = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+    classification = _classification(config)
+    expected_hex = classification.action_hash.removeprefix("sha256:")
+
+    result = client.evaluate(classification)
+
+    assert result.decision == "ALLOW"
+    assert agent.calls[0]["action"] == f"privacy.h{expected_hex}"
+
+
+def test_same_action_produces_same_hash_surrogate():
+    config = _privacy_config(action="hash", resource="redacted")
+    classification = _classification(config)
+    first_agent = RecordingAgent()
+    second_agent = RecordingAgent()
+    RuntimeGateClient(
+        agent=first_agent,
+        config=config,
+        control_grant={"id": "grant"},
+    ).evaluate(classification)
+    RuntimeGateClient(
+        agent=second_agent,
+        config=config,
+        control_grant={"id": "grant"},
+    ).evaluate(classification)
+
+    assert first_agent.calls[0]["action"] == second_agent.calls[0]["action"]
+
+
+def test_different_actions_produce_different_hash_surrogates():
+    config = _privacy_config(action="hash", resource="redacted")
+    agent = RecordingAgent()
+    client = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+    first = ToolCallClassifier(config, server_name="github").classify(
+        tool="create_issue",
+        arguments={"owner": "acme", "repo": "alpha"},
+    )
+    second = ToolCallClassifier(config, server_name="github").classify(
+        tool="read_file",
+        arguments={"owner": "acme", "repo": "alpha", "path": "README.md"},
+    )
+
+    client.evaluate(first)
+    client.evaluate(second)
+
+    assert agent.calls[0]["action"] != agent.calls[1]["action"]
+    assert agent.calls[0]["action"].startswith("privacy.h")
+    assert agent.calls[1]["action"].startswith("privacy.h")
+
+
+def test_redacted_and_hash_wire_body_exclude_raw_action_material():
+    redacted_config = _privacy_config(action="redacted")
+    hash_config = _privacy_config(action="hash", resource="redacted")
+    redacted_agent = RecordingAgent()
+    hash_agent = RecordingAgent()
+    redacted_client = RuntimeGateClient(
+        agent=redacted_agent,
+        config=redacted_config,
+        control_grant={"id": "grant"},
+    )
+    hash_client = RuntimeGateClient(
+        agent=hash_agent,
+        config=hash_config,
+        control_grant={"id": "grant"},
+    )
+
+    redacted_client.evaluate(_classification(redacted_config))
+    hash_client.evaluate(_classification(hash_config))
+
+    for call in (redacted_agent.calls[0], hash_agent.calls[0]):
+        body_text = json.dumps(call, sort_keys=True)
+        for forbidden in (
+            "create_issue",
+            "github.create_issue",
+            "github",
+            "private-repo",
+            SECRET,
+        ):
+            assert forbidden not in body_text
+
+
+@pytest.mark.parametrize(
+    "action_hash",
+    [
+        "sha256:" + ("a" * 63),
+        "sha256:" + ("a" * 65),
+        "sha256:" + ("A" * 64),
+        "deadbeef",
+        "",
+    ],
+)
+def test_invalid_hash_action_material_rejects_before_http(action_hash):
+    config = _privacy_config(action="hash", resource="redacted")
+    agent = RecordingAgent()
+    client = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+    metadata = _classification(config).backend_metadata()
+    metadata = {**metadata, "action_hash": action_hash}
+    if action_hash and action_hash != metadata.get("action"):
+        metadata = {**metadata, "action": action_hash}
+
+    with pytest.raises(RuntimeGateWireContractError):
+        client.evaluate(_metadata_classification(metadata))
+
+    assert agent.calls == []
+
+
+@pytest.mark.parametrize(
+    "invalid_action",
+    ["redacted", "GitHub.Create_Issue", "github", ""],
+)
+def test_invalid_plain_wire_action_rejects_before_http(invalid_action):
+    config = _privacy_config(action="plain", resource="plain")
+    agent = RecordingAgent()
+    client = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+    metadata = _classification(config).backend_metadata()
+    metadata = {**metadata, "action": invalid_action}
+
+    with pytest.raises(RuntimeGateWireContractError):
+        client.evaluate(_metadata_classification(metadata))
+
+    assert agent.calls == []
+
+
+@pytest.mark.parametrize(
+    ("privacy_action", "metadata_patch"),
+    [
+        ("plain", {"action": "redacted", "action_hash": None}),
+        ("plain", {"action": "github.create_issue", "action_hash": "sha256:" + ("a" * 64)}),
+        ("redacted", {"action": "github.create_issue", "action_hash": None}),
+        ("redacted", {"action": "redacted", "action_hash": "sha256:" + ("a" * 64)}),
+        ("hash", {"action": "redacted", "action_hash": None}),
+        (
+            "hash",
+            {
+                "action": "sha256:" + ("a" * 64),
+                "action_hash": "sha256:" + ("b" * 64),
+            },
+        ),
+    ],
+)
+def test_privacy_mode_material_mismatch_is_terminal_before_http(
+    privacy_action,
+    metadata_patch,
+):
+    config = _privacy_config(
+        action=privacy_action,
+        resource="plain" if privacy_action == "plain" else "redacted",
+    )
+    agent = RecordingAgent()
+    client = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+    metadata = _classification(config).backend_metadata()
+    metadata = {**metadata, **metadata_patch}
+
+    with pytest.raises(RuntimeGateWireContractError):
+        client.evaluate(_metadata_classification(metadata))
+
+    assert agent.calls == []
+
+
+def test_invalid_plain_wire_action_passthrough_denies_without_fallback_or_downstream(
+    tmp_path,
+):
+    config = _config(
+        privacy={
+            "action": "plain",
+            "resource": "plain",
+            "payload": "hash_only",
+            "evidence_upload": False,
+        },
+        fallback=_all_allow_fallback(),
+    )
+    agent = RecordingAgent()
+    gate = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+    passthrough, log_path = _passthrough(tmp_path, gate, config)
+    passthrough.classifier = ToolCallClassifier(config, server_name="my-github")
+    client_out = io.StringIO()
+    tool_call = _json_line({
+        "jsonrpc": "2.0",
+        "id": "call-1",
+        "method": "tools/call",
+        "params": {
+            "name": "create_issue",
+            "arguments": {"owner": "acme", "repo": "private-repo", "title": SECRET},
+        },
+    })
+
+    assert passthrough.run_stdio(io.StringIO(tool_call), client_out) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    assert response.get("error", response).get("code") == JSONRPC_RUNTIME_GATE_UNTRUSTED, response
+    # claim-check: allow blocked is the asserted negative response contract
+    assert response["error"]["data"]["status"] == "blocked"
+    assert response["error"]["data"]["reason"] == "untrusted_runtime_decision"
+    assert response["error"]["data"]["target_reached"] is False
+    assert SECRET not in client_out.getvalue()
+    assert len(agent.calls) == 0
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
+
+
+def test_wire_action_normalization_preserves_local_classification_metadata():
+    for action_mode in ("plain", "redacted", "hash"):
+        config = _privacy_config(
+            action=action_mode,
+            resource="plain" if action_mode == "plain" else "redacted",
+        )
+        agent = RecordingAgent()
+        client = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+        classification = _classification(config)
+        before_metadata = classification.backend_metadata()
+        before_evidence = classification.local_evidence_metadata()
+
+        client.evaluate(classification)
+
+        after_metadata = classification.backend_metadata()
+        after_evidence = classification.local_evidence_metadata()
+        assert after_metadata == before_metadata
+        assert after_evidence == before_evidence
+
+
+def test_public_wire_contract_action_inventory_matches_sender():
+    spec = _contract_action_spec()
+    dotted = runtime_gate_module._DOTTED_WIRE_ACTION_RE
+    hash_pattern = re.compile(spec["hash_pattern"])
+    plain_agent = RecordingAgent()
+    redacted_agent = RecordingAgent()
+    hash_agent = RecordingAgent()
+    plain_config = _privacy_config(action="plain", resource="plain")
+    redacted_config = _privacy_config(action="redacted")
+    hash_config = _privacy_config(action="hash", resource="redacted")
+
+    RuntimeGateClient(
+        agent=plain_agent,
+        config=plain_config,
+        control_grant={"id": "grant"},
+    ).evaluate(_classification(plain_config))
+    RuntimeGateClient(
+        agent=redacted_agent,
+        config=redacted_config,
+        control_grant={"id": "grant"},
+    ).evaluate(_classification(redacted_config))
+    RuntimeGateClient(
+        agent=hash_agent,
+        config=hash_config,
+        control_grant={"id": "grant"},
+    ).evaluate(_classification(hash_config))
+
+    assert dotted.fullmatch(plain_agent.calls[0]["action"])
+    assert redacted_agent.calls[0]["action"] == spec["redacted_exact"]
+    assert hash_pattern.fullmatch(hash_agent.calls[0]["action"])
 
 
 def _package_classification(config: ProxyConfig):
@@ -1579,9 +1892,9 @@ def test_runtime_gate_accepts_contract_environment_values(environment):
 def test_runtime_gate_rejects_contract_invalid_mcp_proxy_environment_before_http():
     config = _config()
     agent = RecordingAgent()
-    invalid = deepcopy(
-        _public_wire_contract()["invalid_request_fixtures"][0]["body_patch"]
-    )
+    fixtures = _public_wire_contract()["invalid_request_fixtures"]
+    invalid_fixture = next(item for item in fixtures if item["name"] == "legacy_mcp_proxy_environment")
+    invalid = deepcopy(invalid_fixture["body_patch"])
 
     with pytest.raises(ValueError, match="environment invalid") as exc_info:
         RuntimeGateClient(

@@ -21,6 +21,11 @@
       "payload_hash": "sha256:<64 lowercase hex>",
       "policy_context_hash": "<64 lowercase hex>"
     },
+    "action": {
+      "plain_pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$",
+      "redacted_exact": "privacy.redacted",
+      "hash_pattern": "^privacy\\.h[0-9a-f]{64}$"
+    },
     "install_clone_context": {
       "required": [
         "operation",
@@ -184,6 +189,16 @@
     }
   ],
   "invalid_request_fixtures": [
+    {
+      "name": "legacy_redacted_action_token",
+      "body_patch": {"action": "redacted"},
+      "expected_error": "action"
+    },
+    {
+      "name": "legacy_hash_action_token",
+      "body_patch": {"action": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+      "expected_error": "action"
+    },
     {
       "name": "legacy_mcp_proxy_environment",
       "body_patch": {"environment": "mcp_proxy"},
