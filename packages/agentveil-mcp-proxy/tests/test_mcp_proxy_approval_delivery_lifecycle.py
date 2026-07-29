@@ -381,6 +381,7 @@ def test_stale_foreign_runtime_manifest_is_not_reused(tmp_path, monkeypatch):
     home = tmp_path / "home"
     proxy_dir = home / "mcp-proxy"
     proxy_dir.mkdir(parents=True)
+    os.chmod(proxy_dir, 0o700)
     token = "fixture-session-token-not-real"
     save_manifest(
         proxy_dir,
@@ -409,6 +410,7 @@ def test_matching_runtime_manifest_is_reused(tmp_path, monkeypatch):
     home = tmp_path / "home"
     proxy_dir = home / "mcp-proxy"
     proxy_dir.mkdir(parents=True)
+    os.chmod(proxy_dir, 0o700)
     token = "fixture-session-token-not-real"
     identity = current_approval_center_runtime_identity()
     save_manifest(
@@ -483,6 +485,7 @@ def test_runtime_fingerprint_changes_when_evidence_dependency_drifts(tmp_path):
 def test_lifecycle_lock_serializes_concurrent_processes(tmp_path):
     home = tmp_path / "home"
     (home / "mcp-proxy").mkdir(parents=True)
+    os.chmod(home / "mcp-proxy", 0o700)
     log_path = tmp_path / "lock-log.txt"
     log_path.write_text("", encoding="utf-8")
     worker = tmp_path / "lock_worker.py"
@@ -529,6 +532,7 @@ def test_stale_lifecycle_lock_recovers(tmp_path, monkeypatch):
     home = tmp_path / "home"
     proxy_dir = home / "mcp-proxy"
     proxy_dir.mkdir(parents=True)
+    os.chmod(proxy_dir, 0o700)
     lock_path = proxy_dir / "approval-center.lifecycle.lock"
     lock_path.write_text("99999999\n", encoding="utf-8")
     monkeypatch.setattr(
@@ -574,6 +578,7 @@ def test_runtime_mismatch_reconcile_avoids_ephemeral_fallback(tmp_path, monkeypa
     home = tmp_path / "home"
     proxy_dir = home / "mcp-proxy"
     proxy_dir.mkdir(parents=True)
+    os.chmod(proxy_dir, 0o700)
     token = "fixture-session-token-not-real"
     save_manifest(
         proxy_dir,
@@ -726,6 +731,7 @@ def test_unowned_pid_not_terminated_on_prepare(tmp_path, monkeypatch):
     home = tmp_path / "home"
     proxy_dir = home / "mcp-proxy"
     proxy_dir.mkdir(parents=True)
+    os.chmod(proxy_dir, 0o700)
     foreign_pid = os.getpid()
     token = "fixture-session-token-not-real"
     save_manifest(

@@ -28,6 +28,7 @@ from agentveil_mcp_proxy.client_packs import (
     get_client_pack,
     normalize_client_pack_ids,
 )
+from agentveil_mcp_proxy.control_artifacts import write_atomic_control_file
 from agentveil_mcp_proxy.policy import build_redirect_automation_metadata
 from agentveil_mcp_proxy.role_doctor import (
     REDIRECT_LINEAGE_MAX_AGE_SECONDS,
@@ -306,14 +307,8 @@ def write_hook_runtime_binding(proxy_home: Path, binding: HookRuntimeBinding) ->
         owner_pid=binding.owner_pid,
         instance_token=binding.instance_token,
     )
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = target.with_suffix(".tmp")
-    temp_path.write_text(json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n", encoding="utf-8")
-    temp_path.replace(target)
-    try:
-        target.chmod(0o600)
-    except OSError:
-        pass
+    body = json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n"
+    write_atomic_control_file(target, body.encode("utf-8"))
 
 
 def clear_hook_runtime_binding(

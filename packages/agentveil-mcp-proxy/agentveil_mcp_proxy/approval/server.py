@@ -50,6 +50,12 @@ from agentveil_mcp_proxy.evidence.observability import (
     verified_redirect_projection_rows,
 )
 from agentveil_mcp_proxy.evidence.store import ApprovalStatus
+from agentveil_mcp_proxy.control_artifacts import (
+    ControlArtifactError,
+    ensure_control_directory,
+    open_exclusive_control_file,
+    rewrite_locked_control_file,
+)
 
 
 MAX_POST_BODY_BYTES = 8192
@@ -222,25 +228,29 @@ def publish_owner_claim(
     cannot revive a stale token/session pair.
     """
 
-    claim_dir.mkdir(parents=True, exist_ok=True)
     path = _owner_claim_path(claim_dir, pid, instance_token)
     payload = {
         "pid": int(pid),
         "instance_token": instance_token,
         "session_id": session_id,
     }
-    fh = path.open("a+", encoding="utf-8")
+    try:
+        fh = open_exclusive_control_file(path)
+    except ControlArtifactError as exc:
+        raise OSError(exc.code) from None
     try:
         if not _try_exclusive_claim_lock(fh):
             raise OSError("owner claim lease is already held")
-        fh.seek(0)
-        fh.truncate()
-        fh.write(json.dumps(payload, separators=(",", ":")))
-        fh.flush()
+        # Mode 0600, full write, file+dir fsync — only after the lock is held.
+        # Secret bytes are written only after mode 0600 is verified.
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        rewrite_locked_control_file(fh, body, directory=path.parent)
+    except ControlArtifactError as exc:
         try:
-            path.chmod(0o600)
+            fh.close()
         except OSError:
             pass
+        raise OSError(exc.code) from None
     except Exception:
         try:
             fh.close()
@@ -2273,7 +2283,10 @@ class _ManagedCenterLifecycleLock:
         self._handle: Any | None = None
 
     def __enter__(self) -> "_ManagedCenterLifecycleLock":
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            ensure_control_directory(self._path.parent)
+        except ControlArtifactError as exc:
+            raise OSError(exc.code) from None
         deadline = time.monotonic() + self._timeout_seconds
         while True:
             try:

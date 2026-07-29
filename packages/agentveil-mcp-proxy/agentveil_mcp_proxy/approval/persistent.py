@@ -14,10 +14,16 @@ import secrets
 import socket
 import sys
 import time
-from typing import Any, Callable
+from typing import Any
+from typing import Callable as Callable
 from urllib.parse import urlsplit
 
-from agentveil_mcp_proxy.approval.server import ApprovalServer, ApprovalServerError
+from agentveil_mcp_proxy.approval.server import ApprovalServer
+from agentveil_mcp_proxy.approval.server import ApprovalServerError as ApprovalServerError
+from agentveil_mcp_proxy.control_artifacts import (
+    ControlArtifactError,
+    write_atomic_control_file,
+)
 
 
 MANIFEST_FILENAME = "approval-center.manifest.json"
@@ -173,13 +179,12 @@ def load_manifest(proxy_dir: Path) -> ApprovalCenterManifest | None:
 
 def save_manifest(proxy_dir: Path, manifest: ApprovalCenterManifest) -> None:
     path = manifest_path(proxy_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.tmp")
     payload = json.dumps(manifest.to_dict(), indent=2, sort_keys=True) + "\n"
-    with open(tmp_path, "w", encoding="utf-8") as handle:
-        handle.write(payload)
-    os.chmod(tmp_path, 0o600)
-    os.replace(tmp_path, path)
+    try:
+        write_atomic_control_file(path, payload.encode("utf-8"))
+    except ControlArtifactError as exc:
+        # Bounded error omits tokens, paths, and payload from caller-visible text.
+        raise PersistentApprovalCenterError(exc.code) from None
 
 
 def is_process_alive(pid: int | None) -> bool:
