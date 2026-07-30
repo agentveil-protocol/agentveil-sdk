@@ -24,19 +24,23 @@ generic filesystem framework).
 
 ## Guarantees
 
-- Control parent directories are created as real directories owned by the current
-  user with mode `0700`. Existing parents that are symlinks, non-directories,
-  wrong-owner, or any mode other than `0700` are rejected with a bounded error (no silent
-  chmod repair of an unsafe existing parent). Ancestors are not chmod'd.
-- Published files use mode `0600` from the first written byte (`O_EXCL` create +
-  `fchmod` where available). Owner-claim rewrite sets and verifies `0600` after
-  lock acquisition and before truncate/write of secrets.
+- Control parent directories are validated as real, non-symlink directories.
+  POSIX platforms additionally require current-user ownership and mode `0700`;
+  unsafe existing parents are rejected without silent chmod repair. Windows
+  retains the user-profile ACL inherited at creation because Python's POSIX
+  mode bits are not a meaningful Windows custody boundary. Ancestors are not
+  chmod'd.
+- Published files use `O_EXCL` creation. POSIX sets mode `0600` before the first
+  written byte and verifies it before owner-claim rewrite. Windows retains
+  inherited ACL custody while preserving type, link, and exclusive-create
+  checks.
 - Target and temp paths are opened with `O_NOFOLLOW` / `lstat` checks; symlink,
   non-regular, wrong-owner, and hardlinked claim targets are rejected.
-- Manifest and binding publish via exclusive temp + `fsync` + atomic `replace` +
-  directory `fsync`. Owner-claim publish writes the full payload, fsyncs the
-  file, and fsyncs the claim directory. Short/zero write and fsync failures are
-  not treated as successful publication.
+- Manifest and binding publish via exclusive temp + file `fsync` + atomic
+  `replace`; POSIX additionally fsyncs the directory. Owner-claim publish writes
+  the full payload and fsyncs the file, plus the claim directory on POSIX.
+  Short/zero write and supported fsync failures are not treated as successful
+  publication.
 - Owner-claim publish keeps the process-held OS lock; truncate/write happens only
   after exclusive lock acquisition. Concurrent same-claim publish has exactly one
   winner.

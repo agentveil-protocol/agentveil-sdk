@@ -27,14 +27,19 @@ class ControlArtifactError(RuntimeError):
         super().__init__(self.code)
 
 
+def _uses_posix_filesystem_custody() -> bool:
+    return os.name != "nt"
+
+
 def ensure_control_directory(path: Path) -> None:
-    """Create or validate one control directory with mode ``0700``.
+    """Create or validate one private control directory.
 
     Ancestors may be created with default umask. Only ``path`` itself is the
-    control directory that must be ``0700``, owned by the current user, a real
-    directory, and not a symlink.
+    control directory. It must be a real directory and not a symlink. POSIX
+    platforms additionally require mode ``0700`` and current-user ownership;
+    Windows relies on the user-profile ACL inherited at directory creation.
 
-    Existing directories with any mode other than ``0700`` are rejected
+    Existing POSIX directories with any mode other than ``0700`` are rejected
     with a bounded error (no silent chmod repair).
     """
 
@@ -61,7 +66,7 @@ def ensure_control_directory(path: Path) -> None:
         raise ControlArtifactError("control_directory_invalid") from exc
     _assert_safe_control_directory_stat(st, require_mode_0700=not created)
 
-    if created:
+    if created and _uses_posix_filesystem_custody():
         try:
             os.chmod(target, 0o700)
             st = os.lstat(target)
@@ -79,10 +84,11 @@ def _assert_safe_control_directory_stat(
         raise ControlArtifactError("control_directory_invalid")
     if not stat.S_ISDIR(info.st_mode):
         raise ControlArtifactError("control_directory_invalid")
-    if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
-        raise ControlArtifactError("control_directory_invalid")
-    if require_mode_0700 and stat.S_IMODE(info.st_mode) != 0o700:
-        raise ControlArtifactError("control_directory_invalid")
+    if _uses_posix_filesystem_custody():
+        if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+            raise ControlArtifactError("control_directory_invalid")
+        if require_mode_0700 and stat.S_IMODE(info.st_mode) != 0o700:
+            raise ControlArtifactError("control_directory_invalid")
 
 
 def write_atomic_control_file(path: Path, data: bytes) -> None:
@@ -113,11 +119,13 @@ def write_atomic_control_file(path: Path, data: bytes) -> None:
             fd = os.open(str(tmp_path), flags, 0o600)
         except OSError as exc:
             raise ControlArtifactError("control_artifact_write_failed") from exc
-        try:
-            if hasattr(os, "fchmod"):
+        if _uses_posix_filesystem_custody():
+            try:
+                if not hasattr(os, "fchmod"):
+                    raise ControlArtifactError("control_artifact_write_failed")
                 os.fchmod(fd, 0o600)
-        except OSError as exc:
-            raise ControlArtifactError("control_artifact_write_failed") from exc
+            except OSError as exc:
+                raise ControlArtifactError("control_artifact_write_failed") from exc
 
         _write_all(fd, payload)
         try:
@@ -188,15 +196,17 @@ def open_exclusive_control_file(path: Path) -> Any:
             return open_exclusive_control_file(target)
         except OSError as exc:
             raise ControlArtifactError("control_artifact_write_failed") from exc
-        try:
-            if hasattr(os, "fchmod"):
-                os.fchmod(fd, 0o600)
-        except OSError as exc:
+        if _uses_posix_filesystem_custody():
             try:
-                os.close(fd)
-            except OSError:
-                pass
-            raise ControlArtifactError("control_artifact_write_failed") from exc
+                if not hasattr(os, "fchmod"):
+                    raise ControlArtifactError("control_artifact_write_failed")
+                os.fchmod(fd, 0o600)
+            except OSError as exc:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise ControlArtifactError("control_artifact_write_failed") from exc
 
     try:
         info = os.fstat(fd)
@@ -229,14 +239,17 @@ def rewrite_locked_control_file(fh: Any, data: bytes, *, directory: Path) -> Non
         raise ControlArtifactError("control_artifact_write_failed") from exc
 
     try:
-        if hasattr(os, "fchmod"):
+        if _uses_posix_filesystem_custody():
+            if not hasattr(os, "fchmod"):
+                raise ControlArtifactError("control_artifact_write_failed")
             os.fchmod(fd, 0o600)
-        else:
-            raise ControlArtifactError("control_artifact_write_failed")
         info = os.fstat(fd)
     except OSError as exc:
         raise ControlArtifactError("control_artifact_write_failed") from exc
-    if stat.S_IMODE(info.st_mode) != 0o600:
+    if (
+        _uses_posix_filesystem_custody()
+        and stat.S_IMODE(info.st_mode) != 0o600
+    ):
         raise ControlArtifactError("control_artifact_write_failed")
     _assert_safe_claim_target_stat(info)
 
@@ -301,6 +314,8 @@ def _write_all(fd: int, data: bytes) -> None:
 
 
 def _fsync_directory(path: Path) -> None:
+    if not _uses_posix_filesystem_custody():
+        return
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
         flags |= os.O_DIRECTORY

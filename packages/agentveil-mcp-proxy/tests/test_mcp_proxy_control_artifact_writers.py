@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+import agentveil_mcp_proxy.control_artifacts as control_artifacts_module
 from agentveil_mcp_proxy.approval.persistent import (
     ApprovalCenterManifest,
     MANIFEST_SCHEMA_VERSION,
@@ -131,6 +132,77 @@ def test_ensure_control_directory_rejects_wrong_owner(tmp_path, monkeypatch):
     with pytest.raises(ControlArtifactError) as excinfo:
         ensure_control_directory(control)
     assert str(control) not in str(excinfo.value)
+
+
+def test_non_posix_directory_does_not_require_posix_mode_bits(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        control_artifacts_module,
+        "_uses_posix_filesystem_custody",
+        lambda: False,
+    )
+    control = tmp_path / "control"
+    control.mkdir(mode=0o755)
+    os.chmod(control, 0o755)
+
+    ensure_control_directory(control)
+
+
+def test_non_posix_atomic_writer_preserves_available_custody(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        control_artifacts_module,
+        "_uses_posix_filesystem_custody",
+        lambda: False,
+    )
+    control = tmp_path / "control"
+    control.mkdir(mode=0o755)
+    os.chmod(control, 0o755)
+    path = control / "artifact.json"
+
+    write_atomic_control_file(path, b'{"ok":true}')
+
+    assert path.read_bytes() == b'{"ok":true}'
+    assert path.is_file()
+    assert not path.is_symlink()
+
+
+def test_non_posix_rewrite_preserves_bounded_file_custody(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        control_artifacts_module,
+        "_uses_posix_filesystem_custody",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        os,
+        "fchmod",
+        lambda *_args: pytest.fail("non-POSIX path must not call fchmod"),
+        raising=False,
+    )
+    control = tmp_path / "control"
+    control.mkdir()
+    path = control / "x.claim"
+    path.write_bytes(b"old")
+
+    with open(path, "r+", encoding="utf-8", newline="") as fh:
+        rewrite_locked_control_file(fh, b'{"ok":true}', directory=control)
+
+    assert path.read_bytes() == b'{"ok":true}'
+
+
+def test_non_posix_directory_fsync_is_not_simulated(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        control_artifacts_module,
+        "_uses_posix_filesystem_custody",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        os,
+        "open",
+        lambda *_args, **_kwargs: pytest.fail(
+            "non-POSIX path must not open a directory for fsync"
+        ),
+    )
+
+    control_artifacts_module._fsync_directory(tmp_path)
 
 
 def test_save_manifest_parent_0700_and_file_0600(tmp_path):
