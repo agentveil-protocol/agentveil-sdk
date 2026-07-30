@@ -961,6 +961,100 @@ def test_generation_guard_on_passthrough(tmp_path: Path) -> None:
         passthrough.stop()
 
 
+class _EofBytes:
+    @staticmethod
+    def read1(_size: int) -> bytes:
+        return b""
+
+    read = read1
+
+
+class _EofStdout:
+    buffer = _EofBytes()
+
+
+class _EofProcess:
+    stdout = _EofStdout()
+
+    def __init__(self, poll_result: int | None):
+        self.poll_result = poll_result
+
+    def poll(self) -> int | None:
+        return self.poll_result
+
+
+class _RecordingApprovalManager:
+    def __init__(self) -> None:
+        self.reasons: list[str] = []
+        self.lock = threading.Lock()
+
+    def invalidate_all_bound_approvals(self, *, reason: str) -> None:
+        with self.lock:
+            self.reasons.append(reason)
+
+
+def _eof_passthrough(
+    manager: _RecordingApprovalManager,
+    *,
+    poll_result: int | None,
+    stopping: bool = False,
+) -> McpPassthrough:
+    passthrough = McpPassthrough(
+        DownstreamConfig(command=sys.executable),
+        approval_manager=manager,
+    )
+    passthrough.process = _EofProcess(poll_result)  # type: ignore[assignment]
+    passthrough._stopping = stopping
+    return passthrough
+
+
+def test_unexpected_stdout_eof_retires_bound_approvals_before_poll_updates() -> None:
+    manager = _RecordingApprovalManager()
+    passthrough = _eof_passthrough(manager, poll_result=None)
+
+    passthrough._read_stdout()
+    passthrough._read_stdout()
+
+    assert str(passthrough._downstream_error) == "downstream closed stdout"
+    assert manager.reasons == ["downstream_generation_changed"]
+
+
+def test_expected_stdout_eof_during_stop_does_not_retire_approvals() -> None:
+    manager = _RecordingApprovalManager()
+    passthrough = _eof_passthrough(manager, poll_result=None, stopping=True)
+
+    passthrough._read_stdout()
+
+    assert passthrough._downstream_error is None
+    assert manager.reasons == []
+
+
+def test_concurrent_exit_observers_retire_bound_approvals_once() -> None:
+    manager = _RecordingApprovalManager()
+    passthrough = _eof_passthrough(manager, poll_result=17)
+    start = threading.Barrier(3)
+
+    def _observe_stdout() -> None:
+        start.wait()
+        passthrough._read_stdout()
+
+    def _observe_process() -> None:
+        start.wait()
+        passthrough._note_downstream_process_exited()
+
+    stdout_observer = threading.Thread(target=_observe_stdout)
+    process_observer = threading.Thread(target=_observe_process)
+    stdout_observer.start()
+    process_observer.start()
+    start.wait()
+    stdout_observer.join(timeout=2)
+    process_observer.join(timeout=2)
+
+    assert not stdout_observer.is_alive()
+    assert not process_observer.is_alive()
+    assert manager.reasons == ["downstream_generation_changed"]
+
+
 def test_atomic_send_rejects_when_reconnect_wins_race(tmp_path: Path) -> None:
     """Approved stale request must not write after reconnect wins the lock."""
 
