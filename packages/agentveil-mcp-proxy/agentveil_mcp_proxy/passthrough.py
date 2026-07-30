@@ -1815,8 +1815,9 @@ class McpPassthrough:
     def _note_downstream_process_exited(self) -> None:
         """Latch unavailable and retire approvals bound to the dead generation."""
 
-        first_observation = self._downstream_error is None and not self._stopping
-        self._set_downstream_error(PassthroughError("downstream process exited"))
+        first_observation = self._set_downstream_error(
+            PassthroughError("downstream process exited")
+        )
         if first_observation:
             self._retire_pending_approvals_after_downstream_death()
 
@@ -4905,7 +4906,11 @@ class McpPassthrough:
                 if not self._stopping and proc.poll() is not None:
                     self._note_downstream_process_exited()
                 elif not self._stopping:
-                    self._set_downstream_error(PassthroughError("downstream closed stdout"))
+                    first_observation = self._set_downstream_error(
+                        PassthroughError("downstream closed stdout")
+                    )
+                    if first_observation:
+                        self._retire_pending_approvals_after_downstream_death()
                 return
 
             try:
@@ -5035,8 +5040,10 @@ class McpPassthrough:
     def _id_key(self, value: Any) -> str:
         return json.dumps(value, separators=(",", ":"), sort_keys=True, ensure_ascii=False)
 
-    def _set_downstream_error(self, error: PassthroughError) -> None:
+    def _set_downstream_error(self, error: PassthroughError) -> bool:
         with self._stdout_condition:
+            first_observation = not self._stopping and self._downstream_error is None
             if not self._stopping:
                 self._downstream_error = error
             self._stdout_condition.notify_all()
+            return first_observation
