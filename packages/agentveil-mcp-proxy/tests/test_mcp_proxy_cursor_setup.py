@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -358,6 +359,7 @@ def test_ensure_approval_center_spawn_failure_returns_without_long_wait(
 ) -> None:
     home = cursor_setup.setup_home(tmp_path)
     (home / "mcp-proxy").mkdir(parents=True, exist_ok=True)
+    os.chmod(home / "mcp-proxy", 0o700)
     (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
 
     def fail_spawn(**_kwargs):

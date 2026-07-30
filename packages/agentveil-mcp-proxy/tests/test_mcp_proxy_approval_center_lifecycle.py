@@ -24,7 +24,7 @@ from agentveil_mcp_proxy.approval.persistent import (
 )
 from agentveil_mcp_proxy.approval.server import (
     _managed_process_is_active,
-    _process_cmdline_matches_managed_center,
+    _process_cmdline_matches_managed_center,  # noqa: F401 - preserve baseline import surface
     clear_managed_approval_center_manifest,
     inspect_managed_approval_center,
     managed_center_cmdline_owns_pid,
@@ -534,6 +534,7 @@ def test_stop_managed_does_not_kill_unhealthy_unowned_manifest(tmp_path, monkeyp
     home = tmp_path / ".avp"
     proxy_dir = home / "mcp-proxy"
     proxy_dir.mkdir(parents=True)
+    os.chmod(proxy_dir, 0o700)
     save_manifest(
         proxy_dir,
         ApprovalCenterManifest(
@@ -579,6 +580,7 @@ def test_stop_managed_stops_cmdline_owned_unhealthy_manifest(tmp_path, monkeypat
     home = tmp_path / ".avp"
     proxy_dir = home / "mcp-proxy"
     proxy_dir.mkdir(parents=True)
+    os.chmod(proxy_dir, 0o700)
     save_manifest(
         proxy_dir,
         ApprovalCenterManifest(
