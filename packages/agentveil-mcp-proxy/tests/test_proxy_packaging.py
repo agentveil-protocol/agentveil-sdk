@@ -71,8 +71,8 @@ def test_proxy_package_depends_on_public_sdk():
         pyproject = tomllib.load(f)
 
     dependencies = pyproject["project"].get("dependencies", [])
-    assert pyproject["project"]["version"] == "0.7.36"
-    assert "agentveil>=0.7.21,<0.8" in dependencies
+    assert pyproject["project"]["version"] == "0.7.37"
+    assert "agentveil>=0.7.22,<0.8" in dependencies
 
 
 def test_release_acceptance_verifier_pins_proxy_and_backend_signers():

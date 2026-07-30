@@ -13,8 +13,24 @@
         "payload_hash",
         "risk_class",
         "policy_context_hash",
-        "install_clone_context"
+        "install_clone_context",
+        "content_risk_signals",
+        "paid_policy_route_kind"
       ]
+    },
+    "content_risk_signals": {
+      "exact_keys": [
+        "contains_secret_like_value",
+        "destructive_shell_pattern",
+        "write_then_execute_risk",
+        "credential_exfil_pattern"
+      ],
+      "value_type": "strict_boolean",
+      "raw_content_forbidden": true
+    },
+    "paid_policy_route_kind": {
+      "allowed_values": ["mcp_tools_call"],
+      "may_only_tighten_existing_decision": true
     },
     "environment": {"claim_check": "claim-check: allow production is a finite public wire enum value.", "allowed_values": ["production", "staging", "development", "unknown"], "default_client_value": "unknown"},
     "hash_formats": {
