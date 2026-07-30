@@ -32,6 +32,7 @@ from agentveil.exceptions import (
 from agentveil_mcp_proxy.approval import ApprovalManager, ApprovalServer
 from agentveil_mcp_proxy.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
 from agentveil_mcp_proxy.classification import ToolCallClassifier
+import agentveil_mcp_proxy.classification as classification_module
 from agentveil_mcp_proxy.evidence import (
     ApprovalEvidenceStore,
     ApprovalStatus,
@@ -446,6 +447,32 @@ def test_ask_backend_runtime_request_is_privacy_safe_metadata_only():
         "github.create_issue",
     ):
         assert forbidden not in body_text
+
+
+def test_runtime_gate_forwards_only_bounded_paid_content_risk_signals(monkeypatch):
+    signals = {
+        "contains_secret_like_value": True,
+        "destructive_shell_pattern": False,
+        "write_then_execute_risk": False,
+        "credential_exfil_pattern": False,
+    }
+    monkeypatch.setattr(
+        classification_module,
+        "derive_content_risk_signals",
+        lambda arguments: signals,
+    )
+    config = _config()
+    agent = RecordingAgent()
+    client = RuntimeGateClient(agent=agent, config=config, control_grant={"id": "grant"})
+
+    assert client.evaluate(_classification(config)).decision == "ALLOW"
+    call = agent.calls[0]
+    assert call["content_risk_signals"] == signals
+    assert call["paid_policy_route_kind"] == "mcp_tools_call"
+    body_text = json.dumps(call, sort_keys=True)
+    assert SECRET not in body_text
+    assert "summarize confidential plan" not in body_text
+    assert "ghp_secret_token" not in body_text
 
 
 def test_default_runtime_environment_is_unknown():

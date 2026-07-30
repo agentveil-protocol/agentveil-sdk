@@ -36,6 +36,10 @@ from agentveil.exceptions import (
     AVPServerError,
 )
 from agentveil.runtime_install_clone import validate_install_clone_context
+from agentveil.runtime_content_risk_signals import (
+    validate_content_risk_signals,
+    validate_paid_policy_route_kind,
+)
 
 log = logging.getLogger("agentveil")
 
@@ -1355,6 +1359,8 @@ class AVPAgent:
         risk_class: Optional[str] = None,
         policy_context_hash: Optional[str] = None,
         install_clone_context: Optional[dict] = None,
+        content_risk_signals: Optional[dict] = None,
+        paid_policy_route_kind: Optional[str] = None,
     ) -> dict:
         """
         Evaluate whether this agent may perform one action right now.
@@ -1392,6 +1398,18 @@ class AVPAgent:
         if install_clone_context is not None:
             body_data["install_clone_context"] = validate_install_clone_context(
                 install_clone_context
+            )
+        if content_risk_signals is not None:
+            body_data["content_risk_signals"] = validate_content_risk_signals(
+                content_risk_signals
+            )
+        if paid_policy_route_kind is not None:
+            if content_risk_signals is None:
+                raise AVPValidationError(
+                    "paid_policy_route_kind requires content_risk_signals"
+                )
+            body_data["paid_policy_route_kind"] = validate_paid_policy_route_kind(
+                paid_policy_route_kind
             )
         return self._post_json("/v1/runtime/evaluate", body_data)
 

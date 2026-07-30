@@ -27,6 +27,10 @@ from agentveil.delegation import DelegationInvalid, verify_delegation
 from agentveil.exceptions import AVPValidationError
 from agentveil.proof import ProofVerificationError, verify_signed_jcs
 from agentveil.runtime_install_clone import validate_install_clone_context
+from agentveil.runtime_content_risk_signals import (
+    PAID_POLICY_ROUTE_KIND_MCP_TOOLS_CALL,
+    validate_content_risk_signals,
+)
 from agentveil_mcp_proxy.circuit_breaker import (
     CircuitBreaker,
     CircuitBreakerOpenError,
@@ -134,6 +138,8 @@ class _RuntimeGateRequest:
     risk_class: str
     policy_context_hash: str
     install_clone_context: Mapping[str, Any] | None = None
+    content_risk_signals: Mapping[str, bool] | None = None
+    paid_policy_route_kind: str | None = None
 
 
 class RuntimeGateClient:
@@ -250,6 +256,12 @@ class RuntimeGateClient:
                     evaluate_kwargs["install_clone_context"] = dict(
                         request.install_clone_context
                     )
+                if request.content_risk_signals is not None:
+                    evaluate_kwargs["content_risk_signals"] = dict(
+                        request.content_risk_signals
+                    )
+                if request.paid_policy_route_kind is not None:
+                    evaluate_kwargs["paid_policy_route_kind"] = request.paid_policy_route_kind
                 response = self.agent.runtime_evaluate(**evaluate_kwargs)
             except Exception as exc:
                 raise _classify_runtime_request_error(exc) from exc
@@ -305,6 +317,7 @@ class RuntimeGateClient:
     def _build_request(self, classification: ClassifiedToolCall) -> _RuntimeGateRequest:
         metadata = classification.backend_metadata()
         install_clone_context = metadata.get("install_clone_context")
+        content_risk_signals = metadata.get("content_risk_signals")
         if install_clone_context is not None:
             if not isinstance(install_clone_context, Mapping):
                 raise RuntimeGateUnavailableError("install_clone_context invalid")
@@ -312,6 +325,11 @@ class RuntimeGateClient:
                 install_clone_context = validate_install_clone_context(install_clone_context)
             except AVPValidationError as exc:
                 raise RuntimeGateUnavailableError("install_clone_context invalid") from exc
+        if content_risk_signals is not None:
+            try:
+                content_risk_signals = validate_content_risk_signals(content_risk_signals)
+            except AVPValidationError as exc:
+                raise RuntimeGateUnavailableError("content_risk_signals invalid") from exc
         return _RuntimeGateRequest(
             action=_wire_action_from_metadata(self.config.privacy.action, metadata),
             resource=_runtime_field(metadata.get("resource")),
@@ -323,6 +341,12 @@ class RuntimeGateClient:
                 "policy_context_hash",
             ),
             install_clone_context=install_clone_context,
+            content_risk_signals=content_risk_signals,
+            paid_policy_route_kind=(
+                PAID_POLICY_ROUTE_KIND_MCP_TOOLS_CALL
+                if content_risk_signals is not None
+                else None
+            ),
         )
 
     def _decision_receipt_jcs(self, response: Mapping[str, Any]) -> str:

@@ -38,6 +38,7 @@ from agentveil_mcp_proxy.policy import (
     RiskClass,
     ToolCallContext,
 )
+from agentveil_mcp_proxy.content_risk_signals import derive_content_risk_signals
 
 
 HASH_PREFIX = "sha256:"
@@ -300,6 +301,7 @@ class ClassifiedToolCall:
     role: str | None = None
     authority: str | None = None
     metadata_evidence: Mapping[str, Any] | None = None
+    content_risk_signals: Mapping[str, bool] | None = None
 
     def backend_metadata(self) -> dict[str, Any]:
         """Return privacy-filtered metadata intended for later backend calls."""
@@ -324,6 +326,8 @@ class ClassifiedToolCall:
         )
         if install_clone_context is not None:
             metadata["install_clone_context"] = install_clone_context
+        if self.content_risk_signals is not None:
+            metadata["content_risk_signals"] = dict(self.content_risk_signals)
         return metadata
 
     def local_evidence_metadata(self) -> dict[str, Any]:
@@ -397,6 +401,7 @@ class ToolCallClassifier:
         if tool in _PACKAGE_INSTALL_CLONE_CONTEXT_TOOLS:
             collected = collect_install_metadata_evidence(tool=tool, arguments=args)
             metadata_evidence = collected or None
+        content_risk_signals = derive_content_risk_signals(args)
         return ClassifiedToolCall(
             server=self.server_name,
             tool=tool,
@@ -413,6 +418,7 @@ class ToolCallClassifier:
             role=context.role,
             authority=context.authority,
             metadata_evidence=metadata_evidence,
+            content_risk_signals=content_risk_signals,
         )
 
 

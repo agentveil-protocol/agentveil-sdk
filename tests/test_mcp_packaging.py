@@ -52,7 +52,9 @@ def test_sdk_release_version_is_synchronized():
         and any(isinstance(target, ast.Name) and target.id == "__version__" for target in node.targets)
     )
 
-    assert pyproject["project"]["version"] == "0.7.21"
+    # The root SDK and its legacy MCP entry point share one distribution
+    # version. This test enforces that they stay synchronized across releases;
+    # it must not pin a historical release number.
     assert ast.literal_eval(version_node) == pyproject["project"]["version"]
 
 
