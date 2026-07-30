@@ -205,6 +205,31 @@ def test_non_posix_directory_fsync_is_not_simulated(tmp_path, monkeypatch):
     control_artifacts_module._fsync_directory(tmp_path)
 
 
+def test_missing_o_cloexec_uses_available_exclusive_flags(tmp_path, monkeypatch):
+    monkeypatch.delattr(os, "O_CLOEXEC", raising=False)
+    control = _secure_dir(tmp_path / "control")
+    artifact = control / "artifact.json"
+
+    write_atomic_control_file(artifact, b'{"ok":true}')
+    lease = publish_owner_claim(
+        control,
+        pid=os.getpid(),
+        instance_token="no-cloexec",
+        session_id="session",
+    )
+    try:
+        assert artifact.read_bytes() == b'{"ok":true}'
+        claim = read_owner_claim(
+            control,
+            os.getpid(),
+            instance_token="no-cloexec",
+        )
+        assert claim is not None
+        assert claim["session_id"] == "session"
+    finally:
+        clear_owner_claim(lease)
+
+
 def test_save_manifest_parent_0700_and_file_0600(tmp_path):
     proxy_dir = tmp_path / "proxy"
     previous = os.umask(0o000)

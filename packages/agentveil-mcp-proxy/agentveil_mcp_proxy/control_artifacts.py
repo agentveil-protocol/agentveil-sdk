@@ -108,7 +108,7 @@ def write_atomic_control_file(path: Path, data: bytes) -> None:
     tmp_path = target.with_name(
         f".{target.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
     )
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
 
@@ -178,7 +178,7 @@ def open_exclusive_control_file(path: Path) -> Any:
 
     if existing is not None:
         _assert_safe_claim_target_stat(existing)
-        flags = os.O_RDWR | os.O_CLOEXEC
+        flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         try:
@@ -186,7 +186,7 @@ def open_exclusive_control_file(path: Path) -> Any:
         except OSError as exc:
             raise ControlArtifactError("control_artifact_write_failed") from exc
     else:
-        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         try:
