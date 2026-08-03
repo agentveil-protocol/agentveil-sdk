@@ -39,6 +39,8 @@ def build_auth_header(
     path: str,
     body: bytes = b"",
     params: dict | list[tuple[str, object]] | None = None,
+    *,
+    force_v2: bool = False,
 ) -> dict[str, str]:
     """
     Build AVP-Sig Authorization header.
@@ -54,13 +56,18 @@ def build_auth_header(
         body: Request body bytes
         params: Optional query params. When provided, signs AVP-Sig v2 with
             canonical query binding.
+        force_v2: When True, sign AVP-Sig v2 even when the canonical query is
+            empty. Non-boolean values are rejected before signing.
     """
+    if not isinstance(force_v2, bool):
+        raise TypeError("force_v2 must be a bool")
+
     ts = int(time.time())
     nonce = secrets.token_hex(16)
     body_hash = hashlib.sha256(body).hexdigest()
 
     canonical_query = canonicalize_query_params(params)
-    sig_version = "2" if canonical_query else "1"
+    sig_version = "2" if canonical_query or force_v2 else "1"
     if sig_version == "2":
         message = f"v2:{method}:{path}:{canonical_query}:{ts}:{nonce}:{body_hash}"
     else:

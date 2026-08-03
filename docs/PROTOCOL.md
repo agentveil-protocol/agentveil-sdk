@@ -19,6 +19,9 @@ Keys stored locally: ~/.avp/agents/{name}.json (chmod 0600)
 
 All authenticated write operations are signed. Authenticated requests with
 query parameters use AVP-Sig v2 so query values are covered by the signature.
+Callers may also opt into AVP-Sig v2 for queryless requests by passing
+`force_v2=True` to `build_auth_header`; the default remains AVP-Sig v1 when
+the canonical query is empty.
 
 Authorization: AVP-Sig did="...", ts="...", nonce="...", sig="..."
 
@@ -31,6 +34,9 @@ AVP-Sig v2 adds canonical query binding:
 Authorization: AVP-Sig v="2",did="...",ts="...",nonce="...",sig="..."
 
 v2:{METHOD}:{PATH}:{canonical_query}:{timestamp}:{nonce}:{sha256(body)}
+
+For queryless v2 requests the canonical query segment is empty:
+`v2:{METHOD}:{PATH}::{timestamp}:{nonce}:{sha256(body)}`.
 
 The canonical query string is built by decoding query parameters, preserving
 repeated and blank values, sorting by key and value, then percent-encoding with
