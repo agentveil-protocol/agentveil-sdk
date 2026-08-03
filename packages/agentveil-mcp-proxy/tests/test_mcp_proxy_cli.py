@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 import agentveil_mcp_proxy.cli as proxy_cli
+import agentveil_mcp_proxy.console_credentials as console_creds
 from agentveil.delegation import verify_delegation
 from agentveil.exceptions import AVPNotFoundError, AVPServerError, AVPValidationError
 from agentveil_mcp_proxy.cli import (
@@ -33,6 +34,18 @@ from agentveil_mcp_proxy.cli import (
     reissue_grant,
     run_proxy,
     smoke_proxy,
+)
+from agentveil_mcp_proxy.console_credentials import (
+    CREDENTIAL_SCOPE,
+    credential_path,
+    load_credential,
+    save_credential,
+)
+from agentveil_mcp_proxy.console_pairing_client import (
+    PairingClientError,
+    PairingStart,
+    PairingToken,
+    RevokeOutcome,
 )
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore, PendingApproval
 from agentveil_mcp_proxy.identity import encrypted_identity_payload, load_agent_from_identity
@@ -3226,3 +3239,313 @@ def test_demo_human_output_omits_role_presets_hint(tmp_path, capsys):
     ]) == 0
     text = capsys.readouterr().out
     assert proxy_cli._ROLE_PRESETS_DISCOVERABILITY_HINT not in text
+
+
+# --- Console login / logout (Slice 4) --------------------------------------
+
+CONSOLE_DEVICE_CODE = "device-code-secret-cli"
+CONSOLE_USER_CODE = "ABCD-2468"
+CONSOLE_TOKEN = "confirmed-device-token-secret-cli"
+CONSOLE_URL = "https://agentveil.dev/console/pairing"
+
+
+def _console_start() -> PairingStart:
+    return PairingStart(
+        device_code=CONSOLE_DEVICE_CODE,
+        user_code=CONSOLE_USER_CODE,
+        verification_url=CONSOLE_URL,
+        expires_in=600,
+        interval=5,
+    )
+
+
+class _FakeConsoleClient:
+    def __init__(
+        self,
+        *,
+        start=None,
+        token=None,
+        start_error=None,
+        poll_error=None,
+        revoke_result=None,
+        revoke_error=None,
+        fail_if_used=False,
+    ):
+        self._start = start
+        self._token = token
+        self._start_error = start_error
+        self._poll_error = poll_error
+        self._revoke_result = revoke_result
+        self._revoke_error = revoke_error
+        self._fail_if_used = fail_if_used
+        self.started = False
+        self.polled = False
+        self.revoked_with = None
+        self.revoke_calls: list[str] = []
+
+    def start(self):
+        if self._fail_if_used:
+            raise AssertionError("network start() must not be called")
+        self.started = True
+        if self._start_error is not None:
+            raise self._start_error
+        return self._start
+
+    def poll_for_token(self, start):
+        self.polled = True
+        if self._poll_error is not None:
+            raise self._poll_error
+        return self._token
+
+    def revoke(self, token):
+        if self._fail_if_used:
+            raise AssertionError("network revoke() must not be called")
+        self.revoke_calls.append(token)
+        self.revoked_with = token
+        if self._revoke_error is not None:
+            raise self._revoke_error
+        return self._revoke_result
+
+
+def _install_console_client(monkeypatch, client):
+    monkeypatch.setattr(proxy_cli, "_console_pairing_client", lambda: client)
+
+
+def test_login_and_logout_registered_in_parser():
+    parser = proxy_cli.build_parser()
+    assert parser.parse_args(["login", "--no-open"]).command == "login"
+    assert parser.parse_args(["logout"]).command == "logout"
+
+
+def test_login_full_flow_writes_credential(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    client = _FakeConsoleClient(
+        start=_console_start(),
+        token=PairingToken(token=CONSOLE_TOKEN, scope=CREDENTIAL_SCOPE),
+    )
+    _install_console_client(monkeypatch, client)
+
+    exit_code = main(["login", "--no-open"])
+    out, _err = capsys.readouterr()
+
+    assert exit_code == 0
+    assert CONSOLE_URL in out
+    assert CONSOLE_USER_CODE in out
+    assert "Connected to AgentVeil Console." in out
+    # The command output excludes the device code and confirmed token.
+    assert CONSOLE_DEVICE_CODE not in out
+    assert CONSOLE_TOKEN not in out
+
+    stored = load_credential(home=home)
+    assert stored is not None
+    assert stored.token == CONSOLE_TOKEN
+    assert stored.scope == CREDENTIAL_SCOPE
+    path = credential_path(home=home)
+    if os.name != "nt":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_login_browser_opens_after_instruction(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    client = _FakeConsoleClient(
+        start=_console_start(),
+        token=PairingToken(token=CONSOLE_TOKEN, scope=CREDENTIAL_SCOPE),
+    )
+    stream = io.StringIO()
+    recorded = {}
+
+    def _fake_open(url):
+        recorded["url"] = url
+        recorded["output_before_open"] = stream.getvalue()
+        return True
+
+    assert (
+        proxy_cli.run_console_login_cli(
+            open_browser=True,
+            client=client,
+            browser_open=_fake_open,
+            out=stream,
+        )
+        == 0
+    )
+    assert recorded["url"] == CONSOLE_URL
+    assert CONSOLE_USER_CODE in recorded["output_before_open"]
+
+
+def test_login_no_open_does_not_open_browser(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    client = _FakeConsoleClient(
+        start=_console_start(),
+        token=PairingToken(token=CONSOLE_TOKEN, scope=CREDENTIAL_SCOPE),
+    )
+    _install_console_client(monkeypatch, client)
+    opened = []
+    monkeypatch.setattr(proxy_cli.webbrowser, "open", lambda url: opened.append(url))
+
+    assert main(["login", "--no-open"]) == 0
+    assert opened == []
+
+
+def test_login_existing_credential_is_not_overwritten(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    save_credential(CONSOLE_TOKEN, home=home)
+    client = _FakeConsoleClient(fail_if_used=True)
+    _install_console_client(monkeypatch, client)
+
+    exit_code = main(["login"])
+    out, _err = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "Already connected" in out
+    assert client.started is False
+    assert load_credential(home=home).token == CONSOLE_TOKEN
+
+
+def test_login_credential_write_failure_leaves_no_partial(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    client = _FakeConsoleClient(
+        start=_console_start(),
+        token=PairingToken(token=CONSOLE_TOKEN, scope=CREDENTIAL_SCOPE),
+    )
+    _install_console_client(monkeypatch, client)
+
+    def _boom(*_args, **_kwargs):
+        raise console_creds.CredentialError("credential_write_failed")
+
+    monkeypatch.setattr(console_creds, "_atomic_write_to_directory_fd", _boom)
+
+    exit_code = main(["login", "--no-open"])
+    _out, err = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "ERROR:" in err
+    assert not credential_path(home=home).exists()
+    assert CONSOLE_TOKEN not in err
+    assert client.revoke_calls == [CONSOLE_TOKEN]
+
+
+def test_login_store_failure_revokes_orphan_token(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    client = _FakeConsoleClient(
+        start=_console_start(),
+        token=PairingToken(token=CONSOLE_TOKEN, scope=CREDENTIAL_SCOPE),
+        revoke_result=RevokeOutcome.REVOKED,
+    )
+    _install_console_client(monkeypatch, client)
+
+    def _boom(*_args, **_kwargs):
+        raise console_creds.CredentialError("credential_write_failed")
+
+    monkeypatch.setattr(console_creds, "_atomic_write_to_directory_fd", _boom)
+
+    exit_code = main(["login", "--no-open"])
+    _out, err = capsys.readouterr()
+
+    assert exit_code == 1
+    assert client.revoke_calls == [CONSOLE_TOKEN]
+    assert "ERROR:" in err
+
+
+def test_login_recheck_revokes_token_when_credential_appears(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    client = _FakeConsoleClient(
+        start=_console_start(),
+        token=PairingToken(token="orphan-token-value", scope=CREDENTIAL_SCOPE),
+        revoke_result=RevokeOutcome.REVOKED,
+    )
+    _install_console_client(monkeypatch, client)
+    save_credential(CONSOLE_TOKEN, home=home)
+
+    calls = {"count": 0}
+    original_load = proxy_cli.load_credential
+
+    def _load_once_then_existing(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] <= 1:
+            return None
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(proxy_cli, "load_credential", _load_once_then_existing)
+
+    exit_code = main(["login", "--no-open"])
+    out, _err = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "Already connected" in out
+    assert client.revoke_calls == ["orphan-token-value"]
+    assert load_credential(home=home).token == CONSOLE_TOKEN
+
+
+def test_logout_without_credential_is_idempotent(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+
+    def _no_client():
+        raise AssertionError("logout must not build a client without a credential")
+
+    monkeypatch.setattr(proxy_cli, "_console_pairing_client", _no_client)
+
+    exit_code = main(["logout"])
+    out, _err = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "Not connected to AgentVeil Console." in out
+
+
+def test_logout_revoked_removes_credential(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    save_credential(CONSOLE_TOKEN, home=home)
+    client = _FakeConsoleClient(revoke_result=RevokeOutcome.REVOKED)
+    _install_console_client(monkeypatch, client)
+
+    exit_code = main(["logout"])
+    out, _err = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "Disconnected from AgentVeil Console." in out
+    assert client.revoked_with == CONSOLE_TOKEN
+    assert not credential_path(home=home).exists()
+    assert CONSOLE_TOKEN not in out
+
+
+def test_logout_unauthorized_removes_credential(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    save_credential(CONSOLE_TOKEN, home=home)
+    client = _FakeConsoleClient(revoke_result=RevokeOutcome.ALREADY_UNAVAILABLE)
+    _install_console_client(monkeypatch, client)
+
+    exit_code = main(["logout"])
+    out, _err = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "already" in out.lower()
+    assert not credential_path(home=home).exists()
+
+
+def test_logout_ambiguous_preserves_credential(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    save_credential(CONSOLE_TOKEN, home=home)
+    client = _FakeConsoleClient(
+        revoke_error=PairingClientError("transport_failed")
+    )
+    _install_console_client(monkeypatch, client)
+
+    exit_code = main(["logout"])
+    out, err = capsys.readouterr()
+
+    assert exit_code == 1
+    assert credential_path(home=home).exists()
+    assert load_credential(home=home).token == CONSOLE_TOKEN
+    assert "ERROR:" in err
+    assert CONSOLE_TOKEN not in out
+    assert CONSOLE_TOKEN not in err

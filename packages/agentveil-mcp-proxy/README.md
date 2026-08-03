@@ -270,6 +270,8 @@ for your specific downstream server.
 
 | Command | Purpose |
 |---|---|
+| `login` | Connect this machine to the optional AgentVeil Console via device pairing. |
+| `logout` | Revoke the Console device token and remove the local credential. |
 | `init` | Create encrypted identity, config, and control grant. |
 | `init --quickstart-filesystem <path>` | Configure the built-in filesystem downstream for local first run. |
 | `doctor` | Validate local files and control grant. |
@@ -292,6 +294,27 @@ for your specific downstream server.
 | `setup status --json` | Print bounded connector/proxy status. |
 | `setup remove <cursor|claude-code|codex|gemini-cli>` | Preview managed connector removal. |
 | `setup remove <cursor|claude-code|codex|gemini-cli> --yes` | Remove only AgentVeil-managed connector entries. |
+
+## Connect To AgentVeil Console (Optional)
+
+If you use the hosted AgentVeil Console, you can connect this machine with a
+short device-pairing flow:
+
+```bash
+agentveil-mcp-proxy login
+agentveil-mcp-proxy logout
+```
+
+`login` prints a verification URL and a short code, attempts to open the URL in
+your browser (use `--no-open` for headless/terminal use), and stores a single
+device token locally at `~/.avp/console/device-token.json` with owner-only
+`0600` permissions. `logout` revokes that token with the Console and removes the
+local file.
+
+Connecting to Console is optional. It does not activate paid, Team, policy, or
+project-sync features, and it does not change how routed MCP calls or project
+connectors are controlled locally. The stored token grants only the
+`bounded_summary_upload` scope.
 
 ## Relationship To AgentVeil
 

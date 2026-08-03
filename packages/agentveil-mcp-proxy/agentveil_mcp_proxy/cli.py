@@ -32,6 +32,7 @@ import sys
 import tempfile
 import threading
 import time
+import webbrowser
 from typing import Any, Callable, Iterable, Mapping, TextIO
 from urllib.parse import quote, urlencode
 from urllib.request import HTTPCookieProcessor, Request, build_opener
@@ -203,6 +204,18 @@ from agentveil_mcp_proxy.cursor_setup import (
     CursorSetupError,
 )
 from agentveil_mcp_proxy.runtime_gate import RuntimeGateClient
+from agentveil_mcp_proxy.console_credentials import (
+    CredentialError,
+    console_login_lock,
+    delete_credential,
+    load_credential,
+    save_credential,
+)
+from agentveil_mcp_proxy.console_pairing_client import (
+    ConsolePairingClient,
+    PairingClientError,
+    RevokeOutcome,
+)
 
 
 DEFAULT_BASE_URL = "https://agentveil.dev"
@@ -3732,6 +3745,161 @@ _ROOT_CLI_EPILOG = (
 )
 
 
+def _console_pairing_client() -> ConsolePairingClient:
+    return ConsolePairingClient()
+
+
+def _revoke_orphan_console_token(
+    pairing: ConsolePairingClient,
+    token: str,
+) -> None:
+    """Best-effort revoke when local custody cannot retain a confirmed token."""
+
+    try:
+        pairing.revoke(token)
+    except PairingClientError:
+        pass
+
+
+def run_console_login_cli(
+    *,
+    open_browser: bool = True,
+    client: ConsolePairingClient | None = None,
+    browser_open: Callable[[str], Any] | None = None,
+    out: TextIO | None = None,
+) -> int:
+    """Connect this machine to AgentVeil Console via device pairing."""
+
+    stream = out or sys.stdout
+    try:
+        with console_login_lock():
+            try:
+                existing = load_credential()
+            except CredentialError as exc:
+                raise ProxyCliError(
+                    f"Existing Console credential is unreadable ({exc.code}). "
+                    "Run logout or remove it, then retry.",
+                    exit_code=1,
+                ) from exc
+            if existing is not None:
+                print(
+                    "Already connected to AgentVeil Console. Run logout first.",
+                    file=stream,
+                )
+                return 0
+
+            pairing = client or _console_pairing_client()
+            try:
+                start = pairing.start()
+                print(
+                    f"To connect, open {start.verification_url} "
+                    f"and enter code {start.user_code}.",
+                    file=stream,
+                )
+                if open_browser:
+                    opener = browser_open or webbrowser.open
+                    try:
+                        opener(start.verification_url)
+                    except Exception:
+                        # Inability to open a browser is non-fatal: the URL and
+                        # code were already printed for manual entry.
+                        pass
+                token = pairing.poll_for_token(start)
+            except PairingClientError as exc:
+                raise ProxyCliError(
+                    f"Login failed ({exc.code}); not connected to AgentVeil Console.",
+                    exit_code=1,
+                ) from exc
+
+            try:
+                existing = load_credential()
+            except CredentialError as exc:
+                _revoke_orphan_console_token(pairing, token.token)
+                raise ProxyCliError(
+                    f"Existing Console credential is unreadable ({exc.code}). "
+                    "Run logout or remove it, then retry.",
+                    exit_code=1,
+                ) from exc
+            if existing is not None:
+                _revoke_orphan_console_token(pairing, token.token)
+                print(
+                    "Already connected to AgentVeil Console. Run logout first.",
+                    file=stream,
+                )
+                return 0
+
+            try:
+                save_credential(token.token, scope=token.scope)
+            except CredentialError as exc:
+                _revoke_orphan_console_token(pairing, token.token)
+                raise ProxyCliError(
+                    f"Login could not store the credential ({exc.code}); not connected.",
+                    exit_code=1,
+                ) from exc
+    except CredentialError as exc:
+        if exc.code == "login_in_progress":
+            raise ProxyCliError(
+                "Another Console login is already in progress.",
+                exit_code=1,
+            ) from exc
+        raise ProxyCliError(
+            f"Console login custody check failed ({exc.code}).",
+            exit_code=1,
+        ) from exc
+
+    print("Connected to AgentVeil Console.", file=stream)
+    return 0
+
+
+def run_console_logout_cli(
+    *,
+    client: ConsolePairingClient | None = None,
+    out: TextIO | None = None,
+) -> int:
+    """Disconnect this machine from AgentVeil Console."""
+
+    stream = out or sys.stdout
+    try:
+        credential = load_credential()
+    except CredentialError as exc:
+        raise ProxyCliError(
+            f"Local Console credential is unreadable ({exc.code}); kept in "
+            "place. Remove it manually if needed.",
+            exit_code=1,
+        ) from exc
+    if credential is None:
+        print("Not connected to AgentVeil Console.", file=stream)
+        return 0
+
+    pairing = client or _console_pairing_client()
+    try:
+        outcome = pairing.revoke(credential.token)
+    except PairingClientError as exc:
+        raise ProxyCliError(
+            f"Logout could not confirm revocation ({exc.code}); local "
+            "connection kept. Try again.",
+            exit_code=1,
+        ) from exc
+
+    try:
+        delete_credential()
+    except CredentialError as exc:
+        raise ProxyCliError(
+            f"Logout revoked the remote token but could not remove the local "
+            f"file ({exc.code}).",
+            exit_code=1,
+        ) from exc
+    if outcome == RevokeOutcome.REVOKED:
+        print("Disconnected from AgentVeil Console.", file=stream)
+    else:
+        print(
+            "Removed the local connection; the Console token was already "
+            "unavailable.",
+            file=stream,
+        )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     from agentveil_mcp_proxy import __version__ as package_version
 
@@ -3804,6 +3972,21 @@ def build_parser() -> argparse.ArgumentParser:
     _add_json_arg(init)
     init.add_argument("--plaintext", action="store_true", help="Store the proxy private key unencrypted")
     init.add_argument("--force", action="store_true")
+
+    login = subparsers.add_parser(
+        "login",
+        help="Connect this machine to AgentVeil Console",
+    )
+    login.add_argument(
+        "--no-open",
+        action="store_true",
+        help="Do not attempt to open the verification URL in a browser",
+    )
+
+    subparsers.add_parser(
+        "logout",
+        help="Disconnect this machine from AgentVeil Console",
+    )
 
     doctor = subparsers.add_parser(
         "doctor",
@@ -6643,6 +6826,10 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     try:
+        if args.command == "login":
+            return run_console_login_cli(open_browser=not args.no_open)
+        if args.command == "logout":
+            return run_console_logout_cli()
         if args.command == "init":
             downstream_config = None
             policy_pack = args.policy_pack
