@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib.metadata import entry_points
+import re
 from typing import Any, Callable, Mapping, Protocol
 
 PUBLIC_PAID_PROVIDER_CONTRACT_VERSION = "1"
@@ -370,3 +371,232 @@ def deactivate_with_paid_provider() -> PaidProviderSnapshot:
             provider_contract_version=_optional_str(getattr(provider, "provider_contract_version", None)),
             error_code=ERROR_PROVIDER_RESPONSE_INVALID,
         )
+
+
+INSTALLED_PROVIDER_ACTIVATION_HANDOFF_CONTRACT_VERSION = "1"
+INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP = (
+    "agentveil_mcp_proxy.installed_provider_activation_handoffs"
+)
+INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME = "v1"
+
+BOUNDED_HANDOFF_REQUEST_KEYS = frozenset(
+    {
+        "contract_version",
+        "activation_credential",
+        "activation_reference",
+        "plan_family",
+        "package_name",
+        "package_version",
+        "provider_id",
+        "avp_home",
+    }
+)
+BOUNDED_HANDOFF_RESPONSE_KEYS = frozenset(
+    {
+        "contract_version",
+        "status",
+        "public_fallback_available",
+        "summary",
+        "error_code",
+    }
+)
+ALLOWED_HANDOFF_RESPONSE_STATUSES = frozenset({"active", "error"})
+
+MAX_HANDOFF_SUMMARY_LENGTH = 256
+MAX_HANDOFF_ERROR_CODE_LENGTH = 64
+MAX_HANDOFF_PLAN_FAMILY_LENGTH = 64
+MAX_HANDOFF_PROVIDER_ID_LENGTH = 64
+MAX_HANDOFF_PACKAGE_NAME_LENGTH = 64
+MAX_HANDOFF_PACKAGE_VERSION_LENGTH = 32
+MAX_HANDOFF_ACTIVATION_REFERENCE_LENGTH = 80
+MAX_HANDOFF_ACTIVATION_CREDENTIAL_LENGTH = 4096
+MAX_HANDOFF_AVP_HOME_LENGTH = 4096
+_HANDOFF_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+ERROR_HANDOFF_HOOK_MISSING = "handoff_hook_missing"
+ERROR_HANDOFF_HOOK_MULTIPLE = "handoff_hook_multiple"
+ERROR_HANDOFF_HOOK_MALFORMED = "handoff_hook_malformed"
+ERROR_HANDOFF_HOOK_INCOMPATIBLE = "handoff_hook_incompatible"
+ERROR_HANDOFF_HOOK_IMPORT_FAILED = "handoff_hook_import_failed"
+ERROR_HANDOFF_HOOK_EXCEPTION = "handoff_hook_exception"
+ERROR_HANDOFF_RESPONSE_INVALID = "handoff_response_invalid"
+ERROR_HANDOFF_RESPONSE_INACTIVE = "handoff_response_inactive"
+ERROR_HANDOFF_METADATA_OVERSIZED = "handoff_metadata_oversized"
+
+_HANDOFF_FORBIDDEN_RESPONSE_MARKERS = (
+    "activation_credential",
+    "license_key",
+    "entitlement_token",
+    "presigned_url",
+    "workspace",
+    "member_id",
+    "team_",
+    "policy_release",
+    "module_id",
+)
+
+_ENTRYPOINT_TARGET_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*$")
+
+
+@dataclass(frozen=True)
+class InstalledProviderActivationHandoffRequest:
+    """Bounded in-memory request passed to an exact installed-distribution hook."""
+
+    contract_version: str
+    activation_credential: str
+    activation_reference: str
+    plan_family: str | None
+    package_name: str
+    package_version: str
+    provider_id: str
+    avp_home: str
+
+    def __repr__(self) -> str:
+        return (
+            "InstalledProviderActivationHandoffRequest("
+            f"contract_version={self.contract_version!r}, "
+            "activation_credential='***', "
+            f"activation_reference={self.activation_reference!r}, "
+            f"plan_family={self.plan_family!r}, "
+            f"package_name={self.package_name!r}, "
+            f"package_version={self.package_version!r}, "
+            f"provider_id={self.provider_id!r}, "
+            "avp_home='***')"
+        )
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+    def to_hook_payload(self) -> dict[str, Any]:
+        return {
+            "contract_version": self.contract_version,
+            "activation_credential": self.activation_credential,
+            "activation_reference": self.activation_reference,
+            "plan_family": self.plan_family,
+            "package_name": self.package_name,
+            "package_version": self.package_version,
+            "provider_id": self.provider_id,
+            "avp_home": self.avp_home,
+        }
+
+
+@dataclass(frozen=True)
+class InstalledProviderActivationHandoffResult:
+    status: str
+    public_fallback_available: bool
+    summary: str | None
+    error_code: str | None
+
+
+def _handoff_text_contains_forbidden_marker(text: str | None) -> bool:
+    if text is None:
+        return False
+    lowered = text.lower()
+    if contains_private_provider_marker(text):
+        return True
+    return any(marker in lowered for marker in _HANDOFF_FORBIDDEN_RESPONSE_MARKERS)
+
+
+def _bounded_handoff_optional_str(
+    value: Any,
+    *,
+    max_len: int,
+    required: bool = False,
+) -> str | None:
+    if value is None:
+        if required:
+            raise ValueError(ERROR_HANDOFF_RESPONSE_INVALID)
+        return None
+    if not isinstance(value, str):
+        raise ValueError(ERROR_HANDOFF_RESPONSE_INVALID)
+    text = value.strip()
+    if not text or len(text) > max_len:
+        raise ValueError(ERROR_HANDOFF_RESPONSE_INVALID)
+    return text
+
+
+def assert_handoff_request_fields_bounded(
+    *,
+    contract_version: str,
+    activation_credential: str,
+    activation_reference: str,
+    plan_family: str | None,
+    package_name: str,
+    package_version: str,
+    provider_id: str,
+    avp_home: str,
+) -> None:
+    if contract_version != INSTALLED_PROVIDER_ACTIVATION_HANDOFF_CONTRACT_VERSION:
+        raise ValueError(ERROR_HANDOFF_HOOK_INCOMPATIBLE)
+    if not activation_credential.strip():
+        raise ValueError(ERROR_HANDOFF_RESPONSE_INVALID)
+    if len(activation_credential) > MAX_HANDOFF_ACTIVATION_CREDENTIAL_LENGTH:
+        raise ValueError(ERROR_HANDOFF_RESPONSE_INVALID)
+    _bounded_handoff_optional_str(
+        activation_reference,
+        max_len=MAX_HANDOFF_ACTIVATION_REFERENCE_LENGTH,
+        required=True,
+    )
+    if plan_family is not None:
+        _bounded_handoff_optional_str(plan_family, max_len=MAX_HANDOFF_PLAN_FAMILY_LENGTH, required=True)
+    _bounded_handoff_optional_str(package_name, max_len=MAX_HANDOFF_PACKAGE_NAME_LENGTH, required=True)
+    _bounded_handoff_optional_str(package_version, max_len=MAX_HANDOFF_PACKAGE_VERSION_LENGTH, required=True)
+    _bounded_handoff_optional_str(provider_id, max_len=MAX_HANDOFF_PROVIDER_ID_LENGTH, required=True)
+    if not avp_home.strip() or len(avp_home) > MAX_HANDOFF_AVP_HOME_LENGTH:
+        raise ValueError(ERROR_HANDOFF_RESPONSE_INVALID)
+
+
+def validate_installed_provider_activation_handoff_response(
+    raw: Mapping[str, Any],
+) -> InstalledProviderActivationHandoffResult:
+    """Validate a closed-by-default hook response."""
+
+    if not isinstance(raw, Mapping):
+        raise ValueError(ERROR_HANDOFF_RESPONSE_INVALID)
+
+    extra = set(raw) - BOUNDED_HANDOFF_RESPONSE_KEYS
+    if extra:
+        raise ValueError(ERROR_HANDOFF_RESPONSE_INVALID)
+
+    contract = _bounded_handoff_optional_str(
+        raw.get("contract_version"),
+        max_len=8,
+        required=True,
+    )
+    status = _bounded_handoff_optional_str(raw.get("status"), max_len=16, required=True)
+    summary = _bounded_handoff_optional_str(raw.get("summary"), max_len=MAX_HANDOFF_SUMMARY_LENGTH)
+    error_code = _bounded_handoff_optional_str(raw.get("error_code"), max_len=MAX_HANDOFF_ERROR_CODE_LENGTH)
+
+    if contract != INSTALLED_PROVIDER_ACTIVATION_HANDOFF_CONTRACT_VERSION:
+        raise ValueError(ERROR_HANDOFF_HOOK_INCOMPATIBLE)
+    if status not in ALLOWED_HANDOFF_RESPONSE_STATUSES:
+        raise ValueError(ERROR_HANDOFF_RESPONSE_INVALID)
+    if not isinstance(raw.get("public_fallback_available"), bool):
+        raise ValueError(ERROR_HANDOFF_RESPONSE_INVALID)
+    if _handoff_text_contains_forbidden_marker(summary) or _handoff_text_contains_forbidden_marker(
+        error_code,
+    ):
+        raise ValueError(ERROR_HANDOFF_RESPONSE_INVALID)
+    if status == "active":
+        if error_code is not None:
+            raise ValueError(ERROR_HANDOFF_RESPONSE_INVALID)
+    else:
+        if not error_code or _HANDOFF_ERROR_CODE_RE.fullmatch(error_code) is None:
+            raise ValueError(ERROR_HANDOFF_RESPONSE_INVALID)
+
+    return InstalledProviderActivationHandoffResult(
+        status=status,
+        public_fallback_available=bool(raw.get("public_fallback_available")),
+        summary=summary,
+        error_code=error_code,
+    )
+
+
+def assert_handoff_entrypoint_target(target: str) -> tuple[str, str]:
+    """Validate an entry-point target and return ``(module, attr)``."""
+
+    normalized = target.strip()
+    if not _ENTRYPOINT_TARGET_RE.fullmatch(normalized):
+        raise ValueError(ERROR_HANDOFF_HOOK_MALFORMED)
+    module_path, attr_name = normalized.split(":", 1)
+    return module_path, attr_name

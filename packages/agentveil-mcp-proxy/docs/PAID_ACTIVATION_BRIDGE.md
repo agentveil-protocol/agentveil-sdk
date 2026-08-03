@@ -29,6 +29,9 @@ entitlement JSON paste, or `private=true` is required for the normal path.
 | non-empty URL | That base URL |
 
 Successful activation through the backend writes both durable files below.
+When the backend requires an installed-provider handoff, both files are written
+only after the exact vendored wheel hook reports bounded `active` completion.
+See `INSTALLED_PROVIDER_ACTIVATION_HANDOFF.md`.
 Unavailable/failed activation returns non-zero (or explicit unavailable
 output) and omits `active` claims and paid-active-looking `install.json`.
 
