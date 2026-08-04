@@ -3549,3 +3549,342 @@ def test_logout_ambiguous_preserves_credential(tmp_path, monkeypatch, capsys):
     assert "ERROR:" in err
     assert CONSOLE_TOKEN not in out
     assert CONSOLE_TOKEN not in err
+
+
+def test_console_project_status_sync_skipped_without_credential(tmp_path, monkeypatch, capsys):
+    from test_mcp_proxy_codex_setup import (
+        _install_fast_codex_setup_fakes,
+        _isolate_cli_home,
+        _make_proxy_command,
+    )
+    from test_mcp_proxy_console_project_status_client import BackendEchoTransport
+
+    isolated_home = tmp_path / "home"
+    _isolate_cli_home(monkeypatch, isolated_home)
+    proxy_command = _make_proxy_command(tmp_path)
+    _install_fast_codex_setup_fakes(monkeypatch, proxy_command=proxy_command)
+    transport = BackendEchoTransport()
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_project_status_client._urllib_transport",
+        transport,
+    )
+
+    project = tmp_path / "project"
+    project.mkdir()
+    rc = main(["setup", "codex", "--project-dir", str(project), "--yes", "--json"])
+    capsys.readouterr()
+
+    assert rc == 0
+    assert transport.calls == []
+
+
+def test_console_project_status_sync_on_codex_setup_and_status_when_logged_in(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from test_mcp_proxy_codex_setup import (
+        _install_fast_codex_setup_fakes,
+        _isolate_cli_home,
+        _make_proxy_command,
+    )
+
+    avp_home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(avp_home))
+    isolated_home = tmp_path / "home"
+    _isolate_cli_home(monkeypatch, isolated_home)
+    save_credential(CONSOLE_TOKEN, home=avp_home)
+    proxy_command = _make_proxy_command(tmp_path)
+    _install_fast_codex_setup_fakes(monkeypatch, proxy_command=proxy_command)
+    sync_calls = []
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_project_status_client.sync_project_status",
+        lambda **kwargs: sync_calls.append(kwargs) or "accepted",
+    )
+
+    project = tmp_path / "checkout-service"
+    project.mkdir()
+    assert main(["setup", "codex", "--project-dir", str(project), "--yes", "--json"]) == 0
+    capsys.readouterr()
+    assert len(sync_calls) == 1
+    assert sync_calls[0]["connector"] == "codex"
+    assert sync_calls[0]["project_dir"] == project.resolve()
+
+    assert main(["setup", "status", "--client", "codex", "--project-dir", str(project), "--json"]) == 0
+    capsys.readouterr()
+    assert len(sync_calls) == 2
+
+
+def test_console_upload_failure_does_not_change_codex_setup_output(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from test_mcp_proxy_codex_setup import (
+        _install_fast_codex_setup_fakes,
+        _isolate_cli_home,
+        _make_proxy_command,
+    )
+
+    avp_home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(avp_home))
+    isolated_home = tmp_path / "home"
+    _isolate_cli_home(monkeypatch, isolated_home)
+    save_credential(CONSOLE_TOKEN, home=avp_home)
+    proxy_command = _make_proxy_command(tmp_path)
+    _install_fast_codex_setup_fakes(monkeypatch, proxy_command=proxy_command)
+
+    def _fail_sync(**_kwargs):
+        raise RuntimeError("network must not leak")
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_project_status_client.sync_project_status",
+        _fail_sync,
+    )
+
+    project = tmp_path / "project"
+    project.mkdir()
+    rc = main(["setup", "codex", "--project-dir", str(project), "--yes", "--json"])
+    out, err = capsys.readouterr()
+
+    assert rc == 0
+    assert "setup-codex" in out
+    assert "network must not leak" not in out
+    assert "network must not leak" not in err
+    assert CONSOLE_TOKEN not in out
+    assert CONSOLE_TOKEN not in err
+
+
+@pytest.mark.parametrize(
+    ("client", "setup_argv", "status_argv", "connector"),
+    [
+        (
+            "cursor",
+            ["setup", "cursor", "--yes"],
+            ["setup", "status"],
+            "cursor",
+        ),
+        (
+            "claude-code",
+            ["setup", "claude-code", "--yes"],
+            ["setup", "status"],
+            "claude-code",
+        ),
+        (
+            "gemini-cli",
+            ["setup", "gemini-cli", "--yes"],
+            ["setup", "status", "--client", "gemini-cli"],
+            "gemini-cli",
+        ),
+    ],
+)
+def test_console_project_status_sync_on_setup_status_for_connectors(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    client,
+    setup_argv,
+    status_argv,
+    connector,
+):
+    from agentveil_mcp_proxy import cursor_setup
+    from test_mcp_proxy_codex_setup import _make_proxy_command
+
+    avp_home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(avp_home))
+    save_credential(CONSOLE_TOKEN, home=avp_home)
+    project = tmp_path / "checkout-service"
+    project.mkdir()
+    sync_calls = []
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_project_status_client.sync_project_status",
+        lambda **kwargs: sync_calls.append(kwargs) or "accepted",
+    )
+
+    if client == "cursor":
+        def fake_init_proxy(**kwargs):
+            home = kwargs["home"]
+            (home / "mcp-proxy").mkdir(parents=True, exist_ok=True)
+            (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+
+        def fake_prepare(_workspace, *, force=False):
+            home = cursor_setup.setup_home(_workspace)
+            home.mkdir(parents=True, exist_ok=True)
+            (home / "passphrase").write_text("secret\n", encoding="utf-8")
+            return home
+
+        monkeypatch.setattr(proxy_cli, "init_proxy", fake_init_proxy)
+        monkeypatch.setattr(cursor_setup, "prepare_proxy_home", fake_prepare)
+        monkeypatch.setattr(proxy_cli, "initialize_product_route_profile", lambda _prof: None)
+        monkeypatch.setattr(
+            cursor_setup,
+            "ensure_approval_center_running",
+            lambda **_kwargs: SimpleNamespace(
+                status=SimpleNamespace(state="running"),
+                started=True,
+                reused=False,
+                restarted=False,
+                reason="center started",
+            ),
+        )
+        monkeypatch.setattr("shutil.which", lambda _name: "agentveil-mcp-proxy")
+        setup = [*setup_argv, "--workspace", str(project), "--json"]
+        status = [*status_argv, "--workspace", str(project), "--json"]
+    elif client == "claude-code":
+        monkeypatch.setattr(
+            proxy_cli,
+            "init_proxy",
+            lambda **kwargs: (kwargs["home"] / "mcp-proxy").mkdir(parents=True, exist_ok=True)
+            or (kwargs["home"] / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8"),
+        )
+        monkeypatch.setattr(proxy_cli, "_resolve_setup_proxy_command", lambda: "agentveil-mcp-proxy")
+        monkeypatch.setattr(
+            "agentveil_mcp_proxy.approval.server.ensure_managed_approval_center_for_cli",
+            lambda **_kwargs: SimpleNamespace(
+                status=SimpleNamespace(state="running"),
+                started=True,
+                reused=False,
+                restarted=False,
+                reason="center started",
+            ),
+        )
+        monkeypatch.setattr(
+            "agentveil_mcp_proxy.approval.server.inspect_managed_approval_center",
+            lambda _home: SimpleNamespace(state="running", url="http://127.0.0.1/approval/"),
+        )
+        setup = [*setup_argv, "--project-dir", str(project), "--json"]
+        status = [*status_argv, "--project-dir", str(project), "--json"]
+    else:
+        from test_mcp_proxy_gemini_setup import _install_fast_gemini_setup_fakes
+
+        isolated_home = tmp_path / "home"
+        monkeypatch.setenv("HOME", str(isolated_home))
+        proxy_command = _make_proxy_command(tmp_path)
+        _install_fast_gemini_setup_fakes(monkeypatch, proxy_command=proxy_command)
+        setup = [*setup_argv, "--project-dir", str(project), "--json"]
+        status = [*status_argv, "--project-dir", str(project), "--json"]
+
+    assert main(setup) == 0
+    capsys.readouterr()
+    assert len(sync_calls) == 1
+    assert sync_calls[0]["connector"] == connector
+
+    assert main(status) == 0
+    capsys.readouterr()
+    assert len(sync_calls) == 2
+
+
+def test_console_project_status_preview_does_not_sync(tmp_path, monkeypatch, capsys):
+    from test_mcp_proxy_codex_setup import (
+        _install_fast_codex_setup_fakes,
+        _isolate_cli_home,
+        _make_proxy_command,
+    )
+
+    avp_home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(avp_home))
+    save_credential(CONSOLE_TOKEN, home=avp_home)
+    isolated_home = tmp_path / "home"
+    _isolate_cli_home(monkeypatch, isolated_home)
+    proxy_command = _make_proxy_command(tmp_path)
+    _install_fast_codex_setup_fakes(monkeypatch, proxy_command=proxy_command)
+    sync_calls = []
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_project_status_client.sync_project_status",
+        lambda **kwargs: sync_calls.append(kwargs) or "accepted",
+    )
+
+    project = tmp_path / "project"
+    project.mkdir()
+    rc = main(["setup", "codex", "--project-dir", str(project), "--json"])
+    capsys.readouterr()
+    assert rc == 0
+    assert sync_calls == []
+
+
+def test_console_project_status_failed_setup_does_not_sync(tmp_path, monkeypatch, capsys):
+    from test_mcp_proxy_codex_setup import (
+        _install_fast_codex_setup_fakes,
+        _isolate_cli_home,
+        _make_proxy_command,
+    )
+
+    avp_home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(avp_home))
+    save_credential(CONSOLE_TOKEN, home=avp_home)
+    isolated_home = tmp_path / "home"
+    _isolate_cli_home(monkeypatch, isolated_home)
+    proxy_command = _make_proxy_command(tmp_path)
+    _install_fast_codex_setup_fakes(monkeypatch, proxy_command=proxy_command)
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.approval.server.ensure_managed_approval_center_for_cli",
+        lambda **_kwargs: SimpleNamespace(
+            status=SimpleNamespace(state="stale"),
+            started=False,
+            reused=False,
+            restarted=False,
+            reason="approval-center did not become healthy",
+        ),
+    )
+    sync_calls = []
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_project_status_client.sync_project_status",
+        lambda **kwargs: sync_calls.append(kwargs) or "accepted",
+    )
+
+    project = tmp_path / "project"
+    project.mkdir()
+    rc = main(["setup", "codex", "--project-dir", str(project), "--yes", "--json"])
+    capsys.readouterr()
+    assert rc == 1
+    assert sync_calls == []
+
+
+@pytest.mark.parametrize("output_json", [False, True])
+def test_console_upload_failure_preserves_setup_output_across_formats(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    output_json,
+):
+    from test_mcp_proxy_codex_setup import (
+        _install_fast_codex_setup_fakes,
+        _isolate_cli_home,
+        _make_proxy_command,
+    )
+
+    avp_home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(avp_home))
+    save_credential(CONSOLE_TOKEN, home=avp_home)
+    isolated_home = tmp_path / "home"
+    _isolate_cli_home(monkeypatch, isolated_home)
+    proxy_command = _make_proxy_command(tmp_path)
+    _install_fast_codex_setup_fakes(monkeypatch, proxy_command=proxy_command)
+
+    argv_base = ["setup", "codex", "--project-dir"]
+    if output_json:
+        argv_base.append("--json")
+
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_project_status_client.sync_project_status",
+        lambda **_kwargs: "accepted",
+    )
+    assert main([*argv_base, str(project), "--yes"]) == 0
+    accepted_out, accepted_err = capsys.readouterr()
+
+    def _fail_sync(**_kwargs):
+        raise RuntimeError("network must not leak")
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_project_status_client.sync_project_status",
+        _fail_sync,
+    )
+    assert main([*argv_base, str(project), "--yes"]) == 0
+    failed_out, failed_err = capsys.readouterr()
+
+    assert failed_out == accepted_out
+    assert failed_err == accepted_err
+    assert "network must not leak" not in failed_out
+    assert "network must not leak" not in failed_err

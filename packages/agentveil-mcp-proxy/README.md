@@ -316,6 +316,13 @@ project-sync features, and it does not change how routed MCP calls or project
 connectors are controlled locally. The stored token grants only the
 `bounded_summary_upload` scope.
 
+After `login`, successful project connector setup and explicit `setup status`
+for Codex, Claude Code, Cursor, or Gemini CLI may send one bounded project
+connection summary to the Console. Without a stored credential this step is a
+silent no-op: no network request and no extra CLI output. Console rejection or
+outage never changes local setup results, exit codes, connector files, or
+Approval Center behavior.
+
 ## Relationship To AgentVeil
 
 `agentveil-mcp-proxy` is the public package for AgentVeil project connectors

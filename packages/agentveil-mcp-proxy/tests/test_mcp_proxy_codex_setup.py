@@ -334,3 +334,27 @@ def test_command_ownership_requires_exact_module_invocation():
     assert not codex_setup.command_invokes_managed_hook(
         "/usr/bin/python3 -m other.module agentveil_mcp_proxy.codex_hook"
     )
+
+
+def test_setup_codex_attempts_console_project_status_sync(tmp_path, monkeypatch, capsys):
+    from agentveil_mcp_proxy.console_credentials import save_credential
+
+    avp_home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(avp_home))
+    save_credential("console-token-for-sync-test", home=avp_home)
+    isolated_home = tmp_path / "home"
+    _isolate_cli_home(monkeypatch, isolated_home)
+    proxy_command = _make_proxy_command(tmp_path)
+    _install_fast_codex_setup_fakes(monkeypatch, proxy_command=proxy_command)
+    sync_calls = []
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_project_status_client.sync_project_status",
+        lambda **kwargs: sync_calls.append(kwargs) or "accepted",
+    )
+
+    project = tmp_path / "checkout-service"
+    project.mkdir()
+    assert main(["setup", "codex", "--project-dir", str(project), "--yes"]) == 0
+    capsys.readouterr()
+    assert len(sync_calls) == 1
+    assert sync_calls[0]["connector"] == "codex"

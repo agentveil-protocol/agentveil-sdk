@@ -1622,6 +1622,29 @@ def _attach_connector_trust_boundary(
     return enriched
 
 
+def _best_effort_console_project_status_sync(
+    *,
+    connector: str,
+    connector_status: Mapping[str, Any],
+    project_dir: Path,
+) -> None:
+    """Upload bounded project status when a Console credential is present."""
+
+    from agentveil_mcp_proxy import __version__ as package_version
+    from agentveil_mcp_proxy.console_project_status_client import sync_project_status
+
+    try:
+        sync_project_status(
+            connector=connector,
+            connector_status=connector_status,
+            project_dir=project_dir,
+            package_version=package_version,
+            load_credential_fn=load_credential,
+        )
+    except Exception:
+        return
+
+
 def print_setup_status_cli(
     *,
     home: Path | None = None,
@@ -5406,6 +5429,11 @@ def run_setup_cursor_cli(
             print(f"Cursor: {message}")
             if not opened:
                 print(f"Open manually: {target}")
+    _best_effort_console_project_status_sync(
+        connector="cursor",
+        connector_status=status,
+        project_dir=target,
+    )
     return 0
 
 
@@ -5432,6 +5460,11 @@ def run_setup_cursor_status_cli(*, workspace: Path | None, output_json: bool) ->
         print(f"  mcp observed:    {status['mcp_route_observed']}")
         print(f"  restart required:{status['restart_required']}")
         print(f"  next: {status['next_step']}")
+    _best_effort_console_project_status_sync(
+        connector="cursor",
+        connector_status=status,
+        project_dir=target,
+    )
     return 0
 
 
@@ -6141,6 +6174,11 @@ def run_setup_claude_code_cli(
         print(f"  approval_center: running ({action})")
         print(f"  status:      {status['status']}")
         print("Restart Claude Code for this project, then run `agentveil-mcp-proxy setup status`.")
+    _best_effort_console_project_status_sync(
+        connector="claude-code",
+        connector_status=status,
+        project_dir=target,
+    )
     return 0
 
 
@@ -6338,6 +6376,11 @@ def run_setup_codex_cli(
         print("  hook trust:  Codex will ask you to trust the AgentVeil project hook once.")
         print("               Until that hook fires, status remains advisory, not protected.")
         print("Open or restart Codex in this project, trust the AgentVeil hook if prompted, then run `agentveil-mcp-proxy setup status --client codex`.")
+    _best_effort_console_project_status_sync(
+        connector="codex",
+        connector_status=status,
+        project_dir=target,
+    )
     return 0
 
 
@@ -6376,6 +6419,11 @@ def run_setup_codex_status_cli(
         print(f"  hook trust req.: {status['hook_trust_required']}")
         print(f"  restart required:{status['restart_required']}")
         print(f"  next: {status['next_step']}")
+    _best_effort_console_project_status_sync(
+        connector="codex",
+        connector_status=status,
+        project_dir=target,
+    )
     return 0
 
 
@@ -6631,6 +6679,11 @@ def run_setup_gemini_cli(
             "Open or restart Gemini CLI in this project, trust the folder if prompted, "
             "then run `agentveil-mcp-proxy setup status --client gemini-cli`."
         )
+    _best_effort_console_project_status_sync(
+        connector="gemini-cli",
+        connector_status=status,
+        project_dir=target,
+    )
     return 0
 
 
@@ -6666,6 +6719,11 @@ def run_setup_gemini_status_cli(
         print(f"  folder trust req:{status['hook_trust_required']}")
         print(f"  restart required:{status['restart_required']}")
         print(f"  next: {status['next_step']}")
+    _best_effort_console_project_status_sync(
+        connector="gemini-cli",
+        connector_status=status,
+        project_dir=target,
+    )
     return 0
 
 
@@ -6758,6 +6816,11 @@ def run_setup_connector_status_cli(*, project_dir: Path | None, output_json: boo
         print(f"  approval_center: {center.state}")
         print(f"  restart required: {status['restart_required']}")
         print(f"  next: {status['next_step']}")
+    _best_effort_console_project_status_sync(
+        connector="claude-code",
+        connector_status=status,
+        project_dir=target,
+    )
     return 0
 
 
