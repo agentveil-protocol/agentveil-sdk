@@ -2427,6 +2427,41 @@ def test_signal_handlers_are_restored_after_run_proxy(tmp_path):
     assert signal.getsignal(signal.SIGINT) == before_int
 
 
+def test_run_proxy_starts_decision_summary_dispatcher(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    _set_downstream(init.config_path, _idle_downstream(tmp_path))
+    lifecycle = {"started": 0, "stopped": 0}
+
+    class RecordingDispatcher:
+        is_active = True
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            lifecycle["started"] += 1
+
+        def stop(self, **kwargs):
+            lifecycle["stopped"] += 1
+
+        def notify_terminal_record(self, record):
+            return None
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.cli.ConsoleDecisionSummaryDispatcher",
+        RecordingDispatcher,
+    )
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(""),
+        out=io.StringIO(),
+        approval_ui_mode="none",
+    ) == 0
+    assert lifecycle == {"started": 1, "stopped": 1}
+
+
 def test_downstream_dies_when_proxy_is_killed_ungracefully(tmp_path):
     if sys.platform == "darwin":
         pytest.skip(

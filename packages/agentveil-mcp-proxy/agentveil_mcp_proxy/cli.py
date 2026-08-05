@@ -216,6 +216,10 @@ from agentveil_mcp_proxy.console_pairing_client import (
     PairingClientError,
     RevokeOutcome,
 )
+from agentveil_mcp_proxy.console_decision_summary_client import (
+    ConsoleDecisionSummaryDispatcher,
+    attach_terminal_evidence_observer,
+)
 
 
 DEFAULT_BASE_URL = "https://agentveil.dev"
@@ -2937,6 +2941,13 @@ def run_proxy(
             approval_grant_private_key_seed=approval_grant_private_key_seed,
             approval_grant_agent_did=approval_grant_agent_did,
         )
+        decision_summary_dispatcher = ConsoleDecisionSummaryDispatcher(home=paths.home)
+        decision_summary_dispatcher.start()
+        if decision_summary_dispatcher.is_active:
+            attach_terminal_evidence_observer(
+                approval_manager,
+                decision_summary_dispatcher,
+            )
         runtime_gate_factory = lambda: RuntimeGateClient.from_files(
             identity_path=identity_path,
             control_grant_path=control_grant_path,
@@ -2957,6 +2968,8 @@ def run_proxy(
             return 0
         finally:
             _restore_signal_handlers(previous_handlers)
+            if decision_summary_dispatcher.is_active:
+                decision_summary_dispatcher.stop()
             if getattr(approval_server, "owns_server_process", True):
                 approval_server.stop()
             evidence_store.close()

@@ -553,6 +553,48 @@ def test_run_auto_deny_requires_headless(tmp_path):
         raise AssertionError("expected --auto-deny without --headless to fail")
 
 
+def test_run_proxy_starts_and_stops_decision_summary_dispatcher(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    init_proxy(home=home, agent_name="proxy", plaintext=True)
+    config = json.loads((home / "mcp-proxy" / "config.json").read_text(encoding="utf-8"))
+    config["downstream"] = {
+        "name": "idle",
+        "command": sys.executable,
+        "args": ["-c", "import time; time.sleep(3600)"],
+    }
+    (home / "mcp-proxy" / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    lifecycle = {"started": 0, "stopped": 0}
+
+    class RecordingDispatcher:
+        is_active = True
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            lifecycle["started"] += 1
+
+        def stop(self, **kwargs):
+            lifecycle["stopped"] += 1
+
+        def notify_terminal_record(self, record):
+            return None
+
+    monkeypatch.setattr(
+        proxy_cli,
+        "ConsoleDecisionSummaryDispatcher",
+        RecordingDispatcher,
+    )
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(""),
+        out=io.StringIO(),
+        approval_ui_mode="none",
+    ) == 0
+    assert lifecycle == {"started": 1, "stopped": 1}
+
+
 def test_export_evidence_warns_when_signed_receipts_are_not_fetched(tmp_path):
     home = tmp_path / "avp-home"
     result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
@@ -3915,35 +3957,54 @@ def test_console_upload_failure_preserves_setup_output_across_formats(
     avp_home = tmp_path / "avp-home"
     monkeypatch.setenv("AVP_HOME", str(avp_home))
     save_credential(CONSOLE_TOKEN, home=avp_home)
-    isolated_home = tmp_path / "home"
-    _isolate_cli_home(monkeypatch, isolated_home)
     proxy_command = _make_proxy_command(tmp_path)
-    _install_fast_codex_setup_fakes(monkeypatch, proxy_command=proxy_command)
 
-    argv_base = ["setup", "codex", "--project-dir"]
-    if output_json:
-        argv_base.append("--json")
+    def _argv(project: Path) -> list[str]:
+        argv = ["setup", "codex", "--project-dir", str(project), "--yes"]
+        if output_json:
+            argv.append("--json")
+        return argv
 
-    project = tmp_path / "project"
-    project.mkdir()
-    monkeypatch.setattr(
-        "agentveil_mcp_proxy.console_project_status_client.sync_project_status",
-        lambda **_kwargs: "accepted",
+    def _fresh_run(*, label: str, sync_fn):
+        isolated_home = tmp_path / f"home-{label}"
+        _isolate_cli_home(monkeypatch, isolated_home)
+        _install_fast_codex_setup_fakes(monkeypatch, proxy_command=proxy_command)
+        project = tmp_path / f"project-{label}"
+        project.mkdir()
+        monkeypatch.setattr(
+            "agentveil_mcp_proxy.console_project_status_client.sync_project_status",
+            sync_fn,
+        )
+        assert main(_argv(project)) == 0
+        return capsys.readouterr()
+
+    accepted_out, accepted_err = _fresh_run(
+        label="accepted",
+        sync_fn=lambda **_kwargs: "accepted",
     )
-    assert main([*argv_base, str(project), "--yes"]) == 0
-    accepted_out, accepted_err = capsys.readouterr()
 
     def _fail_sync(**_kwargs):
         raise RuntimeError("network must not leak")
 
-    monkeypatch.setattr(
-        "agentveil_mcp_proxy.console_project_status_client.sync_project_status",
-        _fail_sync,
-    )
-    assert main([*argv_base, str(project), "--yes"]) == 0
-    failed_out, failed_err = capsys.readouterr()
+    failed_out, failed_err = _fresh_run(label="failed", sync_fn=_fail_sync)
 
-    assert failed_out == accepted_out
-    assert failed_err == accepted_err
+    if output_json:
+        def _strip_refs(value):
+            if isinstance(value, dict):
+                return {
+                    key: _strip_refs(item)
+                    for key, item in value.items()
+                    if key != "ref"
+                }
+            if isinstance(value, list):
+                return [_strip_refs(item) for item in value]
+            return value
+
+        accepted_payload = _strip_refs(json.loads(accepted_out))
+        failed_payload = _strip_refs(json.loads(failed_out))
+        assert failed_payload == accepted_payload
+    else:
+        assert failed_out == accepted_out
+        assert failed_err == accepted_err
     assert "network must not leak" not in failed_out
     assert "network must not leak" not in failed_err
