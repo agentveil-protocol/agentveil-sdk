@@ -318,10 +318,15 @@ connectors are controlled locally. The stored token grants only the
 
 After `login`, successful project connector setup and explicit `setup status`
 for Codex, Claude Code, Cursor, or Gemini CLI may send one bounded project
-connection summary to the Console. Without a stored credential this step is a
-silent no-op: no network request and no extra CLI output. Console rejection or
-outage never changes local setup results, exit codes, connector files, or
-Approval Center behavior.
+connection summary to the Console. The upload includes a bounded local report
+field, `private_guardrails_status`, with one of `active`, `inactive`, or
+`unavailable`. That value reflects only the installed local paid provider state;
+it does not grant entitlement. Console combines this report with server-owned
+workspace capability before showing `Active`. Without a stored credential this
+step is a silent no-op: no network request, no provider discovery, and no extra
+CLI output. Boundary: the upload is best-effort and isolated from local setup;
+Console rejection or outage does not change setup results, exit codes, connector
+files, or Approval Center behavior.
 
 ## Relationship To AgentVeil
 

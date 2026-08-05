@@ -29,6 +29,15 @@ from agentveil_mcp_proxy.console_credentials import (
     StoredCredential,
     load_credential,
 )
+from agentveil_mcp_proxy.paid_provider import (
+    PUBLIC_PAID_PROVIDER_CONTRACT_VERSION,
+    PaidProviderSnapshot,
+    STATUS_ACTIVE,
+    STATUS_DISABLED,
+    STATUS_EXPIRED,
+    STATUS_REVOKED,
+    discover_paid_provider,
+)
 
 CONSOLE_ORIGIN = "https://agentveil.dev"
 _ORIGIN_HOST = "agentveil.dev"
@@ -55,6 +64,7 @@ _REQUEST_KEYS = frozenset({
     "project_display_label",
     "observed_at",
     "package_version",
+    "private_guardrails_status",
 })
 _REQUIRED_REQUEST_KEYS = _REQUEST_KEYS - {"package_version"}
 _RESPONSE_KEYS = frozenset({
@@ -65,6 +75,20 @@ _RESPONSE_KEYS = frozenset({
     "project_display_label",
     "observed_at",
     "scope_statement",
+})
+
+_LOCAL_REPORT_ACTIVE = "active"
+_LOCAL_REPORT_INACTIVE = "inactive"
+_LOCAL_REPORT_UNAVAILABLE = "unavailable"
+_LOCAL_REPORT_VALUES = frozenset({
+    _LOCAL_REPORT_ACTIVE,
+    _LOCAL_REPORT_INACTIVE,
+    _LOCAL_REPORT_UNAVAILABLE,
+})
+_INACTIVE_PROVIDER_STATUSES = frozenset({
+    STATUS_EXPIRED,
+    STATUS_REVOKED,
+    STATUS_DISABLED,
 })
 
 
@@ -95,12 +119,14 @@ class ProjectStatusSummary:
     route_state: str
     project_display_label: str
     observed_at: str
+    private_guardrails_status: str
     package_version: str | None = None
 
 
 Transport = Callable[..., RawResponse]
 LoadCredential = Callable[..., StoredCredential | None]
 Clock = Callable[[], float]
+DiscoverPaidProvider = Callable[[], PaidProviderSnapshot]
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -255,6 +281,35 @@ def normalize_package_version(value: str | None) -> str | None:
     return version
 
 
+def _validate_private_guardrails_status(value: str) -> str:
+    if not isinstance(value, str):
+        raise ProjectStatusClientError("invalid_private_guardrails_status")
+    if value not in _LOCAL_REPORT_VALUES:
+        raise ProjectStatusClientError("invalid_private_guardrails_status")
+    return value
+
+
+def resolve_private_guardrails_status(snapshot: object) -> str:
+    """Map a bounded paid-provider snapshot to a local Console report."""
+
+    if not isinstance(snapshot, PaidProviderSnapshot):
+        return _LOCAL_REPORT_UNAVAILABLE
+    if snapshot.error_code:
+        return _LOCAL_REPORT_UNAVAILABLE
+    if not snapshot.provider_present:
+        return _LOCAL_REPORT_UNAVAILABLE
+    if snapshot.provider_contract_version != PUBLIC_PAID_PROVIDER_CONTRACT_VERSION:
+        return _LOCAL_REPORT_UNAVAILABLE
+    if snapshot.status == STATUS_ACTIVE and snapshot.private_provider_enabled:
+        return _LOCAL_REPORT_ACTIVE
+    if (
+        snapshot.status in _INACTIVE_PROVIDER_STATUSES
+        and not snapshot.private_provider_enabled
+    ):
+        return _LOCAL_REPORT_INACTIVE
+    return _LOCAL_REPORT_UNAVAILABLE
+
+
 def _route_value_missing(value: object) -> bool:
     return not isinstance(value, str) or value == "missing"
 
@@ -292,6 +347,7 @@ def build_project_status_summary(
     connector: str,
     connector_status: Mapping[str, Any],
     project_dir: Path,
+    private_guardrails_status: str,
     package_version: str | None = None,
     observed_at: str | None = None,
     clock: Clock | None = None,
@@ -315,6 +371,9 @@ def build_project_status_summary(
         route_state=_validate_route_state(route_state),
         project_display_label=label,
         observed_at=canonical_observed,
+        private_guardrails_status=_validate_private_guardrails_status(
+            private_guardrails_status
+        ),
         package_version=version,
     )
 
@@ -327,6 +386,9 @@ def summary_to_request_payload(summary: ProjectStatusSummary) -> dict[str, str]:
         "route_state": summary.route_state,
         "project_display_label": summary.project_display_label,
         "observed_at": summary.observed_at,
+        "private_guardrails_status": _validate_private_guardrails_status(
+            summary.private_guardrails_status
+        ),
     }
     if summary.package_version is not None:
         payload["package_version"] = summary.package_version
@@ -467,6 +529,7 @@ def sync_project_status(
     home: Path | None = None,
     package_version: str | None = None,
     load_credential_fn: LoadCredential = load_credential,
+    discover_paid_provider_fn: DiscoverPaidProvider | None = None,
     transport: Transport | None = None,
     clock: Clock | None = None,
 ) -> str:
@@ -479,12 +542,22 @@ def sync_project_status(
     if skip is not None:
         return skip
 
+    discover = discover_paid_provider_fn or discover_paid_provider
+    try:
+        provider_snapshot = discover()
+        private_guardrails_status = resolve_private_guardrails_status(
+            provider_snapshot
+        )
+    except Exception:
+        private_guardrails_status = _LOCAL_REPORT_UNAVAILABLE
+
     try:
         summary = build_project_status_summary(
             connector=connector,
             connector_status=connector_status,
             project_dir=project_dir,
             package_version=package_version,
+            private_guardrails_status=private_guardrails_status,
             clock=clock,
         )
     except ProjectStatusClientError:
@@ -515,6 +588,7 @@ __all__ = [
     "build_project_status_summary",
     "normalize_connector_status",
     "normalize_package_version",
+    "resolve_private_guardrails_status",
     "summary_to_request_payload",
     "sync_project_status",
     "validate_project_display_label",
