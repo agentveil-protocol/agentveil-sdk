@@ -44,6 +44,8 @@ from agentveil_mcp_proxy.paid_provider import (
     ERROR_HANDOFF_HOOK_MULTIPLE,
     ERROR_HANDOFF_METADATA_OVERSIZED,
     ERROR_HANDOFF_RESPONSE_INACTIVE,
+    ERROR_HANDOFF_RESPONSE_INVALID,
+    contains_private_provider_marker,
 )
 
 INSTALL_FILENAME = "install.json"
@@ -137,6 +139,78 @@ ERROR_INSTALL_SAFETY_MALFORMED = "install_safety_malformed"
 
 MAX_HANDOFF_ENTRY_POINTS_BYTES = 8192
 MAX_HANDOFF_DIST_INFO_METADATA_BYTES = 65536
+
+_HANDOFF_RESPONSE_URL_RE = re.compile(r"(?i)(?:https?://|file://)")
+_HANDOFF_RESPONSE_WINDOWS_ABS_PATH_RE = re.compile(r"(?i)(?:[a-z]:\\|\\\\[^\s]+)")
+_POSIX_ABS_PATH_BOUNDARY_CHARS = frozenset(" \t\n\r'\"`(,[{<:=;,")
+_HANDOFF_RESPONSE_FORBIDDEN_MARKERS = (
+    "activation_credential",
+    "license_key",
+    "entitlement_token",
+    "presigned_url",
+    "workspace",
+    "member_id",
+    "team_",
+    "policy_release",
+    "module_id",
+)
+
+
+def _handoff_response_text_contains_absolute_posix_path(text: str) -> bool:
+    """Reject slash starts that indicate absolute or path-like values, not inline ratios."""
+
+    for index, char in enumerate(text):
+        if char != "/":
+            continue
+        if index == 0:
+            return True
+        if text[index - 1] in _POSIX_ABS_PATH_BOUNDARY_CHARS:
+            return True
+    return False
+
+
+def _handoff_response_text_is_public_bounded(
+    text: str | None,
+    *,
+    activation_credential: str,
+    resolved_avp_home: str,
+) -> bool:
+    if text is None:
+        return True
+    if activation_credential and activation_credential in text:
+        return False
+    if resolved_avp_home and resolved_avp_home in text:
+        return False
+    if _HANDOFF_RESPONSE_URL_RE.search(text):
+        return False
+    if _HANDOFF_RESPONSE_WINDOWS_ABS_PATH_RE.search(text):
+        return False
+    if _handoff_response_text_contains_absolute_posix_path(text):
+        return False
+    lowered = text.lower()
+    if any(marker in lowered for marker in _HANDOFF_RESPONSE_FORBIDDEN_MARKERS):
+        return False
+    if contains_private_provider_marker(text):
+        return False
+    return True
+
+
+def assert_handoff_response_fields_public_bounded(
+    *,
+    summary: str | None,
+    error_code: str | None,
+    activation_credential: str,
+    resolved_avp_home: str,
+) -> None:
+    """Reject hook response strings that would leak secrets, homes, or local URLs."""
+
+    for field in (summary, error_code):
+        if not _handoff_response_text_is_public_bounded(
+            field,
+            activation_credential=activation_credential,
+            resolved_avp_home=resolved_avp_home,
+        ):
+            raise ValueError(ERROR_HANDOFF_RESPONSE_INVALID)
 
 
 class PaidInstallError(ValueError):
@@ -1138,7 +1212,16 @@ def invoke_installed_provider_activation_handoff(
     try:
         result = validate_installed_provider_activation_handoff_response(raw_response)
     except ValueError as exc:
-        raise PaidInstallError(str(exc), exit_code=1)
+        raise PaidInstallError(str(exc), exit_code=1) from None
+    try:
+        assert_handoff_response_fields_public_bounded(
+            summary=result.summary,
+            error_code=result.error_code,
+            activation_credential=license_key,
+            resolved_avp_home=resolved_home,
+        )
+    except ValueError:
+        raise PaidInstallError(ERROR_HANDOFF_RESPONSE_INVALID, exit_code=1) from None
     if result.status != STATUS_ACTIVE:
         raise PaidInstallError(
             result.error_code or ERROR_HANDOFF_RESPONSE_INACTIVE,

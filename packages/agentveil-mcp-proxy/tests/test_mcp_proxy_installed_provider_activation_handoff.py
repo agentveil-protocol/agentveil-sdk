@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import copy
+import hashlib
 import importlib
+import importlib.resources
 import io
 import json
 import os
@@ -30,6 +33,8 @@ from agentveil_mcp_proxy.paid_install import (
     ERROR_HANDOFF_HOOK_EXCEPTION,
     ERROR_INSTALL_FAILED,
     INSTALL_FILENAME,
+    MAX_HANDOFF_DIST_INFO_METADATA_BYTES,
+    MAX_HANDOFF_ENTRY_POINTS_BYTES,
     ActivationValidateResult,
     EntitlementResult,
     InstallSafetyResult,
@@ -48,19 +53,31 @@ from agentveil_mcp_proxy.paid_install import (
     write_install_state,
 )
 from agentveil_mcp_proxy.paid_provider import (
+    ALLOWED_HANDOFF_RESPONSE_STATUSES,
     BOUNDED_HANDOFF_REQUEST_KEYS,
     BOUNDED_HANDOFF_RESPONSE_KEYS,
     ERROR_HANDOFF_HOOK_IMPORT_FAILED,
+    ERROR_HANDOFF_HOOK_INCOMPATIBLE,
     ERROR_HANDOFF_HOOK_MALFORMED,
     ERROR_HANDOFF_HOOK_MISSING,
     ERROR_HANDOFF_HOOK_MULTIPLE,
+    ERROR_HANDOFF_METADATA_OVERSIZED,
+    ERROR_HANDOFF_RESPONSE_INACTIVE,
     ERROR_HANDOFF_RESPONSE_INVALID,
+    FORBIDDEN_PRIVATE_MARKERS,
     INSTALLED_PROVIDER_ACTIVATION_HANDOFF_CONTRACT_VERSION,
     INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP,
     INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME,
     InstalledProviderActivationHandoffRequest,
     MAX_HANDOFF_ACTIVATION_CREDENTIAL_LENGTH,
+    MAX_HANDOFF_ACTIVATION_REFERENCE_LENGTH,
     MAX_HANDOFF_AVP_HOME_LENGTH,
+    MAX_HANDOFF_ERROR_CODE_LENGTH,
+    MAX_HANDOFF_PACKAGE_NAME_LENGTH,
+    MAX_HANDOFF_PACKAGE_VERSION_LENGTH,
+    MAX_HANDOFF_PLAN_FAMILY_LENGTH,
+    MAX_HANDOFF_PROVIDER_ID_LENGTH,
+    MAX_HANDOFF_SUMMARY_LENGTH,
     assert_handoff_request_fields_bounded,
     set_paid_provider_loader,
     validate_installed_provider_activation_handoff_response,
@@ -83,10 +100,15 @@ PACKAGE_NAME = "agentveil-private-policy"
 PACKAGE_VERSION = "0.1.0"
 MODULE_NAME = PACKAGE_NAME.replace("-", "_")
 RAW_LICENSE_KEY = "avp_live_handoff_secret_key_do_not_leak_xyz123"
+ALT_LICENSE_KEY_SAME_LENGTH = "avp_live_handoff_secret_key_do_not_leak_xyz124"
+EXPECTED_CREDENTIAL_DIGEST = hashlib.sha256(RAW_LICENSE_KEY.encode("utf-8")).hexdigest()
+assert len(ALT_LICENSE_KEY_SAME_LENGTH) == len(RAW_LICENSE_KEY)
+assert ALT_LICENSE_KEY_SAME_LENGTH != RAW_LICENSE_KEY
 ENTITLEMENT_TOKEN = "avp_ent_handoff.token.secret.do.not.leak"
-_CONTRACT_PATH = (
+_CONTRACT_FIXTURE_PATH = (
     Path(__file__).resolve().parent / "fixtures" / "paid_installed_provider_activation_handoff_contract.json"
 )
+_CANONICAL_CONTRACT_RELATIVE = "contracts/installed_provider_activation_handoff_v1.json"
 FORBIDDEN_MARKERS = (
     RAW_LICENSE_KEY,
     ENTITLEMENT_TOKEN,
@@ -101,6 +123,7 @@ FORBIDDEN_MARKERS = (
 )
 
 SUCCESS_HOOK_SOURCE = """
+import hashlib
 import json
 from pathlib import Path
 
@@ -109,7 +132,9 @@ def run_activation_handoff(request):
     record_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "contract_version": request.contract_version,
-        "credential_len": len(request.activation_credential),
+        "credential_sha256": hashlib.sha256(
+            request.activation_credential.encode("utf-8")
+        ).hexdigest(),
         "activation_reference": request.activation_reference,
         "plan_family": request.plan_family,
         "package_name": request.package_name,
@@ -239,8 +264,231 @@ def _tools_list_names(proxy: _RecordingPassthrough) -> list[str]:
     return sorted(tool.get("name", "") for tool in tools if isinstance(tool, dict))
 
 
+def _canonical_handoff_contract_bytes() -> bytes:
+    return importlib.resources.files("agentveil_mcp_proxy").joinpath(
+        _CANONICAL_CONTRACT_RELATIVE
+    ).read_bytes()
+
+
 def _handoff_contract() -> dict:
-    return json.loads(_CONTRACT_PATH.read_text(encoding="utf-8"))
+    return json.loads(_canonical_handoff_contract_bytes().decode("utf-8"))
+
+
+def _runtime_handoff_error_code_keys() -> frozenset[str]:
+    return frozenset(
+        {
+            ERROR_HANDOFF_HOOK_MISSING,
+            ERROR_HANDOFF_HOOK_MULTIPLE,
+            ERROR_HANDOFF_HOOK_MALFORMED,
+            ERROR_HANDOFF_HOOK_INCOMPATIBLE,
+            ERROR_HANDOFF_HOOK_IMPORT_FAILED,
+            ERROR_HANDOFF_HOOK_EXCEPTION,
+            ERROR_HANDOFF_RESPONSE_INVALID,
+            ERROR_HANDOFF_RESPONSE_INACTIVE,
+            ERROR_HANDOFF_METADATA_OVERSIZED,
+        }
+    )
+
+
+_CANONICAL_TOP_LEVEL_KEYS = frozenset(
+    {
+        "schema_version",
+        "protocol_name",
+        "contract_version",
+        "entrypoint_group",
+        "entrypoint_name",
+        "request",
+        "response",
+        "error_codes",
+        "limits",
+        "privacy",
+    }
+)
+_CANONICAL_REQUEST_KEYS = frozenset({"allowed_keys", "required_keys", "nullable_value_keys"})
+_CANONICAL_RESPONSE_KEYS = frozenset(
+    {
+        "allowed_keys",
+        "required_keys",
+        "allowed_statuses",
+        "success_status",
+        "active_status_forbids_error_code",
+        "error_status_requires_bounded_error_code",
+    }
+)
+_CANONICAL_LIMITS_KEYS = frozenset(
+    {
+        "max_entry_points_bytes",
+        "max_dist_info_metadata_bytes",
+        "max_summary_length",
+        "max_error_code_length",
+        "max_plan_family_length",
+        "max_provider_id_length",
+        "max_package_name_length",
+        "max_package_version_length",
+        "max_activation_reference_length",
+        "max_activation_credential_length",
+        "max_avp_home_length",
+    }
+)
+_CANONICAL_PRIVACY_KEYS = frozenset(
+    {
+        "deny_only_metadata",
+        "purpose",
+        "artifact_forbidden_markers",
+        "response_forbidden_markers",
+        "private_provider_markers",
+    }
+)
+
+
+def _assert_handoff_contract_runtime_invariants(contract: dict) -> None:
+    assert set(contract) == _CANONICAL_TOP_LEVEL_KEYS
+    assert contract["schema_version"] == "avp.paid_installed_provider_activation_handoff.v1"
+    assert contract["protocol_name"] == "installed_provider_activation_handoff"
+    assert set(contract["request"]) == _CANONICAL_REQUEST_KEYS
+    assert set(contract["response"]) == _CANONICAL_RESPONSE_KEYS
+    assert set(contract["limits"]) == _CANONICAL_LIMITS_KEYS
+    assert set(contract["privacy"]) == _CANONICAL_PRIVACY_KEYS
+    assert contract["contract_version"] == INSTALLED_PROVIDER_ACTIVATION_HANDOFF_CONTRACT_VERSION
+    assert contract["entrypoint_group"] == INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP
+    assert contract["entrypoint_name"] == INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME
+
+    request = contract["request"]
+    assert set(request["allowed_keys"]) == set(BOUNDED_HANDOFF_REQUEST_KEYS)
+    assert set(request["required_keys"]) == set(BOUNDED_HANDOFF_REQUEST_KEYS)
+    assert request.get("nullable_value_keys") == ["plan_family"]
+    assert "plan_family" in request["required_keys"]
+
+    response = contract["response"]
+    assert set(response["allowed_keys"]) == set(BOUNDED_HANDOFF_RESPONSE_KEYS)
+    assert set(response["required_keys"]) == {
+        "contract_version",
+        "status",
+        "public_fallback_available",
+    }
+    assert set(response["allowed_statuses"]) == set(ALLOWED_HANDOFF_RESPONSE_STATUSES)
+    assert response["success_status"] == "active"
+    assert response["active_status_forbids_error_code"] is True
+    assert response["error_status_requires_bounded_error_code"] is True
+
+    assert set(contract["error_codes"]) == _runtime_handoff_error_code_keys()
+
+    limits = contract["limits"]
+    assert limits["max_entry_points_bytes"] == MAX_HANDOFF_ENTRY_POINTS_BYTES
+    assert limits["max_dist_info_metadata_bytes"] == MAX_HANDOFF_DIST_INFO_METADATA_BYTES
+    assert limits["max_summary_length"] == MAX_HANDOFF_SUMMARY_LENGTH
+    assert limits["max_error_code_length"] == MAX_HANDOFF_ERROR_CODE_LENGTH
+    assert limits["max_plan_family_length"] == MAX_HANDOFF_PLAN_FAMILY_LENGTH
+    assert limits["max_provider_id_length"] == MAX_HANDOFF_PROVIDER_ID_LENGTH
+    assert limits["max_package_name_length"] == MAX_HANDOFF_PACKAGE_NAME_LENGTH
+    assert limits["max_package_version_length"] == MAX_HANDOFF_PACKAGE_VERSION_LENGTH
+    assert limits.get("max_activation_reference_length") == MAX_HANDOFF_ACTIVATION_REFERENCE_LENGTH
+    assert limits.get("max_activation_credential_length") == MAX_HANDOFF_ACTIVATION_CREDENTIAL_LENGTH
+    assert limits.get("max_avp_home_length") == MAX_HANDOFF_AVP_HOME_LENGTH
+
+    privacy = contract["privacy"]
+    assert privacy["deny_only_metadata"] is True
+    assert "not Team authority" in privacy["purpose"]
+    artifact_markers = privacy["artifact_forbidden_markers"]
+    response_markers = privacy["response_forbidden_markers"]
+    assert set(artifact_markers) == {
+        "activation_credential",
+        "license_key",
+        "entitlement_token",
+        "presigned_url",
+        "/Users/",
+        "workspace",
+        "member_id",
+        "team_",
+    }
+    assert set(response_markers) == {
+        "activation_credential",
+        "license_key",
+        "entitlement_token",
+        "presigned_url",
+        "workspace",
+        "member_id",
+        "team_",
+        "policy_release",
+        "module_id",
+    }
+    assert set(privacy["private_provider_markers"]) == set(FORBIDDEN_PRIVATE_MARKERS)
+
+
+def _leaky_summary_hook_source(*, summary_expr: str) -> str:
+    return f"""
+def run_activation_handoff(request):
+    return {{
+        "contract_version": "1",
+        "status": "active",
+        "public_fallback_available": True,
+        "summary": {summary_expr},
+        "error_code": None,
+    }}
+"""
+
+
+def _leaky_summary_hook_source_literal(*, summary: str) -> str:
+    return f"""
+def run_activation_handoff(request):
+    return {{
+        "contract_version": "1",
+        "status": "active",
+        "public_fallback_available": True,
+        "summary": {summary!r},
+        "error_code": None,
+    }}
+"""
+
+
+INCOMPATIBLE_VERSION_HOOK_SOURCE = """
+def run_activation_handoff(request):
+    return {
+        "contract_version": "999",
+        "status": "active",
+        "public_fallback_available": True,
+        "summary": "ok",
+        "error_code": None,
+    }
+"""
+
+MALFORMED_HOOK_SOURCE = """
+def run_activation_handoff(request):
+    return {
+        "contract_version": "1",
+        "status": "active",
+        "public_fallback_available": "yes",
+        "summary": "ok",
+        "error_code": None,
+    }
+"""
+
+LEAKY_ERROR_CODE_HOOK_SOURCE = """
+def run_activation_handoff(request):
+    return {
+        "contract_version": "1",
+        "status": "error",
+        "public_fallback_available": True,
+        "summary": "declined",
+        "error_code": request.activation_credential,
+    }
+"""
+
+
+def _hook_payload_always_emits_plan_family_key():
+    request = InstalledProviderActivationHandoffRequest(
+        contract_version="1",
+        activation_credential=RAW_LICENSE_KEY,
+        activation_reference=activation_reference_from_credential(RAW_LICENSE_KEY),
+        plan_family=None,
+        package_name=PACKAGE_NAME,
+        package_version=PACKAGE_VERSION,
+        provider_id="private_v1",
+        avp_home="/tmp/avp-home",
+    )
+    payload = request.to_hook_payload()
+    assert "plan_family" in payload
+    assert payload["plan_family"] is None
 
 
 def _entry_points_text(*, target: str | None, extra_lines: str = "") -> str:
@@ -364,6 +612,17 @@ class _FakeBackend:
         return self.wheel_bytes
 
 
+@dataclass
+class _CredentialRecordingBackend(_FakeBackend):
+    validation_credential_digests: list[str] = field(default_factory=list)
+
+    def validate_activation(self, license_key: str) -> ActivationValidateResult:
+        self.validation_credential_digests.append(
+            hashlib.sha256(license_key.encode("utf-8")).hexdigest()
+        )
+        return super().validate_activation(license_key)
+
+
 @pytest.fixture(autouse=True)
 def _reset_backend(monkeypatch):
     set_paid_backend_client(None)
@@ -394,14 +653,42 @@ def _handoff_request_kwargs(**overrides):
     return base
 
 
-def test_handoff_contract_fixture_matches_public_constants():
+def test_handoff_contract_fixture_matches_canonical_installed_artifact():
+    fixture = json.loads(_CONTRACT_FIXTURE_PATH.read_text(encoding="utf-8"))
+    canonical = _handoff_contract()
+    assert fixture == canonical, (
+        "tests/fixtures/paid_installed_provider_activation_handoff_contract.json "
+        "must match the installed canonical artifact exactly"
+    )
+
+
+def test_handoff_contract_canonical_matches_runtime_invariants():
     contract = _handoff_contract()
-    assert contract["schema_version"] == "avp.paid_installed_provider_activation_handoff.v1"
-    assert contract["contract_version"] == INSTALLED_PROVIDER_ACTIVATION_HANDOFF_CONTRACT_VERSION
-    assert contract["entrypoint_group"] == INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP
-    assert contract["entrypoint_name"] == INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME
-    assert set(contract["request"]["allowed_keys"]) == set(BOUNDED_HANDOFF_REQUEST_KEYS)
-    assert set(contract["response"]["allowed_keys"]) == set(BOUNDED_HANDOFF_RESPONSE_KEYS)
+    _assert_handoff_contract_runtime_invariants(contract)
+    _hook_payload_always_emits_plan_family_key()
+
+
+@pytest.mark.parametrize(
+    "mutator",
+    [
+        lambda contract: contract["request"]["required_keys"].remove("plan_family"),
+        lambda contract: contract["request"].pop("nullable_value_keys", None),
+        lambda contract: contract["limits"].pop("max_activation_credential_length"),
+        lambda contract: contract["limits"].pop("max_avp_home_length"),
+        lambda contract: contract["response"].__setitem__("success_status", "pending"),
+        lambda contract: contract["error_codes"].pop(ERROR_HANDOFF_HOOK_MISSING),
+        lambda contract: contract["privacy"].__setitem__("deny_only_metadata", False),
+        lambda contract: contract["privacy"]["response_forbidden_markers"].append("console_authority"),
+        lambda contract: contract.__setitem__("extra_top_level", True),
+        lambda contract: contract["request"].__setitem__("extra_nested", True),
+        lambda contract: contract["privacy"].__setitem__("extra_privacy", True),
+    ],
+)
+def test_canonical_contract_rejects_adversarial_mutations(mutator):
+    contract = copy.deepcopy(_handoff_contract())
+    mutator(contract)
+    with pytest.raises(AssertionError):
+        _assert_handoff_contract_runtime_invariants(contract)
 
 
 @pytest.mark.parametrize(
@@ -424,6 +711,210 @@ def test_handoff_contract_fixture_matches_public_constants():
 def test_handoff_response_validation_rejects_invalid_payloads(payload, expected_error):
     with pytest.raises(ValueError, match=expected_error):
         validate_installed_provider_activation_handoff_response(payload)
+
+
+@pytest.mark.parametrize(
+    "summary_expr",
+    [
+        "request.activation_credential",
+        "request.avp_home",
+        "'Windows leak C:\\\\Users\\\\secret\\\\key.txt'",
+        "'https://example.com/secret'",
+        "'file:///etc/passwd'",
+        "'presigned https://bucket.s3.amazonaws.com/x?X-Amz-Signature=abc'",
+        "'agentveil_private_policy internal'",
+    ],
+)
+def test_hook_summary_privacy_violations_fail_closed_without_cause(tmp_path, summary_expr):
+    home = tmp_path / "avp-home"
+    wheel, digest = _wheel_bytes(
+        tmp_path / "wheel",
+        hook_source=_leaky_summary_hook_source(summary_expr=summary_expr),
+    )
+    set_paid_backend_client(
+        _FakeBackend(
+            wheel_bytes=wheel,
+            artifact_hash=digest,
+            artifact_size=len(wheel),
+            provider_handoff_required=True,
+        )
+    )
+    with pytest.raises(PaidActivationError, match=ERROR_HANDOFF_RESPONSE_INVALID) as exc_info:
+        build_paid_activate_payload(license_key=RAW_LICENSE_KEY, home=home)
+    assert exc_info.value.__cause__ is None
+    assert load_install_state(install_state_path(home)) is None
+    activation = load_activation_state(activation_path(home))
+    assert activation is None or activation.get("status") != STATUS_ACTIVE
+    assert RAW_LICENSE_KEY not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        "/",
+        "/tmp/",
+        "//server/share",
+        "[/srv/data]",
+        "{/home/u}",
+        "</opt/app>",
+        "`/etc/passwd`",
+        "path:\n/etc/passwd",
+    ],
+)
+def test_hook_summary_absolute_posix_path_matrix_rejected(tmp_path, summary):
+    home = tmp_path / "avp-home"
+    wheel, digest = _wheel_bytes(
+        tmp_path / "wheel",
+        hook_source=_leaky_summary_hook_source_literal(summary=summary),
+    )
+    set_paid_backend_client(
+        _FakeBackend(
+            wheel_bytes=wheel,
+            artifact_hash=digest,
+            artifact_size=len(wheel),
+            provider_handoff_required=True,
+        )
+    )
+    with pytest.raises(PaidActivationError, match=ERROR_HANDOFF_RESPONSE_INVALID) as exc_info:
+        build_paid_activate_payload(license_key=RAW_LICENSE_KEY, home=home)
+    assert exc_info.value.__cause__ is None
+    assert load_install_state(install_state_path(home)) is None
+
+
+def test_safe_hook_summary_still_activates(tmp_path):
+    home = tmp_path / "avp-home"
+    wheel, digest = _wheel_bytes(
+        tmp_path / "wheel",
+        hook_source=_leaky_summary_hook_source(summary_expr="'Installed hook completed.'"),
+    )
+    set_paid_backend_client(
+        _FakeBackend(
+            wheel_bytes=wheel,
+            artifact_hash=digest,
+            artifact_size=len(wheel),
+            provider_handoff_required=True,
+        )
+    )
+    payload = build_paid_activate_payload(license_key=RAW_LICENSE_KEY, home=home)
+    assert payload["activation"]["status"] == STATUS_ACTIVE
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        "version 1/2",
+        "relative/path",
+        "ratio a/b",
+        "Installed hook completed.",
+    ],
+)
+def test_safe_hook_summary_allows_relative_text(tmp_path, summary):
+    home = tmp_path / "avp-home"
+    wheel, digest = _wheel_bytes(
+        tmp_path / "wheel",
+        hook_source=_leaky_summary_hook_source_literal(summary=summary),
+    )
+    set_paid_backend_client(
+        _FakeBackend(
+            wheel_bytes=wheel,
+            artifact_hash=digest,
+            artifact_size=len(wheel),
+            provider_handoff_required=True,
+        )
+    )
+    payload = build_paid_activate_payload(license_key=RAW_LICENSE_KEY, home=home)
+    assert payload["activation"]["status"] == STATUS_ACTIVE
+
+
+def test_hook_incompatible_contract_version_surfaces_typed_error(tmp_path):
+    home = tmp_path / "avp-home"
+    wheel, digest = _wheel_bytes(tmp_path / "wheel", hook_source=INCOMPATIBLE_VERSION_HOOK_SOURCE)
+    set_paid_backend_client(
+        _FakeBackend(
+            wheel_bytes=wheel,
+            artifact_hash=digest,
+            artifact_size=len(wheel),
+            provider_handoff_required=True,
+        )
+    )
+    with pytest.raises(PaidActivationError, match=ERROR_HANDOFF_HOOK_INCOMPATIBLE) as exc_info:
+        build_paid_activate_payload(license_key=RAW_LICENSE_KEY, home=home)
+    assert exc_info.value.__cause__ is None
+
+
+def test_hook_malformed_response_surfaces_handoff_response_invalid(tmp_path):
+    home = tmp_path / "avp-home"
+    wheel, digest = _wheel_bytes(tmp_path / "wheel", hook_source=MALFORMED_HOOK_SOURCE)
+    set_paid_backend_client(
+        _FakeBackend(
+            wheel_bytes=wheel,
+            artifact_hash=digest,
+            artifact_size=len(wheel),
+            provider_handoff_required=True,
+        )
+    )
+    with pytest.raises(PaidActivationError, match=ERROR_HANDOFF_RESPONSE_INVALID) as exc_info:
+        build_paid_activate_payload(license_key=RAW_LICENSE_KEY, home=home)
+    assert exc_info.value.__cause__ is None
+
+
+def test_hook_error_code_privacy_violation_fail_closed_without_cause(tmp_path):
+    home = tmp_path / "avp-home"
+    wheel, digest = _wheel_bytes(tmp_path / "wheel", hook_source=LEAKY_ERROR_CODE_HOOK_SOURCE)
+    set_paid_backend_client(
+        _FakeBackend(
+            wheel_bytes=wheel,
+            artifact_hash=digest,
+            artifact_size=len(wheel),
+            provider_handoff_required=True,
+        )
+    )
+    with pytest.raises(PaidActivationError, match=ERROR_HANDOFF_RESPONSE_INVALID) as exc_info:
+        build_paid_activate_payload(license_key=RAW_LICENSE_KEY, home=home)
+    assert exc_info.value.__cause__ is None
+    assert RAW_LICENSE_KEY not in str(exc_info.value)
+    assert load_install_state(install_state_path(home)) is None
+
+
+def test_replacement_summary_privacy_violation_preserves_prior_install_state(tmp_path):
+    home = tmp_path / "avp-home"
+    initial_wheel, initial_digest = _wheel_bytes(
+        tmp_path / "wheel-initial",
+        metadata_extra="Wheel-Marker: initial\n",
+    )
+    set_paid_backend_client(
+        _FakeBackend(
+            wheel_bytes=initial_wheel,
+            artifact_hash=initial_digest,
+            artifact_size=len(initial_wheel),
+            provider_handoff_required=True,
+        )
+    )
+    build_paid_activate_payload(license_key=RAW_LICENSE_KEY, home=home)
+    cache_path = home / "paid" / "cache" / f"{PACKAGE_NAME}-{PACKAGE_VERSION}.whl"
+    old_cache_bytes = cache_path.read_bytes()
+    prior_vendor = vendor_root(home) / f"{PACKAGE_NAME}-{PACKAGE_VERSION}"
+    (prior_vendor / "marker.txt").write_text("keep-me", encoding="utf-8")
+    wheel, digest = _wheel_bytes(
+        tmp_path / "wheel",
+        hook_source=_leaky_summary_hook_source(summary_expr="request.activation_credential"),
+    )
+    set_paid_backend_client(
+        _FakeBackend(
+            wheel_bytes=wheel,
+            artifact_hash=digest,
+            artifact_size=len(wheel),
+            provider_handoff_required=True,
+        )
+    )
+    with pytest.raises(PaidActivationError, match=ERROR_HANDOFF_RESPONSE_INVALID) as exc_info:
+        build_paid_activate_payload(license_key=RAW_LICENSE_KEY, home=home)
+    assert exc_info.value.__cause__ is None
+    preserved = load_install_state(install_state_path(home))
+    assert preserved is not None
+    assert preserved["status"] == STATUS_ACTIVE
+    assert cache_path.read_bytes() == old_cache_bytes
+    assert (prior_vendor / "marker.txt").read_text(encoding="utf-8") == "keep-me"
 
 
 def test_legacy_backend_without_handoff_flag_keeps_builder_path(tmp_path):
@@ -491,6 +982,63 @@ def test_handoff_request_redacts_credential_in_repr_and_str():
     assert "/tmp/avp-home" not in repr(request)
 
 
+def test_run_paid_activate_install_flow_delivers_exact_same_credential_once(tmp_path, capsys):
+    home = tmp_path / "avp-home"
+    wheel, digest = _wheel_bytes(tmp_path / "wheel")
+    backend = _CredentialRecordingBackend(
+        wheel_bytes=wheel,
+        artifact_hash=digest,
+        artifact_size=len(wheel),
+        provider_handoff_required=True,
+    )
+    set_paid_backend_client(backend)
+    result = run_paid_activate_install_flow(
+        license_key=RAW_LICENSE_KEY,
+        home=home,
+        client=backend,
+    )
+    assert result.activation_status == STATUS_ACTIVE
+    assert result.install_state["status"] == STATUS_ACTIVE
+    assert backend.validation_credential_digests == [EXPECTED_CREDENTIAL_DIGEST]
+    trace = json.loads((home / "paid" / ".handoff_trace.json").read_text(encoding="utf-8"))
+    assert len(trace) == 1
+    assert trace[0]["credential_sha256"] == EXPECTED_CREDENTIAL_DIGEST
+    install_state_text = json.dumps(result.install_state)
+    assert RAW_LICENSE_KEY not in install_state_text
+    captured = capsys.readouterr()
+    output_text = captured.out + captured.err
+    assert RAW_LICENSE_KEY not in output_text
+    assert RAW_LICENSE_KEY not in _handoff_contract_bytes_text()
+    with pytest.raises(AssertionError):
+        backend.validate_activation(ALT_LICENSE_KEY_SAME_LENGTH)
+
+
+def _handoff_contract_bytes_text() -> str:
+    return _canonical_handoff_contract_bytes().decode("utf-8")
+
+
+def test_same_length_credential_substitution_is_rejected_before_hook(tmp_path):
+    home = tmp_path / "avp-home"
+    wheel, digest = _wheel_bytes(tmp_path / "wheel")
+    backend = _CredentialRecordingBackend(
+        wheel_bytes=wheel,
+        artifact_hash=digest,
+        artifact_size=len(wheel),
+        provider_handoff_required=True,
+    )
+    set_paid_backend_client(backend)
+    with pytest.raises(AssertionError):
+        run_paid_activate_install_flow(
+            license_key=ALT_LICENSE_KEY_SAME_LENGTH,
+            home=home,
+            client=backend,
+        )
+    assert backend.validation_credential_digests == [
+        hashlib.sha256(ALT_LICENSE_KEY_SAME_LENGTH.encode("utf-8")).hexdigest()
+    ]
+    assert not (home / "paid" / ".handoff_trace.json").is_file()
+
+
 def test_hook_receives_bounded_context_once_in_memory(tmp_path):
     home = tmp_path / "avp-home"
     wheel, digest = _wheel_bytes(tmp_path / "wheel")
@@ -514,7 +1062,7 @@ def test_hook_receives_bounded_context_once_in_memory(tmp_path):
     trace = json.loads((home / "paid" / ".handoff_trace.json").read_text(encoding="utf-8"))
     assert len(trace) == 1
     call = trace[0]
-    assert call["credential_len"] == len(RAW_LICENSE_KEY)
+    assert call["credential_sha256"] == EXPECTED_CREDENTIAL_DIGEST
     assert call["activation_reference"] == activation_reference_from_credential(RAW_LICENSE_KEY)
     assert call["plan_family"] == "builder"
     assert call["package_name"] == PACKAGE_NAME
@@ -759,12 +1307,17 @@ def test_built_wheel_installed_path_handoff(tmp_path):
     assert result.install_state["status"] == STATUS_ACTIVE
 
 
-def test_handoff_contract_forbids_team_vocabulary_in_privacy_markers():
+def test_handoff_contract_privacy_markers_are_deny_only_metadata():
     contract = _handoff_contract()
-    markers = " ".join(contract["privacy_forbidden_markers"]).lower()
+    privacy = contract["privacy"]
+    assert privacy["deny_only_metadata"] is True
+    markers = " ".join(privacy["artifact_forbidden_markers"]).lower()
     assert "workspace" in markers
     assert "member_id" in markers
     assert "team_" in markers
+    response_markers = " ".join(privacy["response_forbidden_markers"]).lower()
+    assert "policy_release" in response_markers
+    assert "module_id" in response_markers
 
 
 def test_tools_list_surface_unchanged_after_handoff_activation(tmp_path):

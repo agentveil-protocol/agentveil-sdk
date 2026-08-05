@@ -57,14 +57,22 @@ credential. Secret-bearing request objects redact the credential in `repr` and
 `str`. Errors must not contain credential fragments, backend URLs, presigned
 URLs, or private module names.
 
-## Fixture
+## Canonical contract artifact
 
-Checked-in contract artifact:
+Installed package data (single public owner):
+
+`agentveil_mcp_proxy/contracts/installed_provider_activation_handoff_v1.json`
+
+The artifact locks request/response key sets, nullable `plan_family` semantics,
+credential/home bounds, status semantics, error codes, limits, and deny-only
+privacy scan metadata (`privacy.deny_only_metadata=true`).
+
+Test fixture (must match canonical exactly):
 
 `tests/fixtures/paid_installed_provider_activation_handoff_contract.json`
 
-Public tests validate protocol names, allowed keys, statuses, error codes, and
-metadata size limits against that fixture.
+Public tests validate the full claim-bearing contract object and adversarial
+mutations against the installed canonical artifact.
 
 ## Failure behavior
 
