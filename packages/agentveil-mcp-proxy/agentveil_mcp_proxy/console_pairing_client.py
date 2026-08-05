@@ -46,7 +46,7 @@ _START_KEYS = frozenset(
     {"device_code", "user_code", "verification_uri", "expires_in", "interval"}
 )
 _PENDING_KEYS = frozenset({"status"})
-_CONFIRMED_KEYS = frozenset({"status", "token", "scope"})
+_CONSUMED_KEYS = frozenset({"status", "token", "scope"})
 _REVOKED_KEYS = frozenset({"status"})
 
 _USER_CODE_RE = re.compile(r"^[A-Z0-9]+(?:-[A-Z0-9]+)*$")
@@ -86,7 +86,7 @@ class PairingStart:
 
 @dataclass(frozen=True)
 class PairingToken:
-    """Validated confirmed token. ``token`` is a secret; do not print."""
+    """Validated consumed token. ``token`` is a secret; do not print."""
 
     token: str
     scope: str
@@ -224,7 +224,7 @@ class ConsolePairingClient:
         )
 
     def poll_for_token(self, start: PairingStart) -> PairingToken:
-        """Poll ``/consume`` on a monotonic deadline until confirmed or expired."""
+        """Poll ``/consume`` on a monotonic deadline until consumed or expired."""
 
         interval = min(start.interval, start.expires_in)
         deadline = self._clock() + start.expires_in
@@ -244,8 +244,8 @@ class ConsolePairingClient:
                     raise PairingClientError("expired")
                 self._sleep(min(interval, remaining))
                 continue
-            if status == "confirmed":
-                if set(payload) != _CONFIRMED_KEYS:
+            if status == "consumed":
+                if set(payload) != _CONSUMED_KEYS:
                     raise PairingClientError("malformed_consume")
                 token = _require_secret_str(
                     payload["token"], _MAX_TOKEN_LENGTH, "malformed_consume"

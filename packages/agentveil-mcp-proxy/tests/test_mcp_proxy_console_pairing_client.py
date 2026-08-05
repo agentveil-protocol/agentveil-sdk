@@ -255,14 +255,14 @@ def test_start_rejects_malicious_verification_uri(uri):
 # --- poll / consume --------------------------------------------------------
 
 
-def test_poll_pending_then_confirmed_returns_token():
+def test_poll_pending_then_consumed_returns_token():
     clock = FakeClock()
     transport = FakeTransport(
         [
             _json_response(200, {"status": "pending"}),
             _json_response(
                 200,
-                {"status": "confirmed", "token": TOKEN, "scope": "bounded_summary_upload"},
+                {"status": "consumed", "token": TOKEN, "scope": "bounded_summary_upload"},
             ),
         ]
     )
@@ -278,7 +278,21 @@ def test_poll_pending_then_confirmed_returns_token():
     consume_call = transport.calls[0]
     assert consume_call["url"] == f"{CONSOLE_ORIGIN}/console/pairing/consume"
     assert json.loads(consume_call["body"]) == {"device_code": DEVICE_CODE}
-    assert clock.now > 0  # a bounded sleep occurred between pending and confirm
+    assert clock.now > 0  # a bounded sleep occurred between pending and consume
+
+
+def test_poll_legacy_confirmed_status_fails_closed():
+    client = _client(
+        [
+            _json_response(
+                200,
+                {"status": "confirmed", "token": TOKEN, "scope": "bounded_summary_upload"},
+            )
+        ]
+    )
+    with pytest.raises(PairingClientError) as exc:
+        client.poll_for_token(_start(_start_payload()))
+    assert exc.value.code == "unexpected_status"
 
 
 def test_poll_is_bounded_and_never_runs_forever():
@@ -312,23 +326,65 @@ def test_poll_unknown_status_fails_closed():
 
 
 @pytest.mark.parametrize(
-    "payload",
+    ("payload", "expected_error"),
     [
-        {"status": "confirmed", "scope": "bounded_summary_upload"},
-        {"status": "confirmed", "token": "", "scope": "bounded_summary_upload"},
-        {"status": "confirmed", "token": TOKEN, "scope": "bounded_summary_upload", "x": 1},
+        (
+            {"status": "consumed", "scope": "bounded_summary_upload"},
+            "malformed_consume",
+        ),
+        (
+            {"status": "consumed", "token": "", "scope": "bounded_summary_upload"},
+            "malformed_consume",
+        ),
+        (
+            {"status": "consumed", "token": None, "scope": "bounded_summary_upload"},
+            "malformed_consume",
+        ),
+        (
+            {"status": "consumed", "token": True, "scope": "bounded_summary_upload"},
+            "malformed_consume",
+        ),
+        (
+            {"status": "consumed", "token": 123, "scope": "bounded_summary_upload"},
+            "malformed_consume",
+        ),
+        (
+            {"status": "consumed", "token": [], "scope": "bounded_summary_upload"},
+            "malformed_consume",
+        ),
+        (
+            {"status": "consumed", "token": {}, "scope": "bounded_summary_upload"},
+            "malformed_consume",
+        ),
+        (
+            {
+                "status": "consumed",
+                "token": TOKEN,
+                "scope": "bounded_summary_upload",
+                "x": 1,
+            },
+            "malformed_consume",
+        ),
+        (
+            {"status": 123, "token": TOKEN, "scope": "bounded_summary_upload"},
+            "unexpected_status",
+        ),
+        (
+            {"status": "consumed", "token": TOKEN, "scope": 123},
+            "unexpected_scope",
+        ),
     ],
 )
-def test_poll_confirmed_malformed_fails_closed(payload):
+def test_poll_consumed_malformed_fails_closed(payload, expected_error):
     client = _client([_json_response(200, payload)])
     with pytest.raises(PairingClientError) as exc:
         client.poll_for_token(_start(_start_payload()))
-    assert exc.value.code == "malformed_consume"
+    assert exc.value.code == expected_error
 
 
-def test_poll_confirmed_wrong_scope_fails_closed():
+def test_poll_consumed_wrong_scope_fails_closed():
     client = _client(
-        [_json_response(200, {"status": "confirmed", "token": TOKEN, "scope": "other"})]
+        [_json_response(200, {"status": "consumed", "token": TOKEN, "scope": "other"})]
     )
     with pytest.raises(PairingClientError) as exc:
         client.poll_for_token(_start(_start_payload()))
