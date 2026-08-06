@@ -4647,7 +4647,7 @@ class McpPassthrough:
             expires_at=None,
         )
         try:
-            store.record_terminal_deny(
+            updated = store.record_terminal_deny(
                 request_id=request_id_text,
                 session_id=getattr(manager, "session_id", None) or str(uuid.uuid4()),
                 client_id=getattr(manager, "client_id", None),
@@ -4665,6 +4665,7 @@ class McpPassthrough:
             )
         except ApprovalEvidenceError:
             return
+        manager._notify_terminal_evidence(updated)
 
     def _record_allow_controlled_path_if_needed(
         self,
