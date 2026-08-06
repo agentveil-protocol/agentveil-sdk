@@ -3518,14 +3518,14 @@ def test_console_login_credential_write_failure_leaves_no_partial(tmp_path, monk
     def _boom(*_args, **_kwargs):
         raise console_creds.CredentialError("credential_write_failed")
 
-    monkeypatch.setattr(console_creds, "_atomic_write_to_directory_fd", _boom)
+    monkeypatch.setattr(proxy_cli, "save_credential", _boom)
 
     exit_code = main(["login", "--no-open"])
     _out, err = capsys.readouterr()
 
     assert exit_code == 1
     assert "ERROR:" in err
-    assert not credential_path(home=home).exists()
+    assert load_credential(home=home) is None
     assert CONSOLE_TOKEN not in err
     assert client.revoke_calls == [CONSOLE_TOKEN]
 
@@ -3543,7 +3543,7 @@ def test_console_login_store_failure_revokes_orphan_token(tmp_path, monkeypatch,
     def _boom(*_args, **_kwargs):
         raise console_creds.CredentialError("credential_write_failed")
 
-    monkeypatch.setattr(console_creds, "_atomic_write_to_directory_fd", _boom)
+    monkeypatch.setattr(proxy_cli, "save_credential", _boom)
 
     exit_code = main(["login", "--no-open"])
     _out, err = capsys.readouterr()
@@ -3613,7 +3613,7 @@ def test_console_logout_revoked_removes_credential(tmp_path, monkeypatch, capsys
     assert exit_code == 0
     assert "Disconnected from AgentVeil Console." in out
     assert client.revoked_with == CONSOLE_TOKEN
-    assert not credential_path(home=home).exists()
+    assert load_credential(home=home) is None
     assert CONSOLE_TOKEN not in out
 
 
@@ -3629,7 +3629,7 @@ def test_console_logout_unauthorized_removes_credential(tmp_path, monkeypatch, c
 
     assert exit_code == 0
     assert "already" in out.lower()
-    assert not credential_path(home=home).exists()
+    assert load_credential(home=home) is None
 
 
 def test_console_logout_ambiguous_preserves_credential(tmp_path, monkeypatch, capsys):
@@ -3645,7 +3645,6 @@ def test_console_logout_ambiguous_preserves_credential(tmp_path, monkeypatch, ca
     out, err = capsys.readouterr()
 
     assert exit_code == 1
-    assert credential_path(home=home).exists()
     assert load_credential(home=home).token == CONSOLE_TOKEN
     assert "ERROR:" in err
     assert CONSOLE_TOKEN not in out

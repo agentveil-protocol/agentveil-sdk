@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,45 @@ from agentveil_mcp_proxy.console_credentials import (
 
 POSIX = os.name != "nt"
 TOKEN = "opaque-device-token-value"
+
+
+class _FakeWindowsCredentialBackend:
+    def __init__(self) -> None:
+        self.values: dict[str, bytes] = {}
+        self.lock_names: list[str] = []
+        self.fail_write_after: int | None = None
+        self.write_calls = 0
+        self.lock_timeout = False
+
+    def read(self, target: str) -> bytes | None:
+        return self.values.get(target)
+
+    def write(self, target: str, blob: bytes) -> None:
+        self.write_calls += 1
+        if (
+            self.fail_write_after is not None
+            and self.write_calls > self.fail_write_after
+        ):
+            raise creds._WindowsCredentialBackendError()
+        self.values[target] = bytes(blob)
+
+    def delete(self, target: str) -> bool:
+        return self.values.pop(target, None) is not None
+
+    @contextmanager
+    def lock(self, name: str, *, nonblocking: bool):
+        self.lock_names.append(name)
+        if nonblocking and self.lock_timeout:
+            raise creds._WindowsCredentialLockTimeout()
+        yield
+
+
+@pytest.fixture
+def windows_backend(monkeypatch):
+    backend = _FakeWindowsCredentialBackend()
+    monkeypatch.setattr(creds, "_uses_windows_credential_manager", lambda: True)
+    monkeypatch.setattr(creds, "_windows_credential_backend", lambda: backend)
+    return backend
 
 
 def _mode(path: Path) -> int:
@@ -57,8 +97,12 @@ def test_created_directory_and_file_modes(tmp_path):
     if POSIX:
         assert _mode(path) == 0o600
         assert _mode(path.parent) == 0o700
+    else:
+        assert not path.exists()
+        assert not path.parent.exists()
 
 
+@pytest.mark.skipif(not POSIX, reason="filesystem payload is a POSIX guarantee")
 def test_persisted_payload_is_bounded_exact_schema(tmp_path):
     save_credential(TOKEN, home=tmp_path)
     payload = json.loads(credential_path(home=tmp_path).read_text(encoding="utf-8"))
@@ -100,6 +144,7 @@ def test_load_rejects_hardlink(tmp_path):
         load_credential(home=tmp_path)
 
 
+@pytest.mark.skipif(not POSIX, reason="filesystem custody is a POSIX guarantee")
 def test_load_rejects_non_regular(tmp_path):
     path = credential_path(home=tmp_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -128,6 +173,7 @@ def test_load_rejects_permissive_mode(tmp_path):
         load_credential(home=tmp_path)
 
 
+@pytest.mark.skipif(not POSIX, reason="filesystem custody is a POSIX guarantee")
 def test_load_rejects_oversized_file(tmp_path):
     path = credential_path(home=tmp_path)
     _write_raw(path, b"x" * (8192 + 1))
@@ -136,6 +182,7 @@ def test_load_rejects_oversized_file(tmp_path):
         load_credential(home=tmp_path)
 
 
+@pytest.mark.skipif(not POSIX, reason="filesystem custody is a POSIX guarantee")
 def test_load_rejects_malformed_json(tmp_path):
     _write_raw(credential_path(home=tmp_path), b"{not json")
 
@@ -155,6 +202,7 @@ def test_load_rejects_malformed_json(tmp_path):
         {"scope": CREDENTIAL_SCOPE, "token": TOKEN},
     ],
 )
+@pytest.mark.skipif(not POSIX, reason="filesystem custody is a POSIX guarantee")
 def test_load_rejects_unknown_schema_scope_or_types(tmp_path, payload):
     _write_raw(
         credential_path(home=tmp_path),
@@ -179,6 +227,7 @@ def test_save_rejects_bad_token(tmp_path, bad_token):
     assert load_credential(home=tmp_path) is None
 
 
+@pytest.mark.skipif(not POSIX, reason="filesystem custody is a POSIX guarantee")
 def test_atomic_write_failure_keeps_prior_credential(tmp_path, monkeypatch):
     save_credential(TOKEN, home=tmp_path)
 
@@ -199,7 +248,10 @@ def test_delete_removes_regular_credential(tmp_path):
     path = credential_path(home=tmp_path)
 
     assert delete_credential(home=tmp_path) is True
-    assert not path.exists()
+    if POSIX:
+        assert not path.exists()
+    else:
+        assert load_credential(home=tmp_path) is None
 
 
 def test_delete_missing_is_false(tmp_path):
@@ -219,6 +271,7 @@ def test_delete_rejects_symlink_and_preserves_target(tmp_path):
     assert real.exists()
 
 
+@pytest.mark.skipif(not POSIX, reason="filesystem custody is a POSIX guarantee")
 def test_error_text_carries_no_token(tmp_path):
     _write_raw(credential_path(home=tmp_path), b"{bad")
     try:
@@ -392,3 +445,122 @@ def test_login_lock_survives_parent_directory_swap(tmp_path, monkeypatch):
     with console_login_lock(home=home):
         assert (backup / ".login.lock").exists()
         assert not (external / ".login.lock").exists()
+
+
+# --- Windows Credential Manager custody --------------------------------------
+
+
+def test_windows_save_load_delete_uses_current_user_credential_store(
+    tmp_path,
+    windows_backend,
+):
+    save_credential(TOKEN, home=tmp_path)
+
+    assert not credential_path(home=tmp_path).exists()
+    assert load_credential(home=tmp_path) == creds.StoredCredential(
+        scope=CREDENTIAL_SCOPE,
+        token=TOKEN,
+    )
+    assert delete_credential(home=tmp_path) is True
+    assert load_credential(home=tmp_path) is None
+    assert windows_backend.values == {}
+
+
+@pytest.mark.parametrize(
+    ("token", "expected_chunks"),
+    [
+        ("x" * 4096, 2),
+        ("\U0001F642" * 4096, creds._WINDOWS_MAX_CHUNKS),
+    ],
+)
+def test_windows_store_chunks_maximum_contract_token_without_raw_path(
+    tmp_path,
+    windows_backend,
+    token,
+    expected_chunks,
+):
+    save_credential(token, home=tmp_path)
+
+    active_target = creds._windows_active_target(tmp_path)
+    generation, chunk_count, token_byte_length = creds._parse_windows_metadata(
+        windows_backend.values[active_target]
+    )
+    assert token_byte_length == len(token.encode("utf-8"))
+    assert chunk_count == expected_chunks
+    assert load_credential(home=tmp_path).token == token
+    assert str(tmp_path) not in "\n".join(windows_backend.values)
+    assert not any(
+        len(blob) > creds._WINDOWS_CREDENTIAL_BLOB_BYTES
+        for blob in windows_backend.values.values()
+    )
+    assert generation
+
+
+def test_windows_save_failure_preserves_prior_active_credential(
+    tmp_path,
+    windows_backend,
+):
+    save_credential(TOKEN, home=tmp_path)
+    windows_backend.fail_write_after = windows_backend.write_calls + 1
+
+    with pytest.raises(CredentialError, match="credential_write_failed"):
+        save_credential("y" * 4096, home=tmp_path)
+
+    loaded = load_credential(home=tmp_path)
+    assert loaded is not None
+    assert loaded.token == TOKEN
+
+
+def test_windows_rejects_malformed_pointer_and_missing_chunk(
+    tmp_path,
+    windows_backend,
+):
+    active_target = creds._windows_active_target(tmp_path)
+    windows_backend.values[active_target] = b"{}"
+
+    with pytest.raises(CredentialError, match="credential_invalid"):
+        load_credential(home=tmp_path)
+
+    del windows_backend.values[active_target]
+    save_credential(TOKEN, home=tmp_path)
+    generation, chunk_count, _ = creds._parse_windows_metadata(
+        windows_backend.values[active_target]
+    )
+    del windows_backend.values[
+        creds._windows_chunk_target(creds._windows_namespace(tmp_path), generation, 0)
+    ]
+
+    with pytest.raises(CredentialError, match="credential_invalid"):
+        load_credential(home=tmp_path)
+    assert chunk_count == 1
+
+
+def test_windows_login_lock_is_named_and_fails_closed_on_contention(
+    tmp_path,
+    windows_backend,
+):
+    windows_backend.lock_timeout = True
+
+    with pytest.raises(CredentialError, match="login_in_progress"):
+        with console_login_lock(home=tmp_path):
+            pytest.fail("lock should not be acquired")
+
+    assert windows_backend.lock_names == [
+        creds._windows_mutex_name(tmp_path, purpose="login")
+    ]
+    assert str(tmp_path) not in windows_backend.lock_names[0]
+
+
+def test_windows_native_backend_errors_do_not_expose_token_or_path(
+    tmp_path,
+    windows_backend,
+):
+    windows_backend.fail_write_after = 0
+    try:
+        save_credential(TOKEN, home=tmp_path)
+    except CredentialError as exc:
+        assert str(exc) == "credential_write_failed"
+        assert TOKEN not in str(exc)
+        assert str(tmp_path) not in str(exc)
+    else:  # pragma: no cover - defensive
+        pytest.fail("expected CredentialError")
