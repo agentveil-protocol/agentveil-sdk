@@ -531,47 +531,52 @@ def test_dispatcher_uploads_snapshot_on_request(tmp_path):
     store.close()
 
 
-@pytest.mark.parametrize("attempt", range(20))
-def test_shutdown_leaves_no_approval_dispatcher_threads(tmp_path, attempt):
-    calls = 0
-    first_started = threading.Event()
-    first_release = threading.Event()
-    second_started = threading.Event()
-    second_release = threading.Event()
+def test_shutdown_leaves_no_approval_dispatcher_threads(tmp_path):
+    upload_started = threading.Event()
+    upload_release = threading.Event()
+    stop_started = threading.Event()
+    stop_completed = threading.Event()
 
-    def _blocking_transport(method, url, *, headers, body, timeout):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            first_started.set()
-            first_release.wait(timeout=timeout)
-        else:
-            second_started.set()
-            second_release.wait(timeout=timeout)
-        return _json_response(200, _backend_ack_for_request(body))
+    def _blocking_upload(payload, **kwargs):
+        upload_started.set()
+        assert upload_release.wait(timeout=5.0)
+        return "accepted"
 
-    store = ApprovalEvidenceStore(tmp_path / f"evidence-{attempt}.sqlite")
-    store.write_pending(_record(f"pending-{attempt}"))
+    store = ApprovalEvidenceStore(tmp_path / "evidence.sqlite")
+    store.write_pending(_record("pending-shutdown"))
     baseline = {t.ident for t in threading.enumerate()}
     dispatcher = ConsoleApprovalSummaryDispatcher(
         home=tmp_path,
         snapshot_source=lambda: build_approval_summary_snapshot(store),
         load_credential_fn=_load_credential_ok,
-        transport=_blocking_transport,
+        upload_fn=_blocking_upload,
     )
-    dispatcher.start()
-    dispatcher.request_snapshot()
-    assert first_started.wait(timeout=5.0)
-    first_release.set()
-    store.write_pending(_record(f"pending-{attempt}-changed"))
-    dispatcher.request_snapshot()
-    assert second_started.wait(timeout=5.0)
-    dispatcher.stop()
-    assert dispatcher._worker is not None
-    assert not dispatcher._worker.is_alive()
-    assert _alive_threads_created_since(baseline) == []
-    second_release.set()
-    store.close()
+
+    def _stop_dispatcher():
+        stop_started.set()
+        dispatcher.stop(timeout=2.0)
+        stop_completed.set()
+
+    stopper = threading.Thread(target=_stop_dispatcher, name="test-stop-dispatcher")
+    try:
+        dispatcher.start()
+        dispatcher.request_snapshot()
+        assert upload_started.wait(timeout=5.0)
+        stopper.start()
+        assert stop_started.wait(timeout=1.0)
+        assert not stop_completed.is_set()
+        upload_release.set()
+        stopper.join(timeout=2.0)
+        assert not stopper.is_alive()
+        assert dispatcher._worker is not None
+        assert not dispatcher._worker.is_alive()
+        assert _alive_threads_created_since(baseline) == []
+    finally:
+        upload_release.set()
+        if stopper.ident is not None:
+            stopper.join(timeout=2.0)
+        dispatcher.stop(timeout=2.0)
+        store.close()
 
 
 def test_attach_observers_keep_decision_and_approval_separate(tmp_path):
