@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import atexit
 import json
 import os
+import re
 import secrets
 import sys
 import threading
@@ -58,6 +59,7 @@ from agentveil_mcp_proxy.evidence.approval_grant import (
 from agentveil_mcp_proxy.evidence.observability import (
     approval_display_risk_class,
     approval_resource_display,
+    bounded_approval_resource_display,
     classify_downstream_response,
     parse_action_gate_metadata,
 )
@@ -79,6 +81,27 @@ from agentveil_mcp_proxy.runtime_gate import DEFAULT_RUNTIME_ENVIRONMENT, Runtim
 APPROVAL_SCOPE_EXACT = "exact"
 APPROVAL_SCOPE_SIMILAR_5M = "similar_5m"
 PREBIND_CANCELLATION_TTL_SECONDS = 300.0
+
+_SAFE_APPROVAL_BASENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,126}$")
+_SECRETISH_BASENAME_RE = re.compile(
+    r"(?i)(password|secret|token|api[_-]?key|private[_-]?key|bearer)"
+)
+
+
+def _approval_target_basename_for_metadata(resource_plain: str | None) -> str | None:
+    """Return a bounded basename accepted by the metadata grammar."""
+
+    bounded = bounded_approval_resource_display(resource_plain)
+    if bounded is None:
+        return None
+    candidate = bounded.strip()
+    if not candidate or not _SAFE_APPROVAL_BASENAME_RE.fullmatch(candidate):
+        return None
+    if "/" in candidate or "\\" in candidate:
+        return None
+    if _SECRETISH_BASENAME_RE.search(candidate):
+        return None
+    return candidate
 
 
 def normalize_client_request_id(client_request_id: Any) -> tuple[str, Any] | None:
@@ -179,6 +202,7 @@ class ApprovalManager:
         self._browser_opened_request_ids: set[str] = set()
         self._approval_generations: dict[str, int] = {}
         self.terminal_evidence_observer: Callable[[PendingApproval], None] | None = None
+        self.approval_state_observer: Callable[[], None] | None = None
         self.approval_server.set_decision_handler(self._persist_server_decision)
 
     def _notify_terminal_evidence(self, record: PendingApproval | None) -> None:
@@ -193,6 +217,17 @@ class ApprovalManager:
             return
         try:
             observer(record)
+        except Exception:
+            return
+
+    def _notify_approval_state(self) -> None:
+        """Best-effort approval snapshot hook; observer failures are swallowed."""
+
+        observer = self.approval_state_observer
+        if observer is None:
+            return
+        try:
+            observer()
         except Exception:
             return
 
@@ -401,6 +436,7 @@ class ApprovalManager:
                     )
             url = self.approval_server.register(prompt)
             self._set_delivery_status(request_id, DELIVERY_STATUS_QUEUED)
+            self._notify_approval_state()
         actionable_ui = self._notify(prompt, url)
         delivery_status = self._delivery_status_for(request_id)
         if not self.wait_for_decision:
@@ -591,6 +627,7 @@ class ApprovalManager:
         )
         self._forget_approval_generation(request_id)
         self._release_client_request_binding_for_request(request_id)
+        self._notify_approval_state()
         return ApprovalOutcome(
             request_id,
             ApprovalStatus.INVALIDATED.value,
@@ -717,6 +754,7 @@ class ApprovalManager:
         )
         self._forget_approval_generation(request_id)
         self._release_client_request_binding_for_request(request_id)
+        self._notify_approval_state()
         return ApprovalOutcome(
             request_id,
             ApprovalStatus.CANCELLED.value,
@@ -833,6 +871,8 @@ class ApprovalManager:
                         )
                     except ApprovalEvidenceTransitionError:
                         pass
+                    else:
+                        self._notify_approval_state()
                     self.approval_server.unregister(
                         request_id,
                         terminal_state=TERMINAL_APPROVAL_EXPIRED,
@@ -851,6 +891,9 @@ class ApprovalManager:
             )
             terminal = self._outcome_if_terminal_evidence(request_id)
             if terminal is not None:
+                # A managed Approval Center persists the operator decision in
+                # the shared store before this proxy observes it.
+                self._notify_approval_state()
                 return terminal
             if decision is not None:
                 if decision.decision == "approve":
@@ -976,6 +1019,7 @@ class ApprovalManager:
                     error_class=classified.error_class,
                 )
                 self._notify_terminal_evidence(updated)
+                self._notify_approval_state()
             else:
                 result_hash = sha256_jcs(response.get("result", {}))
                 updated = self.evidence_store.transition(
@@ -985,6 +1029,7 @@ class ApprovalManager:
                     result_hash=result_hash,
                 )
                 self._notify_terminal_evidence(updated)
+                self._notify_approval_state()
                 parent_request_id = updated.granted_by_request_id
                 if parent_request_id is not None:
                     self.evidence_store.annotate_linked_execution(
@@ -1010,6 +1055,7 @@ class ApprovalManager:
         except ApprovalEvidenceError:
             return
         self._notify_terminal_evidence(updated)
+        self._notify_approval_state()
 
     def _persist_server_decision(self, decision: ApprovalServerDecision) -> bool:
         """Persist evidence as soon as the approval UI POST is accepted.
@@ -1177,6 +1223,7 @@ class ApprovalManager:
             )
             self._forget_approval_generation(request_id)
             self._release_client_request_binding_for_request(request_id)
+            self._notify_approval_state()
             return ApprovalOutcome(
                 request_id, ApprovalStatus.APPROVED.value, reason, approval_scope
             )
@@ -1297,6 +1344,7 @@ class ApprovalManager:
                 error_class=reason,
             )
             self._notify_terminal_evidence(updated)
+            self._notify_approval_state()
             self.approval_server.unregister(
                 request_id,
                 terminal_state=TERMINAL_ALREADY_DECIDED_DENY,
@@ -1497,6 +1545,9 @@ class ApprovalManager:
             action_gate_metadata["role"] = classification.role
         if classification.authority is not None:
             action_gate_metadata["authority"] = classification.authority
+        target_basename = _approval_target_basename_for_metadata(classification.resource_plain)
+        if target_basename is not None:
+            action_gate_metadata["target_basename"] = target_basename
         if runtime_decision is not None:
             projection = runtime_decision.paid_approval_center_projection
             if isinstance(projection, Mapping) and projection:

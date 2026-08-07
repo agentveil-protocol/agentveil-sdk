@@ -2431,26 +2431,45 @@ def test_run_proxy_starts_decision_summary_dispatcher(tmp_path, monkeypatch):
     home = tmp_path / "avp-home"
     init = init_proxy(home=home, agent_name="proxy", plaintext=True)
     _set_downstream(init.config_path, _idle_downstream(tmp_path))
-    lifecycle = {"started": 0, "stopped": 0}
+    lifecycle = {"decision_started": 0, "decision_stopped": 0, "approval_started": 0, "approval_stopped": 0}
 
-    class RecordingDispatcher:
+    class RecordingDecisionDispatcher:
         is_active = True
 
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
         def start(self):
-            lifecycle["started"] += 1
+            lifecycle["decision_started"] += 1
 
         def stop(self, **kwargs):
-            lifecycle["stopped"] += 1
+            lifecycle["decision_stopped"] += 1
 
         def notify_terminal_record(self, record):
             return None
 
+    class RecordingApprovalDispatcher:
+        is_active = True
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            lifecycle["approval_started"] += 1
+
+        def stop(self, **kwargs):
+            lifecycle["approval_stopped"] += 1
+
+        def request_snapshot(self):
+            return None
+
     monkeypatch.setattr(
         "agentveil_mcp_proxy.cli.ConsoleDecisionSummaryDispatcher",
-        RecordingDispatcher,
+        RecordingDecisionDispatcher,
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.cli.ConsoleApprovalSummaryDispatcher",
+        RecordingApprovalDispatcher,
     )
 
     assert run_proxy(
@@ -2459,7 +2478,168 @@ def test_run_proxy_starts_decision_summary_dispatcher(tmp_path, monkeypatch):
         out=io.StringIO(),
         approval_ui_mode="none",
     ) == 0
-    assert lifecycle == {"started": 1, "stopped": 1}
+    assert lifecycle == {
+        "decision_started": 1,
+        "decision_stopped": 1,
+        "approval_started": 1,
+        "approval_stopped": 1,
+    }
+
+
+def test_console_upload_failure_preserves_local_approval_center_flow(tmp_path, monkeypatch):
+    import httpx
+    import re
+
+    from agentveil_mcp_proxy.console_credentials import CREDENTIAL_SCOPE, StoredCredential
+
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    _set_downstream(init.config_path, _normal_downstream(tmp_path), log_path=log_path)
+    _set_approval_policy(init.config_path, server="fake-downstream", tool="write_file")
+    _set_wait_for_decision(init.config_path)
+
+    real_dispatcher = proxy_cli.ConsoleApprovalSummaryDispatcher
+    upload_errors = {"count": 0}
+
+    class FailingApprovalDispatcher:
+        is_active = False
+
+        def __init__(self, **kwargs):
+            self._kwargs = kwargs
+            self._inner = None
+
+        def start(self):
+            kwargs = dict(self._kwargs)
+
+            def _fail_upload(*args, **kwargs):
+                upload_errors["count"] += 1
+                raise RuntimeError("console unavailable")
+
+            kwargs["upload_fn"] = _fail_upload
+            kwargs["load_credential_fn"] = lambda home=None: StoredCredential(
+                token="offline-console-token",
+                scope=CREDENTIAL_SCOPE,
+            )
+            self._inner = real_dispatcher(**kwargs)
+            self._inner.start()
+            self.is_active = self._inner.is_active
+
+        def stop(self, **kwargs):
+            if self._inner is not None:
+                self._inner.stop(**kwargs)
+
+        def request_snapshot(self):
+            if self._inner is not None:
+                self._inner.request_snapshot()
+
+    monkeypatch.setattr(proxy_cli, "ConsoleApprovalSummaryDispatcher", FailingApprovalDispatcher)
+    monkeypatch.setattr(webbrowser, "open", lambda _url: False)
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("approval center must not construct AVPAgent before approve")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+
+    client_out = io.StringIO()
+    client_err = _TtyStringIO()
+    tool_call = _json_line({
+        "jsonrpc": "2.0",
+        "id": "call-1",
+        "method": "tools/call",
+        "params": {"name": "write_file", "arguments": {"path": "console-fail-proof.txt", "content": "OK"}},
+    })
+    result_box: dict[str, int] = {}
+
+    def _run_proxy() -> None:
+        result_box["rc"] = run_proxy(
+            home=home,
+            client_in=io.StringIO(tool_call),
+            out=client_out,
+            err=client_err,
+            approval_ui_mode="none",
+        )
+
+    worker = threading.Thread(target=_run_proxy, daemon=True)
+    worker.start()
+
+    deadline = time.monotonic() + 5
+    approval_url = ""
+    while time.monotonic() < deadline:
+        match = re.search(
+            r"record_id=[^:\s]+:\s+(http://127\.0\.0\.1:\d+/approval/\S+)",
+            client_err.getvalue(),
+        )
+        if match:
+            approval_url = match.group(1)
+            break
+        time.sleep(0.01)
+    assert approval_url, client_err.getvalue()
+
+    with httpx.Client() as client:
+        csrf_match = re.search(
+            r'name="csrf_token" value="([^"]+)"',
+            client.get(approval_url).text,
+        )
+        assert csrf_match, "expected csrf token on approval page"
+        approve = client.post(
+            approval_url,
+            data={
+                "decision": "approve",
+                "csrf_token": csrf_match.group(1),
+                "approval_scope": "exact",
+            },
+        )
+    assert approve.status_code == 200
+
+    worker.join(timeout=5)
+    assert result_box.get("rc") == 0
+
+    responses = _responses(client_out.getvalue())
+    assert len(responses) == 1
+    assert "result" in responses[0]
+    assert "error" not in responses[0]
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list", "tools/call"]
+
+    records = _evidence_records(home)
+    approved = [record for record in records if record.get("status") in {"approved", "executed"}]
+    assert approved, records
+    assert upload_errors["count"] >= 1
+    assert "console unavailable" not in client_out.getvalue()
+    assert "console unavailable" not in client_err.getvalue()
+
+
+def test_offline_without_console_credential_preserves_local_approval_flow(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    _set_downstream(init.config_path, _normal_downstream(tmp_path), log_path=log_path)
+    _set_approval_policy(init.config_path, server="fake-downstream", tool="write_file")
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("offline approval must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+
+    client_out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line({
+            "jsonrpc": "2.0",
+            "id": "call-1",
+            "method": "tools/call",
+            "params": {"name": "write_file", "arguments": {"path": "offline-proof.txt"}},
+        })),
+        out=client_out,
+        approval_ui_mode="none",
+    ) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    assert response["error"]["data"]["status"] == "approval_required"
+    assert response["error"]["data"]["record_status"] == "pending"
+    assert _pending_approval_count(home) == 1
 
 
 def test_downstream_dies_when_proxy_is_killed_ungracefully(tmp_path):

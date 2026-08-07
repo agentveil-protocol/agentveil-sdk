@@ -220,6 +220,11 @@ from agentveil_mcp_proxy.console_decision_summary_client import (
     ConsoleDecisionSummaryDispatcher,
     attach_terminal_evidence_observer,
 )
+from agentveil_mcp_proxy.console_approval_summary_client import (
+    ConsoleApprovalSummaryDispatcher,
+    attach_approval_state_observer,
+    build_approval_summary_snapshot,
+)
 
 
 DEFAULT_BASE_URL = "https://agentveil.dev"
@@ -2948,6 +2953,17 @@ def run_proxy(
                 approval_manager,
                 decision_summary_dispatcher,
             )
+        approval_summary_dispatcher = ConsoleApprovalSummaryDispatcher(
+            home=paths.home,
+            snapshot_source=lambda: build_approval_summary_snapshot(evidence_store),
+        )
+        approval_summary_dispatcher.start()
+        if approval_summary_dispatcher.is_active:
+            attach_approval_state_observer(
+                approval_manager,
+                approval_summary_dispatcher,
+            )
+            approval_summary_dispatcher.request_snapshot()
         runtime_gate_factory = lambda: RuntimeGateClient.from_files(
             identity_path=identity_path,
             control_grant_path=control_grant_path,
@@ -2970,6 +2986,8 @@ def run_proxy(
             _restore_signal_handlers(previous_handlers)
             if decision_summary_dispatcher.is_active:
                 decision_summary_dispatcher.stop()
+            if approval_summary_dispatcher.is_active:
+                approval_summary_dispatcher.stop()
             if getattr(approval_server, "owns_server_process", True):
                 approval_server.stop()
             evidence_store.close()
