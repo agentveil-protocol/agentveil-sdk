@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import httpx
 
 from agentveil_mcp_proxy.approval.client import (
     RemoteApprovalServer,
@@ -33,6 +34,21 @@ from agentveil_mcp_proxy.approval.persistent import (
     save_manifest,
     token_hash_for,
 )
+from agentveil_mcp_proxy.approval.server import (
+    build_owner_client_id,
+    clear_owner_claim,
+    publish_owner_claim,
+    ERROR_CLASS_GENERATION_CHANGED,
+)
+from agentveil_mcp_proxy.console_approval_summary_client import (
+    ConsoleApprovalSummaryDispatcher,
+    attach_approval_state_observer,
+    build_approval_summary_snapshot,
+    derive_approval_id,
+)
+from agentveil_mcp_proxy.console_credentials import CREDENTIAL_SCOPE, StoredCredential
+from test_mcp_proxy_approval import _config as _approval_config, _get_csrf, _post_decision, _write_rule
+from test_mcp_proxy_persistent_approval_center import _classification, _start_persistent_center
 from agentveil_mcp_proxy.approval.server import (
     ApprovalServer,
     ensure_managed_approval_center_running,
@@ -92,13 +108,6 @@ def _config(*, approval_timeout_seconds: int = 300) -> ProxyConfig:
     )
 
 
-def _classification(config: ProxyConfig):
-    return ToolCallClassifier(config, server_name="filesystem").classify(
-        tool="write_file",
-        arguments={"path": "ops/canary.json", "content": "x"},
-    )
-
-
 def _manager(tmp_path: Path, *, browser_open, wait_for_decision: bool = True):
     store = ApprovalEvidenceStore(tmp_path / "evidence.sqlite")
     server = ApprovalServer(
@@ -119,6 +128,389 @@ def _manager(tmp_path: Path, *, browser_open, wait_for_decision: bool = True):
         notifier=SimpleNamespace(notify=lambda _prompt: None),
     )
     return manager, store, server
+
+
+def _wait_until(predicate, *, timeout: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def _managed_production_stack(
+    tmp_path: Path,
+    *,
+    browser_open,
+    approval_timeout_seconds: int = 300,
+    upload_hook=None,
+):
+    """Managed center + RemoteApprovalServer + real Console dispatcher wiring."""
+
+    home = tmp_path / "avp-home"
+    config = _approval_config(
+        policy_rule=_write_rule(),
+        approval_timeout_seconds=approval_timeout_seconds,
+        ui_open_mode="browser",
+    )
+    persistent_store, center_server, _center_manager, proxy_dir = _start_persistent_center(
+        tmp_path,
+        config=config,
+    )
+    run_store = ApprovalEvidenceStore(proxy_dir / "evidence.sqlite")
+    run_server = resolve_approval_server(
+        proxy_dir,
+        evidence_store=run_store,
+        fallback_factory=lambda: (_ for _ in ()).throw(
+            AssertionError("expected managed persistent Approval Center")
+        ),
+    )
+    instance_token = "lifecycle-managed-inst"
+    client_id = build_owner_client_id(
+        "github",
+        pid=os.getpid(),
+        instance_token=instance_token,
+    )
+    lease = publish_owner_claim(
+        proxy_dir / "owner_claims",
+        pid=os.getpid(),
+        instance_token=instance_token,
+        session_id="session-delivery-123456",
+    )
+    manager = ApprovalManager(
+        evidence_store=run_store,
+        approval_server=run_server,
+        config=config,
+        client_id=client_id,
+        session_id="session-delivery-123456",
+        cli_out=io.StringIO(),
+        browser_open=browser_open,
+        wait_for_decision=False,
+        notifier=SimpleNamespace(notify=lambda _prompt: None),
+    )
+    uploaded: list = []
+
+    def _upload_fn(payload, **_kwargs):
+        if upload_hook is not None:
+            upload_hook(payload)
+        uploaded.append(payload)
+        return "accepted"
+
+    dispatcher = ConsoleApprovalSummaryDispatcher(
+        home=home,
+        snapshot_source=lambda: build_approval_summary_snapshot(run_store),
+        load_credential_fn=lambda home=None: StoredCredential(
+            token="fixture-console-token-not-real",
+            scope=CREDENTIAL_SCOPE,
+        ),
+        upload_fn=_upload_fn,
+    )
+    dispatcher.start()
+    attach_approval_state_observer(manager, dispatcher)
+    return SimpleNamespace(
+        manager=manager,
+        run_store=run_store,
+        run_server=run_server,
+        center_server=center_server,
+        persistent_store=persistent_store,
+        dispatcher=dispatcher,
+        uploaded=uploaded,
+        config=config,
+        proxy_dir=proxy_dir,
+        lease=lease,
+    )
+
+
+def _stop_managed_stack(stack: SimpleNamespace) -> None:
+    stack.dispatcher.stop()
+    clear_owner_claim(stack.lease)
+    stack.run_server.stop()
+    stack.center_server.stop()
+    stack.run_store.close()
+    stack.persistent_store.close()
+
+
+def _latest_upload_snapshot(stack: SimpleNamespace):
+    assert stack.uploaded, "expected at least one Console snapshot upload"
+    return stack.uploaded[-1]
+
+
+def _write_classification(config: ProxyConfig, *, path: str):
+    return ToolCallClassifier(config, server_name="filesystem").classify(
+        tool="write_file",
+        arguments={"path": path, "content": "x"},
+    )
+
+
+def test_product_browser_delivery_pending_get_is_actionable_before_operator_action(tmp_path):
+    """Real browser_open on managed center must GET HTTP 200 Approve/Deny before decision."""
+
+    browser_get_statuses: list[int] = []
+
+    def browser_open(url: str) -> bool:
+        with httpx.Client() as client:
+            response = client.get(url)
+            browser_get_statuses.append(response.status_code)
+            assert "Approve" in response.text
+            assert "Deny" in response.text
+        return True
+
+    stack = _managed_production_stack(tmp_path, browser_open=browser_open)
+    try:
+        outcome = stack.manager.request_approval(
+            _write_classification(stack.config, path="ops/pending-browser.json"),
+            reason="local_approval_required",
+        )
+        assert outcome.status == ApprovalStatus.PENDING.value
+        assert browser_get_statuses == [200]
+        assert _wait_until(lambda: bool(stack.uploaded))
+        snapshot = _latest_upload_snapshot(stack)
+        assert len(snapshot.pending) == 1
+        assert snapshot.pending[0].approval_id == derive_approval_id(outcome.request_id)
+        assert snapshot.resolutions == ()
+        assert stack.center_server.prompt_for(outcome.request_id) is not None
+    finally:
+        _stop_managed_stack(stack)
+
+
+def test_first_console_upload_get_of_product_pending_url_is_actionable(tmp_path):
+    """C7L-001 boundary: managed dispatcher GET returns 200 on the product URL."""
+
+    upload_get_statuses: list[int] = []
+    context: dict = {}
+
+    def _get_product_url_at_upload(payload) -> None:
+        if not payload.pending or "stack" not in context:
+            return
+        stack = context["stack"]
+        for record in stack.run_store.list_records():
+            if derive_approval_id(record.request_id) != payload.pending[0].approval_id:
+                continue
+            url = stack.run_server.approval_url(record.request_id)
+            with httpx.Client() as client:
+                response = client.get(url)
+                upload_get_statuses.append(response.status_code)
+                if response.status_code == 200:
+                    assert "Approve" in response.text
+                    assert "Deny" in response.text
+            return
+
+    stack = _managed_production_stack(
+        tmp_path,
+        browser_open=lambda _url: True,
+        upload_hook=_get_product_url_at_upload,
+    )
+    context["stack"] = stack
+    try:
+        outcome = stack.manager.request_approval(
+            _write_classification(stack.config, path="ops/upload-race.json"),
+            reason="local_approval_required",
+        )
+        assert outcome.status == ApprovalStatus.PENDING.value
+        assert _wait_until(lambda: bool(upload_get_statuses))
+        assert upload_get_statuses == [200]
+        assert outcome.approval_url == stack.run_server.approval_url(outcome.request_id)
+    finally:
+        _stop_managed_stack(stack)
+
+
+def test_early_observer_get_of_product_pending_url_is_not_actionable(tmp_path, monkeypatch):
+    """C7L-001 base reproducer: notify after write_pending probes unregistered product URL."""
+
+    sync_get_statuses: list[int] = []
+    stack = _managed_production_stack(tmp_path, browser_open=lambda _url: True)
+    try:
+
+        def _sync_observer() -> None:
+            snapshot = build_approval_summary_snapshot(stack.run_store)
+            if snapshot is None or not snapshot.pending:
+                return
+            for record in stack.run_store.list_records():
+                if derive_approval_id(record.request_id) != snapshot.pending[0].approval_id:
+                    continue
+                url = stack.run_server.approval_url(record.request_id)
+                with httpx.Client() as client:
+                    sync_get_statuses.append(client.get(url).status_code)
+                return
+
+        stack.manager.approval_state_observer = _sync_observer
+        original_write = stack.run_store.write_pending
+
+        def _write_pending_with_early_notify(record):
+            outcome = original_write(record)
+            stack.manager._notify_approval_state()
+            return outcome
+
+        monkeypatch.setattr(stack.run_store, "write_pending", _write_pending_with_early_notify)
+
+        outcome = stack.manager.request_approval(
+            _write_classification(stack.config, path="ops/base-race.json"),
+            reason="local_approval_required",
+        )
+        assert outcome.status == ApprovalStatus.PENDING.value
+        assert sync_get_statuses[0] == 404
+        assert sync_get_statuses[-1] == 200
+    finally:
+        _stop_managed_stack(stack)
+
+
+def test_managed_approval_console_lifecycle_matrix(tmp_path):
+    """Managed pending→terminal matrix with browser delivery and snapshots."""
+
+    browser_get_statuses: list[int] = []
+    approve_next_browser_delivery = False
+
+    def browser_open(url: str) -> bool:
+        nonlocal approve_next_browser_delivery
+        with httpx.Client() as client:
+            response = client.get(url)
+            browser_get_statuses.append(response.status_code)
+            if approve_next_browser_delivery:
+                csrf = _get_csrf(client, url)
+                assert (
+                    _post_decision(client, url, decision="approve", csrf=csrf).status_code
+                    == 200
+                )
+                approve_next_browser_delivery = False
+        return True
+
+    stack = _managed_production_stack(
+        tmp_path,
+        browser_open=browser_open,
+        approval_timeout_seconds=2,
+    )
+    try:
+        pending_outcome = stack.manager.request_approval(
+            _write_classification(stack.config, path="ops/pending.json"),
+            reason="local_approval_required",
+        )
+        assert pending_outcome.status == ApprovalStatus.PENDING.value
+        assert browser_get_statuses[-1] == 200
+        assert _wait_until(lambda: bool(stack.uploaded))
+        pending_snapshot = build_approval_summary_snapshot(stack.run_store)
+        assert pending_snapshot is not None
+        assert len(pending_snapshot.pending) == 1
+        assert pending_snapshot.resolutions == ()
+
+        with httpx.Client() as client:
+            url = pending_outcome.approval_url
+            assert url is not None
+            csrf = _get_csrf(client, url)
+            assert _post_decision(client, url, decision="approve", csrf=csrf).status_code == 200
+        assert _wait_until(
+            lambda: stack.run_store.get_pending(pending_outcome.request_id) is not None
+            and stack.run_store.get_pending(pending_outcome.request_id).status
+            == ApprovalStatus.APPROVED.value
+        )
+        approved_snapshot = build_approval_summary_snapshot(stack.run_store)
+        assert approved_snapshot is not None
+        assert approved_snapshot.pending == ()
+        assert any(item.status == "approved" for item in approved_snapshot.resolutions)
+
+        deny_outcome = stack.manager.request_approval(
+            _write_classification(stack.config, path="ops/deny.json"),
+            reason="local_approval_required",
+        )
+        assert browser_get_statuses[-1] == 200
+        with httpx.Client() as client:
+            url = deny_outcome.approval_url
+            assert url is not None
+            csrf = _get_csrf(client, url)
+            assert _post_decision(client, url, decision="deny", csrf=csrf).status_code == 200
+        assert _wait_until(
+            lambda: stack.run_store.get_pending(deny_outcome.request_id) is not None
+            and stack.run_store.get_pending(deny_outcome.request_id).status
+            == ApprovalStatus.DENIED.value
+        )
+        denied_snapshot = build_approval_summary_snapshot(stack.run_store)
+        assert denied_snapshot is not None
+        assert any(item.status == "denied" for item in denied_snapshot.resolutions)
+
+        expire_outcome = stack.manager.request_approval(
+            _write_classification(stack.config, path="ops/expire.json"),
+            reason="local_approval_required",
+        )
+        assert browser_get_statuses[-1] == 200
+        assert _wait_until(
+            lambda: stack.run_store.get_pending(expire_outcome.request_id) is not None
+            and stack.run_store.get_pending(expire_outcome.request_id).status
+            == ApprovalStatus.EXPIRED.value,
+            timeout=5.0,
+        )
+        expired_snapshot = build_approval_summary_snapshot(stack.run_store)
+        assert expired_snapshot is not None
+        assert any(item.status == "expired" for item in expired_snapshot.resolutions)
+
+        cancel_outcome = stack.manager.request_approval(
+            _write_classification(stack.config, path="ops/cancel.json"),
+            reason="local_approval_required",
+        )
+        assert browser_get_statuses[-1] == 200
+        cancelled = stack.manager.cancel_approval(
+            cancel_outcome.request_id,
+            reason="client_cancelled",
+        )
+        assert cancelled.status == ApprovalStatus.CANCELLED.value
+        cancelled_snapshot = build_approval_summary_snapshot(stack.run_store)
+        assert cancelled_snapshot is not None
+        assert stack.run_store.get_pending(cancel_outcome.request_id).status == (
+            ApprovalStatus.CANCELLED.value
+        )
+        assert not any(
+            item.approval_id == derive_approval_id(cancel_outcome.request_id)
+            for item in cancelled_snapshot.resolutions
+        )
+
+        stack.manager.note_downstream_generation(1)
+        invalidate_outcome = stack.manager.request_approval(
+            _write_classification(stack.config, path="ops/invalidate.json"),
+            reason="local_approval_required",
+            downstream_generation=0,
+        )
+        assert invalidate_outcome.status == ApprovalStatus.INVALIDATED.value
+        assert invalidate_outcome.reason == ERROR_CLASS_GENERATION_CHANGED
+        invalidated_snapshot = build_approval_summary_snapshot(stack.run_store)
+        assert invalidated_snapshot is not None
+        assert not any(
+            item.approval_id == derive_approval_id(invalidate_outcome.request_id)
+            for item in invalidated_snapshot.resolutions
+        )
+        with httpx.Client() as client:
+            stale = client.get(stack.center_server.approval_url(invalidate_outcome.request_id))
+        assert stale.status_code == 410
+
+        stack.manager.wait_for_decision = True
+        approve_next_browser_delivery = True
+        block_outcome = stack.manager.request_approval(
+            _write_classification(stack.config, path="ops/block.json"),
+            reason="local_approval_required",
+        )
+        assert block_outcome.status == ApprovalStatus.APPROVED.value
+        assert browser_get_statuses[-1] == 200
+        uploads_before_block = len(stack.uploaded)
+        stack.manager.record_execution_result(
+            block_outcome,
+            {
+                "jsonrpc": "2.0",
+                "id": "terminal-call",
+                "error": {"code": -32000, "message": "bounded downstream failure"},
+            },
+            downstream_tool_call_seen=True,
+        )
+        assert _wait_until(lambda: len(stack.uploaded) > uploads_before_block)
+        blocked_record = stack.run_store.get_pending(block_outcome.request_id)
+        assert blocked_record is not None
+        assert blocked_record.status == ApprovalStatus.BLOCKED.value  # claim-check: allow negative lifecycle enum assertion
+        blocked_snapshot = build_approval_summary_snapshot(stack.run_store)
+        assert blocked_snapshot is not None
+        assert any(
+            item.approval_id == derive_approval_id(block_outcome.request_id)
+            and item.status == "resolved"
+            for item in blocked_snapshot.resolutions
+        )
+    finally:
+        _stop_managed_stack(stack)
 
 
 def test_browser_opener_false_is_not_success_and_retries():

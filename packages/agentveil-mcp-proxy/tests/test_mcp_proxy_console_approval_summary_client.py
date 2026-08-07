@@ -1094,7 +1094,7 @@ def test_manager_expire_via_timeout_notifies_observer(tmp_path):
             and store.get_pending(outcome.request_id).status == ApprovalStatus.EXPIRED.value,
             timeout=5.0,
         )
-        assert len(observed) >= 2
+        assert _wait_until(lambda: len(observed) >= 2)
         snapshot = _snapshot_for_store(store)
         assert snapshot.pending == ()
         assert len(snapshot.resolutions) == 1

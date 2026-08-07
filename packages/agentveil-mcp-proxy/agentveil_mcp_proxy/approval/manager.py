@@ -368,7 +368,6 @@ class ApprovalManager:
                 self.evidence_store.write_pending(record)
             except ApprovalEvidenceError as exc:
                 raise ApprovalFlowError("approval evidence persistence failed") from exc
-            self._notify_approval_state()
 
         if client_request_id is not None:
             self._bind_client_request(client_request_id, request_id)
@@ -437,6 +436,7 @@ class ApprovalManager:
                     )
             url = self.approval_server.register(prompt)
             self._set_delivery_status(request_id, DELIVERY_STATUS_QUEUED)
+            self._notify_approval_state()
         actionable_ui = self._notify(prompt, url)
         delivery_status = self._delivery_status_for(request_id)
         if not self.wait_for_decision:
@@ -1016,6 +1016,7 @@ class ApprovalManager:
                     error_class=classified.error_class,
                 )
                 self._notify_terminal_evidence(updated)
+                self._notify_approval_state()
             else:
                 result_hash = sha256_jcs(response.get("result", {}))
                 updated = self.evidence_store.transition(
@@ -1025,6 +1026,7 @@ class ApprovalManager:
                     result_hash=result_hash,
                 )
                 self._notify_terminal_evidence(updated)
+                self._notify_approval_state()
                 parent_request_id = updated.granted_by_request_id
                 if parent_request_id is not None:
                     self.evidence_store.annotate_linked_execution(
@@ -1050,6 +1052,7 @@ class ApprovalManager:
         except ApprovalEvidenceError:
             return
         self._notify_terminal_evidence(updated)
+        self._notify_approval_state()
 
     def _persist_server_decision(self, decision: ApprovalServerDecision) -> bool:
         """Persist evidence as soon as the approval UI POST is accepted.
