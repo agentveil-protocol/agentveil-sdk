@@ -587,3 +587,45 @@ def test_connector_status_bounded_no_absolute_paths(tmp_path: Path) -> None:
         "scope", "status", "hook", "mcp_route", "proxy_route",
         "restart_required", "matched_tool_classes", "next_step",
     }
+
+
+def test_setup_claude_code_attempts_console_project_status_sync(tmp_path, monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    from agentveil_mcp_proxy import cli as proxy_cli
+    from agentveil_mcp_proxy.cli import main
+    from agentveil_mcp_proxy.console_credentials import save_credential
+
+    avp_home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(avp_home))
+    save_credential("console-token-for-sync-test", home=avp_home)
+
+    def fake_init_proxy(**kwargs):
+        home = kwargs["home"]
+        (home / "mcp-proxy").mkdir(parents=True, exist_ok=True)
+        (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(proxy_cli, "init_proxy", fake_init_proxy)
+    monkeypatch.setattr(proxy_cli, "_resolve_setup_proxy_command", lambda: "agentveil-mcp-proxy")
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.approval.server.ensure_managed_approval_center_for_cli",
+        lambda **_kwargs: SimpleNamespace(
+            status=SimpleNamespace(state="running"),
+            started=True,
+            reused=False,
+            restarted=False,
+            reason="center started",
+        ),
+    )
+    sync_calls = []
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_project_status_client.sync_project_status",
+        lambda **kwargs: sync_calls.append(kwargs) or "accepted",
+    )
+
+    project = tmp_path / "checkout-service"
+    project.mkdir()
+    assert main(["setup", "claude-code", "--project-dir", str(project), "--yes"]) == 0
+    capsys.readouterr()
+    assert len(sync_calls) == 1
+    assert sync_calls[0]["connector"] == "claude-code"

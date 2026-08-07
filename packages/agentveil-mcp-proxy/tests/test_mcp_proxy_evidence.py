@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 import os
 from pathlib import Path
@@ -2268,3 +2268,78 @@ def test_process_level_exact_grant_consume_has_one_winner(tmp_path):
         ]
         assert len(children) == 1
         assert check.get_exact_grant_claim("grant-proc") is not None
+
+
+def test_approval_manager_deny_notifies_terminal_evidence_observer(tmp_path):
+    from agentveil_mcp_proxy.approval.manager import ApprovalManager
+    from agentveil_mcp_proxy.approval.server import ApprovalServer
+    from agentveil_mcp_proxy.console_decision_summary_client import build_decision_summary_payload
+    from agentveil_mcp_proxy.policy import ProxyConfig
+
+    config = ProxyConfig.from_dict(
+        {
+            "proxy_config_schema_version": 1,
+            "avp": {
+                "agent_name": "proxy",
+                "base_url": "https://agentveil.dev",
+                "trusted_signer_dids": ["did:key:z6MktrustedSigner"],
+            },
+            "mode": "protect",
+            "privacy": {
+                "action": "redacted",
+                "resource": "hash",
+                "payload": "hash_only",
+                "evidence_upload": False,
+            },
+            "fallback": {
+                "read": "allow",
+                "write": "approval",
+                "destructive": "block",
+                "production": "block",  # claim-check: allow fallback risk_class enum value
+                "financial": "block",
+                "unknown": "approval",
+            },
+            "downstream": {},
+            "policy": {
+                "id": "approval-test",
+                "policy_schema_version": 1,
+                "default_decision": "approval",
+                "default_risk_class": "write",
+                "rules": [],
+            },
+            "approval": {
+                "approval_timeout_seconds": 300,
+                "on_timeout": "deny",
+                "ui_open_mode": "none",
+            },
+        }
+    )
+    store = ApprovalEvidenceStore(tmp_path / "evidence.sqlite")
+    server = ApprovalServer()
+    server.start()
+    manager = ApprovalManager(
+        evidence_store=store,
+        approval_server=server,
+        config=config,
+        client_id="pytest",
+        wait_for_decision=False,
+    )
+    observed: list[PendingApproval] = []
+    manager.terminal_evidence_observer = observed.append
+    store.write_pending(
+        replace(
+            _record("deny-observer-1"),
+            tool_name="write_file",
+            action_class="write",
+        )
+    )
+    manager._deny("deny-observer-1", "user_denied")
+
+    assert len(observed) == 1
+    assert observed[0].status == ApprovalStatus.DENIED.value
+    payload = build_decision_summary_payload(observed[0])
+    assert payload is not None
+    assert payload.decision == "denied"
+    assert payload.target_reached is False
+    server.stop()
+    store.close()

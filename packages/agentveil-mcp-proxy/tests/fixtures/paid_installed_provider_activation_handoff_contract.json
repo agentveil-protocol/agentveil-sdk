@@ -1,0 +1,107 @@
+{
+  "schema_version": "avp.paid_installed_provider_activation_handoff.v1",
+  "protocol_name": "installed_provider_activation_handoff",
+  "contract_version": "1",
+  "entrypoint_group": "agentveil_mcp_proxy.installed_provider_activation_handoffs",
+  "entrypoint_name": "v1",
+  "request": {
+    "allowed_keys": [
+      "contract_version",
+      "activation_credential",
+      "activation_reference",
+      "plan_family",
+      "package_name",
+      "package_version",
+      "provider_id",
+      "avp_home"
+    ],
+    "required_keys": [
+      "contract_version",
+      "activation_credential",
+      "activation_reference",
+      "plan_family",
+      "package_name",
+      "package_version",
+      "provider_id",
+      "avp_home"
+    ],
+    "nullable_value_keys": [
+      "plan_family"
+    ]
+  },
+  "response": {
+    "allowed_keys": [
+      "contract_version",
+      "status",
+      "public_fallback_available",
+      "summary",
+      "error_code"
+    ],
+    "required_keys": [
+      "contract_version",
+      "status",
+      "public_fallback_available"
+    ],
+    "allowed_statuses": [
+      "active",
+      "error"
+    ],
+    "success_status": "active",
+    "active_status_forbids_error_code": true,
+    "error_status_requires_bounded_error_code": true
+  },
+  "error_codes": {
+    "handoff_hook_missing": "installed distribution has no compatible activation hook",
+    "handoff_hook_multiple": "installed distribution declares multiple activation hooks",
+    "handoff_hook_malformed": "installed distribution hook metadata is malformed",
+    "handoff_hook_incompatible": "installed distribution hook contract is incompatible",
+    "handoff_hook_import_failed": "installed distribution hook could not be loaded",
+    "handoff_hook_exception": "installed distribution hook raised an exception",
+    "handoff_response_invalid": "installed distribution hook returned an invalid response",
+    "handoff_response_inactive": "installed distribution hook did not report active completion",
+    "handoff_metadata_oversized": "installed distribution metadata exceeds bounded size"
+  },
+  "limits": {
+    "max_entry_points_bytes": 8192,
+    "max_dist_info_metadata_bytes": 65536,
+    "max_summary_length": 256,
+    "max_error_code_length": 64,
+    "max_plan_family_length": 64,
+    "max_provider_id_length": 64,
+    "max_package_name_length": 64,
+    "max_package_version_length": 32,
+    "max_activation_reference_length": 80,
+    "max_activation_credential_length": 4096,
+    "max_avp_home_length": 4096
+  },
+  "privacy": {
+    "deny_only_metadata": true,
+    "purpose": "Bounded output scan markers only; not Team authority, entitlement, or workspace vocabulary.",
+    "artifact_forbidden_markers": [
+      "activation_credential",
+      "license_key",
+      "entitlement_token",
+      "presigned_url",
+      "/Users/",
+      "workspace",
+      "member_id",
+      "team_"
+    ],
+    "response_forbidden_markers": [
+      "activation_credential",
+      "license_key",
+      "entitlement_token",
+      "presigned_url",
+      "workspace",
+      "member_id",
+      "team_",
+      "policy_release",
+      "module_id"
+    ],
+    "private_provider_markers": [
+      "agentveil_private_policy",
+      "private_policy_internal",
+      "internal_provider_state"
+    ]
+  }
+}

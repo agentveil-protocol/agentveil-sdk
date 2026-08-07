@@ -481,6 +481,7 @@ def test_install_wheel_rejects_zip_slip_entry(tmp_path):
     target_dir = tmp_path / "vendor"
     with pytest.raises(PaidInstallError) as exc:
         install_wheel_to_vendor(
+            home=tmp_path,
             wheel_path=wheel_path,
             target_dir=target_dir,
             expected_package_name=PACKAGE_NAME,

@@ -270,6 +270,8 @@ for your specific downstream server.
 
 | Command | Purpose |
 |---|---|
+| `login` | Connect this machine to the optional AgentVeil Console via device pairing. |
+| `logout` | Revoke the Console device token and remove the local credential. |
 | `init` | Create encrypted identity, config, and control grant. |
 | `init --quickstart-filesystem <path>` | Configure the built-in filesystem downstream for local first run. |
 | `doctor` | Validate local files and control grant. |
@@ -292,6 +294,39 @@ for your specific downstream server.
 | `setup status --json` | Print bounded connector/proxy status. |
 | `setup remove <cursor|claude-code|codex|gemini-cli>` | Preview managed connector removal. |
 | `setup remove <cursor|claude-code|codex|gemini-cli> --yes` | Remove only AgentVeil-managed connector entries. |
+
+## Connect To AgentVeil Console (Optional)
+
+If you use the hosted AgentVeil Console, you can connect this machine with a
+short device-pairing flow:
+
+```bash
+agentveil-mcp-proxy login
+agentveil-mcp-proxy logout
+```
+
+`login` prints a verification URL and a short code, attempts to open the URL in
+your browser (use `--no-open` for headless/terminal use), and stores a single
+device token locally at `~/.avp/console/device-token.json` with owner-only
+`0600` permissions. `logout` revokes that token with the Console and removes the
+local file.
+
+Connecting to Console is optional. It does not activate paid, Team, policy, or
+project-sync features, and it does not change how routed MCP calls or project
+connectors are controlled locally. The stored token grants only the
+`bounded_summary_upload` scope.
+
+After `login`, successful project connector setup and explicit `setup status`
+for Codex, Claude Code, Cursor, or Gemini CLI may send one bounded project
+connection summary to the Console. The upload includes a bounded local report
+field, `private_guardrails_status`, with one of `active`, `inactive`, or
+`unavailable`. That value reflects only the installed local paid provider state;
+it does not grant entitlement. Console combines this report with server-owned
+workspace capability before showing `Active`. Without a stored credential this
+step is a silent no-op: no network request, no provider discovery, and no extra
+CLI output. Boundary: the upload is best-effort and isolated from local setup;
+Console rejection or outage does not change setup results, exit codes, connector
+files, or Approval Center behavior.
 
 ## Relationship To AgentVeil
 

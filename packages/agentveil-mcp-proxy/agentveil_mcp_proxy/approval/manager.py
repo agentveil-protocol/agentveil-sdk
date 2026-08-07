@@ -178,7 +178,23 @@ class ApprovalManager:
         # suppress opening the card for a later distinct request B.
         self._browser_opened_request_ids: set[str] = set()
         self._approval_generations: dict[str, int] = {}
+        self.terminal_evidence_observer: Callable[[PendingApproval], None] | None = None
         self.approval_server.set_decision_handler(self._persist_server_decision)
+
+    def _notify_terminal_evidence(self, record: PendingApproval | None) -> None:
+        """Best-effort terminal evidence hook; observer failures are swallowed."""
+
+        # claim-check: allow boundary doc; negative tests assert local control unchanged on observer failure.
+
+        if record is None:
+            return
+        observer = self.terminal_evidence_observer
+        if observer is None:
+            return
+        try:
+            observer(record)
+        except Exception:
+            return
 
     def close(self) -> None:
         """Release the live owner claim lease on clean shutdown."""
@@ -923,13 +939,14 @@ class ApprovalManager:
             runtime_decision=runtime_decision,
         )
         try:
-            self.evidence_store.transition(
+            updated = self.evidence_store.transition(
                 request_id,
                 ApprovalStatus.BLOCKED.value,
                 error_class="runtime_gate_block",
             )
         except ApprovalEvidenceError as exc:
             raise ApprovalFlowError("runtime decision evidence persistence failed") from exc
+        self._notify_terminal_evidence(updated)
 
     def record_execution_result(
         self,
@@ -951,13 +968,14 @@ class ApprovalManager:
                 payload = response.get("error")
                 if not isinstance(payload, Mapping):
                     payload = response.get("result", {})
-                self.evidence_store.transition(
+                updated = self.evidence_store.transition(
                     outcome.request_id,
                     classified.store_status,
                     result_status=classified.execution_status,
                     result_hash=sha256_jcs(payload if isinstance(payload, (dict, list)) else {}),
                     error_class=classified.error_class,
                 )
+                self._notify_terminal_evidence(updated)
             else:
                 result_hash = sha256_jcs(response.get("result", {}))
                 updated = self.evidence_store.transition(
@@ -966,6 +984,7 @@ class ApprovalManager:
                     result_status="executed",
                     result_hash=result_hash,
                 )
+                self._notify_terminal_evidence(updated)
                 parent_request_id = updated.granted_by_request_id
                 if parent_request_id is not None:
                     self.evidence_store.annotate_linked_execution(
@@ -982,7 +1001,7 @@ class ApprovalManager:
         if not outcome.approved:
             return
         try:
-            self.evidence_store.transition(
+            updated = self.evidence_store.transition(
                 outcome.request_id,
                 ApprovalStatus.ERROR.value,
                 result_status="error",
@@ -990,6 +1009,7 @@ class ApprovalManager:
             )
         except ApprovalEvidenceError:
             return
+        self._notify_terminal_evidence(updated)
 
     def _persist_server_decision(self, decision: ApprovalServerDecision) -> bool:
         """Persist evidence as soon as the approval UI POST is accepted.
@@ -1267,7 +1287,7 @@ class ApprovalManager:
                     current.error_class or "client_cancelled",
                 )
             now = int(time.time())
-            self.evidence_store.transition(
+            updated = self.evidence_store.transition(
                 request_id,
                 ApprovalStatus.DENIED.value,
                 approval_token_hash=self.approval_server.token_hash,
@@ -1276,6 +1296,7 @@ class ApprovalManager:
                 user_decision_timestamp=now,
                 error_class=reason,
             )
+            self._notify_terminal_evidence(updated)
             self.approval_server.unregister(
                 request_id,
                 terminal_state=TERMINAL_ALREADY_DECIDED_DENY,

@@ -1,6 +1,6 @@
 [project]
 name = "agentveil-mcp-proxy"
-version = "0.7.37"
+version = "0.7.38"
 description = "Source-available MCP route for approval and local evidence on routed MCP tool calls"
 readme = {file = "README.md", content-type = "text/markdown"}
 requires-python = ">=3.10"
@@ -21,7 +21,8 @@ classifiers = [
 ]
 
 dependencies = [
-    "agentveil>=0.7.22,<0.8",
+    "agentveil>=0.7.23,<0.8",
+    "cryptography>=42.0.0",
     "mcp>=1.0.0",
 ]
 
@@ -36,13 +37,16 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project.optional-dependencies]
-test = ["pytest>=8.0.0", "pytest-asyncio>=0.23.0"]
+test = ["build>=1.2.2", "pytest>=8.0.0", "pytest-asyncio>=0.23.0"]
 
 [project.scripts]
 agentveil-mcp-proxy = "agentveil_mcp_proxy.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["agentveil_mcp_proxy*"]
+
+[tool.setuptools.package-data]
+agentveil_mcp_proxy = ["contracts/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -912,3 +912,49 @@ def test_user_mcp_wrapper_resolves_prepared_workspace(tmp_path: Path, monkeypatc
     assert exc.value.code == 0
     assert captured["env"]["AVP_CURSOR_WORKSPACE"] == str(tmp_path.resolve())
     assert captured["env"]["MCP_CONTENT_ROOT"] == str(tmp_path.resolve())
+
+
+def test_setup_cursor_attempts_console_project_status_sync(tmp_path, monkeypatch, capsys):
+    from agentveil_mcp_proxy.console_credentials import save_credential
+
+    avp_home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(avp_home))
+    save_credential("console-token-for-sync-test", home=avp_home)
+
+    def fake_init_proxy(**kwargs):
+        home = kwargs["home"]
+        (home / "mcp-proxy").mkdir(parents=True, exist_ok=True)
+        (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+
+    def fake_prepare(_workspace, *, force=False):
+        home = cursor_setup.setup_home(_workspace)
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "passphrase").write_text("secret\n", encoding="utf-8")
+        return home
+
+    def fake_ensure_running(**_kwargs):
+        return SimpleNamespace(
+            status=SimpleNamespace(state="running"),
+            started=True,
+            reused=False,
+            restarted=False,
+            reason="center started",
+        )
+
+    monkeypatch.setattr(proxy_cli, "init_proxy", fake_init_proxy)
+    monkeypatch.setattr(cursor_setup, "prepare_proxy_home", fake_prepare)
+    monkeypatch.setattr(proxy_cli, "initialize_product_route_profile", lambda _prof: None)
+    monkeypatch.setattr(cursor_setup, "ensure_approval_center_running", fake_ensure_running)
+    monkeypatch.setattr("shutil.which", lambda _name: "agentveil-mcp-proxy")
+    sync_calls = []
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_project_status_client.sync_project_status",
+        lambda **kwargs: sync_calls.append(kwargs) or "accepted",
+    )
+
+    workspace = tmp_path / "checkout-service"
+    workspace.mkdir()
+    assert main(["setup", "cursor", "--workspace", str(workspace), "--yes"]) == 0
+    capsys.readouterr()
+    assert len(sync_calls) == 1
+    assert sync_calls[0]["connector"] == "cursor"

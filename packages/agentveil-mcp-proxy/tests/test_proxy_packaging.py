@@ -71,8 +71,19 @@ def test_proxy_package_depends_on_public_sdk():
         pyproject = tomllib.load(f)
 
     dependencies = pyproject["project"].get("dependencies", [])
-    assert pyproject["project"]["version"] == "0.7.37"
-    assert "agentveil>=0.7.22,<0.8" in dependencies
+    assert pyproject["project"]["version"] == "0.7.38"
+    assert "agentveil>=0.7.23,<0.8" in dependencies
+    assert "cryptography>=42.0.0" in dependencies
+
+
+def test_proxy_package_includes_canonical_handoff_contract():
+    contract_path = (
+        PACKAGE_ROOT / "agentveil_mcp_proxy" / "contracts" / "installed_provider_activation_handoff_v1.json"
+    )
+    assert contract_path.is_file()
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    assert contract["schema_version"] == "avp.paid_installed_provider_activation_handoff.v1"
+    assert contract["contract_version"] == "1"
 
 
 def test_release_acceptance_verifier_pins_proxy_and_backend_signers():

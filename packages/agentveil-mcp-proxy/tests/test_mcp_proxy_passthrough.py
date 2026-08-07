@@ -2427,6 +2427,41 @@ def test_signal_handlers_are_restored_after_run_proxy(tmp_path):
     assert signal.getsignal(signal.SIGINT) == before_int
 
 
+def test_run_proxy_starts_decision_summary_dispatcher(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    _set_downstream(init.config_path, _idle_downstream(tmp_path))
+    lifecycle = {"started": 0, "stopped": 0}
+
+    class RecordingDispatcher:
+        is_active = True
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            lifecycle["started"] += 1
+
+        def stop(self, **kwargs):
+            lifecycle["stopped"] += 1
+
+        def notify_terminal_record(self, record):
+            return None
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.cli.ConsoleDecisionSummaryDispatcher",
+        RecordingDispatcher,
+    )
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(""),
+        out=io.StringIO(),
+        approval_ui_mode="none",
+    ) == 0
+    assert lifecycle == {"started": 1, "stopped": 1}
+
+
 def test_downstream_dies_when_proxy_is_killed_ungracefully(tmp_path):
     if sys.platform == "darwin":
         pytest.skip(
@@ -3170,6 +3205,61 @@ def test_instruction_file_write_honors_local_block_policy(tmp_path, monkeypatch)
     assert response["error"]["data"]["reason"] == "local_policy_block"
     assert "approval_url" not in response["error"]["data"]
     assert _pending_approval_count(home) == 0
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
+
+
+def test_local_policy_block_notifies_decision_summary_dispatcher(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    _set_downstream(init.config_path, _filesystem_schema_downstream(tmp_path), log_path=log_path)
+    _set_block_policy(init.config_path, server="fake-downstream", tool="write_file")
+    observed = []
+
+    class RecordingDispatcher:
+        is_active = True
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            return None
+
+        def stop(self, **kwargs):
+            return None
+
+        def notify_terminal_record(self, record):
+            observed.append(record)
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.cli.ConsoleDecisionSummaryDispatcher",
+        RecordingDispatcher,
+    )
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line({
+            "jsonrpc": "2.0",
+            "id": "call-1",
+            "method": "tools/call",
+            "params": {
+                "name": "write_file",
+                # claim-check: allow bounded fixture content; downstream execution is denied.
+                "arguments": {"path": "summary.md", "content": "blocked"},
+            },
+        })),
+        out=client_out,
+        approval_ui_mode="none",
+    ) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    assert response["error"]["data"]["reason"] == "local_policy_block"
+    assert len(observed) == 1
+    # claim-check: allow bounded terminal evidence status enum asserted by this regression.
+    assert observed[0].status == "blocked"
+    assert observed[0].tool_name == "write_file"
+    assert observed[0].error_class == "local_policy_block"
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
 
 

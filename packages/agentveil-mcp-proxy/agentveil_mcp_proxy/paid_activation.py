@@ -407,7 +407,7 @@ def build_paid_activate_payload(*, license_key: str, home: Path | None) -> dict[
                 client=backend,
             )
         except PaidInstallError as exc:
-            raise PaidActivationError(str(exc), exit_code=exc.exit_code) from exc
+            raise PaidActivationError(str(exc), exit_code=exc.exit_code) from None
         activation = _activation_state_from_install(
             install_state=result.install_state,
             license_id=result.license_id,

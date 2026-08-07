@@ -5,25 +5,47 @@
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 import hashlib
+import importlib
 import io
 import json
 import os
 from pathlib import Path
 import platform
 import re
+import secrets
+import shutil
 import sys
 import urllib.error
 import zipfile
 import urllib.request
-from typing import Any, Mapping, Protocol
+from configparser import ConfigParser, DuplicateOptionError
+from typing import Any, Callable, Mapping, Protocol
 
 from agentveil_mcp_proxy.evidence.proof import _fsync_parent_directory
 from agentveil_mcp_proxy.paid_provider import (
+    INSTALLED_PROVIDER_ACTIVATION_HANDOFF_CONTRACT_VERSION,
+    INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP,
+    INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME,
+    InstalledProviderActivationHandoffRequest,
+    InstalledProviderActivationHandoffResult,
     PUBLIC_PAID_PROVIDER_CONTRACT_VERSION,
     STATUS_ACTIVE,
     PaidProviderSnapshot,
+    assert_handoff_entrypoint_target,
+    assert_handoff_request_fields_bounded,
+    validate_installed_provider_activation_handoff_response,
+    ERROR_HANDOFF_HOOK_EXCEPTION,
+    ERROR_HANDOFF_HOOK_IMPORT_FAILED,
+    ERROR_HANDOFF_HOOK_MALFORMED,
+    ERROR_HANDOFF_HOOK_MISSING,
+    ERROR_HANDOFF_HOOK_MULTIPLE,
+    ERROR_HANDOFF_METADATA_OVERSIZED,
+    ERROR_HANDOFF_RESPONSE_INACTIVE,
+    ERROR_HANDOFF_RESPONSE_INVALID,
+    contains_private_provider_marker,
 )
 
 INSTALL_FILENAME = "install.json"
@@ -115,6 +137,81 @@ ERROR_INSTALL_FAILED = "install_failed"
 ERROR_INSTALL_SAFETY_BLOCKED = "install_safety_blocked"
 ERROR_INSTALL_SAFETY_MALFORMED = "install_safety_malformed"
 
+MAX_HANDOFF_ENTRY_POINTS_BYTES = 8192
+MAX_HANDOFF_DIST_INFO_METADATA_BYTES = 65536
+
+_HANDOFF_RESPONSE_URL_RE = re.compile(r"(?i)(?:https?://|file://)")
+_HANDOFF_RESPONSE_WINDOWS_ABS_PATH_RE = re.compile(r"(?i)(?:[a-z]:\\|\\\\[^\s]+)")
+_POSIX_ABS_PATH_BOUNDARY_CHARS = frozenset(" \t\n\r'\"`(,[{<:=;,")
+_HANDOFF_RESPONSE_FORBIDDEN_MARKERS = (
+    "activation_credential",
+    "license_key",
+    "entitlement_token",
+    "presigned_url",
+    "workspace",
+    "member_id",
+    "team_",
+    "policy_release",
+    "module_id",
+)
+
+
+def _handoff_response_text_contains_absolute_posix_path(text: str) -> bool:
+    """Reject slash starts that indicate absolute or path-like values, not inline ratios."""
+
+    for index, char in enumerate(text):
+        if char != "/":
+            continue
+        if index == 0:
+            return True
+        if text[index - 1] in _POSIX_ABS_PATH_BOUNDARY_CHARS:
+            return True
+    return False
+
+
+def _handoff_response_text_is_public_bounded(
+    text: str | None,
+    *,
+    activation_credential: str,
+    resolved_avp_home: str,
+) -> bool:
+    if text is None:
+        return True
+    if activation_credential and activation_credential in text:
+        return False
+    if resolved_avp_home and resolved_avp_home in text:
+        return False
+    if _HANDOFF_RESPONSE_URL_RE.search(text):
+        return False
+    if _HANDOFF_RESPONSE_WINDOWS_ABS_PATH_RE.search(text):
+        return False
+    if _handoff_response_text_contains_absolute_posix_path(text):
+        return False
+    lowered = text.lower()
+    if any(marker in lowered for marker in _HANDOFF_RESPONSE_FORBIDDEN_MARKERS):
+        return False
+    if contains_private_provider_marker(text):
+        return False
+    return True
+
+
+def assert_handoff_response_fields_public_bounded(
+    *,
+    summary: str | None,
+    error_code: str | None,
+    activation_credential: str,
+    resolved_avp_home: str,
+) -> None:
+    """Reject hook response strings that would leak secrets, homes, or local URLs."""
+
+    for field in (summary, error_code):
+        if not _handoff_response_text_is_public_bounded(
+            field,
+            activation_credential=activation_credential,
+            resolved_avp_home=resolved_avp_home,
+        ):
+            raise ValueError(ERROR_HANDOFF_RESPONSE_INVALID)
+
 
 class PaidInstallError(ValueError):
     """Raised when paid install flow inputs or artifacts are invalid."""
@@ -134,6 +231,7 @@ class ActivationValidateResult:
     period_end: str | None
     public_fallback_available: bool
     error_code: str | None
+    provider_handoff_required: bool = False
 
 
 @dataclass(frozen=True)
@@ -466,6 +564,145 @@ def _is_safe_zip_member(name: str) -> bool:
     return ".." not in Path(name).parts
 
 
+def _validated_wheel_members(archive: zipfile.ZipFile) -> list[str]:
+    members = archive.namelist()
+    if len(members) != len(set(members)):
+        raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
+    return members
+
+
+def _resolved_home_root(home: Path) -> Path:
+    return home.expanduser().resolve()
+
+
+def _assert_trusted_home_path(home: Path, path: Path) -> Path:
+    """Reject symlink components between AVP home and the target path."""
+
+    home_path = home.expanduser()
+    if home_path.is_symlink():
+        raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
+    home_root = home_path.resolve()
+    candidate = path.expanduser()
+    if candidate.is_symlink():
+        raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(home_root)
+    except ValueError as exc:
+        raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1) from exc
+
+    walk = home_root
+    for part in resolved.relative_to(home_root).parts:
+        walk = walk / part
+        if walk.is_symlink():
+            raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
+    return resolved
+
+
+def _assert_non_symlink_vendor_path(home: Path, path: Path) -> None:
+    _assert_trusted_home_path(home, path)
+
+
+def _vendor_live_dir(home: Path, *, package_name: str, package_version: str) -> Path:
+    return vendor_root(home) / f"{package_name}-{package_version}"
+
+
+def _vendor_stage_dir(home: Path, *, package_name: str, package_version: str) -> Path:
+    token = secrets.token_hex(8)
+    return vendor_root(home) / f".staging-{package_name}-{package_version}-{token}"
+
+
+def _discard_staged_vendor(stage_dir: Path) -> None:
+    if stage_dir.exists():
+        shutil.rmtree(stage_dir, ignore_errors=True)
+
+
+@dataclass(frozen=True)
+class _VendorPublishRollback:
+    backup_dir: Path | None
+    created_live: bool
+
+
+def _publish_staged_vendor(*, home: Path, stage_dir: Path, live_dir: Path) -> _VendorPublishRollback:
+    _assert_non_symlink_vendor_path(home, stage_dir)
+    if live_dir.exists():
+        _assert_non_symlink_vendor_path(home, live_dir)
+        backup_dir = live_dir.with_name(f"{live_dir.name}.backup")
+        _discard_staged_vendor(backup_dir)
+        os.replace(live_dir, backup_dir)
+        try:
+            os.replace(stage_dir, live_dir)
+        except OSError:
+            if live_dir.exists():
+                shutil.rmtree(live_dir, ignore_errors=True)
+            os.replace(backup_dir, live_dir)
+            raise
+        return _VendorPublishRollback(backup_dir=backup_dir, created_live=False)
+    live_dir.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(stage_dir, live_dir)
+    return _VendorPublishRollback(backup_dir=None, created_live=True)
+
+
+def _rollback_published_vendor(*, live_dir: Path, rollback: _VendorPublishRollback) -> None:
+    if rollback.backup_dir is not None and rollback.backup_dir.exists():
+        if live_dir.exists():
+            shutil.rmtree(live_dir, ignore_errors=True)
+        os.replace(rollback.backup_dir, live_dir)
+        return
+    if rollback.created_live and live_dir.exists():
+        shutil.rmtree(live_dir, ignore_errors=True)
+
+
+@dataclass(frozen=True)
+class _WheelCacheRollback:
+    backup_path: Path | None
+    created_live: bool
+
+
+def _rollback_wheel_cache(*, wheel_path: Path, rollback: _WheelCacheRollback) -> None:
+    if rollback.backup_path is not None and rollback.backup_path.exists():
+        if wheel_path.exists():
+            wheel_path.unlink(missing_ok=True)
+        os.replace(rollback.backup_path, wheel_path)
+        return
+    if rollback.created_live and wheel_path.exists():
+        wheel_path.unlink(missing_ok=True)
+
+
+def _commit_wheel_cache(*, wheel_stage_path: Path, wheel_path: Path) -> None:
+    wheel_path.parent.mkdir(parents=True, exist_ok=True)
+    if wheel_path.exists():
+        backup_path = wheel_path.with_name(f"{wheel_path.name}.backup")
+        if backup_path.exists():
+            backup_path.unlink(missing_ok=True)
+        os.replace(wheel_path, backup_path)
+        rollback = _WheelCacheRollback(backup_path=backup_path, created_live=False)
+        try:
+            os.replace(wheel_stage_path, wheel_path)
+            os.chmod(wheel_path, 0o600)
+            backup_path.unlink(missing_ok=True)
+        except OSError:
+            _rollback_wheel_cache(wheel_path=wheel_path, rollback=rollback)
+            raise
+        return
+    rollback = _WheelCacheRollback(backup_path=None, created_live=True)
+    try:
+        os.replace(wheel_stage_path, wheel_path)
+        os.chmod(wheel_path, 0o600)
+    except OSError:
+        _rollback_wheel_cache(wheel_path=wheel_path, rollback=rollback)
+        raise
+
+
+def _restore_install_state_bytes(path: Path, prior_bytes: bytes | None) -> None:
+    if prior_bytes is None:
+        if path.exists():
+            path.unlink()
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(prior_bytes)
+
+
 def verify_wheel_artifact(
     wheel_bytes: bytes,
     *,
@@ -491,12 +728,23 @@ def verify_wheel_artifact(
 
 def install_wheel_to_vendor(
     *,
+    home: Path,
     wheel_path: Path,
     target_dir: Path,
     expected_package_name: str,
     expected_package_version: str,
+    require_empty_target: bool = False,
 ) -> None:
-    target_dir.mkdir(parents=True, exist_ok=True)
+    _assert_non_symlink_vendor_path(home, target_dir)
+    if target_dir.exists():
+        if target_dir.is_symlink() or not target_dir.is_dir():
+            raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
+        if require_empty_target and any(target_dir.iterdir()):
+            raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
+    else:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        _assert_non_symlink_vendor_path(home, target_dir)
+
     resolved_target = target_dir.resolve()
     bounded_name = validate_bounded_package_name(expected_package_name)
     bounded_version = validate_bounded_package_version(expected_package_version)
@@ -508,7 +756,7 @@ def install_wheel_to_vendor(
             if metadata.package_version != bounded_version:
                 raise PaidInstallError(ERROR_VERSION_MISMATCH, exit_code=1)
             _metadata_entry_name(archive)
-            members = archive.namelist()
+            members = _validated_wheel_members(archive)
             for member in members:
                 if not _is_safe_zip_member(member):
                     raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
@@ -519,10 +767,12 @@ def install_wheel_to_vendor(
                 if member.endswith("/"):
                     continue
                 destination = target_dir / member
+                if destination.exists() and destination.is_symlink():
+                    raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 destination.write_bytes(archive.read(member))
-    except zipfile.BadZipFile as exc:
-        raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1) from exc
+    except zipfile.BadZipFile:
+        raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
 
 
 class HttpPaidBackendClient:
@@ -629,6 +879,13 @@ class HttpPaidBackendClient:
 
     def validate_activation(self, license_key: str) -> ActivationValidateResult:
         payload = self._post_json("/v1/paid/activate/validate", {"license_key": license_key})
+        handoff_required = payload.get("provider_handoff_required")
+        if handoff_required is None:
+            provider_handoff_required = False
+        elif isinstance(handoff_required, bool):
+            provider_handoff_required = handoff_required
+        else:
+            raise PaidInstallError(ERROR_ACTIVATION_INVALID, exit_code=1)
         return ActivationValidateResult(
             valid=bool(payload.get("valid")),
             customer_ref_fingerprint=_optional_str(payload.get("customer_ref_fingerprint")),
@@ -638,6 +895,7 @@ class HttpPaidBackendClient:
             period_end=_optional_str(payload.get("period_end")),
             public_fallback_available=bool(payload.get("public_fallback_available", True)),
             error_code=_optional_str(payload.get("error_code")),
+            provider_handoff_required=provider_handoff_required,
         )
 
     def issue_entitlement(
@@ -722,6 +980,256 @@ def _optional_int(value: Any) -> int | None:
     return int(value)
 
 
+def activation_reference_from_credential(license_key: str) -> str:
+    digest = hashlib.sha256(license_key.encode("utf-8")).hexdigest()
+    return f"act_ref_{digest}"
+
+
+def _normalized_dist_info_prefix(package_name: str, package_version: str) -> str:
+    module_name = package_name.replace("-", "_")
+    return f"{module_name}-{package_version}.dist-info"
+
+
+def _find_exact_dist_info_dir(vendor_dir: Path, *, package_name: str, package_version: str) -> Path:
+    expected_prefix = _normalized_dist_info_prefix(package_name, package_version)
+    matches = [
+        path
+        for path in vendor_dir.iterdir()
+        if path.is_dir() and path.name == expected_prefix and _is_safe_zip_member(path.name)
+    ]
+    if len(matches) != 1:
+        raise PaidInstallError(ERROR_HANDOFF_HOOK_MISSING, exit_code=1)
+    return matches[0]
+
+
+def _read_bounded_dist_info_file(dist_info_dir: Path, filename: str, *, max_bytes: int) -> str:
+    path = dist_info_dir / filename
+    if not path.is_file():
+        raise PaidInstallError(ERROR_HANDOFF_HOOK_MISSING, exit_code=1)
+    data = path.read_bytes()
+    if len(data) > max_bytes:
+        raise PaidInstallError(ERROR_HANDOFF_METADATA_OVERSIZED, exit_code=1)
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise PaidInstallError(ERROR_HANDOFF_HOOK_MALFORMED, exit_code=1) from exc
+
+
+def parse_vendored_entry_points(text: str) -> dict[str, list[tuple[str, str]]]:
+    parser = ConfigParser()
+    parser.optionxform = str  # preserve case for entry-point names
+    try:
+        parser.read_string(text)
+    except DuplicateOptionError as exc:
+        raise PaidInstallError(ERROR_HANDOFF_HOOK_MULTIPLE, exit_code=1) from exc
+    except Exception as exc:
+        raise PaidInstallError(ERROR_HANDOFF_HOOK_MALFORMED, exit_code=1) from exc
+    grouped: dict[str, list[tuple[str, str]]] = {}
+    for section in parser.sections():
+        entries: list[tuple[str, str]] = []
+        for name, target in parser.items(section):
+            entries.append((name.strip(), target.strip()))
+        grouped[section.strip()] = entries
+    return grouped
+
+
+def discover_exact_installed_activation_hook(
+    vendor_dir: Path,
+    *,
+    package_name: str,
+    package_version: str,
+) -> tuple[str, str]:
+    """Discover one compatible hook from the exact vendored distribution only."""
+
+    dist_info_dir = _find_exact_dist_info_dir(
+        vendor_dir,
+        package_name=package_name,
+        package_version=package_version,
+    )
+    _read_bounded_dist_info_file(
+        dist_info_dir,
+        "METADATA",
+        max_bytes=MAX_HANDOFF_DIST_INFO_METADATA_BYTES,
+    )
+    entry_points_text = _read_bounded_dist_info_file(
+        dist_info_dir,
+        "entry_points.txt",
+        max_bytes=MAX_HANDOFF_ENTRY_POINTS_BYTES,
+    )
+    grouped = parse_vendored_entry_points(entry_points_text)
+    candidates = grouped.get(INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP, [])
+    compatible = [
+        (name, target)
+        for name, target in candidates
+        if name == INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME and target
+    ]
+    if not compatible:
+        raise PaidInstallError(ERROR_HANDOFF_HOOK_MISSING, exit_code=1)
+    if len(compatible) > 1:
+        raise PaidInstallError(ERROR_HANDOFF_HOOK_MULTIPLE, exit_code=1)
+    _, target = compatible[0]
+    try:
+        return assert_handoff_entrypoint_target(target)
+    except ValueError:
+        raise PaidInstallError(ERROR_HANDOFF_HOOK_MALFORMED, exit_code=1)
+
+
+def _module_origin_under_vendor(module: Any, vendor_root: Path) -> bool:
+    file_path = getattr(module, "__file__", None)
+    if isinstance(file_path, str) and file_path:
+        try:
+            Path(file_path).resolve().relative_to(vendor_root)
+            return True
+        except ValueError:
+            return False
+    module_paths = getattr(module, "__path__", None)
+    if module_paths is None:
+        return False
+    entries = [entry for entry in module_paths if isinstance(entry, str)]
+    if not entries:
+        return False
+    for entry in entries:
+        try:
+            Path(entry).resolve().relative_to(vendor_root)
+        except ValueError:
+            return False
+    return True
+
+
+def _assert_vendored_import_origins(
+    *,
+    vendor_dir: Path,
+    package_root: str,
+    package_prefix: str,
+) -> None:
+    vendor_root = vendor_dir.resolve()
+    for key, module in sys.modules.items():
+        if key != package_root and not key.startswith(package_prefix):
+            continue
+        if module is None or not _module_origin_under_vendor(module, vendor_root):
+            raise PaidInstallError(ERROR_HANDOFF_HOOK_IMPORT_FAILED, exit_code=1)
+
+
+def load_vendored_hook_callable(
+    vendor_dir: Path,
+    *,
+    home: Path,
+    module_path: str,
+    attr_name: str,
+) -> Callable[[InstalledProviderActivationHandoffRequest], Mapping[str, Any]]:
+    _assert_non_symlink_vendor_path(home, vendor_dir)
+    package_root = module_path.split(".", 1)[0]
+    package_prefix = f"{package_root}."
+    package_dir = vendor_dir / package_root.replace(".", "/")
+    module_file = vendor_dir.joinpath(*module_path.split(".")).with_suffix(".py")
+    if not package_dir.is_dir() and not module_file.is_file():
+        raise PaidInstallError(ERROR_HANDOFF_HOOK_IMPORT_FAILED, exit_code=1)
+
+    original_modules = {
+        key: value
+        for key, value in sys.modules.items()
+        if key == package_root or key.startswith(package_prefix)
+    }
+    vendor_str = str(vendor_dir.resolve())
+    inserted = False
+    imported_module = None
+    try:
+        if vendor_str not in sys.path:
+            sys.path.insert(0, vendor_str)
+            inserted = True
+        for key in list(sys.modules):
+            if key == package_root or key.startswith(package_prefix):
+                sys.modules.pop(key, None)
+        imported_module = importlib.import_module(module_path)
+        _assert_vendored_import_origins(
+            vendor_dir=vendor_dir,
+            package_root=package_root,
+            package_prefix=package_prefix,
+        )
+    except Exception:
+        raise PaidInstallError(ERROR_HANDOFF_HOOK_IMPORT_FAILED, exit_code=1) from None
+    finally:
+        if inserted:
+            with contextlib.suppress(ValueError):
+                sys.path.remove(vendor_str)
+        for key in list(sys.modules):
+            if (key == package_root or key.startswith(package_prefix)) and key not in original_modules:
+                sys.modules.pop(key, None)
+        sys.modules.update(original_modules)
+
+    hook = getattr(imported_module, attr_name, None)
+    if not callable(hook):
+        raise PaidInstallError(ERROR_HANDOFF_HOOK_IMPORT_FAILED, exit_code=1)
+    return hook
+
+
+def invoke_installed_provider_activation_handoff(
+    *,
+    license_key: str,
+    validation: ActivationValidateResult,
+    home: Path,
+    package_name: str,
+    package_version: str,
+    provider_id: str,
+    vendor_dir: Path,
+) -> InstalledProviderActivationHandoffResult:
+    module_path, attr_name = discover_exact_installed_activation_hook(
+        vendor_dir,
+        package_name=package_name,
+        package_version=package_version,
+    )
+    hook = load_vendored_hook_callable(
+        vendor_dir,
+        home=home,
+        module_path=module_path,
+        attr_name=attr_name,
+    )
+    resolved_home = str(home.expanduser().resolve())
+    assert_handoff_request_fields_bounded(
+        contract_version=INSTALLED_PROVIDER_ACTIVATION_HANDOFF_CONTRACT_VERSION,
+        activation_credential=license_key,
+        activation_reference=activation_reference_from_credential(license_key),
+        plan_family=validation.plan,
+        package_name=package_name,
+        package_version=package_version,
+        provider_id=provider_id,
+        avp_home=resolved_home,
+    )
+    request = InstalledProviderActivationHandoffRequest(
+        contract_version=INSTALLED_PROVIDER_ACTIVATION_HANDOFF_CONTRACT_VERSION,
+        activation_credential=license_key,
+        activation_reference=activation_reference_from_credential(license_key),
+        plan_family=validation.plan,
+        package_name=package_name,
+        package_version=package_version,
+        provider_id=provider_id,
+        avp_home=resolved_home,
+    )
+    try:
+        raw_response = hook(request)
+    except Exception:
+        raise PaidInstallError(ERROR_HANDOFF_HOOK_EXCEPTION, exit_code=1) from None
+    try:
+        result = validate_installed_provider_activation_handoff_response(raw_response)
+    except ValueError as exc:
+        raise PaidInstallError(str(exc), exit_code=1) from None
+    try:
+        assert_handoff_response_fields_public_bounded(
+            summary=result.summary,
+            error_code=result.error_code,
+            activation_credential=license_key,
+            resolved_avp_home=resolved_home,
+        )
+    except ValueError:
+        raise PaidInstallError(ERROR_HANDOFF_RESPONSE_INVALID, exit_code=1) from None
+    if result.status != STATUS_ACTIVE:
+        raise PaidInstallError(
+            result.error_code or ERROR_HANDOFF_RESPONSE_INACTIVE,
+            exit_code=1,
+        )
+    return result
+
+
 def run_paid_activate_install_flow(
     *,
     license_key: str,
@@ -776,33 +1284,90 @@ def run_paid_activate_install_flow(
     )
 
     wheel_dir = home / "paid" / "cache"
-    wheel_dir.mkdir(parents=True, exist_ok=True)
     wheel_path = wheel_dir / f"{expected_package_name}-{expected_package_version}.whl"
-    wheel_path.write_bytes(wheel_bytes)
-    os.chmod(wheel_path, 0o600)
+    wheel_stage_path = wheel_dir / f".staging-{expected_package_name}-{expected_package_version}-{secrets.token_hex(8)}.whl"
 
-    target_dir = vendor_root(home) / f"{expected_package_name}-{expected_package_version}"
-    install_wheel_to_vendor(
-        wheel_path=wheel_path,
-        target_dir=target_dir,
-        expected_package_name=expected_package_name,
-        expected_package_version=expected_package_version,
+    target_dir = _vendor_live_dir(
+        home,
+        package_name=expected_package_name,
+        package_version=expected_package_version,
     )
+    stage_dir = _vendor_stage_dir(
+        home,
+        package_name=expected_package_name,
+        package_version=expected_package_version,
+    )
+    _assert_trusted_home_path(home, home / "paid")
+    _assert_trusted_home_path(home, vendor_root(home))
+    if target_dir.exists():
+        _assert_non_symlink_vendor_path(home, target_dir)
 
     from agentveil_mcp_proxy.paid_activation import synthetic_license_id, utc_now_iso
 
-    install_state = {
-        "status": STATUS_ACTIVE,
-        "provider_id": PROVIDER_ID,
-        "package_name": expected_package_name,
-        "package_version": expected_package_version,
-        "public_fallback_available": authorization.public_fallback_available,
-        "error_code": None,
-        "last_installed_at": utc_now_iso(),
-        "install_safety_state": install_safety_state,
-        "install_safety_reason": install_safety_reason,
-    }
-    write_install_state(install_state_path(home), install_state)
+    install_path = install_state_path(home)
+    prior_install_bytes = install_path.read_bytes() if install_path.is_file() else None
+    public_fallback_available = authorization.public_fallback_available
+    try:
+        wheel_stage_path.parent.mkdir(parents=True, exist_ok=True)
+        wheel_stage_path.write_bytes(wheel_bytes)
+        os.chmod(wheel_stage_path, 0o600)
+
+        install_wheel_to_vendor(
+            home=home,
+            wheel_path=wheel_stage_path,
+            target_dir=stage_dir,
+            expected_package_name=expected_package_name,
+            expected_package_version=expected_package_version,
+            require_empty_target=True,
+        )
+        if validation.provider_handoff_required:
+            handoff = invoke_installed_provider_activation_handoff(
+                license_key=license_key,
+                validation=validation,
+                home=home,
+                package_name=expected_package_name,
+                package_version=expected_package_version,
+                provider_id=PROVIDER_ID,
+                vendor_dir=stage_dir,
+            )
+            public_fallback_available = handoff.public_fallback_available
+
+        install_state = {
+            "status": STATUS_ACTIVE,
+            "provider_id": PROVIDER_ID,
+            "package_name": expected_package_name,
+            "package_version": expected_package_version,
+            "public_fallback_available": public_fallback_available,
+            "error_code": None,
+            "last_installed_at": utc_now_iso(),
+            "install_safety_state": install_safety_state,
+            "install_safety_reason": install_safety_reason,
+        }
+        write_install_state(install_path, install_state)
+        vendor_publish_rollback: _VendorPublishRollback | None = None
+        try:
+            vendor_publish_rollback = _publish_staged_vendor(
+                home=home,
+                stage_dir=stage_dir,
+                live_dir=target_dir,
+            )
+            _commit_wheel_cache(wheel_stage_path=wheel_stage_path, wheel_path=wheel_path)
+        except Exception:
+            _restore_install_state_bytes(install_path, prior_install_bytes)
+            if vendor_publish_rollback is not None:
+                _rollback_published_vendor(live_dir=target_dir, rollback=vendor_publish_rollback)
+            raise
+        finally:
+            if (
+                vendor_publish_rollback is not None
+                and vendor_publish_rollback.backup_dir is not None
+            ):
+                _discard_staged_vendor(vendor_publish_rollback.backup_dir)
+    except Exception:
+        _discard_staged_vendor(stage_dir)
+        if wheel_stage_path.exists():
+            wheel_stage_path.unlink()
+        raise
 
     provider = PaidProviderSnapshot(
         provider_present=True,
@@ -810,7 +1375,7 @@ def run_paid_activate_install_flow(
         provider_contract_version=PUBLIC_PAID_PROVIDER_CONTRACT_VERSION,
         status=STATUS_ACTIVE,
         private_provider_enabled=True,
-        public_fallback_available=authorization.public_fallback_available,
+        public_fallback_available=public_fallback_available,
         summary=(
             f"Installed {install_state['package_name']} "
             f"{install_state['package_version']} for paid preview."
@@ -821,7 +1386,7 @@ def run_paid_activate_install_flow(
         provider=provider,
         activation_status=STATUS_ACTIVE,
         install_state=install_state,
-        public_fallback_available=authorization.public_fallback_available,
+        public_fallback_available=public_fallback_available,
         license_id=synthetic_license_id(license_key),
         install_safety_advisory=install_safety_advisory,
     )
