@@ -563,27 +563,47 @@ def test_run_proxy_starts_and_stops_decision_summary_dispatcher(tmp_path, monkey
         "args": ["-c", "import time; time.sleep(3600)"],
     }
     (home / "mcp-proxy" / "config.json").write_text(json.dumps(config), encoding="utf-8")
-    lifecycle = {"started": 0, "stopped": 0}
+    lifecycle = {"decision_started": 0, "decision_stopped": 0, "approval_started": 0, "approval_stopped": 0}
 
-    class RecordingDispatcher:
+    class RecordingDecisionDispatcher:
         is_active = True
 
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
         def start(self):
-            lifecycle["started"] += 1
+            lifecycle["decision_started"] += 1
 
         def stop(self, **kwargs):
-            lifecycle["stopped"] += 1
+            lifecycle["decision_stopped"] += 1
 
         def notify_terminal_record(self, record):
+            return None
+
+    class RecordingApprovalDispatcher:
+        is_active = True
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            lifecycle["approval_started"] += 1
+
+        def stop(self, **kwargs):
+            lifecycle["approval_stopped"] += 1
+
+        def request_snapshot(self):
             return None
 
     monkeypatch.setattr(
         proxy_cli,
         "ConsoleDecisionSummaryDispatcher",
-        RecordingDispatcher,
+        RecordingDecisionDispatcher,
+    )
+    monkeypatch.setattr(
+        proxy_cli,
+        "ConsoleApprovalSummaryDispatcher",
+        RecordingApprovalDispatcher,
     )
 
     assert run_proxy(
@@ -592,7 +612,12 @@ def test_run_proxy_starts_and_stops_decision_summary_dispatcher(tmp_path, monkey
         out=io.StringIO(),
         approval_ui_mode="none",
     ) == 0
-    assert lifecycle == {"started": 1, "stopped": 1}
+    assert lifecycle == {
+        "decision_started": 1,
+        "decision_stopped": 1,
+        "approval_started": 1,
+        "approval_stopped": 1,
+    }
 
 
 def test_export_evidence_warns_when_signed_receipts_are_not_fetched(tmp_path):
