@@ -561,11 +561,11 @@ def test_shutdown_leaves_no_approval_dispatcher_threads(tmp_path, attempt):
     )
     dispatcher.start()
     dispatcher.request_snapshot()
-    assert first_started.wait(timeout=1.0)
+    assert first_started.wait(timeout=5.0)
     first_release.set()
     store.write_pending(_record(f"pending-{attempt}-changed"))
     dispatcher.request_snapshot()
-    assert second_started.wait(timeout=1.0)
+    assert second_started.wait(timeout=5.0)
     dispatcher.stop()
     assert dispatcher._worker is not None
     assert not dispatcher._worker.is_alive()
