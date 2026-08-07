@@ -533,12 +533,21 @@ def test_dispatcher_uploads_snapshot_on_request(tmp_path):
 
 @pytest.mark.parametrize("attempt", range(20))
 def test_shutdown_leaves_no_approval_dispatcher_threads(tmp_path, attempt):
-    started = threading.Event()
-    release = threading.Event()
+    calls = 0
+    first_started = threading.Event()
+    first_release = threading.Event()
+    second_started = threading.Event()
+    second_release = threading.Event()
 
     def _blocking_transport(method, url, *, headers, body, timeout):
-        started.set()
-        release.wait(timeout=timeout)
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first_started.set()
+            first_release.wait(timeout=timeout)
+        else:
+            second_started.set()
+            second_release.wait(timeout=timeout)
         return _json_response(200, _backend_ack_for_request(body))
 
     store = ApprovalEvidenceStore(tmp_path / f"evidence-{attempt}.sqlite")
@@ -552,12 +561,16 @@ def test_shutdown_leaves_no_approval_dispatcher_threads(tmp_path, attempt):
     )
     dispatcher.start()
     dispatcher.request_snapshot()
-    assert started.wait(timeout=1.0)
+    assert first_started.wait(timeout=1.0)
+    first_release.set()
+    store.write_pending(_record(f"pending-{attempt}-changed"))
+    dispatcher.request_snapshot()
+    assert second_started.wait(timeout=1.0)
     dispatcher.stop()
     assert dispatcher._worker is not None
     assert not dispatcher._worker.is_alive()
     assert _alive_threads_created_since(baseline) == []
-    release.set()
+    second_release.set()
     store.close()
 
 
