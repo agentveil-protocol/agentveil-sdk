@@ -145,6 +145,7 @@ def _managed_production_stack(
     browser_open,
     approval_timeout_seconds: int = 300,
     upload_hook=None,
+    wait_for_decision: bool = False,
 ):
     """Managed center + RemoteApprovalServer + real Console dispatcher wiring."""
 
@@ -186,7 +187,7 @@ def _managed_production_stack(
         session_id="session-delivery-123456",
         cli_out=io.StringIO(),
         browser_open=browser_open,
-        wait_for_decision=False,
+        wait_for_decision=wait_for_decision,
         notifier=SimpleNamespace(notify=lambda _prompt: None),
     )
     uploaded: list = []
@@ -311,6 +312,44 @@ def test_first_console_upload_get_of_product_pending_url_is_actionable(tmp_path)
         assert _wait_until(lambda: bool(upload_get_statuses))
         assert upload_get_statuses == [200]
         assert outcome.approval_url == stack.run_server.approval_url(outcome.request_id)
+    finally:
+        _stop_managed_stack(stack)
+
+
+def test_managed_center_denial_uploads_terminal_snapshot(tmp_path):
+    """A remote Deny persisted before polling still notifies Console state."""
+
+    def browser_open(url: str) -> bool:
+        with httpx.Client() as client:
+            csrf = _get_csrf(client, url)
+            response = _post_decision(
+                client,
+                url,
+                decision="deny",
+                csrf=csrf,
+            )
+            assert response.status_code == 200
+        return True
+
+    stack = _managed_production_stack(
+        tmp_path,
+        browser_open=browser_open,
+        wait_for_decision=True,
+    )
+    try:
+        outcome = stack.manager.request_approval(
+            _write_classification(stack.config, path="ops/remote-deny.json"),
+            reason="local_approval_required",
+        )
+        assert outcome.status == ApprovalStatus.DENIED.value
+        assert _wait_until(
+            lambda: bool(stack.uploaded)
+            and stack.uploaded[-1].pending == ()
+            and any(
+                item.status == "denied"
+                for item in stack.uploaded[-1].resolutions
+            )
+        )
     finally:
         _stop_managed_stack(stack)
 

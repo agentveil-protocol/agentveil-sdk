@@ -891,6 +891,9 @@ class ApprovalManager:
             )
             terminal = self._outcome_if_terminal_evidence(request_id)
             if terminal is not None:
+                # A managed Approval Center persists the operator decision in
+                # the shared store before this proxy observes it.
+                self._notify_approval_state()
                 return terminal
             if decision is not None:
                 if decision.decision == "approve":
