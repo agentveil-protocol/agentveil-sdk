@@ -1654,6 +1654,17 @@ def _best_effort_console_project_status_sync(
         return
 
 
+def _best_effort_console_free_builder_sync(*, home: Path | None = None) -> None:
+    """Best-effort Console free Builder preview install when credential allows."""
+
+    from agentveil_mcp_proxy.console_free_builder_client import sync_free_builder_install
+
+    try:
+        sync_free_builder_install(home=home, load_credential_fn=load_credential)
+    except Exception:
+        return
+
+
 def print_setup_status_cli(
     *,
     home: Path | None = None,
@@ -3902,6 +3913,7 @@ def run_console_login_cli(
         ) from exc
 
     print("Connected to AgentVeil Console.", file=stream)
+    _best_effort_console_free_builder_sync()
     return 0
 
 
@@ -5465,6 +5477,7 @@ def run_setup_cursor_cli(
         connector_status=status,
         project_dir=target,
     )
+    _best_effort_console_free_builder_sync()
     return 0
 
 
@@ -5496,6 +5509,7 @@ def run_setup_cursor_status_cli(*, workspace: Path | None, output_json: bool) ->
         connector_status=status,
         project_dir=target,
     )
+    _best_effort_console_free_builder_sync()
     return 0
 
 
@@ -6210,6 +6224,7 @@ def run_setup_claude_code_cli(
         connector_status=status,
         project_dir=target,
     )
+    _best_effort_console_free_builder_sync()
     return 0
 
 
@@ -6412,6 +6427,7 @@ def run_setup_codex_cli(
         connector_status=status,
         project_dir=target,
     )
+    _best_effort_console_free_builder_sync()
     return 0
 
 
@@ -6455,6 +6471,7 @@ def run_setup_codex_status_cli(
         connector_status=status,
         project_dir=target,
     )
+    _best_effort_console_free_builder_sync()
     return 0
 
 
@@ -6715,6 +6732,7 @@ def run_setup_gemini_cli(
         connector_status=status,
         project_dir=target,
     )
+    _best_effort_console_free_builder_sync()
     return 0
 
 
@@ -6755,6 +6773,7 @@ def run_setup_gemini_status_cli(
         connector_status=status,
         project_dir=target,
     )
+    _best_effort_console_free_builder_sync()
     return 0
 
 
@@ -6852,6 +6871,7 @@ def run_setup_connector_status_cli(*, project_dir: Path | None, output_json: boo
         connector_status=status,
         project_dir=target,
     )
+    _best_effort_console_free_builder_sync()
     return 0
 
 

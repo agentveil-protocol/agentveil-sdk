@@ -4032,3 +4032,224 @@ def test_console_upload_failure_preserves_setup_output_across_formats(
         assert failed_err == accepted_err
     assert "network must not leak" not in failed_out
     assert "network must not leak" not in failed_err
+
+
+def test_console_free_builder_sync_skipped_without_credential(tmp_path, monkeypatch, capsys):
+    from test_mcp_proxy_codex_setup import (
+        _install_fast_codex_setup_fakes,
+        _isolate_cli_home,
+        _make_proxy_command,
+    )
+
+    isolated_home = tmp_path / "home"
+    _isolate_cli_home(monkeypatch, isolated_home)
+    proxy_command = _make_proxy_command(tmp_path)
+    _install_fast_codex_setup_fakes(monkeypatch, proxy_command=proxy_command)
+    sync_calls = []
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_free_builder_client.sync_free_builder_install",
+        lambda **kwargs: sync_calls.append(kwargs) or "skipped_no_credential",
+    )
+
+    project = tmp_path / "project"
+    project.mkdir()
+    rc = main(["setup", "codex", "--project-dir", str(project), "--yes", "--json"])
+    capsys.readouterr()
+
+    assert rc == 0
+    assert len(sync_calls) == 1
+
+
+def test_console_free_builder_sync_on_login_when_connected(tmp_path, monkeypatch, capsys):
+    avp_home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(avp_home))
+    sync_calls = []
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_free_builder_client.sync_free_builder_install",
+        lambda **kwargs: sync_calls.append(kwargs) or "installed",
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.cli.console_login_lock",
+        lambda home=None: _null_context(),
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.cli.load_credential",
+        lambda home=None: None,
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.cli.save_credential",
+        lambda token, scope=None, home=None: None,
+    )
+
+    class _FakePairing:
+        def start(self):
+            from agentveil_mcp_proxy.console_pairing_client import PairingStart
+
+            return PairingStart(
+                device_code="device-code-secret",
+                user_code="ABCD-1234",
+                verification_url="https://agentveil.dev/console/pairing",
+                expires_in=600,
+                interval=5,
+            )
+
+        def poll_for_token(self, start):
+            from agentveil_mcp_proxy.console_pairing_client import PairingToken
+
+            del start
+            return PairingToken(token="paired-token-secret", scope=CREDENTIAL_SCOPE)
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.cli._console_pairing_client",
+        lambda: _FakePairing(),
+    )
+
+    assert main(["login", "--no-open"]) == 0
+    capsys.readouterr()
+    assert len(sync_calls) == 1
+
+
+def _null_context():
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _cm():
+        yield
+
+    return _cm()
+
+
+@pytest.mark.parametrize(
+    ("client", "setup_argv", "status_argv", "connector"),
+    [
+        (
+            "cursor",
+            ["setup", "cursor", "--yes"],
+            ["setup", "status"],
+            "cursor",
+        ),
+        (
+            "codex",
+            ["setup", "codex", "--yes"],
+            ["setup", "status", "--client", "codex"],
+            "codex",
+        ),
+        (
+            "claude-code",
+            ["setup", "claude-code", "--yes"],
+            ["setup", "status"],
+            "claude-code",
+        ),
+        (
+            "gemini-cli",
+            ["setup", "gemini-cli", "--yes"],
+            ["setup", "status", "--client", "gemini-cli"],
+            "gemini-cli",
+        ),
+    ],
+)
+def test_console_free_builder_sync_on_setup_status_for_connectors(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    client,
+    setup_argv,
+    status_argv,
+    connector,
+):
+    from agentveil_mcp_proxy import cursor_setup
+    from test_mcp_proxy_codex_setup import _make_proxy_command
+
+    avp_home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(avp_home))
+    save_credential(CONSOLE_TOKEN, home=avp_home)
+    project = tmp_path / "checkout-service"
+    project.mkdir()
+    sync_calls = []
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_free_builder_client.sync_free_builder_install",
+        lambda **kwargs: sync_calls.append(kwargs) or "skipped_no_credential",
+    )
+
+    if client == "cursor":
+        def fake_init_proxy(**kwargs):
+            home = kwargs["home"]
+            (home / "mcp-proxy").mkdir(parents=True, exist_ok=True)
+            (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+
+        def fake_prepare(_workspace, *, force=False):
+            home = cursor_setup.setup_home(_workspace)
+            home.mkdir(parents=True, exist_ok=True)
+            (home / "passphrase").write_text("secret\n", encoding="utf-8")
+            return home
+
+        monkeypatch.setattr(proxy_cli, "init_proxy", fake_init_proxy)
+        monkeypatch.setattr(cursor_setup, "prepare_proxy_home", fake_prepare)
+        monkeypatch.setattr(proxy_cli, "initialize_product_route_profile", lambda _prof: None)
+        monkeypatch.setattr(
+            cursor_setup,
+            "ensure_approval_center_running",
+            lambda **_kwargs: SimpleNamespace(
+                status=SimpleNamespace(state="running"),
+                started=True,
+                reused=False,
+                restarted=False,
+                reason="center started",
+            ),
+        )
+        monkeypatch.setattr("shutil.which", lambda _name: "agentveil-mcp-proxy")
+        setup = [*setup_argv, "--workspace", str(project), "--json"]
+        status = [*status_argv, "--workspace", str(project), "--json"]
+    elif client == "codex":
+        from test_mcp_proxy_codex_setup import (
+            _install_fast_codex_setup_fakes,
+            _isolate_cli_home,
+        )
+
+        isolated_home = tmp_path / "home"
+        _isolate_cli_home(monkeypatch, isolated_home)
+        proxy_command = _make_proxy_command(tmp_path)
+        _install_fast_codex_setup_fakes(monkeypatch, proxy_command=proxy_command)
+        setup = [*setup_argv, "--project-dir", str(project), "--json"]
+        status = [*status_argv, "--project-dir", str(project), "--json"]
+    elif client == "claude-code":
+        monkeypatch.setattr(
+            proxy_cli,
+            "init_proxy",
+            lambda **kwargs: (kwargs["home"] / "mcp-proxy").mkdir(parents=True, exist_ok=True)
+            or (kwargs["home"] / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8"),
+        )
+        monkeypatch.setattr(proxy_cli, "_resolve_setup_proxy_command", lambda: "agentveil-mcp-proxy")
+        monkeypatch.setattr(
+            "agentveil_mcp_proxy.approval.server.ensure_managed_approval_center_for_cli",
+            lambda **_kwargs: SimpleNamespace(
+                status=SimpleNamespace(state="running"),
+                started=True,
+                reused=False,
+                restarted=False,
+                reason="center started",
+            ),
+        )
+        monkeypatch.setattr(
+            "agentveil_mcp_proxy.approval.server.inspect_managed_approval_center",
+            lambda _home: SimpleNamespace(state="running", url="http://127.0.0.1/approval/"),
+        )
+        setup = [*setup_argv, "--project-dir", str(project), "--json"]
+        status = [*status_argv, "--project-dir", str(project), "--json"]
+    else:
+        from test_mcp_proxy_gemini_setup import _install_fast_gemini_setup_fakes
+
+        isolated_home = tmp_path / "home"
+        monkeypatch.setenv("HOME", str(isolated_home))
+        proxy_command = _make_proxy_command(tmp_path)
+        _install_fast_gemini_setup_fakes(monkeypatch, proxy_command=proxy_command)
+        setup = [*setup_argv, "--project-dir", str(project), "--json"]
+        status = [*status_argv, "--project-dir", str(project), "--json"]
+
+    assert main(setup) == 0
+    capsys.readouterr()
+    assert len(sync_calls) == 1
+
+    assert main(status) == 0
+    capsys.readouterr()
+    assert len(sync_calls) == 2

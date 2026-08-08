@@ -221,6 +221,14 @@ class PaidInstallError(ValueError):
         self.exit_code = exit_code
 
 
+class FreeBuilderInstallError(ValueError):
+    """Bounded free Builder install failure without detail leak."""
+
+    def __init__(self, code: str = "free_builder_install_failed"):
+        self.code = str(code)
+        super().__init__(self.code)
+
+
 @dataclass(frozen=True)
 class ActivationValidateResult:
     valid: bool
@@ -279,6 +287,26 @@ class PaidActivateInstallResult:
     public_fallback_available: bool
     license_id: str
     install_safety_advisory: str | None = None
+
+
+@dataclass(frozen=True)
+class FreeBuilderWheelExpectations:
+    """Optional server-owned wheel expectations when explicitly provided."""
+
+    artifact_hash: str | None = None
+    artifact_size_bytes: int | None = None
+    package_name: str | None = None
+    package_version: str | None = None
+
+
+@dataclass(frozen=True)
+class FreeBuilderInstallResult:
+    install_state: dict[str, Any]
+    public_fallback_available: bool
+
+
+MAX_FREE_BUILDER_WHEEL_BYTES = 64 * 1024 * 1024
+FREE_BUILDER_PLAN_FAMILY = "free_builder_preview"
 
 
 class PaidBackendClient(Protocol):
@@ -701,6 +729,47 @@ def _restore_install_state_bytes(path: Path, prior_bytes: bytes | None) -> None:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(prior_bytes)
+
+
+def verify_free_builder_wheel_artifact(
+    wheel_bytes: bytes,
+    *,
+    expectations: FreeBuilderWheelExpectations | None = None,
+) -> WheelMetadata:
+    if len(wheel_bytes) > MAX_FREE_BUILDER_WHEEL_BYTES:
+        raise FreeBuilderInstallError("wheel_too_large")
+    bounded = expectations or FreeBuilderWheelExpectations()
+    if not bounded.artifact_hash:
+        raise FreeBuilderInstallError("artifact_hash_required")
+    if bounded.artifact_size_bytes is None:
+        raise FreeBuilderInstallError("artifact_size_required")
+    try:
+        metadata = parse_wheel_metadata(wheel_bytes)
+        expected_package_name = validate_bounded_package_name(metadata.package_name)
+        expected_package_version = validate_bounded_package_version(metadata.package_version)
+        if bounded.package_name is not None:
+            bounded_name = validate_bounded_package_name(bounded.package_name)
+            if metadata.package_name != bounded_name:
+                raise FreeBuilderInstallError(ERROR_PACKAGE_NAME_MISMATCH)
+            expected_package_name = bounded_name
+        if bounded.package_version is not None:
+            bounded_version = validate_bounded_package_version(bounded.package_version)
+            if metadata.package_version != bounded_version:
+                raise FreeBuilderInstallError(ERROR_VERSION_MISMATCH)
+            expected_package_version = bounded_version
+        verify_wheel_artifact(
+            wheel_bytes,
+            expected_hash=bounded.artifact_hash,
+            expected_size=bounded.artifact_size_bytes,
+            expected_package_name=expected_package_name,
+            expected_package_version=expected_package_version,
+        )
+    except PaidInstallError as exc:
+        raise FreeBuilderInstallError(str(exc.args[0])) from exc
+    return WheelMetadata(
+        package_name=expected_package_name,
+        package_version=expected_package_version,
+    )
 
 
 def verify_wheel_artifact(
@@ -1396,3 +1465,171 @@ def clear_install_state(home: Path) -> None:
     path = install_state_path(home)
     if path.exists():
         path.unlink()
+
+
+def invoke_console_free_builder_activation_handoff(
+    *,
+    activation_credential: str,
+    home: Path,
+    package_name: str,
+    package_version: str,
+    provider_id: str,
+    vendor_dir: Path,
+) -> InstalledProviderActivationHandoffResult:
+    """Run the installed-provider handoff for Console free Builder preview."""
+
+    # claim-check: allow valid=True is synthetic handoff input, not a license proof claim.
+    validation = ActivationValidateResult(
+        valid=True,  # claim-check: allow synthetic handoff input, not license proof
+        customer_ref_fingerprint=None,
+        plan=FREE_BUILDER_PLAN_FAMILY,
+        license_status=None,
+        subscription_status=None,
+        period_end=None,
+        public_fallback_available=True,
+        error_code=None,
+        provider_handoff_required=True,
+    )
+    return invoke_installed_provider_activation_handoff(
+        license_key=activation_credential,
+        validation=validation,
+        home=home,
+        package_name=package_name,
+        package_version=package_version,
+        provider_id=provider_id,
+        vendor_dir=vendor_dir,
+    )
+
+
+def run_free_builder_install_flow(
+    *,
+    wheel_bytes: bytes,
+    home: Path,
+    activation_credential: str,
+    expectations: FreeBuilderWheelExpectations | None = None,
+    discover_paid_provider_fn: Callable[[], PaidProviderSnapshot] | None = None,
+) -> FreeBuilderInstallResult:
+    """Verify, install, and hand off a Console-delivered free Builder wheel."""
+
+    from agentveil_mcp_proxy.console_project_status_client import (
+        resolve_private_guardrails_status,
+    )
+    from agentveil_mcp_proxy.paid_activation import utc_now_iso
+    from agentveil_mcp_proxy.paid_provider import discover_paid_provider
+
+    metadata = verify_free_builder_wheel_artifact(
+        wheel_bytes,
+        expectations=expectations,
+    )
+    expected_package_name = metadata.package_name
+    expected_package_version = metadata.package_version
+
+    wheel_dir = home / "paid" / "cache"
+    wheel_path = wheel_dir / f"{expected_package_name}-{expected_package_version}.whl"
+    wheel_stage_path = wheel_dir / (
+        f".staging-{expected_package_name}-{expected_package_version}-{secrets.token_hex(8)}.whl"
+    )
+    target_dir = _vendor_live_dir(
+        home,
+        package_name=expected_package_name,
+        package_version=expected_package_version,
+    )
+    stage_dir = _vendor_stage_dir(
+        home,
+        package_name=expected_package_name,
+        package_version=expected_package_version,
+    )
+    _assert_trusted_home_path(home, home / "paid")
+    _assert_trusted_home_path(home, vendor_root(home))
+    if target_dir.exists():
+        _assert_non_symlink_vendor_path(home, target_dir)
+
+    install_path = install_state_path(home)
+    prior_install_bytes = install_path.read_bytes() if install_path.is_file() else None
+    public_fallback_available = True
+    discover = discover_paid_provider_fn or discover_paid_provider
+    try:
+        wheel_stage_path.parent.mkdir(parents=True, exist_ok=True)
+        wheel_stage_path.write_bytes(wheel_bytes)
+        os.chmod(wheel_stage_path, 0o600)
+
+        install_wheel_to_vendor(
+            home=home,
+            wheel_path=wheel_stage_path,
+            target_dir=stage_dir,
+            expected_package_name=expected_package_name,
+            expected_package_version=expected_package_version,
+            require_empty_target=True,
+        )
+        handoff = invoke_console_free_builder_activation_handoff(
+            activation_credential=activation_credential,
+            home=home,
+            package_name=expected_package_name,
+            package_version=expected_package_version,
+            provider_id=PROVIDER_ID,
+            vendor_dir=stage_dir,
+        )
+        public_fallback_available = handoff.public_fallback_available
+
+        install_state = {
+            "status": STATUS_ACTIVE,
+            "provider_id": PROVIDER_ID,
+            "package_name": expected_package_name,
+            "package_version": expected_package_version,
+            "public_fallback_available": public_fallback_available,
+            "error_code": None,
+            "last_installed_at": utc_now_iso(),
+            "install_safety_state": INSTALL_SAFETY_STATE_VERIFIED,
+            "install_safety_reason": None,
+        }
+        write_install_state(install_path, install_state)
+        vendor_publish_rollback: _VendorPublishRollback | None = None
+        try:
+            vendor_publish_rollback = _publish_staged_vendor(
+                home=home,
+                stage_dir=stage_dir,
+                live_dir=target_dir,
+            )
+            _commit_wheel_cache(wheel_stage_path=wheel_stage_path, wheel_path=wheel_path)
+        except Exception as exc:
+            _restore_install_state_bytes(install_path, prior_install_bytes)
+            if vendor_publish_rollback is not None:
+                _rollback_published_vendor(live_dir=target_dir, rollback=vendor_publish_rollback)
+            raise FreeBuilderInstallError("install_publish_failed") from exc
+        finally:
+            if (
+                vendor_publish_rollback is not None
+                and vendor_publish_rollback.backup_dir is not None
+            ):
+                _discard_staged_vendor(vendor_publish_rollback.backup_dir)
+    except PaidInstallError as exc:
+        _discard_staged_vendor(stage_dir)
+        if wheel_stage_path.exists():
+            wheel_stage_path.unlink()
+        _restore_install_state_bytes(install_path, prior_install_bytes)
+        raise FreeBuilderInstallError(exc.args[0]) from exc
+    except Exception:
+        _discard_staged_vendor(stage_dir)
+        if wheel_stage_path.exists():
+            wheel_stage_path.unlink()
+        _restore_install_state_bytes(install_path, prior_install_bytes)
+        raise
+
+    try:
+        if resolve_private_guardrails_status(discover()) != "active":
+            _restore_install_state_bytes(install_path, prior_install_bytes)
+            if target_dir.exists():
+                shutil.rmtree(target_dir, ignore_errors=True)
+            raise FreeBuilderInstallError("provider_not_active")
+    except FreeBuilderInstallError:
+        raise
+    except Exception as exc:
+        _restore_install_state_bytes(install_path, prior_install_bytes)
+        if target_dir.exists():
+            shutil.rmtree(target_dir, ignore_errors=True)
+        raise FreeBuilderInstallError("provider_not_active") from exc
+
+    return FreeBuilderInstallResult(
+        install_state=install_state,
+        public_fallback_available=public_fallback_available,
+    )

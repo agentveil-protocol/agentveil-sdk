@@ -29,6 +29,8 @@ from agentveil_mcp_proxy.paid_install import (
     INSTALL_SAFETY_STATE_MALFORMED,
     INSTALL_SAFETY_STATE_REVIEW_RECOMMENDED,
     INSTALL_SAFETY_STATE_VERIFIED,
+    FreeBuilderInstallError,
+    FreeBuilderWheelExpectations,
     HttpPaidBackendClient,
     PaidInstallError,
     build_install_safety_check_request,
@@ -41,6 +43,7 @@ from agentveil_mcp_proxy.paid_install import (
     sha256_hex,
     validate_bounded_package_name,
     validate_bounded_package_version,
+    verify_free_builder_wheel_artifact,
     verify_wheel_artifact,
 )
 
@@ -750,3 +753,34 @@ def test_paid_activate_rejects_extra_safety_check_field(tmp_path, mock_paid_back
     assert code == 1
     assert _MockPaidBackendHandler.state.authorize_call_count == 0
     _assert_no_paid_leaks(out + err)
+
+
+def test_verify_free_builder_wheel_artifact_accepts_bounded_metadata(tmp_path):
+    wheel_path, artifact_hash = _build_test_wheel(tmp_path / "wheel-build")
+    wheel_bytes = wheel_path.read_bytes()
+    metadata = verify_free_builder_wheel_artifact(
+        wheel_bytes,
+        expectations=FreeBuilderWheelExpectations(
+            artifact_hash=artifact_hash,
+            artifact_size_bytes=len(wheel_bytes),
+            package_name=PACKAGE_NAME,
+            package_version=PACKAGE_VERSION,
+        ),
+    )
+    assert metadata.package_name == PACKAGE_NAME
+    assert metadata.package_version == PACKAGE_VERSION
+
+
+def test_verify_free_builder_wheel_artifact_rejects_hash_mismatch(tmp_path):
+    wheel_path, artifact_hash = _build_test_wheel(tmp_path / "wheel-build")
+    wheel_bytes = wheel_path.read_bytes()
+    with pytest.raises(FreeBuilderInstallError):
+        verify_free_builder_wheel_artifact(
+            wheel_bytes,
+            expectations=FreeBuilderWheelExpectations(
+                artifact_hash="0" * 64,
+                artifact_size_bytes=len(wheel_bytes),
+                package_name=PACKAGE_NAME,
+                package_version=PACKAGE_VERSION,
+            ),
+        )
