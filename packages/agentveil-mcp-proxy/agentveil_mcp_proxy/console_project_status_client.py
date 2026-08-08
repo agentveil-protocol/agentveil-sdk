@@ -221,7 +221,7 @@ def _canonical_observed_at(value: datetime) -> str:
     text = utc.strftime("%Y-%m-%dT%H:%M:%S")
     micros = utc.microsecond
     if micros:
-        text += f".{micros:06d}".rstrip("0").rstrip(".")
+        text += f".{micros:06d}"
     return f"{text}Z"
 
 
