@@ -31,6 +31,8 @@ from agentveil_mcp_proxy.paid_provider import (
     INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME,
     InstalledProviderActivationHandoffRequest,
     InstalledProviderActivationHandoffResult,
+    MAX_HANDOFF_PROVIDER_ID_LENGTH,
+    PAID_PROVIDER_ENTRYPOINT_GROUP,
     PUBLIC_PAID_PROVIDER_CONTRACT_VERSION,
     STATUS_ACTIVE,
     PaidProviderSnapshot,
@@ -136,6 +138,9 @@ ERROR_VERSION_MISMATCH = "package_version_mismatch"
 ERROR_INSTALL_FAILED = "install_failed"
 ERROR_INSTALL_SAFETY_BLOCKED = "install_safety_blocked"
 ERROR_INSTALL_SAFETY_MALFORMED = "install_safety_malformed"
+ERROR_VENDORED_PROVIDER_MISSING = "vendored_provider_missing"
+ERROR_VENDORED_PROVIDER_MULTIPLE = "vendored_provider_multiple"
+ERROR_VENDORED_PROVIDER_MALFORMED = "vendored_provider_malformed"
 
 MAX_HANDOFF_ENTRY_POINTS_BYTES = 8192
 MAX_HANDOFF_DIST_INFO_METADATA_BYTES = 65536
@@ -1141,6 +1146,111 @@ def discover_exact_installed_activation_hook(
         return assert_handoff_entrypoint_target(target)
     except ValueError:
         raise PaidInstallError(ERROR_HANDOFF_HOOK_MALFORMED, exit_code=1)
+
+
+def discover_exact_vendored_paid_provider_entry(
+    vendor_dir: Path,
+    *,
+    package_name: str,
+    package_version: str,
+    provider_id: str,
+) -> tuple[str, str]:
+    """Discover one compatible paid provider entry from the exact vendored wheel."""
+
+    dist_info_dir = _find_exact_dist_info_dir(
+        vendor_dir,
+        package_name=package_name,
+        package_version=package_version,
+    )
+    _read_bounded_dist_info_file(
+        dist_info_dir,
+        "METADATA",
+        max_bytes=MAX_HANDOFF_DIST_INFO_METADATA_BYTES,
+    )
+    entry_points_text = _read_bounded_dist_info_file(
+        dist_info_dir,
+        "entry_points.txt",
+        max_bytes=MAX_HANDOFF_ENTRY_POINTS_BYTES,
+    )
+    grouped = parse_vendored_entry_points(entry_points_text)
+    candidates = grouped.get(PAID_PROVIDER_ENTRYPOINT_GROUP, [])
+    compatible = [
+        (name, target)
+        for name, target in candidates
+        if name == provider_id and target
+    ]
+    if not compatible:
+        raise PaidInstallError(ERROR_VENDORED_PROVIDER_MISSING, exit_code=1)
+    if len(compatible) > 1:
+        raise PaidInstallError(ERROR_VENDORED_PROVIDER_MULTIPLE, exit_code=1)
+    _, target = compatible[0]
+    try:
+        return assert_handoff_entrypoint_target(target)
+    except ValueError:
+        raise PaidInstallError(ERROR_VENDORED_PROVIDER_MALFORMED, exit_code=1)
+
+
+def resolve_vendored_paid_provider(*, home: Path | None = None) -> Any | None:
+    """Load a trusted vendored paid provider from bounded install state."""
+
+    resolved_home = (home or Path(os.environ.get("AVP_HOME", "~/.avp"))).expanduser()
+    try:
+        _assert_trusted_home_path(resolved_home, resolved_home / "paid")
+    except PaidInstallError:
+        return None
+
+    install_state = load_install_state(install_state_path(resolved_home))
+    if install_state is None or install_state.get("status") != STATUS_ACTIVE:
+        return None
+
+    provider_id = install_state.get("provider_id")
+    package_name = install_state.get("package_name")
+    package_version = install_state.get("package_version")
+    if not isinstance(provider_id, str) or not provider_id.strip():
+        return None
+    if not isinstance(package_name, str) or not isinstance(package_version, str):
+        return None
+    if len(provider_id) > MAX_HANDOFF_PROVIDER_ID_LENGTH:
+        return None
+
+    try:
+        expected_package_name = validate_bounded_package_name(package_name)
+        expected_package_version = validate_bounded_package_version(package_version)
+    except PaidInstallError:
+        return None
+
+    vendor_dir = _vendor_live_dir(
+        resolved_home,
+        package_name=expected_package_name,
+        package_version=expected_package_version,
+    )
+    if not vendor_dir.is_dir():
+        return None
+
+    try:
+        _assert_non_symlink_vendor_path(resolved_home, vendor_dir)
+        module_path, attr_name = discover_exact_vendored_paid_provider_entry(
+            vendor_dir,
+            package_name=expected_package_name,
+            package_version=expected_package_version,
+            provider_id=provider_id,
+        )
+        factory = load_vendored_hook_callable(
+            vendor_dir,
+            home=resolved_home,
+            module_path=module_path,
+            attr_name=attr_name,
+        )
+        loaded = factory()
+        provider = loaded() if callable(loaded) else loaded
+        if provider is None:
+            return None
+        discovered_id = getattr(provider, "provider_id", None)
+        if discovered_id is not None and str(discovered_id) != provider_id:
+            return None
+        return provider
+    except Exception:
+        return None
 
 
 def _module_origin_under_vendor(module: Any, vendor_root: Path) -> bool:

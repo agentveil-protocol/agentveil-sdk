@@ -78,7 +78,9 @@ from agentveil_mcp_proxy.paid_provider import (
     MAX_HANDOFF_PLAN_FAMILY_LENGTH,
     MAX_HANDOFF_PROVIDER_ID_LENGTH,
     MAX_HANDOFF_SUMMARY_LENGTH,
+    PAID_PROVIDER_ENTRYPOINT_GROUP,
     assert_handoff_request_fields_bounded,
+    discover_paid_provider,
     set_paid_provider_loader,
     validate_installed_provider_activation_handoff_response,
 )
@@ -156,6 +158,43 @@ def run_activation_handoff(request):
         "summary": "Installed hook completed.",
         "error_code": None,
     }
+"""
+
+VENDORED_PROVIDER_SOURCE = """
+class _Provider:
+    provider_id = "private_v1"
+    provider_contract_version = "1"
+
+    def status(self):
+        return {
+            "provider_present": True,
+            "provider_id": self.provider_id,
+            "provider_contract_version": self.provider_contract_version,
+            "status": "active",
+            "private_provider_enabled": True,
+            "public_fallback_available": True,
+            "summary": "Vendored provider active.",
+            "error_code": None,
+        }
+
+    def activate(self, *, license_key):
+        del license_key
+        return self.status()
+
+    def deactivate(self):
+        return {
+            "provider_present": False,
+            "provider_id": None,
+            "provider_contract_version": self.provider_contract_version,
+            "status": "missing",
+            "private_provider_enabled": False,
+            "public_fallback_available": True,
+            "summary": None,
+            "error_code": None,
+        }
+
+def build_vendored_provider():
+    return _Provider()
 """
 
 INACTIVE_HOOK_SOURCE = """
@@ -491,12 +530,16 @@ def _hook_payload_always_emits_plan_family_key():
     assert payload["plan_family"] is None
 
 
-def _entry_points_text(*, target: str | None, extra_lines: str = "") -> str:
+def _entry_points_text(*, target: str | None, extra_lines: str = "", include_paid_provider: bool = True) -> str:
     lines = ["[" + INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP + "]"]
     if target is not None:
         lines.append(f"{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME} = {target}")
     if extra_lines:
         lines.append(extra_lines.rstrip())
+    if include_paid_provider:
+        lines.append("")
+        lines.append("[" + PAID_PROVIDER_ENTRYPOINT_GROUP + "]")
+        lines.append(f"private_v1 = {MODULE_NAME}.vendored_provider:build_vendored_provider")
     return "\n".join(lines) + "\n"
 
 
@@ -509,6 +552,7 @@ def _wheel_bytes(
     duplicate_dist_info: bool = False,
     include_hook_module: bool = True,
     include_package_init: bool = True,
+    include_paid_provider: bool = True,
     extra_files: dict[str, str] | None = None,
     duplicate_member: str | None = None,
 ) -> tuple[bytes, str]:
@@ -517,12 +561,15 @@ def _wheel_bytes(
     hook_source = hook_source or SUCCESS_HOOK_SOURCE
     entry_points = entry_points if entry_points is not None else _entry_points_text(
         target=f"{MODULE_NAME}.handoff_hook:run_activation_handoff",
+        include_paid_provider=include_paid_provider,
     )
     with zipfile.ZipFile(wheel_path, "w") as archive:
         if include_package_init:
             archive.writestr(f"{MODULE_NAME}/__init__.py", "provider_id = 'private_v1'\n")
         if include_hook_module and hook_source is not None:
             archive.writestr(f"{MODULE_NAME}/handoff_hook.py", hook_source)
+        if include_paid_provider:
+            archive.writestr(f"{MODULE_NAME}/vendored_provider.py", VENDORED_PROVIDER_SOURCE)
         for rel_path, content in (extra_files or {}).items():
             archive.writestr(rel_path, content)
         metadata = f"Name: {PACKAGE_NAME}\nVersion: {PACKAGE_VERSION}\n{metadata_extra}"
@@ -1277,6 +1324,30 @@ def test_cli_handoff_activation_output_is_privacy_safe(tmp_path):
 def test_parse_vendored_entry_points_rejects_malformed_ini():
     with pytest.raises(PaidInstallError, match="handoff_hook_malformed"):
         parse_vendored_entry_points("[broken")
+
+
+def test_paid_activate_install_flow_discovers_vendored_provider(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    wheel, digest = _wheel_bytes(tmp_path / "wheel")
+    backend = _FakeBackend(
+        wheel_bytes=wheel,
+        artifact_hash=digest,
+        artifact_size=len(wheel),
+        provider_handoff_required=True,
+    )
+    result = run_paid_activate_install_flow(
+        license_key=RAW_LICENSE_KEY,
+        home=home,
+        client=backend,
+    )
+    assert result.activation_status == STATUS_ACTIVE
+    snapshot = discover_paid_provider()
+    assert snapshot.provider_present is True
+    assert snapshot.provider_id == "private_v1"
+    assert snapshot.status == STATUS_ACTIVE
+    assert snapshot.private_provider_enabled is True
+    _assert_privacy(str(snapshot.to_dict()))
 
 
 def test_built_wheel_installed_path_handoff(tmp_path):
