@@ -6,6 +6,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,11 +45,13 @@ from agentveil_mcp_proxy.paid_provider import (
     STATUS_EXPIRED,
     STATUS_REVOKED,
     PaidProviderSnapshot,
+    discover_paid_provider,
     set_paid_provider_loader,
 )
 from agentveil_mcp_proxy.paid_provider import (
     INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP,
     INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME,
+    PAID_PROVIDER_ENTRYPOINT_GROUP,
 )
 
 TOKEN = "console-device-token-secret"
@@ -64,6 +69,43 @@ def run_activation_handoff(request):
         "summary": "Installed hook completed.",
         "error_code": None,
     }
+"""
+
+VENDORED_PROVIDER_SOURCE = """
+class _Provider:
+    provider_id = "private_v1"
+    provider_contract_version = "1"
+
+    def status(self):
+        return {
+            "provider_present": True,
+            "provider_id": self.provider_id,
+            "provider_contract_version": self.provider_contract_version,
+            "status": "active",
+            "private_provider_enabled": True,
+            "public_fallback_available": True,
+            "summary": "Vendored provider active.",
+            "error_code": None,
+        }
+
+    def activate(self, *, license_key):
+        del license_key
+        return self.status()
+
+    def deactivate(self):
+        return {
+            "provider_present": False,
+            "provider_id": None,
+            "provider_contract_version": self.provider_contract_version,
+            "status": "missing",
+            "private_provider_enabled": False,
+            "public_fallback_available": True,
+            "summary": None,
+            "error_code": None,
+        }
+
+def build_vendored_provider():
+    return _Provider()
 """
 
 
@@ -147,10 +189,14 @@ class BackendEchoTransport:
         return self.responses.pop(0)
 
 
-def _entry_points_text(*, target: str) -> str:
+def _entry_points_text(*, target: str, provider_target: str | None = None) -> str:
+    provider_target = provider_target or f"{MODULE_NAME}.vendored_provider:build_vendored_provider"
     return (
         f"[{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP}]\n"
         f"{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME} = {target}\n"
+        f"\n"
+        f"[{PAID_PROVIDER_ENTRYPOINT_GROUP}]\n"
+        f"private_v1 = {provider_target}\n"
     )
 
 
@@ -160,20 +206,32 @@ def _build_wheel(
     package_name: str = PACKAGE_NAME,
     package_version: str = PACKAGE_VERSION,
     hook_source: str = SUCCESS_HOOK_SOURCE,
+    include_paid_provider: bool = True,
+    entry_points: str | None = None,
 ) -> tuple[bytes, str]:
     tmp_path.mkdir(parents=True, exist_ok=True)
     module_name = package_name.replace("-", "_")
     wheel_path = tmp_path / f"{package_name}-{package_version}.whl"
+    if entry_points is None:
+        entry_points = _entry_points_text(target=f"{module_name}.handoff_hook:run_activation_handoff")
+        if not include_paid_provider:
+            entry_points = (
+                f"[{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP}]\n"
+                f"{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME} = "
+                f"{module_name}.handoff_hook:run_activation_handoff\n"
+            )
     with zipfile.ZipFile(wheel_path, "w") as archive:
         archive.writestr(f"{module_name}/__init__.py", "provider_id = 'private_v1'\n")
         archive.writestr(f"{module_name}/handoff_hook.py", hook_source)
+        if include_paid_provider:
+            archive.writestr(f"{module_name}/vendored_provider.py", VENDORED_PROVIDER_SOURCE)
         archive.writestr(
             f"{module_name}-{package_version}.dist-info/METADATA",
             f"Name: {package_name}\nVersion: {package_version}\n",
         )
         archive.writestr(
             f"{module_name}-{package_version}.dist-info/entry_points.txt",
-            _entry_points_text(target=f"{module_name}.handoff_hook:run_activation_handoff"),
+            entry_points,
         )
         archive.writestr(
             f"{module_name}-{package_version}.dist-info/WHEEL",
@@ -454,16 +512,75 @@ def test_verify_free_builder_wheel_rejects_wrong_package_name(tmp_path):
         )
 
 
-def test_run_free_builder_install_flow_requires_provider_active(tmp_path):
-    wheel_bytes, artifact_hash = _build_wheel(tmp_path / "wheel")
+def test_run_free_builder_install_flow_requires_provider_active(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    wheel_bytes, artifact_hash = _build_wheel(tmp_path / "wheel", include_paid_provider=False)
     with pytest.raises(FreeBuilderInstallError, match="provider_not_active"):
         run_free_builder_install_flow(
             wheel_bytes=wheel_bytes,
-            home=tmp_path,
+            home=home,
             activation_credential=TOKEN,
             expectations=_expectations_for_wheel(wheel_bytes, artifact_hash),
-            discover_paid_provider_fn=lambda: PaidProviderSnapshot(provider_present=False),
         )
+
+
+def test_run_free_builder_install_flow_discovers_vendored_provider(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    wheel_bytes, artifact_hash = _build_wheel(tmp_path / "wheel")
+    result = run_free_builder_install_flow(
+        wheel_bytes=wheel_bytes,
+        home=home,
+        activation_credential=TOKEN,
+        expectations=_expectations_for_wheel(wheel_bytes, artifact_hash),
+    )
+    assert result.install_state["status"] == STATUS_ACTIVE
+    snapshot = discover_paid_provider()
+    assert snapshot.provider_present is True
+    assert snapshot.provider_id == "private_v1"
+    assert snapshot.status == STATUS_ACTIVE
+    assert snapshot.private_provider_enabled is True
+    assert resolve_private_guardrails_status(snapshot) == "active"
+
+
+def test_run_free_builder_install_flow_active_in_fresh_subprocess(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    wheel_bytes, artifact_hash = _build_wheel(tmp_path / "wheel")
+    run_free_builder_install_flow(
+        wheel_bytes=wheel_bytes,
+        home=home,
+        activation_credential=TOKEN,
+        expectations=_expectations_for_wheel(wheel_bytes, artifact_hash),
+    )
+    repo_root = Path(__file__).resolve().parents[3]
+    package_root = repo_root / "packages" / "agentveil-mcp-proxy"
+    env = {
+        **os.environ,
+        "AVP_HOME": str(home),
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONPATH": os.pathsep.join((str(repo_root), str(package_root))),
+    }
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from agentveil_mcp_proxy.paid_provider import discover_paid_provider;"
+            "from agentveil_mcp_proxy.console_project_status_client import resolve_private_guardrails_status;"
+            "snapshot = discover_paid_provider();"
+            "print(snapshot.status, snapshot.provider_present, resolve_private_guardrails_status(snapshot))",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert probe.returncode == 0, probe.stderr
+    assert probe.stdout.strip() == "active True active"
+    assert TOKEN not in probe.stdout
+    assert TOKEN not in probe.stderr
+    assert str(home) not in probe.stdout
 
 
 def test_run_free_builder_install_flow_succeeds_with_active_provider(tmp_path):

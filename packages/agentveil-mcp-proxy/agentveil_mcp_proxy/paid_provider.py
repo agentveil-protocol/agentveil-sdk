@@ -11,6 +11,8 @@ Discovery order for real CLI use:
 1. In-process loader from :func:`set_paid_provider_loader` (tests/integration).
 2. Installed optional providers registered under the
    ``agentveil_mcp_proxy.paid_providers`` packaging entry-point group.
+3. Trusted vendored provider from bounded ``install.json`` plus the exact
+   published wheel under ``AVP_HOME/paid/vendor``.
 """
 
 from __future__ import annotations
@@ -308,7 +310,12 @@ def _resolve_provider() -> PaidActivationProvider | None:
                 return loaded
         except Exception:
             return None
-    return _load_provider_from_entry_points()
+    provider = _load_provider_from_entry_points()
+    if provider is not None:
+        return provider
+    from agentveil_mcp_proxy.paid_install import resolve_vendored_paid_provider
+
+    return resolve_vendored_paid_provider()
 
 
 def discover_paid_provider() -> PaidProviderSnapshot:
