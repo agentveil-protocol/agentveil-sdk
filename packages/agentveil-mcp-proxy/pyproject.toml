@@ -23,7 +23,7 @@ classifiers = [
 dependencies = [
     "agentveil>=0.7.23,<0.8",
     "cryptography>=42.0.0",
-    "mcp>=1.0.0",
+    "mcp>=1.0.0,<2",
 ]
 
 [project.urls]
