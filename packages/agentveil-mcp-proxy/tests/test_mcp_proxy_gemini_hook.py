@@ -34,6 +34,14 @@ def _deny_reason(raw: str) -> str:
     return payload["reason"]
 
 
+def test_gemini_main_allows_bounded_local_git_command() -> None:
+    stdin = io.StringIO(json.dumps(_payload("run_shell_command", {"command": "git status --short"})))
+    stdout = io.StringIO()
+
+    assert gemini_hook.main(stdin=stdin, stdout=stdout) == 0
+    assert json.loads(stdout.getvalue())["decision"] == "allow"
+
+
 def test_gemini_hook_denies_write_file_with_redirect(tmp_path):
     out = io.StringIO()
     decision = gemini_hook.process_hook(
@@ -45,7 +53,7 @@ def test_gemini_hook_denies_write_file_with_redirect(tmp_path):
     assert decision.hook_action == "deny"
     reason = _deny_reason(out.getvalue())
     # claim-check: allow assertion of bounded hook denial text in unit test.
-    assert "Direct native tool use was blocked before mutation" in reason
+    assert "Direct native file mutation was blocked before mutation" in reason
     assert "target_reached=false" in reason
     assert "SECRET_CONTENT" not in reason
     record = json.loads((tmp_path / "evidence.jsonl").read_text(encoding="utf-8"))
@@ -66,7 +74,8 @@ def test_gemini_hook_denies_replace_as_native_write():
     assert decision.hook_action == "deny"
     reason = _deny_reason(out.getvalue())
     assert "denied replace" in reason
-    assert "Use an AgentVeil controlled MCP tool" in reason
+    assert "managed AgentVeil write route is not currently available" in reason
+    assert "write_file" not in reason
 
 
 def test_gemini_hook_denies_write_capable_run_shell_command():
@@ -205,7 +214,7 @@ def test_gemini_native_write_file_registers_durable_origin_and_agent_surface_con
     fixture = publish_live_hook_binding(home, downstream=downstream)
     try:
         out = io.StringIO()
-        gemini_hook.process_hook(
+        decision = gemini_hook.process_hook(
             _payload("write_file", {"path": "note.txt", "content": "hello"}),
             home=home,
             out=out,
@@ -213,6 +222,7 @@ def test_gemini_native_write_file_registers_durable_origin_and_agent_surface_con
         payload = json.loads(out.getvalue())
         redirect_context = parse_redirect_context_from_gemini_hook_output(payload)
         assert redirect_context is not None
+        assert decision.disposition.value == "redirect"
         meta = durable_original_metadata(home, redirect_context["original_request_id"])
         assert meta is not None
         assert meta["redirect_role"] == "original"
@@ -227,13 +237,14 @@ def test_gemini_replace_has_no_verified_redirect_context(tmp_path):
     fixture = publish_live_hook_binding(home, downstream=downstream)
     try:
         out = io.StringIO()
-        gemini_hook.process_hook(
+        decision = gemini_hook.process_hook(
             _payload("replace", {"path": "note.txt", "old_string": "a", "new_string": "b"}),
             home=home,
             out=out,
         )
         payload = json.loads(out.getvalue())
         assert parse_redirect_context_from_gemini_hook_output(payload) is None
+        assert decision.disposition.value == "hard_block"
     finally:
         fixture.lease.close()
 
@@ -241,13 +252,14 @@ def test_gemini_replace_has_no_verified_redirect_context(tmp_path):
 def test_gemini_native_write_file_without_live_binding_has_no_verified_context(tmp_path):
     home, _sandbox, _downstream = init_redirect_contract_home(tmp_path)
     out = io.StringIO()
-    gemini_hook.process_hook(
+    decision = gemini_hook.process_hook(
         _payload("write_file", {"path": "note.txt", "content": "hello"}),
         home=home,
         out=out,
     )
     payload = json.loads(out.getvalue())
     assert parse_redirect_context_from_gemini_hook_output(payload) is None
+    assert decision.disposition.value == "hard_block"
 
 
 def test_gemini_hook_denied_uploads_bounded_decision_summary(monkeypatch):

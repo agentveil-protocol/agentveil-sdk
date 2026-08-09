@@ -34,6 +34,14 @@ def _deny_reason(raw: str) -> str:
     return payload["hookSpecificOutput"]["permissionDecisionReason"]
 
 
+def test_codex_main_allows_bounded_local_git_command() -> None:
+    stdin = io.StringIO(json.dumps(_payload("Bash", {"command": "git status --short"})))
+    stdout = io.StringIO()
+
+    assert codex_hook.main(stdin=stdin, stdout=stdout) == 0
+    assert stdout.getvalue() == ""
+
+
 def test_codex_hook_allows_local_git_add_and_commit():
     out = io.StringIO()
     for command in (
@@ -99,7 +107,8 @@ def test_codex_hook_denies_apply_patch_as_native_write():
     assert decision.hook_action == "deny"
     reason = _deny_reason(out.getvalue())
     assert "denied apply_patch" in reason
-    assert "Use an AgentVeil controlled MCP tool" in reason
+    assert "managed AgentVeil write route is not currently available" in reason
+    assert "write_file" not in reason
 
 
 def test_codex_hook_allows_read_only_bash():
@@ -174,7 +183,7 @@ def test_codex_hook_accepts_camel_case_payload_shape():
     reason = _deny_reason(out.getvalue())
     assert "SECRET_CONTENT" not in reason
     # claim-check: allow hook unit test asserts bounded local deny output.
-    assert "Direct native tool use was blocked before mutation" in reason
+    assert "Direct native file mutation was blocked before mutation" in reason
 
 
 from agentveil_mcp_proxy.client_guidance import parse_redirect_context_from_codex_hook_output
@@ -190,7 +199,7 @@ def test_codex_native_write_registers_durable_origin_and_agent_surface_context(t
     fixture = publish_live_hook_binding(home, downstream=downstream)
     try:
         out = io.StringIO()
-        codex_hook.process_hook(
+        decision = codex_hook.process_hook(
             _payload("Write", {"file_path": "note.txt", "content": "hello"}),
             home=home,
             out=out,
@@ -198,6 +207,7 @@ def test_codex_native_write_registers_durable_origin_and_agent_surface_context(t
         payload = json.loads(out.getvalue())
         redirect_context = parse_redirect_context_from_codex_hook_output(payload)
         assert redirect_context is not None
+        assert decision.disposition.value == "redirect"
         meta = durable_original_metadata(home, redirect_context["original_request_id"])
         assert meta is not None
         assert meta["redirect_role"] == "original"
@@ -212,13 +222,14 @@ def test_codex_apply_patch_has_no_verified_redirect_context(tmp_path):
     fixture = publish_live_hook_binding(home, downstream=downstream)
     try:
         out = io.StringIO()
-        codex_hook.process_hook(
+        decision = codex_hook.process_hook(
             _payload("apply_patch", {"patch": "*** Begin Patch\n*** End Patch"}),
             home=home,
             out=out,
         )
         payload = json.loads(out.getvalue())
         assert parse_redirect_context_from_codex_hook_output(payload) is None
+        assert decision.disposition.value == "hard_block"
     finally:
         fixture.lease.close()
 
@@ -226,13 +237,14 @@ def test_codex_apply_patch_has_no_verified_redirect_context(tmp_path):
 def test_codex_native_write_without_live_binding_has_no_verified_context(tmp_path):
     home, _sandbox, _downstream = init_redirect_contract_home(tmp_path)
     out = io.StringIO()
-    codex_hook.process_hook(
+    decision = codex_hook.process_hook(
         _payload("Write", {"file_path": "note.txt", "content": "hello"}),
         home=home,
         out=out,
     )
     payload = json.loads(out.getvalue())
     assert parse_redirect_context_from_codex_hook_output(payload) is None
+    assert decision.disposition.value == "hard_block"
 
 
 def _install_hook_upload_capture(monkeypatch):

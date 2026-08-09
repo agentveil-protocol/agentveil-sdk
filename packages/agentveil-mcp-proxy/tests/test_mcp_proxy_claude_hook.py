@@ -632,18 +632,17 @@ def test_native_mutation_deny_includes_redirect_instruction(
     assert decision.hook_action == "deny"
     raw = format_hook_output(decision)
     reason = json.loads(raw)["hookSpecificOutput"]["permissionDecisionReason"]
-    assert "Direct native tool use was blocked before mutation" in reason or (  # claim-check: allow tested hook copy.
+    assert "Direct native file mutation was blocked before mutation" in reason or (  # claim-check: allow tested hook copy.
         "Direct native shell use was blocked" in reason  # claim-check: allow tested hook copy.
     )
     if expect_write_file_redirect:
-        assert "controlled MCP tool" in reason
-        assert "write_file" in reason
-        assert "same path, content, and intent" in reason
+        assert "managed AgentVeil write route is not currently available" in reason
+        assert "write_file" not in reason
     else:
         assert "write_file" not in reason
         assert "No controlled MCP route exists for this shell action" in reason
     assert "stop and tell the user" in reason.lower()
-    assert "Do not retry, request another approval" in reason or (
+    assert "Do not bypass through native tools" in reason or (
         "Do not retry through native shell" in reason
     )
     assert "ask the user to approve" not in reason
@@ -857,6 +856,8 @@ def test_main_reads_stdin_and_writes_stdout(tmp_path: Path, monkeypatch) -> None
     rc = main(stdin=in_stream, stdout=out_stream)
     assert rc == 0
     assert "permissionDecision" in out_stream.getvalue()
+    assert "write_file" not in out_stream.getvalue()
+    assert "write route is not currently available" in out_stream.getvalue()
     assert evidence.read_text(encoding="utf-8").strip() != ""
     assert len(detached_uploads) == 1
 
@@ -931,7 +932,7 @@ def test_claude_native_write_registers_durable_origin_and_agent_surface_context(
     fixture = publish_live_hook_binding(home, downstream=downstream)
     try:
         out = io.StringIO()
-        claude_hook.process_hook(
+        decision = claude_hook.process_hook(
             _payload("Write", {"file_path": "note.txt", "content": "hello"}),
             home=home,
             out=out,
@@ -939,6 +940,7 @@ def test_claude_native_write_registers_durable_origin_and_agent_surface_context(
         payload = json.loads(out.getvalue())
         redirect_context = parse_redirect_context_from_claude_hook_output(payload)
         assert redirect_context is not None
+        assert decision.disposition.value == "redirect"
         meta = durable_original_metadata(home, redirect_context["original_request_id"])
         assert meta is not None
         assert meta["redirect_role"] == "original"
@@ -953,13 +955,15 @@ def test_claude_native_edit_has_no_verified_redirect_context(tmp_path: Path) -> 
     fixture = publish_live_hook_binding(home, downstream=downstream)
     try:
         out = io.StringIO()
-        claude_hook.process_hook(
+        decision = claude_hook.process_hook(
             _payload("Edit", {"file_path": "note.txt", "old_string": "a", "new_string": "b"}),
             home=home,
             out=out,
         )
         payload = json.loads(out.getvalue())
         assert parse_redirect_context_from_claude_hook_output(payload) is None
+        assert decision.disposition.value == "hard_block"
+        assert "write_file" not in payload["hookSpecificOutput"]["permissionDecisionReason"]
     finally:
         fixture.lease.close()
 
@@ -967,13 +971,14 @@ def test_claude_native_edit_has_no_verified_redirect_context(tmp_path: Path) -> 
 def test_claude_native_write_without_live_binding_has_no_verified_context(tmp_path: Path) -> None:
     home, _sandbox, _downstream = init_redirect_contract_home(tmp_path)
     out = io.StringIO()
-    claude_hook.process_hook(
+    decision = claude_hook.process_hook(
         _payload("Write", {"file_path": "note.txt", "content": "hello"}),
         home=home,
         out=out,
     )
     payload = json.loads(out.getvalue())
     assert parse_redirect_context_from_claude_hook_output(payload) is None
+    assert decision.disposition.value == "hard_block"
 
 
 def test_claude_hook_denied_uploads_bounded_decision_summary(monkeypatch):

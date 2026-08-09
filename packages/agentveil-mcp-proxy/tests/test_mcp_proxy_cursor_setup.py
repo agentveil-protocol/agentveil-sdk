@@ -45,6 +45,7 @@ def _fast_cursor_center_lifecycle(monkeypatch):
     """Keep cursor setup unit tests deterministic; avoid real center spawn waits."""
     monkeypatch.setattr(cursor_setup, "_START_TIMEOUT_SECONDS", 0.05)
     monkeypatch.setattr(cursor_setup, "_POLL_INTERVAL_SECONDS", 0.001)
+    monkeypatch.setattr(proxy_cli, "_best_effort_console_attach_credential", lambda **_kwargs: None)
 
 
 @pytest.fixture(autouse=True)

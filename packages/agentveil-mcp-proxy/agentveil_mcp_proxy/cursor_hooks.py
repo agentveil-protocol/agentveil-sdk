@@ -14,7 +14,7 @@ import datetime as _dt
 import hashlib
 import json
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -33,7 +33,9 @@ from agentveil_mcp_proxy.client_guidance import (
     format_native_redirect_agent_surface,
     maybe_register_native_redirect_for_hook_deny,
     native_hook_deny_instruction,
+    native_write_redirect_supported,
 )
+from agentveil_mcp_proxy.hook_policy import HookDisposition, resolve_hook_disposition
 from agentveil_mcp_proxy.policy import (
     PolicyConfig,
     PolicyDecision,
@@ -227,6 +229,7 @@ class HookDecision:
     reason_code: str
     context: ToolCallContext
     evaluation: PolicyEvaluation
+    disposition: HookDisposition = HookDisposition.HARD_BLOCK
 
 
 _FAIL_CLOSED = frozenset({
@@ -273,15 +276,15 @@ def decide(payload: Mapping[str, Any], engine: PolicyEngine, *, workspace: Path)
     if hook_event == "beforeMCPExecution" or is_mcp_tool_name(str(payload.get("tool_name") or payload.get("tool_class") or "")):
         tool = normalize_mcp_tool_name(context.tool)
         if tool in _MCP_READ_TOOLS:
-            return HookDecision("allow", "mcp_read_allow", context, evaluation)
+            return HookDecision("allow", "mcp_read_allow", context, evaluation, HookDisposition.ALLOW)
         if _is_agentveil_mcp_routed(payload, workspace):
-            return HookDecision("allow", "controlled_route_passthrough", context, evaluation)
+            return HookDecision("allow", "controlled_route_passthrough", context, evaluation, HookDisposition.ALLOW)
 
     if context.server == AGENTVEIL_CONTROLLED_MCP_SERVER:
-        return HookDecision("allow", "controlled_route_passthrough", context, evaluation)
+        return HookDecision("allow", "controlled_route_passthrough", context, evaluation, HookDisposition.ALLOW)
 
     if evaluation.decision in (PolicyDecision.ALLOW, PolicyDecision.OBSERVE):
-        return HookDecision("allow", "allowed", context, evaluation)
+        return HookDecision("allow", "allowed", context, evaluation, HookDisposition.ALLOW)
     if evaluation.decision in _FAIL_CLOSED:
         return HookDecision("deny", "risky_blocked", context, evaluation)
     return HookDecision("deny", "risky_blocked", context, evaluation)
@@ -298,6 +301,7 @@ def format_cursor_hook_response(
         agent_message = native_hook_deny_instruction(
             native_tool=decision.context.tool,
             risk_class=decision.evaluation.risk_class.value,
+            redirect_route_ready=decision.disposition is HookDisposition.REDIRECT,
         )
     else:
         agent_message = (
@@ -365,14 +369,6 @@ def process_hook(
     config = config or default_proxy_config_for_hook()
     engine = PolicyEngine(config)
     decision = decide(payload, engine, workspace=workspace)
-    record = build_evidence_record(payload, decision)
-    if evidence_path is not None:
-        write_evidence(record, evidence_path)
-    if decision.hook_action == "deny":
-        if detached_upload:
-            best_effort_spawn_hook_denied_summary(record, runtime_home=home)
-        else:
-            best_effort_upload_hook_denied_summary(record, home=home)
     tool_input = payload.get("tool_input") or payload.get("arguments") or {}
     redirect_origin = maybe_register_native_redirect_for_hook_deny(
         hook_action=decision.hook_action,
@@ -383,6 +379,27 @@ def process_hook(
         tool_input=tool_input if isinstance(tool_input, Mapping) else {},
         home=home,
     )
+    if decision.hook_action == "deny":
+        disposition = resolve_hook_disposition(
+            decision.evaluation,
+            native_write_redirect_supported=native_write_redirect_supported(
+                native_tool=decision.context.tool,
+            ),
+            redirect_route_ready=redirect_origin is not None,
+        )
+        decision = replace(
+            decision,
+            disposition=disposition,
+            reason_code="managed_route_redirect" if disposition is HookDisposition.REDIRECT else "risky_blocked",
+        )
+    record = build_evidence_record(payload, decision)
+    if evidence_path is not None:
+        write_evidence(record, evidence_path)
+    if decision.hook_action == "deny":
+        if detached_upload:
+            best_effort_spawn_hook_denied_summary(record, runtime_home=home)
+        else:
+            best_effort_upload_hook_denied_summary(record, home=home)
     response = format_cursor_hook_response(decision, redirect_origin=redirect_origin)
     if out is None:
         out = sys.stdout

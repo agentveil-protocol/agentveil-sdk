@@ -9,6 +9,7 @@ import pytest
 
 from agentveil_mcp_proxy.client_guidance import (
     NATIVE_FILE_WRITE_REDIRECT_INSTRUCTION,
+    NATIVE_FILE_WRITE_ROUTE_UNAVAILABLE_INSTRUCTION,
     NATIVE_SHELL_HARD_BLOCK_INSTRUCTION,
     NATIVE_SHELL_NO_MCP_ROUTE_INSTRUCTION,
     native_hook_deny_instruction,
@@ -37,6 +38,18 @@ def test_native_file_write_tools_get_controlled_write_redirect(native_tool: str)
     assert "write_file" in message
     assert "controlled MCP tool" in message
     assert "same path, content, and intent" in message
+
+
+def test_native_file_write_without_ready_route_has_honest_stop_guidance() -> None:
+    message = native_hook_deny_instruction(
+        native_tool="Write",
+        risk_class="write",
+        redirect_route_ready=False,
+    )
+    assert message == NATIVE_FILE_WRITE_ROUTE_UNAVAILABLE_INSTRUCTION
+    assert "not currently available" in message
+    assert "write_file" not in message
+    assert "controlled MCP tool" not in message
 
 
 @pytest.mark.parametrize(
