@@ -72,7 +72,7 @@ MCP_ROUTE_UNAVAILABLE_USER_MESSAGE = (
     "through native tools. The route must be restored before a new attempt."
 )
 MCP_ROUTE_UNAVAILABLE_NEXT_STEP = MCP_ROUTE_UNAVAILABLE_USER_MESSAGE
-NATIVE_CONTROLLED_MCP_REDIRECT_INSTRUCTION = (
+NATIVE_FILE_WRITE_REDIRECT_INSTRUCTION = (
     "Direct native tool use was blocked before mutation. "
     "Use an AgentVeil controlled MCP tool (for example write_file) for the same operation "
     "when that route is available, preserving the same path, content, and intent. "
@@ -80,6 +80,18 @@ NATIVE_CONTROLLED_MCP_REDIRECT_INSTRUCTION = (
     "Do not retry, request another approval, inspect raw configuration, or bypass "
     "through native tools. The route must be restored before a new attempt."
 )
+# claim-check: allow hook denial copy verified by native shell guidance tests.
+NATIVE_SHELL_HARD_BLOCK_INSTRUCTION = (
+    "Direct native shell use was blocked for a bounded security reason. "  # claim-check: allow tested hook denial copy.
+    "Stop and tell the user. Do not retry through native shell or bypass through native tools."
+)
+# claim-check: allow hook denial copy verified by native shell guidance tests.
+NATIVE_SHELL_NO_MCP_ROUTE_INSTRUCTION = (
+    "Direct native shell use was blocked before mutation. "  # claim-check: allow tested hook denial copy.
+    "No controlled MCP route exists for this shell action. "
+    "Stop and tell the user. Do not retry through native shell."
+)
+NATIVE_CONTROLLED_MCP_REDIRECT_INSTRUCTION = NATIVE_FILE_WRITE_REDIRECT_INSTRUCTION
 
 AGENTVEIL_HOME_ENV = "AGENTVEIL_HOME"
 HOOK_RUNTIME_BINDINGS_DIRNAME = "hook_runtime_bindings"
@@ -92,8 +104,17 @@ _PRODUCT_ROUTE_PROFILE_ROOT_ENV = "PRODUCT_ROUTE_PROFILE_ROOT"
 _PRODUCT_ROUTE_WORKSPACE_DIRNAME = "workspace"
 _CANONICAL_NATIVE_WRITE_TOOLS = frozenset({
     "Write",  # Cursor, Claude Code, Codex
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+    "StrReplace",
+    "ApplyPatch",
+    "apply_patch",
     "write_file",  # Gemini CLI native write
+    "replace",
 })
+
+_NATIVE_FILE_WRITE_DENY_TOOLS = _CANONICAL_NATIVE_WRITE_TOOLS
 
 
 @dataclass(frozen=True)
@@ -491,6 +512,20 @@ def native_write_redirect_supported(*, native_tool: str) -> bool:
     return native_tool in _CANONICAL_NATIVE_WRITE_TOOLS
 
 
+def native_hook_deny_instruction(
+    *,
+    native_tool: str,
+    risk_class: str | None = None,
+) -> str:
+    """Return bounded deny guidance for one native hook denial."""
+
+    if native_tool in _NATIVE_FILE_WRITE_DENY_TOOLS:
+        return NATIVE_FILE_WRITE_REDIRECT_INSTRUCTION
+    if risk_class in {"destructive", "production", "financial"}:  # claim-check: allow bounded risk class labels.
+        return NATIVE_SHELL_HARD_BLOCK_INSTRUCTION
+    return NATIVE_SHELL_NO_MCP_ROUTE_INSTRUCTION
+
+
 def format_native_redirect_agent_surface(
     base_message: str,
     origin: NativeRedirectOrigin | None,
@@ -724,6 +759,9 @@ __all__ = [
     "MCP_ROUTE_UNAVAILABLE_NEXT_STEP",
     "MCP_ROUTE_UNAVAILABLE_USER_MESSAGE",
     "NATIVE_CONTROLLED_MCP_REDIRECT_INSTRUCTION",
+    "NATIVE_FILE_WRITE_REDIRECT_INSTRUCTION",
+    "NATIVE_SHELL_HARD_BLOCK_INSTRUCTION",
+    "NATIVE_SHELL_NO_MCP_ROUTE_INSTRUCTION",
     "NATIVE_REDIRECT_AGENT_CONTEXT_PREFIX",
     "NATIVE_REDIRECT_FOLLOW_UP_TOOL",
     "NATIVE_REDIRECT_ORIGIN_REASON",
@@ -741,6 +779,7 @@ __all__ = [
     "hook_runtime_bindings_dir",
     "maybe_register_native_redirect_for_hook_deny",
     "native_write_redirect_supported",
+    "native_hook_deny_instruction",
     "normalize_native_write_arguments",
     "owner_claims_dir",
     "parse_redirect_context_from_agent_surface",

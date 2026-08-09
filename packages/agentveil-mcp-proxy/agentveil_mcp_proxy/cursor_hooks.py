@@ -16,14 +16,22 @@ import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, MutableMapping
+from typing import Any, Mapping
 
-from agentveil_mcp_proxy.classification import infer_action_family, infer_risk_class
+from agentveil_mcp_proxy.classification import (
+    classify_native_shell_command,
+    infer_action_family,
+    infer_risk_class,
+)
+from agentveil_mcp_proxy.console_decision_summary_client import (
+    best_effort_upload_hook_denied_summary,
+)
 from agentveil_mcp_proxy.client_guidance import (
-    NATIVE_CONTROLLED_MCP_REDIRECT_INSTRUCTION as NATIVE_REDIRECT_INSTRUCTION,
+    NATIVE_FILE_WRITE_REDIRECT_INSTRUCTION,
     NativeRedirectOrigin,
     format_native_redirect_agent_surface,
     maybe_register_native_redirect_for_hook_deny,
+    native_hook_deny_instruction,
 )
 from agentveil_mcp_proxy.policy import (
     PolicyConfig,
@@ -34,6 +42,8 @@ from agentveil_mcp_proxy.policy import (
     RiskClass,
     ToolCallContext,
 )
+
+NATIVE_REDIRECT_INSTRUCTION = NATIVE_FILE_WRITE_REDIRECT_INSTRUCTION
 
 CURSOR_SERVER_LABEL = "cursor"
 AGENTVEIL_CONTROLLED_MCP_SERVER = "agentveil-mcp-proxy"
@@ -55,42 +65,6 @@ _CURSOR_BUILTIN_RISK: Mapping[str, RiskClass] = {
     "Shell": RiskClass.UNKNOWN,
     "Read": RiskClass.READ,
 }
-
-_SHELL_DESTRUCTIVE_TOKENS: tuple[str, ...] = (
-    "rm ",
-    "rmdir ",
-    "unlink ",
-    "shred ",
-    " -delete",
-)
-
-_SHELL_MUTATION_TOKENS: tuple[str, ...] = (
-    " > ",
-    " >> ",
-    " tee ",
-    "mv ",
-    "cp ",
-    "mkdir ",
-    "touch ",
-    "chmod ",
-    "chown ",
-    "curl -o",
-    "wget -O",
-    " -exec",
-    " -i ",
-    " -pi",
-)
-
-_BASH_READONLY_FIRST_TOKEN: frozenset[str] = frozenset({
-    "pwd", "ls", "cat", "head", "tail", "grep", "find", "wc", "which",
-    "whoami", "date", "echo", "true", "false",
-})
-
-_BASH_GIT_READONLY_SUBCOMMANDS: frozenset[str] = frozenset({"status", "diff"})
-
-_SHELL_COMPOSITION_PATTERNS: tuple[str, ...] = (
-    "$(", "`", "|", ";", "&", ">", "<(", "\n", "\r",
-)
 
 
 def is_mcp_tool_name(tool_name: str) -> bool:
@@ -133,33 +107,6 @@ def normalize_hook_payload(
     return normalized
 
 
-def _has_shell_composition(command: str) -> bool:
-    return any(pattern in command for pattern in _SHELL_COMPOSITION_PATTERNS)
-
-
-def _classify_bash(command: str) -> RiskClass:
-    lowered = command.lower().strip()
-    if not lowered:
-        return RiskClass.UNKNOWN
-    if any(tok in lowered for tok in _SHELL_DESTRUCTIVE_TOKENS):
-        return RiskClass.DESTRUCTIVE
-    if any(tok in lowered for tok in _SHELL_MUTATION_TOKENS):
-        return RiskClass.WRITE
-    if _has_shell_composition(lowered):
-        return RiskClass.UNKNOWN
-    tokens = lowered.split()
-    if not tokens:
-        return RiskClass.UNKNOWN
-    first = tokens[0]
-    if first == "git":
-        if len(tokens) >= 2 and tokens[1] in _BASH_GIT_READONLY_SUBCOMMANDS:
-            return RiskClass.READ
-        return RiskClass.UNKNOWN
-    if first in _BASH_READONLY_FIRST_TOKEN:
-        return RiskClass.READ
-    return RiskClass.UNKNOWN
-
-
 def classify_cursor_tool(
     tool_name: str,
     tool_input: Mapping[str, Any] | None = None,
@@ -168,7 +115,7 @@ def classify_cursor_tool(
     command: str = "",
 ) -> RiskClass:
     if hook_event == "beforeShellExecution":
-        return _classify_bash(command)
+        return classify_native_shell_command(command)
     if hook_event == "beforeMCPExecution" or is_mcp_tool_name(tool_name):
         normalized = normalize_mcp_tool_name(tool_name)
         if normalized in _MCP_READ_TOOLS:
@@ -186,7 +133,7 @@ def classify_cursor_tool(
             cmd = ""
             if isinstance(tool_input, Mapping):
                 cmd = str(tool_input.get("command") or "")
-            return _classify_bash(cmd)
+            return classify_native_shell_command(cmd)
         return risk
     return RiskClass.UNKNOWN
 
@@ -346,12 +293,15 @@ def format_cursor_hook_response(
 ) -> dict[str, Any]:
     if decision.hook_action == "allow":
         return {"permission": "allow"}
-    agent_message = NATIVE_REDIRECT_INSTRUCTION
-    if decision.context.server != CURSOR_SERVER_LABEL:
+    if decision.context.server == CURSOR_SERVER_LABEL:
+        agent_message = native_hook_deny_instruction(
+            native_tool=decision.context.tool,
+            risk_class=decision.evaluation.risk_class.value,
+        )
+    else:
         agent_message = (
             f"agentveil: denied {decision.context.tool} "
-            f"(reason_code={decision.reason_code}). "
-            f"{NATIVE_REDIRECT_INSTRUCTION}"
+            f"(reason_code={decision.reason_code})."
         )
     response: dict[str, Any] = {
         "permission": "deny",
@@ -413,8 +363,11 @@ def process_hook(
     config = config or default_proxy_config_for_hook()
     engine = PolicyEngine(config)
     decision = decide(payload, engine, workspace=workspace)
+    record = build_evidence_record(payload, decision)
     if evidence_path is not None:
-        write_evidence(build_evidence_record(payload, decision), evidence_path)
+        write_evidence(record, evidence_path)
+    if decision.hook_action == "deny":
+        best_effort_upload_hook_denied_summary(record, home=home)
     tool_input = payload.get("tool_input") or payload.get("arguments") or {}
     redirect_origin = maybe_register_native_redirect_for_hook_deny(
         hook_action=decision.hook_action,

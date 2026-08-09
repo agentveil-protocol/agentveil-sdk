@@ -5,12 +5,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import queue
 import re
 import socket
 import ssl
 import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -39,6 +41,7 @@ _SCHEMA_VERSION = "1"
 _DEFAULT_QUEUE_CAPACITY = 256
 _MAX_DEDUP_KEYS = 4096
 _SHUTDOWN_JOIN_TIMEOUT_SECONDS = _REQUEST_TIMEOUT_SECONDS + 0.25
+_HOOK_DENIED_UPLOAD_QUEUE_CAPACITY = 256
 
 _DECISION_ALLOWED = "allowed"
 _DECISION_DENIED = "denied"
@@ -62,6 +65,12 @@ _ACTION_FAMILIES = frozenset({
     "shell_like",
 })
 
+_HOOK_NATIVE_TOOL_ACTION_FAMILIES: dict[str, str] = {
+    "bash": "shell_like",
+    "shell": "shell_like",
+    "run_shell_command": "shell_like",
+}
+
 _REQUEST_KEYS = frozenset({
     "schema_version",
     "event_id",
@@ -83,6 +92,7 @@ _RESPONSE_KEYS = frozenset({
     "status",
 })
 _ACK_STATUSES = frozenset({"accepted", "duplicate"})
+_HOOK_DENIED_UPLOAD_ACK_STATUSES = frozenset({"accepted", "duplicate"})
 
 _EVENT_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
@@ -104,6 +114,16 @@ _UPLOADABLE_STATUSES = frozenset({
     ApprovalStatus.DENIED.value,
     ApprovalStatus.BLOCKED.value,  # claim-check: allow terminal evidence status enum value
 })
+
+_hook_denied_deduper_lock = threading.Lock()
+_hook_denied_seen_event_ids: set[str] = set()
+_hook_denied_seen_order: list[str] = []
+_hook_denied_pending_event_ids: set[str] = set()
+_hook_denied_upload_queue: queue.Queue["_HookDeniedUploadJob"] = queue.Queue(
+    maxsize=_HOOK_DENIED_UPLOAD_QUEUE_CAPACITY
+)
+_hook_denied_worker_lock = threading.Lock()
+_hook_denied_worker: threading.Thread | None = None
 
 
 class DecisionSummaryClientError(RuntimeError):
@@ -142,6 +162,15 @@ Transport = Callable[..., RawResponse]
 LoadCredential = Callable[..., StoredCredential | None]
 TerminalEvidenceObserver = Callable[[PendingApproval], None]
 UploadSummary = Callable[[DecisionSummaryPayload], str]
+
+
+@dataclass(frozen=True)
+class _HookDeniedUploadJob:
+    payload: DecisionSummaryPayload
+    home: Path | None
+    load_credential_fn: LoadCredential
+    upload_fn: UploadSummary | None
+    transport: Transport | None
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -366,6 +395,223 @@ def build_decision_summary_payload(
         proof_hash=proof_hash,
         idempotency_key=idempotency_key,
     )
+
+
+def _hook_denied_idempotency_material(record: Mapping[str, Any]) -> dict[str, str]:
+    input_ref = record.get("input_ref")
+    input_hash = ""
+    if isinstance(input_ref, Mapping):
+        raw = input_ref.get("input_hash")
+        if isinstance(raw, str):
+            input_hash = raw
+    hook_event = str(
+        record.get("hook_event")
+        or record.get("hook_event_name")
+        or ""
+    )
+    session_id = str(record.get("session_id") or "")
+    return {
+        "hook_event": hook_event,
+        "server": str(record.get("server") or ""),
+        "tool": str(record.get("tool") or record.get("tool_name") or ""),
+        "reason_code": str(record.get("reason_code") or ""),
+        "input_hash": input_hash,
+        "session_digest": hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:16],
+    }
+
+
+def _hook_denied_event_id(record: Mapping[str, Any]) -> str | None:
+    material = _hook_denied_idempotency_material(record)
+    digest = hashlib.sha256(
+        json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return _validate_event_id(f"hook.denied.{digest[:32]}")
+
+
+def _hook_denied_action_family(record: Mapping[str, Any]) -> str | None:
+    raw = record.get("action_family")
+    if isinstance(raw, str) and raw in _ACTION_FAMILIES:
+        return raw
+    tool = record.get("tool") or record.get("tool_name")
+    if isinstance(tool, str):
+        mapped = _HOOK_NATIVE_TOOL_ACTION_FAMILIES.get(tool.lower())
+        if mapped in _ACTION_FAMILIES:
+            return mapped
+        inferred = infer_action_family(tool)
+        if inferred in _ACTION_FAMILIES:
+            return inferred
+    return None
+
+
+def reset_hook_denied_upload_dedupe_for_tests() -> None:
+    """Clear in-process hook-deny upload dedupe (test isolation only)."""
+
+    with _hook_denied_deduper_lock:
+        _hook_denied_seen_event_ids.clear()
+        _hook_denied_seen_order.clear()
+        _hook_denied_pending_event_ids.clear()
+    while True:
+        try:
+            _hook_denied_upload_queue.get_nowait()
+        except queue.Empty:
+            break
+        _hook_denied_upload_queue.task_done()
+
+
+def wait_for_hook_denied_uploads_for_tests(timeout: float = 5.0) -> bool:
+    """Wait for queued hook-deny uploads to finish (test isolation only)."""
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with _hook_denied_upload_queue.all_tasks_done:
+            if _hook_denied_upload_queue.unfinished_tasks == 0:
+                return True
+        time.sleep(0.005)
+    return False
+
+
+def _hook_denied_occurred_at(record: Mapping[str, Any]) -> str:
+    ts = record.get("ts")
+    if isinstance(ts, str) and ts.strip():
+        try:
+            return _canonical_occurred_at(_parse_rfc3339_utc(ts))
+        except DecisionSummaryClientError:
+            pass
+    return _canonical_occurred_at(datetime.now(timezone.utc))
+
+
+def build_hook_denied_decision_summary_payload(
+    evidence_record: Mapping[str, Any],
+) -> DecisionSummaryPayload | None:
+    """Map one bounded hook deny evidence record to an ingest payload or skip."""
+
+    if evidence_record.get("hook_action") != "deny":
+        return None
+
+    event_id = _hook_denied_event_id(evidence_record)
+    if event_id is None:
+        return None
+
+    action_family = _hook_denied_action_family(evidence_record)
+    if action_family is None:
+        return None
+
+    idempotency_key = _validate_idempotency_key(event_id)
+    return DecisionSummaryPayload(
+        schema_version=_SCHEMA_VERSION,
+        event_id=event_id,
+        action_family=action_family,
+        decision=_DECISION_DENIED,
+        occurred_at=_hook_denied_occurred_at(evidence_record),
+        target_reached=False,
+        proof_status=_PROOF_UNAVAILABLE,
+        proof_hash=None,
+        idempotency_key=idempotency_key,
+    )
+
+
+def _is_hook_denied_event_seen(event_id: str) -> bool:
+    with _hook_denied_deduper_lock:
+        return event_id in _hook_denied_seen_event_ids
+
+
+def _mark_hook_denied_event_seen(event_id: str) -> None:
+    with _hook_denied_deduper_lock:
+        if event_id in _hook_denied_seen_event_ids:
+            return
+        _hook_denied_seen_event_ids.add(event_id)
+        _hook_denied_seen_order.append(event_id)
+        if len(_hook_denied_seen_order) > _MAX_DEDUP_KEYS:
+            oldest = _hook_denied_seen_order.pop(0)
+            _hook_denied_seen_event_ids.discard(oldest)
+
+
+def _mark_hook_denied_event_pending(event_id: str) -> bool:
+    with _hook_denied_deduper_lock:
+        if event_id in _hook_denied_seen_event_ids:
+            return False
+        if event_id in _hook_denied_pending_event_ids:
+            return False
+        _hook_denied_pending_event_ids.add(event_id)
+        return True
+
+
+def _clear_hook_denied_event_pending(event_id: str) -> None:
+    with _hook_denied_deduper_lock:
+        _hook_denied_pending_event_ids.discard(event_id)
+
+
+def _ensure_hook_denied_upload_worker() -> None:
+    global _hook_denied_worker
+    with _hook_denied_worker_lock:
+        if _hook_denied_worker is not None and _hook_denied_worker.is_alive():
+            return
+        _hook_denied_worker = threading.Thread(
+            target=_run_hook_denied_upload_worker,
+            name="console-hook-denied-upload",
+            daemon=True,
+        )
+        _hook_denied_worker.start()
+
+
+def _run_hook_denied_upload_worker() -> None:
+    while True:
+        job = _hook_denied_upload_queue.get()
+        try:
+            _process_hook_denied_upload_job(job)
+        finally:
+            _clear_hook_denied_event_pending(job.payload.event_id)
+            _hook_denied_upload_queue.task_done()
+
+
+def _process_hook_denied_upload_job(job: _HookDeniedUploadJob) -> None:
+    try:
+        if _is_hook_denied_event_seen(job.payload.event_id):
+            return
+        uploader = job.upload_fn or sync_decision_summary
+        result = uploader(
+            job.payload,
+            home=job.home,
+            load_credential_fn=job.load_credential_fn,
+            transport=job.transport,
+        )
+        if isinstance(result, str) and result in _HOOK_DENIED_UPLOAD_ACK_STATUSES:
+            _mark_hook_denied_event_seen(job.payload.event_id)
+    except Exception:
+        return
+
+
+def best_effort_upload_hook_denied_summary(
+    evidence_record: Mapping[str, Any],
+    *,
+    home: Path | None = None,
+    load_credential_fn: LoadCredential = load_credential,
+    upload_fn: UploadSummary | None = None,
+    transport: Transport | None = None,
+) -> None:
+    """Queue one hook-deny upload without blocking the hook response path."""
+
+    try:
+        payload = build_hook_denied_decision_summary_payload(evidence_record)
+        if payload is None:
+            return
+        if not _mark_hook_denied_event_pending(payload.event_id):
+            return
+        _ensure_hook_denied_upload_worker()
+        _hook_denied_upload_queue.put_nowait(
+            _HookDeniedUploadJob(
+                payload=payload,
+                home=home,
+                load_credential_fn=load_credential_fn,
+                upload_fn=upload_fn,
+                transport=transport,
+            )
+        )
+    except queue.Full:
+        if "payload" in locals():
+            _clear_hook_denied_event_pending(payload.event_id)
+    except Exception:
+        return
 
 
 def payload_to_request_body(payload: DecisionSummaryPayload) -> dict[str, Any]:
@@ -661,7 +907,11 @@ __all__ = [
     "Transport",
     "TransportError",
     "attach_terminal_evidence_observer",
+    "best_effort_upload_hook_denied_summary",
     "build_decision_summary_payload",
+    "build_hook_denied_decision_summary_payload",
     "payload_to_request_body",
+    "reset_hook_denied_upload_dedupe_for_tests",
     "sync_decision_summary",
+    "wait_for_hook_denied_uploads_for_tests",
 ]

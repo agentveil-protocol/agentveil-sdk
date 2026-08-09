@@ -32,9 +32,12 @@ from agentveil_mcp_proxy.console_decision_summary_client import (
     _REQUEST_TIMEOUT_SECONDS,
     _SHUTDOWN_JOIN_TIMEOUT_SECONDS,
     attach_terminal_evidence_observer,
+    best_effort_upload_hook_denied_summary,
     build_decision_summary_payload,
+    build_hook_denied_decision_summary_payload,
     payload_to_request_body,
     sync_decision_summary,
+    wait_for_hook_denied_uploads_for_tests,
 )
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore, ApprovalStatus, PendingApproval
 from agentveil_mcp_proxy.policy import (
@@ -44,6 +47,16 @@ from agentveil_mcp_proxy.policy import (
     RiskClass,
 )
 from agentveil_mcp_proxy.runtime_gate import RuntimeGateDecision
+
+
+@pytest.fixture(autouse=True)
+def _reset_hook_denied_upload_dedupe() -> None:
+    from agentveil_mcp_proxy.console_decision_summary_client import (
+        reset_hook_denied_upload_dedupe_for_tests,
+    )
+
+    reset_hook_denied_upload_dedupe_for_tests()
+
 
 TOKEN = "console-device-token-secret-canary"
 SECRET = "SECRET_DECISION_SUMMARY_CANARY"
@@ -928,3 +941,184 @@ def test_privacy_canaries_absent_from_request_json():
         "proof_hash",
         "idempotency_key",
     }
+
+
+def _hook_denied_record(**overrides):
+    record = {
+        "ts": "2026-08-09T10:00:00Z",
+        "session_id": "sess-hook-001",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "server": "codex",
+        "tool": "Bash",
+        "action_family": "shell_like",
+        "hook_action": "deny",
+        "reason_code": "risky_blocked",
+        "input_ref": {"input_hash": "sha256:abc123def4567890", "input_keys": ["command"]},
+    }
+    record.update(overrides)
+    return record
+
+
+def _wait_hook_denied_uploads() -> None:
+    assert wait_for_hook_denied_uploads_for_tests(timeout=2.0)
+
+
+def test_build_hook_denied_decision_summary_payload_maps_denied_record():
+    payload = build_hook_denied_decision_summary_payload(_hook_denied_record())
+    assert payload is not None
+    assert payload.decision == "denied"
+    assert payload.target_reached is False
+    assert payload.proof_status == "unavailable"
+    assert payload.proof_hash is None
+    assert payload.action_family == "shell_like"
+    assert payload.event_id.startswith("hook.denied.")
+
+
+def test_build_hook_denied_decision_summary_payload_skips_allow():
+    assert (
+        build_hook_denied_decision_summary_payload(
+            _hook_denied_record(hook_action="allow")
+        )
+        is None
+    )
+
+
+def test_build_hook_denied_decision_summary_payload_infers_action_family_from_tool():
+    payload = build_hook_denied_decision_summary_payload(
+        _hook_denied_record(action_family="", tool="write_file", tool_name="write_file")
+    )
+    assert payload is not None
+    assert payload.action_family == "write"
+
+
+def test_build_hook_denied_decision_summary_payload_maps_bash_to_shell_like():
+    payload = build_hook_denied_decision_summary_payload(
+        _hook_denied_record(action_family="unknown", tool="Bash", tool_name="Bash")
+    )
+    assert payload is not None
+    assert payload.action_family == "shell_like"
+
+
+def test_hook_denied_upload_dedupes_same_event():
+    calls: list[str] = []
+
+    def _upload(payload, **kwargs):
+        calls.append(payload.event_id)
+        return "accepted"
+
+    record = _hook_denied_record(session_id="dedupe-session")
+    best_effort_upload_hook_denied_summary(record, upload_fn=_upload)
+    _wait_hook_denied_uploads()
+    best_effort_upload_hook_denied_summary(record, upload_fn=_upload)
+    _wait_hook_denied_uploads()
+    assert len(calls) == 1
+
+
+def test_hook_denied_upload_dedupes_after_duplicate_ack():
+    calls: list[str] = []
+
+    def _upload(payload, **kwargs):
+        calls.append(payload.event_id)
+        return "duplicate"
+
+    record = _hook_denied_record(session_id="duplicate-ack-session")
+    best_effort_upload_hook_denied_summary(record, upload_fn=_upload)
+    _wait_hook_denied_uploads()
+    best_effort_upload_hook_denied_summary(record, upload_fn=_upload)
+    _wait_hook_denied_uploads()
+    assert len(calls) == 1
+
+
+def test_hook_denied_upload_retries_after_transient_failure():
+    calls: list[str] = []
+    outcomes = iter(["unavailable", "accepted"])
+
+    def _upload(payload, **kwargs):
+        calls.append(payload.event_id)
+        return next(outcomes)
+
+    record = _hook_denied_record(session_id="retry-unavailable-session")
+    best_effort_upload_hook_denied_summary(record, upload_fn=_upload)
+    _wait_hook_denied_uploads()
+    best_effort_upload_hook_denied_summary(record, upload_fn=_upload)
+    _wait_hook_denied_uploads()
+    best_effort_upload_hook_denied_summary(record, upload_fn=_upload)
+    _wait_hook_denied_uploads()
+    assert len(calls) == 2
+
+
+def test_hook_denied_upload_retries_after_exception():
+    calls: list[int] = []
+
+    def _upload(payload, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise DecisionSummaryClientError("transport_failed")
+        return "accepted"
+
+    record = _hook_denied_record(session_id="retry-exception-session")
+    best_effort_upload_hook_denied_summary(record, upload_fn=_upload)
+    _wait_hook_denied_uploads()
+    best_effort_upload_hook_denied_summary(record, upload_fn=_upload)
+    _wait_hook_denied_uploads()
+    best_effort_upload_hook_denied_summary(record, upload_fn=_upload)
+    _wait_hook_denied_uploads()
+    assert len(calls) == 2
+
+
+def test_hook_denied_upload_does_not_cache_rejected_or_skipped():
+    calls: list[str] = []
+    outcomes = iter(["rejected", "skipped_no_credential", "accepted"])
+
+    def _upload(payload, **kwargs):
+        calls.append(payload.event_id)
+        return next(outcomes)
+
+    record = _hook_denied_record(session_id="retry-rejected-session")
+    for _ in range(4):
+        best_effort_upload_hook_denied_summary(record, upload_fn=_upload)
+        _wait_hook_denied_uploads()
+    assert len(calls) == 3
+
+
+def test_hook_denied_upload_returns_without_waiting_for_slow_upload():
+    release = threading.Event()
+    calls: list[str] = []
+
+    def _upload(payload, **kwargs):
+        calls.append(payload.event_id)
+        release.wait(timeout=1.0)
+        return "accepted"
+
+    record = _hook_denied_record(session_id="slow-upload-session")
+    started = time.monotonic()
+    best_effort_upload_hook_denied_summary(record, upload_fn=_upload)
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.1
+    release.set()
+    _wait_hook_denied_uploads()
+    assert len(calls) == 1
+
+
+def test_hook_denied_request_body_has_no_raw_command_or_path():
+    payload = build_hook_denied_decision_summary_payload(
+        _hook_denied_record(
+            session_id="privacy-session",
+            input_ref={
+                "input_hash": "sha256:deadbeefdeadbeef",
+                "input_keys": ["command"],
+            },
+        )
+    )
+    assert payload is not None
+    encoded = json.dumps(payload_to_request_body(payload))
+    for forbidden in (
+        "git add .",
+        "/private/customer/workspace",
+        "sess-hook-001",
+        "privacy-session",
+        "command",
+        "deadbeefdeadbeef",
+    ):
+        assert forbidden not in encoded

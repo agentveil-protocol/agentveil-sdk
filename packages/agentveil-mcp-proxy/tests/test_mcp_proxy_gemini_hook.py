@@ -5,7 +5,18 @@ from __future__ import annotations
 import io
 import json
 
+import pytest
+
 from agentveil_mcp_proxy import gemini_hook
+
+
+@pytest.fixture(autouse=True)
+def _reset_hook_denied_upload_dedupe() -> None:
+    from agentveil_mcp_proxy.console_decision_summary_client import (
+        reset_hook_denied_upload_dedupe_for_tests,
+    )
+
+    reset_hook_denied_upload_dedupe_for_tests()
 
 
 def _payload(tool_name: str, tool_input: dict | None = None) -> dict:
@@ -67,8 +78,8 @@ def test_gemini_hook_denies_write_capable_run_shell_command():
 
     assert decision.hook_action == "deny"
     reason = _deny_reason(out.getvalue())
-    # claim-check: allow assertion of bounded hook denial text in unit test.
-    assert "Direct native tool use was blocked before mutation" in reason
+    assert "Direct native shell use was blocked" in reason  # claim-check: allow tested hook copy.
+    assert "write_file" not in reason
 
 
 def test_gemini_hook_allows_read_tools():
@@ -125,6 +136,48 @@ def test_gemini_hook_still_denies_non_agentveil_mcp_write():
     assert "denied write_file" in reason
     # claim-check: allow assertion that non-AgentVeil MCP path lacks native-redirect copy.
     assert "Direct native tool use was blocked before mutation" not in reason
+
+
+def test_gemini_hook_allows_local_git_add_and_commit():
+    out = io.StringIO()
+    for command in (
+        "git add agentveil_mcp_proxy/classification.py",
+        "git commit -m 'fix: local dev policy'",
+    ):
+        decision = gemini_hook.process_hook(
+            _payload("run_shell_command", {"command": command}),
+            out=out,
+        )
+        assert decision.hook_action == "allow", command
+        payload = json.loads(out.getvalue())
+        assert payload["decision"] == "allow"
+        out.truncate(0)
+        out.seek(0)
+
+
+def test_gemini_hook_denies_broad_git_add_without_write_file_redirect():
+    out = io.StringIO()
+    decision = gemini_hook.process_hook(
+        _payload("run_shell_command", {"command": "git add ."}),
+        out=out,
+    )
+    assert decision.hook_action == "deny"
+    reason = _deny_reason(out.getvalue())
+    assert "write_file" not in reason
+    assert "No controlled MCP route exists for this shell action" in reason
+
+
+def test_gemini_hook_denies_secret_env_with_hard_block_copy():
+    out = io.StringIO()
+    decision = gemini_hook.process_hook(
+        _payload("run_shell_command", {"command": "AWS_SECRET_ACCESS_KEY=x pytest -q t"}),
+        out=out,
+    )
+    assert decision.hook_action == "deny"
+    reason = _deny_reason(out.getvalue())
+    assert "bounded security reason" in reason
+    assert "write_file" not in reason
+    assert "AWS_SECRET_ACCESS_KEY" not in reason
 
 
 def test_gemini_hook_does_not_leak_raw_command_in_evidence(tmp_path):
@@ -195,3 +248,36 @@ def test_gemini_native_write_file_without_live_binding_has_no_verified_context(t
     )
     payload = json.loads(out.getvalue())
     assert parse_redirect_context_from_gemini_hook_output(payload) is None
+
+
+def test_gemini_hook_denied_uploads_bounded_decision_summary(monkeypatch):
+    from agentveil_mcp_proxy.console_credentials import CREDENTIAL_SCOPE, StoredCredential
+    from agentveil_mcp_proxy.console_decision_summary_client import (
+        payload_to_request_body,
+        wait_for_hook_denied_uploads_for_tests,
+    )
+
+    uploads = []
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_decision_summary_client.load_credential",
+        lambda home=None: StoredCredential(
+            scope=CREDENTIAL_SCOPE,
+            token="hook-upload-token-secret",
+        ),
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_decision_summary_client.sync_decision_summary",
+        lambda payload, **kwargs: uploads.append(payload) or "accepted",
+    )
+    out = io.StringIO()
+    decision = gemini_hook.process_hook(
+        _payload("write_file", {"path": "owned.txt", "content": "SECRET_CONTENT"}),
+        out=out,
+    )
+
+    assert decision.hook_action == "deny"
+    assert wait_for_hook_denied_uploads_for_tests()
+    assert len(uploads) == 1
+    encoded = json.dumps(payload_to_request_body(uploads[0]))
+    assert "SECRET_CONTENT" not in encoded
+    assert "owned.txt" not in encoded

@@ -6,6 +6,8 @@ import json
 from io import StringIO
 from pathlib import Path
 
+import pytest
+
 from agentveil_mcp_proxy import cursor_hooks
 from agentveil_mcp_proxy.client_guidance import (
     parse_redirect_context_from_cursor_hook_output,
@@ -15,6 +17,15 @@ from redirect_hook_contract_fixtures import (
     init_redirect_contract_home,
     publish_live_hook_binding,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_hook_denied_upload_dedupe() -> None:
+    from agentveil_mcp_proxy.console_decision_summary_client import (
+        reset_hook_denied_upload_dedupe_for_tests,
+    )
+
+    reset_hook_denied_upload_dedupe_for_tests()
 
 
 def test_native_write_denied_with_generic_redirect(tmp_path: Path) -> None:
@@ -35,6 +46,103 @@ def test_native_write_denied_with_generic_redirect(tmp_path: Path) -> None:
     assert response["permission"] == "deny"
     assert "write_file" in response["agent_message"]
     assert cursor_hooks.NATIVE_REDIRECT_INSTRUCTION in response["agent_message"]
+
+
+def test_shell_python_m_pytest_allowed_end_to_end(tmp_path: Path) -> None:
+    out = StringIO()
+    decision = cursor_hooks.process_hook(
+        {
+            "hook_event": "beforeShellExecution",
+            "command": "python3 -m pytest -q packages/agentveil-mcp-proxy/tests",
+        },
+        workspace=tmp_path,
+        out=out,
+    )
+    assert decision.hook_action == "allow"
+    assert json.loads(out.getvalue())["permission"] == "allow"
+
+
+def test_shell_git_checkout_path_restore_denied_end_to_end(tmp_path: Path) -> None:
+    out = StringIO()
+    decision = cursor_hooks.process_hook(
+        {"hook_event": "beforeShellExecution", "command": "git checkout -- file.txt"},
+        workspace=tmp_path,
+        out=out,
+    )
+    assert decision.hook_action == "deny"
+
+
+def test_shell_local_git_add_and_commit_allowed(tmp_path: Path) -> None:
+    for command in (
+        "git add packages/agentveil-mcp-proxy/agentveil_mcp_proxy/classification.py",
+        "git commit -m 'fix: local dev policy'",
+    ):
+        out = StringIO()
+        decision = cursor_hooks.process_hook(
+            {"hook_event": "beforeShellExecution", "command": command},
+            workspace=tmp_path,
+            out=out,
+        )
+        assert decision.hook_action == "allow", command
+        assert json.loads(out.getvalue())["permission"] == "allow"
+
+
+def test_shell_broad_git_add_denied_without_write_file_redirect(tmp_path: Path) -> None:
+    out = StringIO()
+    decision = cursor_hooks.process_hook(
+        {"hook_event": "beforeShellExecution", "command": "git add ."},
+        workspace=tmp_path,
+        out=out,
+    )
+    assert decision.hook_action == "deny"
+    response = json.loads(out.getvalue())
+    assert "write_file" not in response["agent_message"]
+    assert "No controlled MCP route exists for this shell action" in response["agent_message"]
+
+
+def test_non_cursor_server_deny_has_no_native_write_redirect() -> None:
+    from agentveil_mcp_proxy.cursor_hooks import HookDecision, format_cursor_hook_response
+    from agentveil_mcp_proxy.policy import PolicyDecision, PolicyEvaluation, RiskClass, ToolCallContext
+
+    decision = HookDecision(
+        "deny",
+        "risky_blocked",
+        ToolCallContext(
+            server="probe",
+            tool="write_note",
+            action="probe.write_note",
+            risk_class=RiskClass.WRITE,
+            action_family="write",
+        ),
+        PolicyEvaluation(
+            decision=PolicyDecision.APPROVAL,
+            risk_class=RiskClass.WRITE,
+            policy_id="cursor_hook_default",
+            policy_rule_id="cursor-write-approval",
+            policy_context_hash="abc123",
+            matched_rule_ids=("cursor-write-approval",),
+        ),
+    )
+    response = format_cursor_hook_response(decision)
+    assert response["permission"] == "deny"
+    assert "write_file" not in response["agent_message"]
+    assert "controlled MCP tool" not in response["agent_message"]
+    assert "denied write_note" in response["agent_message"]
+
+
+def test_shell_destructive_command_uses_hard_block_copy(tmp_path: Path) -> None:
+    out = StringIO()
+    decision = cursor_hooks.process_hook(
+        {"hook_event": "beforeShellExecution", "command": "rm -rf /tmp/workspace"},
+        workspace=tmp_path,
+        out=out,
+    )
+    assert decision.hook_action == "deny"
+    response = json.loads(out.getvalue())
+    message = response["agent_message"]
+    assert "bounded security reason" in message
+    assert "write_file" not in message
+    assert "controlled MCP tool" not in message
 
 
 def test_shell_readonly_allowed(tmp_path: Path) -> None:
@@ -163,3 +271,41 @@ def test_native_write_deny_without_live_binding_has_no_verified_context(tmp_path
     )
     payload = json.loads(out.getvalue())
     assert parse_redirect_context_from_cursor_hook_output(payload) is None
+
+
+def test_cursor_hook_denied_uploads_bounded_decision_summary(monkeypatch, tmp_path: Path) -> None:
+    from agentveil_mcp_proxy.console_credentials import CREDENTIAL_SCOPE, StoredCredential
+    from agentveil_mcp_proxy.console_decision_summary_client import (
+        payload_to_request_body,
+        wait_for_hook_denied_uploads_for_tests,
+    )
+
+    uploads = []
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_decision_summary_client.load_credential",
+        lambda home=None: StoredCredential(
+            scope=CREDENTIAL_SCOPE,
+            token="hook-upload-token-secret",
+        ),
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_decision_summary_client.sync_decision_summary",
+        lambda payload, **kwargs: uploads.append(payload) or "accepted",
+    )
+    out = StringIO()
+    decision = cursor_hooks.process_hook(
+        {
+            "hook_event": "preToolUse",
+            "tool_name": "Write",
+            "tool_input": {"path": "foo.txt", "contents": "secret"},
+        },
+        workspace=tmp_path,
+        out=out,
+    )
+
+    assert decision.hook_action == "deny"
+    assert wait_for_hook_denied_uploads_for_tests()
+    assert len(uploads) == 1
+    encoded = json.dumps(payload_to_request_body(uploads[0]))
+    assert "secret" not in encoded
+    assert "foo.txt" not in encoded
