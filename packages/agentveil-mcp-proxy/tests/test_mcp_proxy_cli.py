@@ -41,6 +41,11 @@ from agentveil_mcp_proxy.console_credentials import (
     load_credential,
     save_credential,
 )
+from agentveil_mcp_proxy.console_attach_client import (
+    AttachClientError,
+    AttachStart,
+    AttachToken,
+)
 from agentveil_mcp_proxy.console_pairing_client import (
     PairingClientError,
     PairingStart,
@@ -3314,6 +3319,10 @@ CONSOLE_DEVICE_CODE = "device-code-secret-cli"
 CONSOLE_USER_CODE = "ABCD-2468"
 CONSOLE_TOKEN = "confirmed-device-token-secret-cli"
 CONSOLE_URL = "https://agentveil.dev/console/pairing"
+CONSOLE_ATTACH_DEVICE_CODE = "attach-device-code-secret-cli"
+CONSOLE_ATTACH_TOKEN = "attach-confirmed-token-secret-cli"
+CONSOLE_ATTACH_STATE = "abcdefghijklmnopqrstuvwxyz0123456789ABCD"
+CONSOLE_ATTACH_URL = f"https://agentveil.dev/console/attach?state={CONSOLE_ATTACH_STATE}"
 
 
 def _console_start() -> PairingStart:
@@ -3375,6 +3384,11 @@ class _FakeConsoleClient:
 
 
 def _install_console_client(monkeypatch, client):
+    class _FailingAttach:
+        def start(self):
+            raise AttachClientError("unexpected_status")
+
+    monkeypatch.setattr(proxy_cli, "_console_attach_client", lambda: _FailingAttach())
     monkeypatch.setattr(proxy_cli, "_console_pairing_client", lambda: client)
 
 
@@ -3445,6 +3459,11 @@ def test_console_login_full_flow_real_decoder_accepts_consumed_response(
                 body=json.dumps(payload).encode("utf-8"),
             )
 
+    class _FailingAttach:
+        def start(self):
+            raise AttachClientError("unexpected_status")
+
+    monkeypatch.setattr(proxy_cli, "_console_attach_client", lambda: _FailingAttach())
     monkeypatch.setattr(
         proxy_cli,
         "_console_pairing_client",
@@ -3692,6 +3711,19 @@ def test_console_project_status_sync_skipped_without_credential(tmp_path, monkey
     monkeypatch.setattr(
         "agentveil_mcp_proxy.console_project_status_client._urllib_transport",
         transport,
+    )
+
+    class _FailingAttach:
+        def start(self):
+            raise AttachClientError("unexpected_status")
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.cli._console_attach_client",
+        lambda: _FailingAttach(),
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.cli.console_login_lock",
+        lambda home=None: _null_context(),
     )
 
     project = tmp_path / "project"
@@ -4249,6 +4281,365 @@ def test_console_free_builder_sync_on_setup_status_for_connectors(
     assert main(setup) == 0
     capsys.readouterr()
     assert len(sync_calls) == 1
+
+    assert main(status) == 0
+    capsys.readouterr()
+    assert len(sync_calls) == 2
+
+
+# --- Console browser-session attach (Slice 4) -------------------------------
+
+
+def _console_attach_start() -> AttachStart:
+    return AttachStart(
+        device_code=CONSOLE_ATTACH_DEVICE_CODE,
+        attach_url=CONSOLE_ATTACH_URL,
+        expires_in=600,
+        interval=5,
+    )
+
+
+class _FakeAttachClient:
+    def __init__(
+        self,
+        *,
+        start=None,
+        token=None,
+        start_error=None,
+        poll_error=None,
+    ):
+        self._start = start
+        self._token = token
+        self._start_error = start_error
+        self._poll_error = poll_error
+        self.started = False
+        self.polled = False
+
+    def start(self):
+        self.started = True
+        if self._start_error is not None:
+            raise self._start_error
+        return self._start or _console_attach_start()
+
+    def poll_for_token(self, start):
+        del start
+        self.polled = True
+        if self._poll_error is not None:
+            raise self._poll_error
+        return self._token or AttachToken(
+            token=CONSOLE_ATTACH_TOKEN,
+            scope=CREDENTIAL_SCOPE,
+        )
+
+
+def _install_attach_login_fakes(monkeypatch, attach_client):
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.cli.console_login_lock",
+        lambda home=None: _null_context(),
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.cli.load_credential",
+        lambda home=None: None,
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.cli._console_attach_client",
+        lambda: attach_client,
+    )
+
+
+def test_console_login_attach_path_without_user_code(tmp_path, monkeypatch, capsys):
+    avp_home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(avp_home))
+    attach = _FakeAttachClient()
+    _install_attach_login_fakes(monkeypatch, attach)
+    opened: list[str] = []
+
+    assert (
+        proxy_cli.run_console_login_cli(
+            open_browser=True,
+            browser_open=lambda url: opened.append(url),
+        )
+        == 0
+    )
+    out, err = capsys.readouterr()
+
+    assert attach.started is True
+    assert attach.polled is True
+    assert opened == [CONSOLE_ATTACH_URL]
+    assert load_credential(home=avp_home).token == CONSOLE_ATTACH_TOKEN
+    assert CONSOLE_USER_CODE not in out
+    assert CONSOLE_USER_CODE not in err
+    assert CONSOLE_ATTACH_DEVICE_CODE not in out
+    assert CONSOLE_ATTACH_TOKEN not in out
+    assert CONSOLE_ATTACH_TOKEN not in err
+
+
+def test_console_login_attach_failure_falls_back_to_pairing(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    avp_home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(avp_home))
+    attach = _FakeAttachClient(start_error=AttachClientError("unexpected_status"))
+    pairing = _FakeConsoleClient(
+        start=_console_start(),
+        token=PairingToken(
+            token=CONSOLE_TOKEN,
+            scope=CREDENTIAL_SCOPE,
+        ),
+    )
+    _install_attach_login_fakes(monkeypatch, attach)
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.cli._console_pairing_client",
+        lambda: pairing,
+    )
+
+    assert proxy_cli.run_console_login_cli(open_browser=False) == 0
+    out, err = capsys.readouterr()
+
+    assert attach.started is True
+    assert attach.polled is False
+    assert pairing.started is True
+    assert pairing.polled is True
+    assert CONSOLE_USER_CODE in out
+    assert load_credential(home=avp_home).token == CONSOLE_TOKEN
+    assert CONSOLE_ATTACH_TOKEN not in out
+    assert CONSOLE_ATTACH_TOKEN not in err
+
+
+def test_console_setup_attach_acquires_credential_and_uploads_status(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from test_mcp_proxy_codex_setup import (
+        _install_fast_codex_setup_fakes,
+        _isolate_cli_home,
+        _make_proxy_command,
+    )
+
+    avp_home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(avp_home))
+    isolated_home = tmp_path / "home"
+    _isolate_cli_home(monkeypatch, isolated_home)
+    proxy_command = _make_proxy_command(tmp_path)
+    _install_fast_codex_setup_fakes(monkeypatch, proxy_command=proxy_command)
+    attach = _FakeAttachClient()
+    sync_calls = []
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.cli._console_attach_client",
+        lambda: attach,
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.cli.console_login_lock",
+        lambda home=None: _null_context(),
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_project_status_client.sync_project_status",
+        lambda **kwargs: sync_calls.append(kwargs) or "accepted",
+    )
+
+    project = tmp_path / "project"
+    project.mkdir()
+    rc = main(["setup", "codex", "--project-dir", str(project), "--yes", "--json"])
+    out, err = capsys.readouterr()
+
+    assert rc == 0
+    assert attach.started is True
+    assert attach.polled is True
+    assert load_credential(home=avp_home).token == CONSOLE_ATTACH_TOKEN
+    assert len(sync_calls) == 1
+    assert CONSOLE_USER_CODE not in out
+    assert CONSOLE_USER_CODE not in err
+    assert CONSOLE_ATTACH_DEVICE_CODE not in out
+    assert CONSOLE_ATTACH_TOKEN not in out
+    assert CONSOLE_ATTACH_TOKEN not in err
+
+
+def test_console_setup_succeeds_when_attach_unavailable(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from test_mcp_proxy_codex_setup import (
+        _install_fast_codex_setup_fakes,
+        _isolate_cli_home,
+        _make_proxy_command,
+    )
+    from test_mcp_proxy_console_project_status_client import BackendEchoTransport
+
+    isolated_home = tmp_path / "home"
+    _isolate_cli_home(monkeypatch, isolated_home)
+    proxy_command = _make_proxy_command(tmp_path)
+    _install_fast_codex_setup_fakes(monkeypatch, proxy_command=proxy_command)
+    attach = _FakeAttachClient(start_error=AttachClientError("transport_failed"))
+    transport = BackendEchoTransport()
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.cli._console_attach_client",
+        lambda: attach,
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.cli.console_login_lock",
+        lambda home=None: _null_context(),
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_project_status_client._urllib_transport",
+        transport,
+    )
+
+    project = tmp_path / "project"
+    rc = main(["setup", "codex", "--project-dir", str(project), "--yes", "--json"])
+    out, err = capsys.readouterr()
+
+    assert rc == 0
+    assert "setup-codex" in out
+    assert transport.calls == []
+    assert "transport_failed" not in out
+    assert "transport_failed" not in err
+
+
+@pytest.mark.parametrize(
+    ("client", "setup_argv", "status_argv", "connector"),
+    [
+        (
+            "cursor",
+            ["setup", "cursor", "--yes"],
+            ["setup", "status"],
+            "cursor",
+        ),
+        (
+            "codex",
+            ["setup", "codex", "--yes"],
+            ["setup", "status", "--client", "codex"],
+            "codex",
+        ),
+        (
+            "claude-code",
+            ["setup", "claude-code", "--yes"],
+            ["setup", "status"],
+            "claude-code",
+        ),
+        (
+            "gemini-cli",
+            ["setup", "gemini-cli", "--yes"],
+            ["setup", "status", "--client", "gemini-cli"],
+            "gemini-cli",
+        ),
+    ],
+)
+def test_console_attach_on_setup_for_connectors(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    client,
+    setup_argv,
+    status_argv,
+    connector,
+):
+    from agentveil_mcp_proxy import cursor_setup
+    from test_mcp_proxy_codex_setup import _make_proxy_command
+
+    avp_home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(avp_home))
+    project = tmp_path / "checkout-service"
+    project.mkdir()
+    attach = _FakeAttachClient()
+    sync_calls = []
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.cli._console_attach_client",
+        lambda: attach,
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.cli.console_login_lock",
+        lambda home=None: _null_context(),
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_project_status_client.sync_project_status",
+        lambda **kwargs: sync_calls.append(kwargs) or "accepted",
+    )
+
+    if client == "cursor":
+        def fake_init_proxy(**kwargs):
+            home = kwargs["home"]
+            (home / "mcp-proxy").mkdir(parents=True, exist_ok=True)
+            (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+
+        def fake_prepare(_workspace, *, force=False):
+            home = cursor_setup.setup_home(_workspace)
+            home.mkdir(parents=True, exist_ok=True)
+            (home / "passphrase").write_text("secret\n", encoding="utf-8")
+            return home
+
+        monkeypatch.setattr(proxy_cli, "init_proxy", fake_init_proxy)
+        monkeypatch.setattr(cursor_setup, "prepare_proxy_home", fake_prepare)
+        monkeypatch.setattr(proxy_cli, "initialize_product_route_profile", lambda _prof: None)
+        monkeypatch.setattr(
+            cursor_setup,
+            "ensure_approval_center_running",
+            lambda **_kwargs: SimpleNamespace(
+                status=SimpleNamespace(state="running"),
+                started=True,
+                reused=False,
+                restarted=False,
+                reason="center started",
+            ),
+        )
+        monkeypatch.setattr("shutil.which", lambda _name: "agentveil-mcp-proxy")
+        setup = [*setup_argv, "--workspace", str(project), "--json"]
+        status = [*status_argv, "--workspace", str(project), "--json"]
+    elif client == "codex":
+        from test_mcp_proxy_codex_setup import (
+            _install_fast_codex_setup_fakes,
+            _isolate_cli_home,
+        )
+
+        isolated_home = tmp_path / "home"
+        _isolate_cli_home(monkeypatch, isolated_home)
+        proxy_command = _make_proxy_command(tmp_path)
+        _install_fast_codex_setup_fakes(monkeypatch, proxy_command=proxy_command)
+        setup = [*setup_argv, "--project-dir", str(project), "--json"]
+        status = [*status_argv, "--project-dir", str(project), "--json"]
+    elif client == "claude-code":
+        monkeypatch.setattr(
+            proxy_cli,
+            "init_proxy",
+            lambda **kwargs: (kwargs["home"] / "mcp-proxy").mkdir(parents=True, exist_ok=True)
+            or (kwargs["home"] / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8"),
+        )
+        monkeypatch.setattr(proxy_cli, "_resolve_setup_proxy_command", lambda: "agentveil-mcp-proxy")
+        monkeypatch.setattr(
+            "agentveil_mcp_proxy.approval.server.ensure_managed_approval_center_for_cli",
+            lambda **_kwargs: SimpleNamespace(
+                status=SimpleNamespace(state="running"),
+                started=True,
+                reused=False,
+                restarted=False,
+                reason="center started",
+            ),
+        )
+        monkeypatch.setattr(
+            "agentveil_mcp_proxy.approval.server.inspect_managed_approval_center",
+            lambda _home: SimpleNamespace(state="running", url="http://127.0.0.1/approval/"),
+        )
+        setup = [*setup_argv, "--project-dir", str(project), "--json"]
+        status = [*status_argv, "--project-dir", str(project), "--json"]
+    else:
+        from test_mcp_proxy_gemini_setup import _install_fast_gemini_setup_fakes
+
+        isolated_home = tmp_path / "home"
+        monkeypatch.setenv("HOME", str(isolated_home))
+        proxy_command = _make_proxy_command(tmp_path)
+        _install_fast_gemini_setup_fakes(monkeypatch, proxy_command=proxy_command)
+        setup = [*setup_argv, "--project-dir", str(project), "--json"]
+        status = [*status_argv, "--project-dir", str(project), "--json"]
+
+    assert main(setup) == 0
+    capsys.readouterr()
+    assert attach.started is True
+    assert load_credential(home=avp_home).token == CONSOLE_ATTACH_TOKEN
+    assert len(sync_calls) == 1
+    assert sync_calls[0]["connector"] == connector
 
     assert main(status) == 0
     capsys.readouterr()

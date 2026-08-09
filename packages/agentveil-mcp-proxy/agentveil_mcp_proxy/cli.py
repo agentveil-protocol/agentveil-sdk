@@ -211,6 +211,10 @@ from agentveil_mcp_proxy.console_credentials import (
     load_credential,
     save_credential,
 )
+from agentveil_mcp_proxy.console_attach_client import (
+    AttachClientError,
+    ConsoleAttachClient,
+)
 from agentveil_mcp_proxy.console_pairing_client import (
     ConsolePairingClient,
     PairingClientError,
@@ -1631,6 +1635,35 @@ def _attach_connector_trust_boundary(
     return enriched
 
 
+def _best_effort_console_attach_credential(
+    *,
+    open_browser: bool = True,
+    browser_open: Callable[[str], Any] | None = None,
+    attach_client: ConsoleAttachClient | None = None,
+) -> None:
+    """Best-effort browser-session attach when no Console credential is stored."""
+
+    try:
+        with console_login_lock():
+            try:
+                existing = load_credential()
+            except CredentialError:
+                return
+            if existing is not None:
+                return
+            _acquire_console_credential_via_attach(
+                attach_client=attach_client,
+                open_browser=open_browser,
+                browser_open=browser_open,
+                interactive=False,
+            )
+    except CredentialError as exc:
+        if exc.code == "login_in_progress":
+            return
+    except Exception:
+        return
+
+
 def _best_effort_console_project_status_sync(
     *,
     connector: str,
@@ -1642,6 +1675,7 @@ def _best_effort_console_project_status_sync(
     from agentveil_mcp_proxy import __version__ as package_version
     from agentveil_mcp_proxy.console_project_status_client import sync_project_status
 
+    _best_effort_console_attach_credential()
     try:
         sync_project_status(
             connector=connector,
@@ -3810,8 +3844,65 @@ _ROOT_CLI_EPILOG = (
 )
 
 
+def _console_attach_client() -> ConsoleAttachClient:
+    return ConsoleAttachClient()
+
+
 def _console_pairing_client() -> ConsolePairingClient:
     return ConsolePairingClient()
+
+
+def _acquire_console_credential_via_attach(
+    *,
+    open_browser: bool,
+    attach_client: ConsoleAttachClient | None = None,
+    browser_open: Callable[[str], Any] | None = None,
+    out: TextIO | None = None,
+    interactive: bool = False,
+) -> bool:
+    """Return True when attach stored a new bounded Console credential."""
+
+    stream = out or sys.stdout
+    attach = attach_client or _console_attach_client()
+    try:
+        start = attach.start()
+    except AttachClientError:
+        return False
+
+    if interactive:
+        print(
+            "To connect, open AgentVeil Console in your browser and approve "
+            "this machine.",
+            file=stream,
+        )
+    if open_browser:
+        opener = browser_open or webbrowser.open
+        try:
+            opener(start.attach_url)
+        except Exception:
+            pass
+
+    try:
+        token = attach.poll_for_token(start)
+    except AttachClientError:
+        return False
+
+    pairing = _console_pairing_client()
+    try:
+        existing = load_credential()
+    except CredentialError:
+        _revoke_orphan_console_token(pairing, token.token)
+        return False
+    if existing is not None:
+        _revoke_orphan_console_token(pairing, token.token)
+        return True
+
+    try:
+        save_credential(token.token, scope=token.scope)
+    except CredentialError:
+        _revoke_orphan_console_token(pairing, token.token)
+        return False
+    return True
 
 
 def _revoke_orphan_console_token(
@@ -3853,54 +3944,63 @@ def run_console_login_cli(
                 )
                 return 0
 
-            pairing = client or _console_pairing_client()
-            try:
-                start = pairing.start()
-                print(
-                    f"To connect, open {start.verification_url} "
-                    f"and enter code {start.user_code}.",
-                    file=stream,
-                )
-                if open_browser:
-                    opener = browser_open or webbrowser.open
-                    try:
-                        opener(start.verification_url)
-                    except Exception:
-                        # Inability to open a browser is non-fatal: the URL and
-                        # code were already printed for manual entry.
-                        pass
-                token = pairing.poll_for_token(start)
-            except PairingClientError as exc:
-                raise ProxyCliError(
-                    f"Login failed ({exc.code}); not connected to AgentVeil Console.",
-                    exit_code=1,
-                ) from exc
+            if _acquire_console_credential_via_attach(
+                attach_client=None,
+                open_browser=open_browser,
+                browser_open=browser_open,
+                out=stream,
+                interactive=True,
+            ):
+                pass
+            else:
+                pairing = client or _console_pairing_client()
+                try:
+                    start = pairing.start()
+                    print(
+                        f"To connect, open {start.verification_url} "
+                        f"and enter code {start.user_code}.",
+                        file=stream,
+                    )
+                    if open_browser:
+                        opener = browser_open or webbrowser.open
+                        try:
+                            opener(start.verification_url)
+                        except Exception:
+                            # Inability to open a browser is non-fatal: the URL and
+                            # code were already printed for manual entry.
+                            pass
+                    token = pairing.poll_for_token(start)
+                except PairingClientError as exc:
+                    raise ProxyCliError(
+                        f"Login failed ({exc.code}); not connected to AgentVeil Console.",
+                        exit_code=1,
+                    ) from exc
 
-            try:
-                existing = load_credential()
-            except CredentialError as exc:
-                _revoke_orphan_console_token(pairing, token.token)
-                raise ProxyCliError(
-                    f"Existing Console credential is unreadable ({exc.code}). "
-                    "Run logout or remove it, then retry.",
-                    exit_code=1,
-                ) from exc
-            if existing is not None:
-                _revoke_orphan_console_token(pairing, token.token)
-                print(
-                    "Already connected to AgentVeil Console. Run logout first.",
-                    file=stream,
-                )
-                return 0
+                try:
+                    existing = load_credential()
+                except CredentialError as exc:
+                    _revoke_orphan_console_token(pairing, token.token)
+                    raise ProxyCliError(
+                        f"Existing Console credential is unreadable ({exc.code}). "
+                        "Run logout or remove it, then retry.",
+                        exit_code=1,
+                    ) from exc
+                if existing is not None:
+                    _revoke_orphan_console_token(pairing, token.token)
+                    print(
+                        "Already connected to AgentVeil Console. Run logout first.",
+                        file=stream,
+                    )
+                    return 0
 
-            try:
-                save_credential(token.token, scope=token.scope)
-            except CredentialError as exc:
-                _revoke_orphan_console_token(pairing, token.token)
-                raise ProxyCliError(
-                    f"Login could not store the credential ({exc.code}); not connected.",
-                    exit_code=1,
-                ) from exc
+                try:
+                    save_credential(token.token, scope=token.scope)
+                except CredentialError as exc:
+                    _revoke_orphan_console_token(pairing, token.token)
+                    raise ProxyCliError(
+                        f"Login could not store the credential ({exc.code}); not connected.",
+                        exit_code=1,
+                    ) from exc
     except CredentialError as exc:
         if exc.code == "login_in_progress":
             raise ProxyCliError(
