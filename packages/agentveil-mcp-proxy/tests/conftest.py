@@ -254,6 +254,24 @@ def _block_approval_browser_and_detached_spawn(
 
 
 @pytest.fixture(autouse=True)
+def _disable_console_attach_for_unrelated_tests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep unrelated CLI tests off the real browser-session attach path."""
+
+    from agentveil_mcp_proxy.console_attach_client import AttachClientError
+
+    class _UnavailableAttachClient:
+        def start(self):
+            raise AttachClientError("transport_failed")
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.cli._console_attach_client",
+        _UnavailableAttachClient,
+    )
+
+
+@pytest.fixture(autouse=True)
 def _isolated_cursor_connect_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Isolate Cursor global MCP config and legacy settings cleanup paths."""
 

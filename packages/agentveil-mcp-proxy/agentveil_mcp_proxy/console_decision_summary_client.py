@@ -450,6 +450,8 @@ def _hook_denied_action_family(record: Mapping[str, Any]) -> str | None:
 def reset_hook_denied_upload_dedupe_for_tests() -> None:
     """Clear in-process hook-deny upload dedupe (test isolation only)."""
 
+    if not wait_for_hook_denied_uploads_for_tests():
+        raise RuntimeError("hook_denied_upload_worker_busy")
     with _hook_denied_deduper_lock:
         _hook_denied_seen_event_ids.clear()
         _hook_denied_seen_order.clear()
@@ -688,16 +690,37 @@ def run_hook_denied_upload_worker(
     return 0 if outcome in _HOOK_DENIED_UPLOAD_ACK_STATUSES else 1
 
 
+def _hook_denied_worker_environment(
+    runtime_home: Path | None,
+) -> tuple[dict[str, str], Path | None]:
+    env = dict(os.environ)
+    credential_home: Path | None = None
+    configured_home = env.get("AVP_HOME")
+    if configured_home and runtime_home is not None:
+        if Path(configured_home).expanduser() == runtime_home.expanduser():
+            env.pop("AVP_HOME", None)
+            credential_home = Path("~/.avp").expanduser()
+    return env, credential_home
+
+
 def best_effort_spawn_hook_denied_summary(
     evidence_record: Mapping[str, Any],
     *,
     runtime_home: Path | None = None,
+    load_credential_fn: LoadCredential = load_credential,
 ) -> None:
     """Detach one bounded hook-deny upload so the hook can return immediately."""
 
     try:
         payload = build_hook_denied_decision_summary_payload(evidence_record)
         if payload is None:
+            return
+        env, credential_home = _hook_denied_worker_environment(runtime_home)
+        _, skip = _resolve_credential(
+            home=credential_home,
+            load_credential_fn=load_credential_fn,
+        )
+        if skip is not None:
             return
         encoded = json.dumps(
             payload_to_request_body(payload),
@@ -706,11 +729,6 @@ def best_effort_spawn_hook_denied_summary(
         ).encode("utf-8")
         if len(encoded) > _MAX_HOOK_WORKER_INPUT_BYTES:
             return
-        env = dict(os.environ)
-        configured_home = env.get("AVP_HOME")
-        if configured_home and runtime_home is not None:
-            if Path(configured_home).expanduser() == runtime_home.expanduser():
-                env.pop("AVP_HOME", None)
         process = subprocess.Popen(
             [sys.executable, "-m", __name__, "--hook-denied-upload-worker"],
             stdin=subprocess.PIPE,

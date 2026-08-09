@@ -40,6 +40,22 @@ def test_release_runs_each_full_suite_once_with_actionable_hang_diagnostics() ->
     assert "compatibility-full:" not in tests_text
 
 
+def test_standard_ci_uses_bounded_control_plane_and_compatibility_smoke() -> None:
+    text = TESTS_WORKFLOW.read_text(encoding="utf-8")
+    assert text.count("timeout-minutes: 15") == 1
+    assert text.count("timeout-minutes: 12") == 1
+    assert text.count("--durations=50 --durations-min=1.0") == 1
+    assert text.count("-o faulthandler_timeout=120") == 1
+    assert text.count("--durations=20 --durations-min=0.5") == 2
+    assert text.count("-o faulthandler_timeout=60") == 3
+    assert "Run bounded MCP Proxy control-plane tests" in text
+    assert "Run bounded compatibility smoke" in text
+    assert "python -m pytest -v packages/agentveil-mcp-proxy/tests\n" not in text
+    assert "test_mcp_proxy_console_decision_summary_client.py" in text
+    assert "test_mcp_proxy_console_project_status_client.py" in text
+    assert "test_console_status_replaces_rejected_credential_and_retries" in text
+
+
 def test_publish_uses_bounded_python_os_and_approval_center_jobs() -> None:
     text = _workflow_text()
     assert "full-suite:" in text

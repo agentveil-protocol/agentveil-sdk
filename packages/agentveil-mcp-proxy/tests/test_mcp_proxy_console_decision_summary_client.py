@@ -1178,6 +1178,10 @@ def test_detached_hook_upload_drops_project_avp_home(monkeypatch, tmp_path):
         captured["env"] = kwargs["env"]
         return _Process()
 
+    def _load_credential(**kwargs):
+        captured["credential_home"] = kwargs["home"]
+        return StoredCredential(scope=CREDENTIAL_SCOPE, token=TOKEN)
+
     monkeypatch.setenv("AVP_HOME", str(tmp_path / "project-home"))
     monkeypatch.setattr(
         "agentveil_mcp_proxy.console_decision_summary_client.subprocess.Popen",
@@ -1188,11 +1192,30 @@ def test_detached_hook_upload_drops_project_avp_home(monkeypatch, tmp_path):
     best_effort_spawn_hook_denied_summary(
         _hook_denied_record(),
         runtime_home=runtime_home,
+        load_credential_fn=_load_credential,
     )
 
     assert "AVP_HOME" not in captured["env"]
+    assert captured["credential_home"] == (tmp_path.home() / ".avp")
     assert captured["command"][-1] == "--hook-denied-upload-worker"
     assert captured["closed"] is True
     encoded = captured["input"].decode("utf-8")
     assert "command" not in encoded
     assert "/Users/" not in encoded
+
+
+def test_detached_hook_upload_without_console_credential_spawns_no_process(
+    monkeypatch,
+):
+    popen_calls = []
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_decision_summary_client.subprocess.Popen",
+        lambda *args, **kwargs: popen_calls.append((args, kwargs)),
+    )
+
+    best_effort_spawn_hook_denied_summary(
+        _hook_denied_record(),
+        load_credential_fn=lambda **_kwargs: None,
+    )
+
+    assert popen_calls == []
