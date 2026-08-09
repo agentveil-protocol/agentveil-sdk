@@ -51,6 +51,21 @@ def test_codex_hook_denies_broad_git_add():
     assert decision.hook_action == "deny"
     reason = _deny_reason(out.getvalue())
     assert "write_file" not in reason
+    assert "No controlled MCP route exists for this shell action" in reason
+
+
+def test_codex_hook_denies_destructive_shell_with_hard_block_copy():
+    out = io.StringIO()
+    decision = codex_hook.process_hook(
+        _payload("Bash", {"command": "rm -rf /tmp/workspace"}),
+        out=out,
+    )
+    assert decision.hook_action == "deny"
+    reason = _deny_reason(out.getvalue())
+    assert "bounded security reason" in reason
+    assert "write_file" not in reason
+    assert "controlled MCP tool" not in reason
+    assert "/tmp/workspace" not in reason
 
 
 def test_codex_hook_denies_native_bash_write_with_redirect(tmp_path):

@@ -97,6 +97,52 @@ def test_shell_broad_git_add_denied_without_write_file_redirect(tmp_path: Path) 
     assert decision.hook_action == "deny"
     response = json.loads(out.getvalue())
     assert "write_file" not in response["agent_message"]
+    assert "No controlled MCP route exists for this shell action" in response["agent_message"]
+
+
+def test_non_cursor_server_deny_has_no_native_write_redirect() -> None:
+    from agentveil_mcp_proxy.cursor_hooks import HookDecision, format_cursor_hook_response
+    from agentveil_mcp_proxy.policy import PolicyDecision, PolicyEvaluation, RiskClass, ToolCallContext
+
+    decision = HookDecision(
+        "deny",
+        "risky_blocked",
+        ToolCallContext(
+            server="probe",
+            tool="write_note",
+            action="probe.write_note",
+            risk_class=RiskClass.WRITE,
+            action_family="write",
+        ),
+        PolicyEvaluation(
+            decision=PolicyDecision.APPROVAL,
+            risk_class=RiskClass.WRITE,
+            policy_id="cursor_hook_default",
+            policy_rule_id="cursor-write-approval",
+            policy_context_hash="abc123",
+            matched_rule_ids=("cursor-write-approval",),
+        ),
+    )
+    response = format_cursor_hook_response(decision)
+    assert response["permission"] == "deny"
+    assert "write_file" not in response["agent_message"]
+    assert "controlled MCP tool" not in response["agent_message"]
+    assert "denied write_note" in response["agent_message"]
+
+
+def test_shell_destructive_command_uses_hard_block_copy(tmp_path: Path) -> None:
+    out = StringIO()
+    decision = cursor_hooks.process_hook(
+        {"hook_event": "beforeShellExecution", "command": "rm -rf /tmp/workspace"},
+        workspace=tmp_path,
+        out=out,
+    )
+    assert decision.hook_action == "deny"
+    response = json.loads(out.getvalue())
+    message = response["agent_message"]
+    assert "bounded security reason" in message
+    assert "write_file" not in message
+    assert "controlled MCP tool" not in message
 
 
 def test_shell_readonly_allowed(tmp_path: Path) -> None:

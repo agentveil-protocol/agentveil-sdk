@@ -164,6 +164,20 @@ def test_gemini_hook_denies_broad_git_add_without_write_file_redirect():
     assert decision.hook_action == "deny"
     reason = _deny_reason(out.getvalue())
     assert "write_file" not in reason
+    assert "No controlled MCP route exists for this shell action" in reason
+
+
+def test_gemini_hook_denies_secret_env_with_hard_block_copy():
+    out = io.StringIO()
+    decision = gemini_hook.process_hook(
+        _payload("run_shell_command", {"command": "AWS_SECRET_ACCESS_KEY=x pytest -q t"}),
+        out=out,
+    )
+    assert decision.hook_action == "deny"
+    reason = _deny_reason(out.getvalue())
+    assert "bounded security reason" in reason
+    assert "write_file" not in reason
+    assert "AWS_SECRET_ACCESS_KEY" not in reason
 
 
 def test_gemini_hook_does_not_leak_raw_command_in_evidence(tmp_path):

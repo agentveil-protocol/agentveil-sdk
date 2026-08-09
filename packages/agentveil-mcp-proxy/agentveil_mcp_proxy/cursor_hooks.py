@@ -27,7 +27,7 @@ from agentveil_mcp_proxy.console_decision_summary_client import (
     best_effort_upload_hook_denied_summary,
 )
 from agentveil_mcp_proxy.client_guidance import (
-    NATIVE_FILE_WRITE_REDIRECT_INSTRUCTION as NATIVE_REDIRECT_INSTRUCTION,
+    NATIVE_FILE_WRITE_REDIRECT_INSTRUCTION,
     NativeRedirectOrigin,
     format_native_redirect_agent_surface,
     maybe_register_native_redirect_for_hook_deny,
@@ -42,6 +42,8 @@ from agentveil_mcp_proxy.policy import (
     RiskClass,
     ToolCallContext,
 )
+
+NATIVE_REDIRECT_INSTRUCTION = NATIVE_FILE_WRITE_REDIRECT_INSTRUCTION
 
 CURSOR_SERVER_LABEL = "cursor"
 AGENTVEIL_CONTROLLED_MCP_SERVER = "agentveil-mcp-proxy"
@@ -299,8 +301,7 @@ def format_cursor_hook_response(
     else:
         agent_message = (
             f"agentveil: denied {decision.context.tool} "
-            f"(reason_code={decision.reason_code}). "
-            f"{NATIVE_REDIRECT_INSTRUCTION}"
+            f"(reason_code={decision.reason_code})."
         )
     response: dict[str, Any] = {
         "permission": "deny",

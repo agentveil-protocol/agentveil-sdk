@@ -700,6 +700,10 @@ def test_claude_hook_denies_secret_env_prefixed_pytest() -> None:
     ):
         decision = decide(_payload("Bash", {"command": command}), engine)
         assert decision.hook_action == "deny", command
+        reason = json.loads(format_hook_output(decision))["hookSpecificOutput"]["permissionDecisionReason"]
+        assert "bounded security reason" in reason, command
+        assert "write_file" not in reason, command
+        assert command.split("=", 1)[0] not in reason, command
 
 
 def test_claude_hook_denies_git_checkout_patch_mode() -> None:
