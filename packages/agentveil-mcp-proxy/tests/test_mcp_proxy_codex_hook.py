@@ -259,6 +259,10 @@ def _install_hook_upload_capture(monkeypatch):
 
 
 def test_codex_hook_denied_uploads_bounded_decision_summary(monkeypatch):
+    from agentveil_mcp_proxy.console_decision_summary_client import (
+        wait_for_hook_denied_uploads_for_tests,
+    )
+
     uploads, payload_to_request_body = _install_hook_upload_capture(monkeypatch)
     out = io.StringIO()
     decision = codex_hook.process_hook(
@@ -267,6 +271,7 @@ def test_codex_hook_denied_uploads_bounded_decision_summary(monkeypatch):
     )
 
     assert decision.hook_action == "deny"
+    assert wait_for_hook_denied_uploads_for_tests()
     assert len(uploads) == 1
     assert uploads[0].decision == "denied"
     encoded = json.dumps(payload_to_request_body(uploads[0]))
@@ -290,6 +295,7 @@ def test_codex_hook_allow_does_not_upload_decision_summary(monkeypatch):
 def test_codex_hook_denied_remains_denied_when_upload_fails(monkeypatch):
     from agentveil_mcp_proxy.console_decision_summary_client import (
         DecisionSummaryClientError,
+        wait_for_hook_denied_uploads_for_tests,
     )
 
     def _fail_upload(**kwargs):
@@ -306,4 +312,5 @@ def test_codex_hook_denied_remains_denied_when_upload_fails(monkeypatch):
     )
 
     assert decision.hook_action == "deny"
+    assert wait_for_hook_denied_uploads_for_tests()
     assert _deny_reason(out.getvalue())

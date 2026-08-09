@@ -275,7 +275,10 @@ def test_native_write_deny_without_live_binding_has_no_verified_context(tmp_path
 
 def test_cursor_hook_denied_uploads_bounded_decision_summary(monkeypatch, tmp_path: Path) -> None:
     from agentveil_mcp_proxy.console_credentials import CREDENTIAL_SCOPE, StoredCredential
-    from agentveil_mcp_proxy.console_decision_summary_client import payload_to_request_body
+    from agentveil_mcp_proxy.console_decision_summary_client import (
+        payload_to_request_body,
+        wait_for_hook_denied_uploads_for_tests,
+    )
 
     uploads = []
     monkeypatch.setattr(
@@ -301,6 +304,7 @@ def test_cursor_hook_denied_uploads_bounded_decision_summary(monkeypatch, tmp_pa
     )
 
     assert decision.hook_action == "deny"
+    assert wait_for_hook_denied_uploads_for_tests()
     assert len(uploads) == 1
     encoded = json.dumps(payload_to_request_body(uploads[0]))
     assert "secret" not in encoded

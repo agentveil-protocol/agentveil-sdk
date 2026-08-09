@@ -37,6 +37,7 @@ from agentveil_mcp_proxy.console_decision_summary_client import (
     build_hook_denied_decision_summary_payload,
     payload_to_request_body,
     sync_decision_summary,
+    wait_for_hook_denied_uploads_for_tests,
 )
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore, ApprovalStatus, PendingApproval
 from agentveil_mcp_proxy.policy import (
@@ -959,6 +960,10 @@ def _hook_denied_record(**overrides):
     return record
 
 
+def _wait_hook_denied_uploads() -> None:
+    assert wait_for_hook_denied_uploads_for_tests(timeout=2.0)
+
+
 def test_build_hook_denied_decision_summary_payload_maps_denied_record():
     payload = build_hook_denied_decision_summary_payload(_hook_denied_record())
     assert payload is not None
@@ -1004,7 +1009,9 @@ def test_hook_denied_upload_dedupes_same_event():
 
     record = _hook_denied_record(session_id="dedupe-session")
     best_effort_upload_hook_denied_summary(record, upload_fn=_upload)
+    _wait_hook_denied_uploads()
     best_effort_upload_hook_denied_summary(record, upload_fn=_upload)
+    _wait_hook_denied_uploads()
     assert len(calls) == 1
 
 
@@ -1017,7 +1024,9 @@ def test_hook_denied_upload_dedupes_after_duplicate_ack():
 
     record = _hook_denied_record(session_id="duplicate-ack-session")
     best_effort_upload_hook_denied_summary(record, upload_fn=_upload)
+    _wait_hook_denied_uploads()
     best_effort_upload_hook_denied_summary(record, upload_fn=_upload)
+    _wait_hook_denied_uploads()
     assert len(calls) == 1
 
 
@@ -1031,8 +1040,11 @@ def test_hook_denied_upload_retries_after_transient_failure():
 
     record = _hook_denied_record(session_id="retry-unavailable-session")
     best_effort_upload_hook_denied_summary(record, upload_fn=_upload)
+    _wait_hook_denied_uploads()
     best_effort_upload_hook_denied_summary(record, upload_fn=_upload)
+    _wait_hook_denied_uploads()
     best_effort_upload_hook_denied_summary(record, upload_fn=_upload)
+    _wait_hook_denied_uploads()
     assert len(calls) == 2
 
 
@@ -1047,8 +1059,11 @@ def test_hook_denied_upload_retries_after_exception():
 
     record = _hook_denied_record(session_id="retry-exception-session")
     best_effort_upload_hook_denied_summary(record, upload_fn=_upload)
+    _wait_hook_denied_uploads()
     best_effort_upload_hook_denied_summary(record, upload_fn=_upload)
+    _wait_hook_denied_uploads()
     best_effort_upload_hook_denied_summary(record, upload_fn=_upload)
+    _wait_hook_denied_uploads()
     assert len(calls) == 2
 
 
@@ -1063,7 +1078,27 @@ def test_hook_denied_upload_does_not_cache_rejected_or_skipped():
     record = _hook_denied_record(session_id="retry-rejected-session")
     for _ in range(4):
         best_effort_upload_hook_denied_summary(record, upload_fn=_upload)
+        _wait_hook_denied_uploads()
     assert len(calls) == 3
+
+
+def test_hook_denied_upload_returns_without_waiting_for_slow_upload():
+    release = threading.Event()
+    calls: list[str] = []
+
+    def _upload(payload, **kwargs):
+        calls.append(payload.event_id)
+        release.wait(timeout=1.0)
+        return "accepted"
+
+    record = _hook_denied_record(session_id="slow-upload-session")
+    started = time.monotonic()
+    best_effort_upload_hook_denied_summary(record, upload_fn=_upload)
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.1
+    release.set()
+    _wait_hook_denied_uploads()
+    assert len(calls) == 1
 
 
 def test_hook_denied_request_body_has_no_raw_command_or_path():

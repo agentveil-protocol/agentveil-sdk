@@ -968,7 +968,10 @@ def test_claude_native_write_without_live_binding_has_no_verified_context(tmp_pa
 
 def test_claude_hook_denied_uploads_bounded_decision_summary(monkeypatch):
     from agentveil_mcp_proxy.console_credentials import CREDENTIAL_SCOPE, StoredCredential
-    from agentveil_mcp_proxy.console_decision_summary_client import payload_to_request_body
+    from agentveil_mcp_proxy.console_decision_summary_client import (
+        payload_to_request_body,
+        wait_for_hook_denied_uploads_for_tests,
+    )
 
     uploads = []
     monkeypatch.setattr(
@@ -989,6 +992,7 @@ def test_claude_hook_denied_uploads_bounded_decision_summary(monkeypatch):
     )
 
     assert decision.hook_action == "deny"
+    assert wait_for_hook_denied_uploads_for_tests()
     assert len(uploads) == 1
     encoded = json.dumps(payload_to_request_body(uploads[0]))
     assert "SECRET" not in encoded
