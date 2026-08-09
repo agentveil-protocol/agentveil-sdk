@@ -6,6 +6,8 @@ import json
 from io import StringIO
 from pathlib import Path
 
+import pytest
+
 from agentveil_mcp_proxy import cursor_hooks
 from agentveil_mcp_proxy.client_guidance import (
     parse_redirect_context_from_cursor_hook_output,
@@ -15,6 +17,15 @@ from redirect_hook_contract_fixtures import (
     init_redirect_contract_home,
     publish_live_hook_binding,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_hook_denied_upload_dedupe() -> None:
+    from agentveil_mcp_proxy.console_decision_summary_client import (
+        reset_hook_denied_upload_dedupe_for_tests,
+    )
+
+    reset_hook_denied_upload_dedupe_for_tests()
 
 
 def test_native_write_denied_with_generic_redirect(tmp_path: Path) -> None:
@@ -214,3 +225,37 @@ def test_native_write_deny_without_live_binding_has_no_verified_context(tmp_path
     )
     payload = json.loads(out.getvalue())
     assert parse_redirect_context_from_cursor_hook_output(payload) is None
+
+
+def test_cursor_hook_denied_uploads_bounded_decision_summary(monkeypatch, tmp_path: Path) -> None:
+    from agentveil_mcp_proxy.console_credentials import CREDENTIAL_SCOPE, StoredCredential
+    from agentveil_mcp_proxy.console_decision_summary_client import payload_to_request_body
+
+    uploads = []
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_decision_summary_client.load_credential",
+        lambda home=None: StoredCredential(
+            scope=CREDENTIAL_SCOPE,
+            token="hook-upload-token-secret",
+        ),
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_decision_summary_client.sync_decision_summary",
+        lambda payload, **kwargs: uploads.append(payload) or "accepted",
+    )
+    out = StringIO()
+    decision = cursor_hooks.process_hook(
+        {
+            "hook_event": "preToolUse",
+            "tool_name": "Write",
+            "tool_input": {"path": "foo.txt", "contents": "secret"},
+        },
+        workspace=tmp_path,
+        out=out,
+    )
+
+    assert decision.hook_action == "deny"
+    assert len(uploads) == 1
+    encoded = json.dumps(payload_to_request_body(uploads[0]))
+    assert "secret" not in encoded
+    assert "foo.txt" not in encoded

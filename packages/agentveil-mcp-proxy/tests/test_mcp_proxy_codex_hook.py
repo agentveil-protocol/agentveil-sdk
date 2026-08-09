@@ -5,7 +5,18 @@ from __future__ import annotations
 import io
 import json
 
+import pytest
+
 from agentveil_mcp_proxy import codex_hook
+
+
+@pytest.fixture(autouse=True)
+def _reset_hook_denied_upload_dedupe() -> None:
+    from agentveil_mcp_proxy.console_decision_summary_client import (
+        reset_hook_denied_upload_dedupe_for_tests,
+    )
+
+    reset_hook_denied_upload_dedupe_for_tests()
 
 
 def _payload(tool_name: str, tool_input: dict | None = None) -> dict:
@@ -207,3 +218,77 @@ def test_codex_native_write_without_live_binding_has_no_verified_context(tmp_pat
     )
     payload = json.loads(out.getvalue())
     assert parse_redirect_context_from_codex_hook_output(payload) is None
+
+
+def _install_hook_upload_capture(monkeypatch):
+    from agentveil_mcp_proxy.console_credentials import CREDENTIAL_SCOPE, StoredCredential
+    from agentveil_mcp_proxy.console_decision_summary_client import (
+        DecisionSummaryPayload,
+        payload_to_request_body,
+    )
+
+    uploads: list[DecisionSummaryPayload] = []
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_decision_summary_client.load_credential",
+        lambda home=None: StoredCredential(
+            scope=CREDENTIAL_SCOPE,
+            token="hook-upload-token-secret",
+        ),
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_decision_summary_client.sync_decision_summary",
+        lambda payload, **kwargs: uploads.append(payload) or "accepted",
+    )
+    return uploads, payload_to_request_body
+
+
+def test_codex_hook_denied_uploads_bounded_decision_summary(monkeypatch):
+    uploads, payload_to_request_body = _install_hook_upload_capture(monkeypatch)
+    out = io.StringIO()
+    decision = codex_hook.process_hook(
+        _payload("Bash", {"command": "git add ."}),
+        out=out,
+    )
+
+    assert decision.hook_action == "deny"
+    assert len(uploads) == 1
+    assert uploads[0].decision == "denied"
+    encoded = json.dumps(payload_to_request_body(uploads[0]))
+    assert "git add ." not in encoded
+    assert "/private/customer/workspace" not in encoded
+    assert "hook-upload-token-secret" not in encoded
+
+
+def test_codex_hook_allow_does_not_upload_decision_summary(monkeypatch):
+    uploads, _payload_to_request_body = _install_hook_upload_capture(monkeypatch)
+    out = io.StringIO()
+    decision = codex_hook.process_hook(
+        _payload("Bash", {"command": "git status --short"}),
+        out=out,
+    )
+
+    assert decision.hook_action == "allow"
+    assert uploads == []
+
+
+def test_codex_hook_denied_remains_denied_when_upload_fails(monkeypatch):
+    from agentveil_mcp_proxy.console_decision_summary_client import (
+        DecisionSummaryClientError,
+    )
+
+    def _fail_upload(**kwargs):
+        raise DecisionSummaryClientError("transport_failed")
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_decision_summary_client.sync_decision_summary",
+        _fail_upload,
+    )
+    out = io.StringIO()
+    decision = codex_hook.process_hook(
+        _payload("Bash", {"command": "git add ."}),
+        out=out,
+    )
+
+    assert decision.hook_action == "deny"
+    assert _deny_reason(out.getvalue())

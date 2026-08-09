@@ -5,7 +5,18 @@ from __future__ import annotations
 import io
 import json
 
+import pytest
+
 from agentveil_mcp_proxy import gemini_hook
+
+
+@pytest.fixture(autouse=True)
+def _reset_hook_denied_upload_dedupe() -> None:
+    from agentveil_mcp_proxy.console_decision_summary_client import (
+        reset_hook_denied_upload_dedupe_for_tests,
+    )
+
+    reset_hook_denied_upload_dedupe_for_tests()
 
 
 def _payload(tool_name: str, tool_input: dict | None = None) -> dict:
@@ -223,3 +234,32 @@ def test_gemini_native_write_file_without_live_binding_has_no_verified_context(t
     )
     payload = json.loads(out.getvalue())
     assert parse_redirect_context_from_gemini_hook_output(payload) is None
+
+
+def test_gemini_hook_denied_uploads_bounded_decision_summary(monkeypatch):
+    from agentveil_mcp_proxy.console_credentials import CREDENTIAL_SCOPE, StoredCredential
+    from agentveil_mcp_proxy.console_decision_summary_client import payload_to_request_body
+
+    uploads = []
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_decision_summary_client.load_credential",
+        lambda home=None: StoredCredential(
+            scope=CREDENTIAL_SCOPE,
+            token="hook-upload-token-secret",
+        ),
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_decision_summary_client.sync_decision_summary",
+        lambda payload, **kwargs: uploads.append(payload) or "accepted",
+    )
+    out = io.StringIO()
+    decision = gemini_hook.process_hook(
+        _payload("write_file", {"path": "owned.txt", "content": "SECRET_CONTENT"}),
+        out=out,
+    )
+
+    assert decision.hook_action == "deny"
+    assert len(uploads) == 1
+    encoded = json.dumps(payload_to_request_body(uploads[0]))
+    assert "SECRET_CONTENT" not in encoded
+    assert "owned.txt" not in encoded

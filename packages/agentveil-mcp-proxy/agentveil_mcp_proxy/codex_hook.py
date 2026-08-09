@@ -27,6 +27,9 @@ from agentveil_mcp_proxy.claude_hook import (
     _classify_bash,
     _split_mcp_tool_name,
 )
+from agentveil_mcp_proxy.console_decision_summary_client import (
+    best_effort_upload_hook_denied_summary,
+)
 from agentveil_mcp_proxy.client_guidance import (
     NativeRedirectOrigin,
     format_native_redirect_agent_surface,
@@ -305,8 +308,11 @@ def process_hook(
 ) -> HookDecision:
     engine = PolicyEngine(config or default_proxy_config_for_hook())
     decision = decide(payload, engine)
+    record = build_evidence_record(payload, decision)
     if evidence_path is not None:
-        write_evidence(build_evidence_record(payload, decision), evidence_path)
+        write_evidence(record, evidence_path)
+    if decision.hook_action == "deny":
+        best_effort_upload_hook_denied_summary(record, home=home)
     redirect_origin = maybe_register_native_redirect_for_hook_deny(
         hook_action=decision.hook_action,
         native_server=decision.context.server,
