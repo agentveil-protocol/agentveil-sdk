@@ -71,7 +71,7 @@ def test_proxy_package_depends_on_public_sdk():
         pyproject = tomllib.load(f)
 
     dependencies = pyproject["project"].get("dependencies", [])
-    assert pyproject["project"]["version"] == "0.7.38"
+    assert pyproject["project"]["version"] == "0.7.39"
     assert "agentveil>=0.7.23,<0.8" in dependencies
     assert "cryptography>=42.0.0" in dependencies
     assert "mcp>=1.0.0,<2" in dependencies
