@@ -748,7 +748,13 @@ _GENERIC_SECRET_PATH_FILENAMES: frozenset[str] = frozenset({
     "tokens",
 })
 
-_SECRET_PATH_SEGMENTS: frozenset[str] = frozenset({"secrets", ".ssh", ".aws", ".gnupg"})
+_SECRET_PATH_SEGMENTS: frozenset[str] = frozenset({".ssh", ".aws", ".gnupg"})
+_GENERIC_SECRET_PATH_SEGMENTS: frozenset[str] = frozenset({
+    "secret",
+    "secrets",
+    "token",
+    "tokens",
+})
 _SECRET_PATH_PREFIXES: tuple[str, ...] = (
     ".env.",
     "credentials.",
@@ -849,6 +855,9 @@ def _path_token_is_secret(path_token: str) -> bool:
         return False
     if any(segment in _SECRET_PATH_SEGMENTS for segment in segments):
         return True
+    if any(segment in _GENERIC_SECRET_PATH_SEGMENTS for segment in segments):
+        if path_like and (len(segments) > 1 or normalized.startswith((".", "~", "/"))):
+            return True
     basename = segments[-1]
     if basename in _SECRET_PATH_FILENAMES:
         return True

@@ -663,6 +663,8 @@ def test_classify_native_shell_git_message_and_review_args_allowed(command: str)
     "command",
     [
         "rg token app.py",
+        "rg secrets",
+        "ls secrets",
         "grep secret app.py",
         "echo secret",
     ],
@@ -678,6 +680,8 @@ def test_classify_native_shell_plain_search_terms_are_not_secret_paths(command: 
     [
         "cat .env",
         "cat ~/.ssh/id_rsa",
+        "cat ./secrets",
+        "cat secrets/api.key",
         "grep token .env",
         "rg secret ~/.aws/credentials",
     ],
