@@ -7,10 +7,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import queue
 import re
 import socket
 import ssl
+import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -42,6 +45,7 @@ _DEFAULT_QUEUE_CAPACITY = 256
 _MAX_DEDUP_KEYS = 4096
 _SHUTDOWN_JOIN_TIMEOUT_SECONDS = _REQUEST_TIMEOUT_SECONDS + 0.25
 _HOOK_DENIED_UPLOAD_QUEUE_CAPACITY = 256
+_MAX_HOOK_WORKER_INPUT_BYTES = 4096
 
 _DECISION_ALLOWED = "allowed"
 _DECISION_DENIED = "denied"
@@ -446,6 +450,8 @@ def _hook_denied_action_family(record: Mapping[str, Any]) -> str | None:
 def reset_hook_denied_upload_dedupe_for_tests() -> None:
     """Clear in-process hook-deny upload dedupe (test isolation only)."""
 
+    if not wait_for_hook_denied_uploads_for_tests():
+        raise RuntimeError("hook_denied_upload_worker_busy")
     with _hook_denied_deduper_lock:
         _hook_denied_seen_event_ids.clear()
         _hook_denied_seen_order.clear()
@@ -610,6 +616,131 @@ def best_effort_upload_hook_denied_summary(
     except queue.Full:
         if "payload" in locals():
             _clear_hook_denied_event_pending(payload.event_id)
+    except Exception:
+        return
+
+
+def _hook_worker_payload_from_body(body: Mapping[str, Any]) -> DecisionSummaryPayload:
+    expected = {
+        "schema_version",
+        "event_id",
+        "action_family",
+        "decision",
+        "occurred_at",
+        "target_reached",
+        "proof_status",
+        "idempotency_key",
+    }
+    if set(body) != expected:
+        raise DecisionSummaryClientError("invalid_worker_payload")
+    event_id = _validate_event_id(body.get("event_id"))
+    idempotency_key = _validate_idempotency_key(body.get("idempotency_key"))
+    action_family = body.get("action_family")
+    if event_id is None or idempotency_key != event_id:
+        raise DecisionSummaryClientError("invalid_worker_payload")
+    if action_family not in _ACTION_FAMILIES:
+        raise DecisionSummaryClientError("invalid_worker_payload")
+    if body.get("schema_version") != _SCHEMA_VERSION:
+        raise DecisionSummaryClientError("invalid_worker_payload")
+    if body.get("decision") != _DECISION_DENIED:
+        raise DecisionSummaryClientError("invalid_worker_payload")
+    if body.get("target_reached") is not False:
+        raise DecisionSummaryClientError("invalid_worker_payload")
+    if body.get("proof_status") != _PROOF_UNAVAILABLE:
+        raise DecisionSummaryClientError("invalid_worker_payload")
+    occurred_at = body.get("occurred_at")
+    if not isinstance(occurred_at, str):
+        raise DecisionSummaryClientError("invalid_worker_payload")
+    canonical_occurred_at = _canonical_occurred_at(_parse_rfc3339_utc(occurred_at))
+    if canonical_occurred_at != occurred_at:
+        raise DecisionSummaryClientError("invalid_worker_payload")
+    return DecisionSummaryPayload(
+        schema_version=_SCHEMA_VERSION,
+        event_id=event_id,
+        action_family=action_family,
+        decision=_DECISION_DENIED,
+        occurred_at=occurred_at,
+        target_reached=False,
+        proof_status=_PROOF_UNAVAILABLE,
+        proof_hash=None,
+        idempotency_key=idempotency_key,
+    )
+
+
+def run_hook_denied_upload_worker(
+    *,
+    stdin: Any = None,
+    upload_fn: UploadSummary | None = None,
+) -> int:
+    """Consume one bounded summary from stdin and upload it synchronously."""
+
+    source = stdin or sys.stdin.buffer
+    try:
+        raw = source.read(_MAX_HOOK_WORKER_INPUT_BYTES + 1)
+        if not isinstance(raw, bytes) or len(raw) > _MAX_HOOK_WORKER_INPUT_BYTES:
+            return 2
+        decoded = json.loads(raw.decode("utf-8"))
+        if not isinstance(decoded, Mapping):
+            return 2
+        payload = _hook_worker_payload_from_body(decoded)
+        uploader = upload_fn or sync_decision_summary
+        outcome = uploader(payload)
+    except Exception:
+        return 2
+    return 0 if outcome in _HOOK_DENIED_UPLOAD_ACK_STATUSES else 1
+
+
+def _hook_denied_worker_environment(
+    runtime_home: Path | None,
+) -> tuple[dict[str, str], Path | None]:
+    env = dict(os.environ)
+    credential_home: Path | None = None
+    configured_home = env.get("AVP_HOME")
+    if configured_home and runtime_home is not None:
+        if Path(configured_home).expanduser() == runtime_home.expanduser():
+            env.pop("AVP_HOME", None)
+            credential_home = Path("~/.avp").expanduser()
+    return env, credential_home
+
+
+def best_effort_spawn_hook_denied_summary(
+    evidence_record: Mapping[str, Any],
+    *,
+    runtime_home: Path | None = None,
+    load_credential_fn: LoadCredential = load_credential,
+) -> None:
+    """Detach one bounded hook-deny upload so the hook can return immediately."""
+
+    try:
+        payload = build_hook_denied_decision_summary_payload(evidence_record)
+        if payload is None:
+            return
+        env, credential_home = _hook_denied_worker_environment(runtime_home)
+        _, skip = _resolve_credential(
+            home=credential_home,
+            load_credential_fn=load_credential_fn,
+        )
+        if skip is not None:
+            return
+        encoded = json.dumps(
+            payload_to_request_body(payload),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) > _MAX_HOOK_WORKER_INPUT_BYTES:
+            return
+        process = subprocess.Popen(
+            [sys.executable, "-m", __name__, "--hook-denied-upload-worker"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            start_new_session=True,
+        )
+        assert process.stdin is not None
+        process.stdin.write(encoded)
+        process.stdin.close()
+        threading.Thread(target=process.wait, daemon=True).start()
     except Exception:
         return
 
@@ -907,11 +1038,19 @@ __all__ = [
     "Transport",
     "TransportError",
     "attach_terminal_evidence_observer",
+    "best_effort_spawn_hook_denied_summary",
     "best_effort_upload_hook_denied_summary",
     "build_decision_summary_payload",
     "build_hook_denied_decision_summary_payload",
     "payload_to_request_body",
     "reset_hook_denied_upload_dedupe_for_tests",
+    "run_hook_denied_upload_worker",
     "sync_decision_summary",
     "wait_for_hook_denied_uploads_for_tests",
 ]
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--hook-denied-upload-worker"]:
+        raise SystemExit(run_hook_denied_upload_worker())
+    raise SystemExit(2)

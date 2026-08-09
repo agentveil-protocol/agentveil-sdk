@@ -4499,6 +4499,38 @@ def test_console_setup_succeeds_when_attach_unavailable(
     assert "transport_failed" not in err
 
 
+def test_console_status_replaces_rejected_credential_and_retries(monkeypatch):
+    attach_calls: list[bool] = []
+    delete_calls: list[bool] = []
+    sync_results = iter(["credential_rejected", "accepted"])
+    sync_calls: list[dict] = []
+
+    monkeypatch.setattr(
+        proxy_cli,
+        "_best_effort_console_attach_credential",
+        lambda: attach_calls.append(True),
+    )
+    monkeypatch.setattr(
+        proxy_cli,
+        "delete_credential",
+        lambda: delete_calls.append(True) or True,
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_project_status_client.sync_project_status",
+        lambda **kwargs: sync_calls.append(kwargs) or next(sync_results),
+    )
+
+    proxy_cli._best_effort_console_project_status_sync(
+        connector="codex",
+        connector_status={"status": "protected", "route_launch_proved": False},
+        project_dir=Path("/tmp/project"),
+    )
+
+    assert attach_calls == [True, True]
+    assert delete_calls == [True]
+    assert len(sync_calls) == 2
+
+
 @pytest.mark.parametrize(
     ("client", "setup_argv", "status_argv", "connector"),
     [

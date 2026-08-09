@@ -28,6 +28,7 @@ from agentveil_mcp_proxy.claude_hook import (
     _split_mcp_tool_name,
 )
 from agentveil_mcp_proxy.console_decision_summary_client import (
+    best_effort_spawn_hook_denied_summary,
     best_effort_upload_hook_denied_summary,
 )
 from agentveil_mcp_proxy.client_guidance import (
@@ -305,6 +306,7 @@ def process_hook(
     evidence_path: Path | None = None,
     home: Path | None = None,
     out: Any = None,
+    detached_upload: bool = False,
 ) -> HookDecision:
     engine = PolicyEngine(config or default_proxy_config_for_hook())
     decision = decide(payload, engine)
@@ -312,7 +314,10 @@ def process_hook(
     if evidence_path is not None:
         write_evidence(record, evidence_path)
     if decision.hook_action == "deny":
-        best_effort_upload_hook_denied_summary(record, home=home)
+        if detached_upload:
+            best_effort_spawn_hook_denied_summary(record, runtime_home=home)
+        else:
+            best_effort_upload_hook_denied_summary(record, home=home)
     redirect_origin = maybe_register_native_redirect_for_hook_deny(
         hook_action=decision.hook_action,
         native_server=decision.context.server,
@@ -347,7 +352,13 @@ def main(argv: list[str] | None = None, *, stdin: Any = None, stdout: Any = None
     evidence_path = Path(args.evidence_path) if args.evidence_path else None
     home_arg = args.home or os.environ.get("AGENTVEIL_HOME")
     home = Path(home_arg).expanduser() if isinstance(home_arg, str) and home_arg.strip() else None
-    process_hook(payload, evidence_path=evidence_path, home=home, out=stdout if stdout is not None else sys.stdout)
+    process_hook(
+        payload,
+        evidence_path=evidence_path,
+        home=home,
+        out=stdout if stdout is not None else sys.stdout,
+        detached_upload=True,
+    )
     return 0
 
 

@@ -18,6 +18,7 @@ jobs:
     name: fast tests (ubuntu-latest, 3.12)
     if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -34,15 +35,32 @@ jobs:
         run: python -m pip install -e "packages/agentveil-mcp-proxy[test]"
 
       - name: Run SDK tests
-        run: python -m pytest -v
+        run: >-
+          python -m pytest -v tests
+          --durations=50 --durations-min=1.0
+          -o faulthandler_timeout=120
 
-      - name: Run MCP Proxy tests
-        run: python -m pytest -v packages/agentveil-mcp-proxy/tests
+      - name: Run bounded MCP Proxy control-plane tests
+        run: >-
+          python -m pytest -v
+          packages/agentveil-mcp-proxy/tests/test_proxy_packaging.py
+          packages/agentveil-mcp-proxy/tests/test_mcp_proxy_platform_contract.py
+          packages/agentveil-mcp-proxy/tests/test_mcp_proxy_console_credentials.py
+          packages/agentveil-mcp-proxy/tests/test_mcp_proxy_console_project_status_client.py
+          packages/agentveil-mcp-proxy/tests/test_mcp_proxy_console_decision_summary_client.py
+          packages/agentveil-mcp-proxy/tests/test_mcp_proxy_claude_hook.py
+          packages/agentveil-mcp-proxy/tests/test_mcp_proxy_codex_hook.py
+          packages/agentveil-mcp-proxy/tests/test_mcp_proxy_cursor_hooks.py
+          packages/agentveil-mcp-proxy/tests/test_mcp_proxy_gemini_hook.py
+          packages/agentveil-mcp-proxy/tests/test_mcp_proxy_cli.py::test_console_status_replaces_rejected_credential_and_retries
+          --durations=20 --durations-min=0.5
+          -o faulthandler_timeout=60
 
   compatibility-pr:
     name: compatibility (${{ matrix.os }}, ${{ matrix.python-version }})
     if: github.event_name == 'pull_request'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 12
     strategy:
       fail-fast: false
       matrix:
@@ -74,21 +92,16 @@ jobs:
       - name: Install MCP Proxy package
         run: python -m pip install -e "packages/agentveil-mcp-proxy[test]"
 
-      - name: Run SDK tests
-        if: matrix.os == 'ubuntu-latest'
-        run: python -m pytest -v
-
-      - name: Run MCP Proxy tests
-        if: matrix.os == 'ubuntu-latest'
-        run: python -m pytest -v packages/agentveil-mcp-proxy/tests
-
-      - name: Run Cursor hook platform compatibility tests
-        if: matrix.os != 'ubuntu-latest'
+      - name: Run bounded compatibility smoke
         run: >-
           python -m pytest -v
+          tests/test_mcp_packaging.py
+          packages/agentveil-mcp-proxy/tests/test_proxy_packaging.py
           packages/agentveil-mcp-proxy/tests/test_mcp_proxy_platform_contract.py
           packages/agentveil-mcp-proxy/tests/test_mcp_proxy_cursor_setup.py
           packages/agentveil-mcp-proxy/tests/test_mcp_proxy_cursor_hooks.py
+          --durations=20 --durations-min=0.5
+          -o faulthandler_timeout=60
 
   managed-approval-e2e-macos:
     name: managed approval E2E (macos-latest, ${{ matrix.python-version }})

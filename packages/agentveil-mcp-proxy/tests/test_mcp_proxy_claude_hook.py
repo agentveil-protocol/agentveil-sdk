@@ -846,13 +846,19 @@ def test_process_hook_allow_writes_evidence_but_no_output(tmp_path: Path) -> Non
 def test_main_reads_stdin_and_writes_stdout(tmp_path: Path, monkeypatch) -> None:
     payload = _payload("Write", {"file_path": "/tmp/x", "content": "y"})
     evidence = tmp_path / "decisions.jsonl"
+    detached_uploads = []
     monkeypatch.setenv("AGENTVEIL_HOOK_EVIDENCE_PATH", str(evidence))
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.claude_hook.best_effort_spawn_hook_denied_summary",
+        lambda record, **kwargs: detached_uploads.append((record, kwargs)),
+    )
     in_stream = io.StringIO(json.dumps(payload))
     out_stream = io.StringIO()
     rc = main(stdin=in_stream, stdout=out_stream)
     assert rc == 0
     assert "permissionDecision" in out_stream.getvalue()
     assert evidence.read_text(encoding="utf-8").strip() != ""
+    assert len(detached_uploads) == 1
 
 
 def test_main_rejects_non_object_payload() -> None:
@@ -863,12 +869,16 @@ def test_main_rejects_non_object_payload() -> None:
     assert out_stream.getvalue() == ""
 
 
-def test_main_evidence_path_arg_writes_evidence(tmp_path: Path) -> None:
+def test_main_evidence_path_arg_writes_evidence(tmp_path: Path, monkeypatch) -> None:
     """S2 wiring: the installed hook command passes --evidence-path."""
     payload = _payload("Write", {"file_path": "/tmp/x", "content": "y"})
     evidence = tmp_path / "agentveil" / "evidence.jsonl"
     in_stream = io.StringIO(json.dumps(payload))
     out_stream = io.StringIO()
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.claude_hook.best_effort_spawn_hook_denied_summary",
+        lambda *_args, **_kwargs: None,
+    )
     rc = main(["--evidence-path", str(evidence)], stdin=in_stream, stdout=out_stream)
     assert rc == 0
     assert "permissionDecision" in out_stream.getvalue()
