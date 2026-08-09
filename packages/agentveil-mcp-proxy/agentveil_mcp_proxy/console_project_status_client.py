@@ -420,6 +420,8 @@ def _decode_response_object(
     *,
     request: ProjectStatusSummary,
 ) -> None:
+    if response.status in {401, 403}:
+        raise ProjectStatusClientError("credential_rejected")
     if response.status != 200:
         raise ProjectStatusClientError("unexpected_status")
     if len(response.content_types) != 1:
@@ -571,6 +573,8 @@ def sync_project_status(
         assert credential is not None
         client.upload(summary, bearer_token=credential.token)
     except ProjectStatusClientError as exc:
+        if exc.code == "credential_rejected":
+            return "credential_rejected"
         if exc.code in {"transport_failed", "unexpected_status"}:
             return "unavailable"
         return "rejected"

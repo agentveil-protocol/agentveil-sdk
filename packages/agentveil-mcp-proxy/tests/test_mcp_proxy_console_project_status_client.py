@@ -215,6 +215,28 @@ def test_sync_without_credential_makes_zero_transport_calls():
     assert discovery_calls == []
 
 
+@pytest.mark.parametrize("status", [401, 403])
+def test_sync_reports_rejected_console_credential(status):
+    transport = FakeTransport([
+        RawResponse(
+            status=status,
+            content_types=("application/json",),
+            body=b'{}',
+        )
+    ])
+
+    result = sync_project_status(
+        connector="codex",
+        connector_status=_advisory_status(),
+        project_dir=Path("/tmp/project"),
+        load_credential_fn=_load_credential_ok,
+        discover_paid_provider_fn=_discover(absent_provider_snapshot()),
+        transport=transport,
+    )
+
+    assert result == "credential_rejected"
+
+
 def test_sync_with_unsafe_credential_makes_zero_transport_calls():
     transport = BackendEchoTransport()
     discovery_calls = []
@@ -297,8 +319,19 @@ def test_invalid_observed_at_rejected(observed_at):
         )
 
 
-@pytest.mark.parametrize("status_code", [301, 401, 403, 404, 409, 429, 500])
-def test_http_failures_return_bounded_outcome(status_code):
+@pytest.mark.parametrize(
+    ("status_code", "expected"),
+    [
+        (301, "unavailable"),
+        (401, "credential_rejected"),
+        (403, "credential_rejected"),
+        (404, "unavailable"),
+        (409, "unavailable"),
+        (429, "unavailable"),
+        (500, "unavailable"),
+    ],
+)
+def test_http_failures_return_bounded_outcome(status_code, expected):
     transport = FakeTransport([
         lambda body: _json_response(
             status_code,
@@ -312,7 +345,7 @@ def test_http_failures_return_bounded_outcome(status_code):
         load_credential_fn=_load_credential_ok,
         transport=transport,
     )
-    assert result == "unavailable"
+    assert result == expected
 
 
 def test_transport_error_returns_unavailable():

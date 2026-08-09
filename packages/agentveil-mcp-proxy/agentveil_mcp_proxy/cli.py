@@ -1670,11 +1670,29 @@ def _best_effort_console_project_status_sync(
     connector_status: Mapping[str, Any],
     project_dir: Path,
 ) -> None:
-    """Upload bounded project status when a Console credential is present."""
+    """Upload status, repairing one rejected Console credential via attach."""
 
     from agentveil_mcp_proxy import __version__ as package_version
     from agentveil_mcp_proxy.console_project_status_client import sync_project_status
 
+    _best_effort_console_attach_credential()
+    try:
+        result = sync_project_status(
+            connector=connector,
+            connector_status=connector_status,
+            project_dir=project_dir,
+            package_version=package_version,
+            load_credential_fn=load_credential,
+        )
+    except Exception:
+        return
+    if result != "credential_rejected":
+        return
+    try:
+        if not delete_credential():
+            return
+    except CredentialError:
+        return
     _best_effort_console_attach_credential()
     try:
         sync_project_status(

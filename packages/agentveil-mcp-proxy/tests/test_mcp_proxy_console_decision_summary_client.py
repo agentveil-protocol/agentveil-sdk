@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import queue
 import threading
@@ -32,10 +33,12 @@ from agentveil_mcp_proxy.console_decision_summary_client import (
     _REQUEST_TIMEOUT_SECONDS,
     _SHUTDOWN_JOIN_TIMEOUT_SECONDS,
     attach_terminal_evidence_observer,
+    best_effort_spawn_hook_denied_summary,
     best_effort_upload_hook_denied_summary,
     build_decision_summary_payload,
     build_hook_denied_decision_summary_payload,
     payload_to_request_body,
+    run_hook_denied_upload_worker,
     sync_decision_summary,
     wait_for_hook_denied_uploads_for_tests,
 )
@@ -1122,3 +1125,74 @@ def test_hook_denied_request_body_has_no_raw_command_or_path():
         "deadbeefdeadbeef",
     ):
         assert forbidden not in encoded
+
+
+def test_hook_denied_worker_uploads_only_bounded_summary():
+    payload = build_hook_denied_decision_summary_payload(_hook_denied_record())
+    assert payload is not None
+    encoded = json.dumps(payload_to_request_body(payload)).encode("utf-8")
+    uploads = []
+
+    result = run_hook_denied_upload_worker(
+        stdin=io.BytesIO(encoded),
+        upload_fn=lambda item: uploads.append(item) or "accepted",
+    )
+
+    assert result == 0
+    assert uploads == [payload]
+
+
+def test_hook_denied_worker_rejects_extra_raw_fields():
+    payload = build_hook_denied_decision_summary_payload(_hook_denied_record())
+    assert payload is not None
+    body = payload_to_request_body(payload)
+    body["command"] = "SECRET raw command"
+
+    assert (
+        run_hook_denied_upload_worker(
+            stdin=io.BytesIO(json.dumps(body).encode("utf-8")),
+            upload_fn=lambda _item: "accepted",
+        )
+        == 2
+    )
+
+
+def test_detached_hook_upload_drops_project_avp_home(monkeypatch, tmp_path):
+    captured = {}
+
+    class _Stdin:
+        def write(self, value):
+            captured["input"] = value
+
+        def close(self):
+            captured["closed"] = True
+
+    class _Process:
+        stdin = _Stdin()
+
+        def wait(self):
+            return 0
+
+    def _popen(command, **kwargs):
+        captured["command"] = command
+        captured["env"] = kwargs["env"]
+        return _Process()
+
+    monkeypatch.setenv("AVP_HOME", str(tmp_path / "project-home"))
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_decision_summary_client.subprocess.Popen",
+        _popen,
+    )
+
+    runtime_home = tmp_path / "project-home"
+    best_effort_spawn_hook_denied_summary(
+        _hook_denied_record(),
+        runtime_home=runtime_home,
+    )
+
+    assert "AVP_HOME" not in captured["env"]
+    assert captured["command"][-1] == "--hook-denied-upload-worker"
+    assert captured["closed"] is True
+    encoded = captured["input"].decode("utf-8")
+    assert "command" not in encoded
+    assert "/Users/" not in encoded
