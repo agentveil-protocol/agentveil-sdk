@@ -14,6 +14,7 @@ import hashlib
 import ipaddress
 import json
 import math
+import posixpath
 import re
 from typing import Any, Mapping
 from urllib.parse import urlsplit
@@ -620,6 +621,545 @@ def _normalize_json(value: Any) -> Any:
     return repr(value)
 
 
+# Native shell classification for client hooks (Claude, Codex, Cursor, Gemini).
+# Default-deny with bounded allowlists for project-local developer workflows.
+_SHELL_DESTRUCTIVE_TOKENS: tuple[str, ...] = (
+    "rm ",
+    "rmdir ",
+    "unlink ",
+    "shred ",
+    "wipe ",
+    " -delete",  # `find ... -delete`
+)
+
+_SHELL_MUTATION_TOKENS: tuple[str, ...] = (
+    " > ",
+    " >> ",
+    " >|",
+    " tee ",
+    "mv ",
+    "cp ",
+    "mkdir ",
+    "touch ",
+    "chmod ",
+    "chown ",
+    " ln ",
+    "curl -o",
+    "wget -O",
+    " dd ",
+    " -exec",   # `find -exec`, `xargs -I {} -exec`
+    " -i ",     # `sed -i`, `perl -i`
+    " -pi",     # `perl -pi`
+)
+
+_SHELL_READONLY_FIRST_TOKEN: frozenset[str] = frozenset({
+    "pwd",
+    "ls",
+    "cat",
+    "head",
+    "tail",
+    "grep",
+    "rg",
+    "find",
+    "wc",
+    "which",
+    "whoami",
+    "date",
+    "echo",
+    "true",
+    "false",
+    "pytest",
+    "ruff",
+})
+
+_GIT_READ_SUBCOMMANDS: frozenset[str] = frozenset({
+    "status",
+    "diff",
+    "log",
+    "show",
+    "rev-parse",
+    "branch",
+})
+
+_GIT_LOCAL_DEV_SUBCOMMANDS: frozenset[str] = frozenset({
+    "add",
+    "commit",
+    "switch",
+    "checkout",
+})
+
+_GIT_REMOTE_OR_RELEASE_SUBCOMMANDS: frozenset[str] = frozenset({
+    "push",
+    "pull",
+    "fetch",
+    "tag",
+    "release",
+    "publish",
+    "deploy",
+})
+
+_SHELL_COMPOSITION_PATTERNS: tuple[str, ...] = (
+    "$(",   # command substitution
+    "`",    # backtick command substitution
+    "|",    # pipe (also covers ||)
+    ";",    # command separator
+    "&",    # background and && chaining
+    ">",    # any output redirect (>, >>, >|, >( )
+    "<(",   # process substitution (executes the inner command)
+    "\n",   # embedded newline => multiple commands
+    "\r",
+)
+
+_SECRET_PATH_FILENAMES: frozenset[str] = frozenset({
+    ".env",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    "id_rsa",
+    "id_ed25519",
+    "credentials",
+    "credential",
+    "secret",
+    "secrets",
+    "token",
+    "tokens",
+})
+
+_SECRET_PATH_SEGMENTS: frozenset[str] = frozenset({"secrets", ".ssh", ".aws", ".gnupg"})
+_SECRET_PATH_PREFIXES: tuple[str, ...] = (
+    ".env.",
+    "credentials.",
+    "credential.",
+    "secret.",
+    "secrets.",
+    "token.",
+    "tokens.",
+)
+_SECRET_PATH_SUFFIXES: tuple[str, ...] = (".env", ".pem", ".key")
+
+_PACKAGE_MANAGERS: frozenset[str] = frozenset({
+    "bun",
+    "cargo",
+    "composer",
+    "gem",
+    "go",
+    "npm",
+    "pip",
+    "pip3",
+    "pnpm",
+    "poetry",
+    "uv",
+    "yarn",
+    "brew",
+})
+
+_PACKAGE_MUTATION_VERBS: frozenset[str] = frozenset({
+    "add",
+    "ci",
+    "get",
+    "install",
+    "remove",
+    "require",
+    "sync",
+    "uninstall",
+    "update",
+    "upgrade",
+})
+
+_SHELL_PROFILE_BASENAMES: frozenset[str] = frozenset({
+    ".bashrc",
+    ".bash_profile",
+    ".profile",
+    ".zprofile",
+    ".zshrc",
+})
+
+
+def _has_shell_composition(command: str) -> bool:
+    """Return True if the command contains shell composition metacharacters."""
+
+    return any(pattern in command for pattern in _SHELL_COMPOSITION_PATTERNS)
+
+
+def _path_token_is_secret(path_token: str) -> bool:
+    """Return True when a shell path token targets a secret or credential file."""
+
+    normalized = path_token.strip("'\"`").replace("\\", "/")
+    if not normalized:
+        return False
+    resolved = posixpath.normpath(normalized)
+    segments = [
+        segment.lower()
+        for segment in resolved.split("/")
+        if segment and segment != "."
+    ]
+    if not segments:
+        return False
+    if any(segment in _SECRET_PATH_SEGMENTS for segment in segments):
+        return True
+    basename = segments[-1]
+    if basename in _SECRET_PATH_FILENAMES:
+        return True
+    if basename in _SHELL_PROFILE_BASENAMES:
+        return True
+    if basename.startswith(_SECRET_PATH_PREFIXES) or basename.endswith(_SECRET_PATH_SUFFIXES):
+        return True
+    return False
+
+
+def _shell_command_references_secret_or_system_path(command: str) -> bool:
+    # claim-check: allow bounded hook classifier secret/system path deny boundary.
+    """Return True when a simple shell command references blocked secret/system paths."""
+
+    lowered = command.lower()
+    if "/etc/" in lowered or lowered.startswith("/etc"):
+        return True
+    for token in command.split():
+        if _path_token_is_secret(token):
+            return True
+    return False
+
+
+def _is_package_manager_mutation(tokens: list[str]) -> bool:
+    if not tokens:
+        return False
+    first = tokens[0]
+    if first not in _PACKAGE_MANAGERS:
+        return False
+    if len(tokens) == 1:
+        return True
+    return tokens[1] in _PACKAGE_MUTATION_VERBS
+
+
+def _is_env_assignment(token: str) -> bool:
+    """Return True for a simple ``KEY=VALUE`` shell env prefix token."""
+
+    if "=" not in token:
+        return False
+    key, _value = token.split("=", 1)
+    if not key or not key[0].isalpha():
+        return False
+    return all(ch.isalnum() or ch == "_" for ch in key)  # claim-check: allow bounded KEY token grammar, not coverage.
+
+
+def _strip_leading_env_assignments(tokens: list[str]) -> list[str]:
+    """Drop leading env assignments so ``PYTHONPATH=x pytest ...`` can classify."""
+
+    idx = 0
+    while idx < len(tokens) and _is_env_assignment(tokens[idx]):
+        idx += 1
+    return tokens[idx:]
+
+
+_SECRET_ENV_KEY_EXACT: frozenset[str] = frozenset({
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "NPM_TOKEN",
+    "PYPI_TOKEN",
+})
+
+
+def _env_key_is_secret_like(key: str) -> bool:
+    """Return True when an env assignment key carries credential semantics."""
+
+    upper = key.upper()
+    if upper in _SECRET_ENV_KEY_EXACT:
+        return True
+    if upper.endswith("_TOKEN") or upper.endswith("_SECRET") or upper.endswith("_PASSWORD"):
+        return True
+    if upper.endswith("_API_KEY") or upper.endswith("_APIKEY"):
+        return True
+    return False
+
+
+def _leading_env_assignments_are_secret(tokens: list[str]) -> bool:
+    """Return True when a leading env prefix sets a secret-like variable."""
+
+    for token in tokens:
+        if not _is_env_assignment(token):
+            break
+        key = token.split("=", 1)[0]
+        if _env_key_is_secret_like(key):
+            return True
+    return False
+
+
+def _classify_ruff_command(tokens: list[str]) -> RiskClass | None:
+    """Classify ``ruff`` invocations; plain check is read, fix/format mutate."""
+
+    if not tokens or tokens[0] != "ruff":
+        return None
+    if len(tokens) >= 2 and tokens[1] == "format":
+        return RiskClass.WRITE
+    if len(tokens) >= 2 and tokens[1] == "check":
+        if any(flag in tokens for flag in ("--fix", "--fix-only", "--fixable")):
+            return RiskClass.WRITE
+        return RiskClass.READ
+    return RiskClass.UNKNOWN
+
+
+def _classify_python_module_invocation(tokens: list[str]) -> RiskClass | None:
+    """Classify bounded ``python -m ...`` verification forms."""
+
+    if len(tokens) < 3 or tokens[0] not in {"python", "python3"} or tokens[1] != "-m":
+        return None
+    module = tokens[2]
+    if module == "pytest":
+        return RiskClass.READ
+    if module in {"pip", "pip3"}:
+        return RiskClass.WRITE
+    return RiskClass.UNKNOWN
+
+
+def _classify_alembic_command(tokens: list[str]) -> RiskClass | None:
+    """Classify ``alembic`` invocations; read-only heads only."""
+
+    if not tokens or tokens[0] != "alembic":
+        return None
+    if len(tokens) >= 2 and tokens[1] == "heads":
+        return RiskClass.READ
+    if len(tokens) >= 2 and tokens[1] in {"upgrade", "downgrade", "stamp", "revision"}:
+        return RiskClass.WRITE
+    return RiskClass.UNKNOWN
+
+
+def _git_checkout_is_path_restore(raw_tokens: list[str]) -> bool:
+    """Return True for ``git checkout [--tree-ish] -- <path>`` file restore forms."""
+
+    if len(raw_tokens) < 2 or raw_tokens[1].lower() != "checkout":
+        return False
+    return "--" in raw_tokens[2:]
+
+
+def _git_pathspec_is_explicit(pathspec: str) -> bool:
+    """Return True when a git pathspec names explicit paths, not magic/broad forms."""
+
+    if pathspec.startswith(":"):
+        return False
+    return pathspec not in {".", ".."} and bool(pathspec)
+
+
+def _git_add_is_broad(raw_tokens: list[str]) -> bool:
+    """Return True for broad git add pathspec or staging forms."""
+
+    args = raw_tokens[2:]
+    if not args:
+        return False
+    lower_args = [arg.lower() for arg in args]
+    if "." in lower_args:
+        return True
+    broad_flags = {"-a", "-A", "--all", "-u", "--update", "--intent-to-add"}  # claim-check: allow literal git flag name.
+    if any(arg in broad_flags for arg in lower_args):
+        return True
+    for arg in args:
+        lower = arg.lower()
+        if lower.startswith("--pathspec-from-file") or lower == "--pathspec-file-nul":
+            return True
+        if lower in {":/", "::"} or lower.startswith(":/"):
+            return True
+    return False
+
+
+def _git_add_has_explicit_paths_only(raw_tokens: list[str]) -> bool:
+    args = raw_tokens[2:]
+    if not args:
+        return False
+    if "--" in args:
+        path_args = args[args.index("--") + 1:]
+        return bool(path_args) and all(  # claim-check: allow bounded pathspec predicate, not coverage.
+            _git_pathspec_is_explicit(path) for path in path_args
+        )
+    path_args = [arg for arg in args if not arg.startswith("-")]
+    return bool(path_args) and all(  # claim-check: allow bounded pathspec predicate, not coverage.
+        _git_pathspec_is_explicit(path) for path in path_args
+    )
+
+
+def _git_commit_is_unsafe(raw_tokens: list[str]) -> bool:
+    """Return True for broad staging, amend, interactive, or patch commit forms."""
+
+    args = raw_tokens[2:]
+    lower_args = [arg.lower() for arg in args]
+    if any(
+        flag in lower_args
+        for flag in ("--all", "--amend", "--interactive", "--patch")  # claim-check: allow literal git flag names.
+    ):
+        return True
+    for arg in args:
+        lower = arg.lower()
+        if lower in {"-a", "-p", "-i"}:
+            return True
+        if arg.startswith("-") and not arg.startswith("--"):
+            flags = arg[1:]
+            if any(ch in flags for ch in ("a", "p", "i")):
+                return True
+    return False
+
+
+def _git_switch_is_unsafe(raw_tokens: list[str]) -> bool:
+    """Return True for ``git switch`` forms that discard, merge, or reset branch refs."""
+
+    if len(raw_tokens) < 2 or raw_tokens[1].lower() != "switch":
+        return False
+    lower_args = [arg.lower() for arg in raw_tokens[2:]]
+    if any(flag in lower_args for flag in ("--discard-changes", "--merge")):
+        return True
+    for arg in raw_tokens[2:]:
+        if arg == "-C":
+            return True
+        if arg.startswith("-") and not arg.startswith("--") and "C" in arg[1:]:
+            return True
+    return False
+
+
+def _git_checkout_is_unsafe(raw_tokens: list[str]) -> bool:
+    """Return True for ``git checkout -B`` or interactive patch checkout forms."""
+
+    if len(raw_tokens) < 2 or raw_tokens[1].lower() != "checkout":
+        return False
+    lower_args = [arg.lower() for arg in raw_tokens[2:]]
+    if any(flag in lower_args for flag in ("--patch",)):
+        return True
+    for arg in raw_tokens[2:]:
+        if arg == "-B":
+            return True
+        if arg.startswith("-") and not arg.startswith("--") and "B" in arg[1:]:
+            return True
+        if arg.startswith("-") and not arg.startswith("--") and "p" in arg[1:]:
+            return True
+    return False
+
+
+def _classify_git_command(raw_tokens: list[str]) -> RiskClass:
+    """Classify a tokenized ``git ...`` command (case preserved for short flags)."""
+
+    if len(raw_tokens) < 2:
+        return RiskClass.UNKNOWN
+    subcommand = raw_tokens[1].lower()
+    lower_args = [arg.lower() for arg in raw_tokens[2:]]
+
+    if subcommand in _GIT_REMOTE_OR_RELEASE_SUBCOMMANDS:
+        return RiskClass.PRODUCTION  # claim-check: allow enum value asserted by classifier tests.
+
+    if subcommand == "reset":
+        if any(flag in lower_args for flag in ("--hard", "-f", "--force")):
+            return RiskClass.DESTRUCTIVE
+        return RiskClass.WRITE
+
+    if subcommand == "clean":
+        clean_args = "".join(lower_args)
+        if any(
+            flag in lower_args or flag in clean_args
+            for flag in ("-f", "--force", "-d", "-x", "-fd", "-ff")
+        ):
+            return RiskClass.DESTRUCTIVE
+        return RiskClass.WRITE
+
+    if subcommand == "rebase":
+        if any(flag in lower_args for flag in ("--hard", "--force", "-f", "--onto")):
+            return RiskClass.DESTRUCTIVE
+        return RiskClass.UNKNOWN
+
+    if subcommand == "add":
+        if _git_add_is_broad(raw_tokens):
+            return RiskClass.WRITE
+        if _git_add_has_explicit_paths_only(raw_tokens):
+            return RiskClass.READ
+        return RiskClass.UNKNOWN
+
+    if subcommand == "commit":
+        if _git_commit_is_unsafe(raw_tokens):
+            return RiskClass.WRITE
+        return RiskClass.READ
+
+    if subcommand == "branch":
+        if any(flag in lower_args for flag in ("-d", "-m", "--move", "--delete")):
+            return RiskClass.WRITE
+        return RiskClass.READ
+
+    if subcommand in ("switch", "checkout"):
+        if subcommand == "checkout" and _git_checkout_is_path_restore(raw_tokens):
+            return RiskClass.WRITE
+        if subcommand == "switch" and _git_switch_is_unsafe(raw_tokens):
+            return RiskClass.WRITE
+        if subcommand == "checkout" and _git_checkout_is_unsafe(raw_tokens):
+            return RiskClass.WRITE
+        if any(flag in lower_args for flag in ("--force", "-f")):
+            return RiskClass.DESTRUCTIVE
+        if subcommand == "checkout" and len(raw_tokens) >= 3 and lower_args[0] in {".", "-"}:
+            return RiskClass.UNKNOWN
+        return RiskClass.READ
+
+    if subcommand in _GIT_READ_SUBCOMMANDS:
+        return RiskClass.READ
+
+    if subcommand in _GIT_LOCAL_DEV_SUBCOMMANDS:
+        return RiskClass.UNKNOWN
+
+    return RiskClass.UNKNOWN
+
+
+def classify_native_shell_command(command: str) -> RiskClass:
+    """Classify a native shell command for hook policy evaluation.
+
+    Unknown commands resolve through hook policy (``ASK_BACKEND`` -> deny).
+    Project-local developer workflows (bounded git add/commit, read-only
+    inspection, local branch switches) classify as ``READ`` so host-agent
+    approval remains the operator gate without a duplicate Approval Center
+    round-trip for ordinary local git.
+    """
+
+    stripped = command.strip()
+    if not stripped:
+        return RiskClass.UNKNOWN
+    lowered = stripped.lower()
+
+    if _shell_command_references_secret_or_system_path(lowered):
+        return RiskClass.DESTRUCTIVE
+
+    if any(tok in lowered for tok in _SHELL_DESTRUCTIVE_TOKENS):
+        return RiskClass.DESTRUCTIVE
+    if any(tok in lowered for tok in _SHELL_MUTATION_TOKENS):
+        return RiskClass.WRITE
+
+    if _has_shell_composition(lowered):
+        return RiskClass.UNKNOWN
+
+    raw_tokens = stripped.split()
+    if _leading_env_assignments_are_secret(raw_tokens):
+        return RiskClass.DESTRUCTIVE
+
+    tokens = _strip_leading_env_assignments(raw_tokens)
+    lower_tokens = [token.lower() for token in tokens]
+    if not tokens:
+        return RiskClass.UNKNOWN
+
+    if _is_package_manager_mutation(lower_tokens):
+        return RiskClass.WRITE
+
+    ruff_risk = _classify_ruff_command(lower_tokens)
+    if ruff_risk is not None:
+        return ruff_risk
+
+    python_module_risk = _classify_python_module_invocation(lower_tokens)
+    if python_module_risk is not None:
+        return python_module_risk
+
+    alembic_risk = _classify_alembic_command(lower_tokens)
+    if alembic_risk is not None:
+        return alembic_risk
+
+    if lower_tokens[0] == "git":
+        return _classify_git_command(tokens)
+
+    if lower_tokens[0] in _SHELL_READONLY_FIRST_TOKEN:
+        return RiskClass.READ
+
+    return RiskClass.UNKNOWN
+
+
 __all__ = [
     "ClassifiedToolCall",
     "HASH_PREFIX",
@@ -629,6 +1169,7 @@ __all__ = [
     "REDACTED",
     "ToolCallClassifier",
     "build_install_clone_context",
+    "classify_native_shell_command",
     "extract_resource",
     "infer_action_family",
     "infer_risk_class",

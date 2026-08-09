@@ -23,6 +23,25 @@ def _deny_reason(raw: str) -> str:
     return payload["hookSpecificOutput"]["permissionDecisionReason"]
 
 
+def test_codex_hook_allows_local_git_add_and_commit():
+    out = io.StringIO()
+    for command in (
+        "git add agentveil_mcp_proxy/classification.py",
+        "git commit -m 'fix: local dev policy'",
+    ):
+        decision = codex_hook.process_hook(_payload("Bash", {"command": command}), out=out)
+        assert decision.hook_action == "allow", command
+        assert out.getvalue() == ""
+
+
+def test_codex_hook_denies_broad_git_add():
+    out = io.StringIO()
+    decision = codex_hook.process_hook(_payload("Bash", {"command": "git add ."}), out=out)
+    assert decision.hook_action == "deny"
+    reason = _deny_reason(out.getvalue())
+    assert "write_file" not in reason
+
+
 def test_codex_hook_denies_native_bash_write_with_redirect(tmp_path):
     out = io.StringIO()
     decision = codex_hook.process_hook(
@@ -33,8 +52,8 @@ def test_codex_hook_denies_native_bash_write_with_redirect(tmp_path):
 
     assert decision.hook_action == "deny"
     reason = _deny_reason(out.getvalue())
-    # claim-check: allow hook unit test asserts the local deny output string.
-    assert "Direct native tool use was blocked before mutation" in reason
+    assert "Direct native shell use was blocked" in reason  # claim-check: allow tested hook copy.
+    assert "write_file" not in reason
     assert "target_reached=false" in reason
     record = json.loads((tmp_path / "evidence.jsonl").read_text(encoding="utf-8"))
     assert record["server"] == "codex"

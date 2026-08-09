@@ -34,14 +34,18 @@ import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, MutableMapping
+from typing import Any, Mapping
 
-from agentveil_mcp_proxy.classification import infer_action_family, infer_risk_class
+from agentveil_mcp_proxy.classification import (
+    classify_native_shell_command,
+    infer_action_family,
+    infer_risk_class,
+)
 from agentveil_mcp_proxy.client_guidance import (
-    NATIVE_CONTROLLED_MCP_REDIRECT_INSTRUCTION as NATIVE_REDIRECT_INSTRUCTION,
     NativeRedirectOrigin,
     format_native_redirect_agent_surface,
     maybe_register_native_redirect_for_hook_deny,
+    native_hook_deny_instruction,
 )
 from agentveil_mcp_proxy.policy import (
     PolicyConfig,
@@ -64,13 +68,14 @@ HOOK_EVENT_DEFAULT = "PreToolUse"
 # tells the agent to "use the controlled MCP tool" dead-ends on the hook itself.
 AGENTVEIL_CONTROLLED_MCP_SERVER = "agentveil-mcp-proxy"
 
-# Generic agent-facing redirect appended to NATIVE-tool deny reasons (S2
+# Generic agent-facing redirect appended to native-tool deny reasons (S2
 # corrective). Shared across connectors via client_guidance so unavailable-route
 # recovery stays connector-independent. Static instruction text only: no
 # approval round-trip (S3), no auto-transformation of Write into an MCP call,
 # and no private playbook content.
 # claim-check: allow "blocked" is literal hook-deny user-facing text; tested in
 # tests/test_mcp_proxy_claude_hook.py native redirect assertions.
+NATIVE_REDIRECT_INSTRUCTION = native_hook_deny_instruction(native_tool="Write")
 
 
 # Claude Code built-in tool names and their natural risk class. Bash is
@@ -88,142 +93,8 @@ _CLAUDE_BUILTIN_RISK: Mapping[str, RiskClass] = {
     "WebFetch": RiskClass.READ,
 }
 
-# Shell classifier uses a deny fallback: default-deny with a small allowlist of
-# unambiguously read-only commands. Denylist heuristics catch obvious
-# mutation shapes for telemetry (WRITE/DESTRUCTIVE risk_class), but ANYTHING
-# not on the allowlist falls through to UNKNOWN -> ASK_BACKEND -> deny.
-#
-# Rationale: arbitrary interpreters (python3 -c, node -e, perl -e) and
-# arbitrary subprocesses can write to the filesystem without matching any
-# specific token pattern. Token-based denylists fail open on these; an
-# allowlist of read-only commands denies unknown commands. The corrective fix for
-# P10D.14 S1 reverses the original token-denylist design.
-
-_SHELL_DESTRUCTIVE_TOKENS: tuple[str, ...] = (
-    "rm ",
-    "rmdir ",
-    "unlink ",
-    "shred ",
-    "wipe ",
-    " -delete",  # `find ... -delete`
-)
-
-_SHELL_MUTATION_TOKENS: tuple[str, ...] = (
-    " > ",
-    " >> ",
-    " >|",
-    " tee ",
-    "mv ",
-    "cp ",
-    "mkdir ",
-    "touch ",
-    "chmod ",
-    "chown ",
-    " ln ",
-    "curl -o",
-    "wget -O",
-    " dd ",
-    " -exec",   # `find -exec`, `xargs -I {} -exec`
-    " -i ",     # `sed -i`, `perl -i`
-    " -pi",     # `perl -pi`
-)
-
-# Single-token executables that are unambiguously read-only when invoked
-# without mutation operators (caught above by destructive/mutation tokens).
-_BASH_READONLY_FIRST_TOKEN: frozenset[str] = frozenset({
-    "pwd",
-    "ls",
-    "cat",
-    "head",
-    "tail",
-    "grep",
-    "find",
-    "wc",
-    "which",
-    "whoami",
-    "date",
-    "echo",
-    "true",
-    "false",
-})
-
-# Git subcommands that are read-only. Anything else (checkout, reset, clean,
-# push, pull, commit, add, merge, rebase, ...) falls through to UNKNOWN.
-_BASH_GIT_READONLY_SUBCOMMANDS: frozenset[str] = frozenset({
-    "status",
-    "diff",
-})
-
-# Shell composition / metacharacters. Presence of ANY of these means the
-# command is not a simple single read-only invocation: it can command-
-# substitute, pipe, chain, background, or redirect into a mutation while the
-# first token still looks read-only (e.g. ``echo $(python3 -c "...")``).
-#
-# Corrective-2 finding: a first-token allowlist is insufficient; an attacker
-# can hide a write inside a substitution/pipe/chain. Any composition token =>
-# deny fallback (UNKNOWN -> deny), regardless of the first token.
-_SHELL_COMPOSITION_PATTERNS: tuple[str, ...] = (
-    "$(",   # command substitution
-    "`",    # backtick command substitution
-    "|",    # pipe (also covers ||)
-    ";",    # command separator
-    "&",    # background and && chaining
-    ">",    # any output redirect (>, >>, >|, >( )
-    "<(",   # process substitution (executes the inner command)
-    "\n",   # embedded newline => multiple commands
-    "\r",
-)
-
-
-def _has_shell_composition(command: str) -> bool:
-    """Return True if the command contains shell composition metacharacters."""
-    return any(pattern in command for pattern in _SHELL_COMPOSITION_PATTERNS)
-
-
-def _classify_bash(command: str) -> RiskClass:
-    """Classify a Bash command. Unknown by default.
-
-    Order of evaluation:
-    1. Destructive tokens (rm, rmdir, find -delete) -> DESTRUCTIVE.
-    2. Mutation tokens (redirects with spaces, sed -i, find -exec, ...) -> WRITE.
-    3. Shell composition metacharacters ($(), backtick, |, ;, &, >, <(, newline)
-       -> UNKNOWN. A composed command is not simple enough to allowlist.
-    4. First-token allowlist (ls, cat, grep, ...) on a simple command -> READ.
-    5. `git <subcommand>` with subcommand in the read-only subset -> READ.
-    6. Anything else -> UNKNOWN (the policy then routes to ASK_BACKEND, which
-       the hook maps to deny in S1).
-
-    Composition (step 3) is checked BEFORE the allowlist (steps 4-5) so a
-    read-looking first token does not carry a hidden mutation through.
-    """
-    lowered = command.lower().strip()
-    if not lowered:
-        return RiskClass.UNKNOWN
-
-    if any(tok in lowered for tok in _SHELL_DESTRUCTIVE_TOKENS):
-        return RiskClass.DESTRUCTIVE
-    if any(tok in lowered for tok in _SHELL_MUTATION_TOKENS):
-        return RiskClass.WRITE
-
-    # Composition guard: nothing past this point may reach the READ allowlist
-    # unless it is a single, simple command.
-    if _has_shell_composition(lowered):
-        return RiskClass.UNKNOWN
-
-    tokens = lowered.split()
-    if not tokens:
-        return RiskClass.UNKNOWN
-
-    first = tokens[0]
-    if first == "git":
-        if len(tokens) >= 2 and tokens[1] in _BASH_GIT_READONLY_SUBCOMMANDS:
-            return RiskClass.READ
-        return RiskClass.UNKNOWN
-
-    if first in _BASH_READONLY_FIRST_TOKEN:
-        return RiskClass.READ
-
-    return RiskClass.UNKNOWN
+# Backward-compatible alias for Codex/Gemini hooks and tests.
+_classify_bash = classify_native_shell_command
 
 
 def _split_mcp_tool_name(tool_name: str) -> tuple[str, str] | None:
@@ -504,7 +375,11 @@ def format_hook_output(
         f"reason_code={decision.reason_code}); target_reached=false"
     )
     if decision.context.server == CLAUDE_SERVER_LABEL:
-        reason = f"{reason}. {NATIVE_REDIRECT_INSTRUCTION}"
+        instruction = native_hook_deny_instruction(
+            native_tool=decision.context.tool,
+            risk_class=decision.evaluation.risk_class.value,
+        )
+        reason = f"{reason}. {instruction}"
     reason = format_native_redirect_agent_surface(reason, redirect_origin)
     hook_specific: dict[str, Any] = {
         "hookEventName": HOOK_EVENT_DEFAULT,

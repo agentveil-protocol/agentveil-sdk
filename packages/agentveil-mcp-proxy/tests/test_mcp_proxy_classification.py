@@ -631,3 +631,101 @@ def test_classify_attaches_role_authority_and_action_family():
     assert classified.role == "reviewer"
     assert classified.authority == "review_only"
     assert classified.policy_evaluation.decision is PolicyDecision.BLOCK
+
+
+def test_classify_native_shell_local_git_add_and_commit_allowed() -> None:
+    from agentveil_mcp_proxy.classification import classify_native_shell_command
+
+    assert classify_native_shell_command("git add src/foo.py tests/bar.py") is RiskClass.READ
+    assert classify_native_shell_command("git commit -m 'slice'") is RiskClass.READ
+
+
+def test_classify_native_shell_blocks_broad_git_and_secrets() -> None:
+    from agentveil_mcp_proxy.classification import classify_native_shell_command
+
+    assert classify_native_shell_command("git add .") is RiskClass.WRITE
+    assert classify_native_shell_command("git add -A") is RiskClass.WRITE
+    assert classify_native_shell_command("git reset --hard") is RiskClass.DESTRUCTIVE
+    assert classify_native_shell_command("git clean -fd") is RiskClass.DESTRUCTIVE
+    assert classify_native_shell_command("git push origin main") is RiskClass.PRODUCTION  # claim-check: allow classifier enum assertion.
+    assert classify_native_shell_command("cat .env") is RiskClass.DESTRUCTIVE
+
+
+def test_classify_native_shell_blocks_git_checkout_path_restore() -> None:
+    from agentveil_mcp_proxy.classification import classify_native_shell_command
+
+    assert classify_native_shell_command("git checkout -- file.txt") is RiskClass.WRITE
+    assert classify_native_shell_command("git checkout HEAD -- file.txt") is RiskClass.WRITE
+    assert classify_native_shell_command("git checkout abc123 -- src/foo.py") is RiskClass.WRITE
+    assert classify_native_shell_command("git checkout feature-branch") is RiskClass.READ
+
+
+def test_classify_native_shell_ruff_read_vs_mutating() -> None:
+    from agentveil_mcp_proxy.classification import classify_native_shell_command
+
+    assert classify_native_shell_command("ruff check packages/agentveil-mcp-proxy") is RiskClass.READ
+    assert classify_native_shell_command("ruff check --fix packages/agentveil-mcp-proxy") is RiskClass.WRITE
+    assert classify_native_shell_command("ruff format packages/agentveil-mcp-proxy") is RiskClass.WRITE
+
+
+def test_classify_native_shell_allows_local_verification_forms() -> None:
+    from agentveil_mcp_proxy.classification import classify_native_shell_command
+
+    assert classify_native_shell_command("python -m pytest -q packages/agentveil-mcp-proxy/tests") is RiskClass.READ
+    assert classify_native_shell_command("python3 -m pytest -q packages/agentveil-mcp-proxy/tests") is RiskClass.READ
+    assert (
+        classify_native_shell_command(
+            "PYTHONPATH=.:packages/agentveil-mcp-proxy pytest -q packages/agentveil-mcp-proxy/tests",
+        )
+        is RiskClass.READ
+    )
+    assert (
+        classify_native_shell_command(
+            "PYTHONPATH=.:packages/agentveil-mcp-proxy ruff check packages/agentveil-mcp-proxy",
+        )
+        is RiskClass.READ
+    )
+    assert classify_native_shell_command("alembic heads") is RiskClass.READ
+
+
+def test_classify_native_shell_blocks_non_verification_python_and_alembic() -> None:
+    from agentveil_mcp_proxy.classification import classify_native_shell_command
+
+    assert classify_native_shell_command("python3 -c \"print('x')\"") is RiskClass.UNKNOWN
+    assert classify_native_shell_command("python -m pip install foo") is RiskClass.WRITE
+    assert classify_native_shell_command("alembic upgrade head") is RiskClass.WRITE
+
+
+def test_classify_native_shell_git_commit_and_switch_bounded_grammar() -> None:
+    from agentveil_mcp_proxy.classification import classify_native_shell_command
+
+    assert classify_native_shell_command("git commit -m fix") is RiskClass.READ
+    assert classify_native_shell_command("git switch feature") is RiskClass.READ
+    assert classify_native_shell_command("git switch -c feature") is RiskClass.READ
+    assert classify_native_shell_command("git add src/foo.py") is RiskClass.READ
+    assert classify_native_shell_command("git add -- src/foo.py") is RiskClass.READ
+    assert classify_native_shell_command("git commit -am fix") is RiskClass.WRITE
+    assert classify_native_shell_command("git commit --all -m fix") is RiskClass.WRITE  # claim-check: allow literal git flag.
+    assert classify_native_shell_command("git commit --amend -m fix") is RiskClass.WRITE
+    assert classify_native_shell_command("git commit --no-edit --amend") is RiskClass.WRITE
+    assert classify_native_shell_command("git commit --interactive") is RiskClass.WRITE
+    assert classify_native_shell_command("git commit --patch") is RiskClass.WRITE
+    assert classify_native_shell_command("git switch --discard-changes feature") is RiskClass.WRITE
+    assert classify_native_shell_command("git switch --merge feature") is RiskClass.WRITE
+    assert classify_native_shell_command("git switch -C feature") is RiskClass.WRITE
+    assert classify_native_shell_command("git checkout -B feature") is RiskClass.WRITE
+    assert classify_native_shell_command("git add :/") is RiskClass.WRITE
+    assert classify_native_shell_command("git add --pathspec-from-file=list.txt") is RiskClass.WRITE
+    assert (
+        classify_native_shell_command("AWS_SECRET_ACCESS_KEY=x pytest -q t")
+        is RiskClass.DESTRUCTIVE
+    )
+    assert (
+        classify_native_shell_command("OPENAI_API_KEY=x pytest -q t")
+        is RiskClass.DESTRUCTIVE
+    )
+    assert classify_native_shell_command("git checkout -p file.txt") is RiskClass.WRITE
+    assert (
+        classify_native_shell_command("PYTHONPATH=.:packages pytest -q t")
+        is RiskClass.READ
+    )

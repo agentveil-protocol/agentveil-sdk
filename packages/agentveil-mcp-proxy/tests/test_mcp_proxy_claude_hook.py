@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import io
 import json
-import os
 from pathlib import Path
 
 import pytest
@@ -18,23 +17,19 @@ import pytest
 from agentveil_mcp_proxy import claude_hook
 from agentveil_mcp_proxy.claude_hook import (
     CLAUDE_SERVER_LABEL,
-    HookDecision,
     _bounded_input_ref,
     build_evidence_record,
     build_tool_call_context,
     classify_claude_tool,
     decide,
-    default_hook_policy,
     default_proxy_config_for_hook,
     format_hook_output,
     main,
     process_hook,
 )
 from agentveil_mcp_proxy.policy import (
-    PolicyConfig,
     PolicyDecision,
     PolicyEngine,
-    ProxyConfig,
     RiskClass,
 )
 
@@ -112,13 +107,12 @@ def test_classify_bash_by_command(command: str, expected_risk: RiskClass) -> Non
         # sed -i / perl -pi in-place edits — caught by mutation tokens
         "sed -i 's/foo/bar/' file",
         "perl -pi -e 's/foo/bar/' file",
-        # git mutation subcommands — caught by git allowlist
-        "git checkout main",
+        # git mutation subcommands that must deny.
         "git reset --hard HEAD~1",
         "git clean -fd",
         "git push origin main",
-        "git commit -m 'x'",
         "git add .",
+        "git add -A",
         # awk, xargs, eval, source — not on allowlist, must not auto-allow
         "awk '{print}' /etc/passwd",
         "xargs -I {} echo {}",
@@ -140,6 +134,73 @@ def test_classify_bash_fail_closed_for_non_allowlisted(command: str) -> None:
 @pytest.mark.parametrize("command", ["git status", "git status -s", "git diff", "git diff --stat"])
 def test_classify_bash_git_readonly_subcommands_allowed(command: str) -> None:
     assert classify_claude_tool("Bash", {"command": command}) is RiskClass.READ
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git add packages/agentveil-mcp-proxy/agentveil_mcp_proxy/classification.py",
+        "git commit -m 'fix: local dev policy'",
+        "git log -3 --oneline",
+        "git show HEAD",
+        "git rev-parse HEAD",
+        "git branch --show-current",
+        "git switch codex/public-hook-local-dev-policy-v1",
+        "git checkout codex/public-hook-local-dev-policy-v1",
+        "pytest -q packages/agentveil-mcp-proxy/tests/test_mcp_proxy_claude_hook.py",
+        "ruff check packages/agentveil-mcp-proxy/agentveil_mcp_proxy/classification.py",
+        "python -m pytest -q packages/agentveil-mcp-proxy/tests/test_mcp_proxy_claude_hook.py",
+        "PYTHONPATH=.:packages/agentveil-mcp-proxy pytest -q packages/agentveil-mcp-proxy/tests",
+        "alembic heads",
+    ],
+)
+def test_classify_bash_local_dev_workflow_allowed(command: str) -> None:
+    assert classify_claude_tool("Bash", {"command": command}) is RiskClass.READ
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git checkout -- file.txt",
+        "git checkout HEAD -- file.txt",
+        "git commit -am fix",
+        "git commit --amend -m fix",
+        "git commit --no-edit --amend",
+        "git commit --interactive",
+        "git switch --discard-changes feature",
+        "git switch --merge feature",
+        "git switch -C feature",
+        "git checkout -B feature",
+        "git add :/",
+        "git add --pathspec-from-file=list.txt",
+        "AWS_SECRET_ACCESS_KEY=x pytest -q t",
+        "OPENAI_API_KEY=x pytest -q t",
+        "git checkout -p file.txt",
+        "ruff check --fix packages/agentveil-mcp-proxy",
+        "ruff format packages/agentveil-mcp-proxy/agentveil_mcp_proxy/classification.py",
+        "alembic upgrade head",
+    ],
+)
+def test_classify_bash_mutating_forms_not_read(command: str) -> None:
+    risk = classify_claude_tool("Bash", {"command": command})
+    assert risk is not RiskClass.READ
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git add .",
+        "git add -A",
+        "git reset --hard",
+        "git clean -fd",
+        "git push origin main",
+        "cat .env",
+        "cat ~/.ssh/id_rsa",
+    ],
+)
+def test_classify_bash_dangerous_or_secret_commands_not_read(command: str) -> None:
+    risk = classify_claude_tool("Bash", {"command": command})
+    assert risk is not RiskClass.READ
 
 
 def test_classify_bash_empty_command_is_unknown() -> None:
@@ -312,9 +373,9 @@ def test_spec2_bash_destructive_blocked_by_rule() -> None:
         "python3 -c \"open('owned.txt','w').write('x')\"",
         "sed -i 's/foo/bar/' file",
         "perl -pi -e 's/foo/bar/' file",
-        "git checkout main",
         "git reset --hard",
         "git clean -fd",
+        "git push origin main",
         "node -e 'require(\"fs\").writeFileSync(\"x\",\"y\")'",
     ],
 )
@@ -544,29 +605,39 @@ from agentveil_mcp_proxy.claude_hook import NATIVE_REDIRECT_INSTRUCTION
 
 
 @pytest.mark.parametrize(
-    "tool_name,tool_input",
+    "tool_name,tool_input,expect_write_file_redirect",
     [
-        ("Write", {"file_path": "/tmp/x", "content": "y"}),
-        ("Edit", {"file_path": "/tmp/x", "old_string": "a", "new_string": "b"}),
-        ("MultiEdit", {"file_path": "/tmp/x", "edits": []}),
-        ("Bash", {"command": "echo y > /tmp/out"}),
+        ("Write", {"file_path": "/tmp/x", "content": "y"}, True),
+        ("Edit", {"file_path": "/tmp/x", "old_string": "a", "new_string": "b"}, True),
+        ("MultiEdit", {"file_path": "/tmp/x", "edits": []}, True),
+        ("Bash", {"command": "echo y > /tmp/out"}, False),
     ],
 )
-def test_native_mutation_deny_includes_redirect_instruction(tool_name, tool_input) -> None:
+def test_native_mutation_deny_includes_redirect_instruction(
+    tool_name,
+    tool_input,
+    expect_write_file_redirect: bool,
+) -> None:
     engine = PolicyEngine(default_proxy_config_for_hook())
     decision = decide(_payload(tool_name, tool_input), engine)
     assert decision.hook_action == "deny"
     raw = format_hook_output(decision)
     reason = json.loads(raw)["hookSpecificOutput"]["permissionDecisionReason"]
-    # Each required instruction element is present.
-    assert "Direct native tool use was blocked before mutation" in reason  # claim-check: allow literal hook-deny text asserted by this test.
-    assert "controlled MCP tool" in reason
-    assert "same path, content, and intent" in reason
+    assert "Direct native tool use was blocked before mutation" in reason or (  # claim-check: allow tested hook copy.
+        "Direct native shell use was blocked" in reason  # claim-check: allow tested hook copy.
+    )
+    if expect_write_file_redirect:
+        assert "controlled MCP tool" in reason
+        assert "write_file" in reason
+        assert "same path, content, and intent" in reason
+    else:
+        assert "write_file" not in reason
+        assert "No controlled MCP route exists for this shell action" in reason
     assert "stop and tell the user" in reason.lower()
-    assert "Do not retry, request another approval" in reason
-    assert "Do not bypass through native tools" in reason or "bypass through native tools" in reason
+    assert "Do not retry, request another approval" in reason or (
+        "Do not retry through native shell" in reason
+    )
     assert "ask the user to approve" not in reason
-    assert NATIVE_REDIRECT_INSTRUCTION in reason
 
 
 def test_native_deny_redirect_does_not_leak_raw_input() -> None:
@@ -588,6 +659,84 @@ def test_native_bash_deny_redirect_does_not_leak_command() -> None:
     decision = decide(payload, engine)
     raw = format_hook_output(decision)
     assert SENTINEL_COMMAND not in raw
+
+
+def test_claude_hook_allows_plain_git_commit_and_switch() -> None:
+    engine = PolicyEngine(default_proxy_config_for_hook())
+    for command in ("git commit -m fix", "git switch feature-branch"):
+        decision = decide(_payload("Bash", {"command": command}), engine)
+        assert decision.hook_action == "allow", command
+
+
+def test_claude_hook_denies_unsafe_git_commit_and_switch_forms() -> None:
+    engine = PolicyEngine(default_proxy_config_for_hook())
+    for command in (
+        "git commit -am fix",
+        "git commit --amend -m fix",
+        "git commit --interactive",
+        "git switch --discard-changes feature",
+        "git switch -C feature",
+        "git add :/",
+        "git add --pathspec-from-file=list.txt",
+    ):
+        decision = decide(_payload("Bash", {"command": command}), engine)
+        assert decision.hook_action == "deny", command
+
+
+def test_claude_hook_denies_secret_env_prefixed_pytest() -> None:
+    engine = PolicyEngine(default_proxy_config_for_hook())
+    for command in (
+        "AWS_SECRET_ACCESS_KEY=x pytest -q t",
+        "OPENAI_API_KEY=x pytest -q t",
+    ):
+        decision = decide(_payload("Bash", {"command": command}), engine)
+        assert decision.hook_action == "deny", command
+
+
+def test_claude_hook_denies_git_checkout_patch_mode() -> None:
+    engine = PolicyEngine(default_proxy_config_for_hook())
+    decision = decide(_payload("Bash", {"command": "git checkout -p file.txt"}), engine)
+    assert decision.hook_action == "deny"
+
+
+def test_claude_hook_allows_pythonpath_prefixed_pytest() -> None:
+    engine = PolicyEngine(default_proxy_config_for_hook())
+    decision = decide(
+        _payload("Bash", {"command": "PYTHONPATH=.:packages pytest -q t"}),
+        engine,
+    )
+    assert decision.hook_action == "allow"
+
+
+def test_claude_hook_denies_git_checkout_path_restore_end_to_end() -> None:
+    engine = PolicyEngine(default_proxy_config_for_hook())
+    decision = decide(_payload("Bash", {"command": "git checkout HEAD -- file.txt"}), engine)
+    assert decision.hook_action == "deny"
+
+
+def test_claude_hook_allows_python_m_pytest_end_to_end() -> None:
+    engine = PolicyEngine(default_proxy_config_for_hook())
+    decision = decide(
+        _payload("Bash", {"command": "python -m pytest -q packages/agentveil-mcp-proxy/tests"}),
+        engine,
+    )
+    assert decision.hook_action == "allow"
+
+
+def test_claude_hook_allows_local_git_add_and_commit() -> None:
+    engine = PolicyEngine(default_proxy_config_for_hook())
+    for command in (
+        "git add packages/agentveil-mcp-proxy/agentveil_mcp_proxy/classification.py",
+        "git commit -m 'fix: local dev policy'",
+    ):
+        decision = decide(_payload("Bash", {"command": command}), engine)
+        assert decision.hook_action == "allow", command
+
+
+def test_claude_hook_denies_broad_git_add_end_to_end() -> None:
+    engine = PolicyEngine(default_proxy_config_for_hook())
+    decision = decide(_payload("Bash", {"command": "git add ."}), engine)
+    assert decision.hook_action == "deny"
 
 
 # ----- S3 corrective: controlled AgentVeil MCP route must pass through -------

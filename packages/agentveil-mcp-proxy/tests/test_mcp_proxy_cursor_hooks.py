@@ -37,6 +37,57 @@ def test_native_write_denied_with_generic_redirect(tmp_path: Path) -> None:
     assert cursor_hooks.NATIVE_REDIRECT_INSTRUCTION in response["agent_message"]
 
 
+def test_shell_python_m_pytest_allowed_end_to_end(tmp_path: Path) -> None:
+    out = StringIO()
+    decision = cursor_hooks.process_hook(
+        {
+            "hook_event": "beforeShellExecution",
+            "command": "python3 -m pytest -q packages/agentveil-mcp-proxy/tests",
+        },
+        workspace=tmp_path,
+        out=out,
+    )
+    assert decision.hook_action == "allow"
+    assert json.loads(out.getvalue())["permission"] == "allow"
+
+
+def test_shell_git_checkout_path_restore_denied_end_to_end(tmp_path: Path) -> None:
+    out = StringIO()
+    decision = cursor_hooks.process_hook(
+        {"hook_event": "beforeShellExecution", "command": "git checkout -- file.txt"},
+        workspace=tmp_path,
+        out=out,
+    )
+    assert decision.hook_action == "deny"
+
+
+def test_shell_local_git_add_and_commit_allowed(tmp_path: Path) -> None:
+    for command in (
+        "git add packages/agentveil-mcp-proxy/agentveil_mcp_proxy/classification.py",
+        "git commit -m 'fix: local dev policy'",
+    ):
+        out = StringIO()
+        decision = cursor_hooks.process_hook(
+            {"hook_event": "beforeShellExecution", "command": command},
+            workspace=tmp_path,
+            out=out,
+        )
+        assert decision.hook_action == "allow", command
+        assert json.loads(out.getvalue())["permission"] == "allow"
+
+
+def test_shell_broad_git_add_denied_without_write_file_redirect(tmp_path: Path) -> None:
+    out = StringIO()
+    decision = cursor_hooks.process_hook(
+        {"hook_event": "beforeShellExecution", "command": "git add ."},
+        workspace=tmp_path,
+        out=out,
+    )
+    assert decision.hook_action == "deny"
+    response = json.loads(out.getvalue())
+    assert "write_file" not in response["agent_message"]
+
+
 def test_shell_readonly_allowed(tmp_path: Path) -> None:
     payload = {"hook_event": "beforeShellExecution", "command": "ls -la"}
     out = StringIO()

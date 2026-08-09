@@ -23,7 +23,6 @@ from typing import Any, Mapping
 from agentveil_mcp_proxy.classification import infer_action_family, infer_risk_class
 from agentveil_mcp_proxy.claude_hook import (
     AGENTVEIL_CONTROLLED_MCP_SERVER,
-    NATIVE_REDIRECT_INSTRUCTION,
     _bounded_input_ref,
     _classify_bash,
     _split_mcp_tool_name,
@@ -32,6 +31,7 @@ from agentveil_mcp_proxy.client_guidance import (
     NativeRedirectOrigin,
     format_native_redirect_agent_surface,
     maybe_register_native_redirect_for_hook_deny,
+    native_hook_deny_instruction,
 )
 from agentveil_mcp_proxy.policy import (
     PolicyDecision,
@@ -239,7 +239,11 @@ def format_hook_output(
         f"reason_code={decision.reason_code}); target_reached=false"
     )
     if decision.context.server == CODEX_SERVER_LABEL:
-        reason = f"{reason}. {NATIVE_REDIRECT_INSTRUCTION}"
+        instruction = native_hook_deny_instruction(
+            native_tool=decision.context.tool,
+            risk_class=decision.evaluation.risk_class.value,
+        )
+        reason = f"{reason}. {instruction}"
     reason = format_native_redirect_agent_surface(reason, redirect_origin)
     hook_specific: dict[str, Any] = {
         "hookEventName": HOOK_EVENT_DEFAULT,

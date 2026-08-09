@@ -67,8 +67,8 @@ def test_gemini_hook_denies_write_capable_run_shell_command():
 
     assert decision.hook_action == "deny"
     reason = _deny_reason(out.getvalue())
-    # claim-check: allow assertion of bounded hook denial text in unit test.
-    assert "Direct native tool use was blocked before mutation" in reason
+    assert "Direct native shell use was blocked" in reason  # claim-check: allow tested hook copy.
+    assert "write_file" not in reason
 
 
 def test_gemini_hook_allows_read_tools():
@@ -125,6 +125,34 @@ def test_gemini_hook_still_denies_non_agentveil_mcp_write():
     assert "denied write_file" in reason
     # claim-check: allow assertion that non-AgentVeil MCP path lacks native-redirect copy.
     assert "Direct native tool use was blocked before mutation" not in reason
+
+
+def test_gemini_hook_allows_local_git_add_and_commit():
+    out = io.StringIO()
+    for command in (
+        "git add agentveil_mcp_proxy/classification.py",
+        "git commit -m 'fix: local dev policy'",
+    ):
+        decision = gemini_hook.process_hook(
+            _payload("run_shell_command", {"command": command}),
+            out=out,
+        )
+        assert decision.hook_action == "allow", command
+        payload = json.loads(out.getvalue())
+        assert payload["decision"] == "allow"
+        out.truncate(0)
+        out.seek(0)
+
+
+def test_gemini_hook_denies_broad_git_add_without_write_file_redirect():
+    out = io.StringIO()
+    decision = gemini_hook.process_hook(
+        _payload("run_shell_command", {"command": "git add ."}),
+        out=out,
+    )
+    assert decision.hook_action == "deny"
+    reason = _deny_reason(out.getvalue())
+    assert "write_file" not in reason
 
 
 def test_gemini_hook_does_not_leak_raw_command_in_evidence(tmp_path):
