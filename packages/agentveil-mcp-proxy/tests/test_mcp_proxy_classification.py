@@ -6,6 +6,8 @@ import io
 import json
 import sys
 
+import pytest
+
 from agentveil_mcp_proxy.classification import (
     HASH_PREFIX,
     REDACTED,
@@ -638,6 +640,58 @@ def test_classify_native_shell_local_git_add_and_commit_allowed() -> None:
 
     assert classify_native_shell_command("git add src/foo.py tests/bar.py") is RiskClass.READ
     assert classify_native_shell_command("git commit -m 'slice'") is RiskClass.READ
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'git commit -m "rm dead code"',
+        'git commit -m "touch base case"',
+        'git commit -m "cp utils helper"',
+        'git commit -m "fix -i option docs"',
+        'git commit -m "a > b"',
+        "git log -i --grep=foo",
+    ],
+)
+def test_classify_native_shell_git_message_and_review_args_allowed(command: str) -> None:
+    from agentveil_mcp_proxy.classification import classify_native_shell_command
+
+    assert classify_native_shell_command(command) is RiskClass.READ
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rg token app.py",
+        "grep secret app.py",
+        "echo secret",
+    ],
+)
+def test_classify_native_shell_plain_search_terms_are_not_secret_paths(command: str) -> None:
+    from agentveil_mcp_proxy.classification import classify_native_shell_command
+
+    assert classify_native_shell_command(command) is RiskClass.READ
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat .env",
+        "cat ~/.ssh/id_rsa",
+        "grep token .env",
+        "rg secret ~/.aws/credentials",
+    ],
+)
+def test_classify_native_shell_secret_path_operands_still_block(command: str) -> None:
+    from agentveil_mcp_proxy.classification import classify_native_shell_command
+
+    assert classify_native_shell_command(command) is RiskClass.DESTRUCTIVE
+
+
+def test_classify_native_shell_unquoted_redirect_still_mutates() -> None:
+    from agentveil_mcp_proxy.classification import classify_native_shell_command
+
+    assert classify_native_shell_command("git status > out.txt") is RiskClass.WRITE
 
 
 def test_classify_native_shell_blocks_broad_git_and_secrets() -> None:

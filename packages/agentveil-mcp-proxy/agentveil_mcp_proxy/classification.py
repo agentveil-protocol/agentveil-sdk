@@ -16,6 +16,7 @@ import json
 import math
 import posixpath
 import re
+import shlex
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
@@ -710,6 +711,25 @@ _SHELL_COMPOSITION_PATTERNS: tuple[str, ...] = (
     "\r",
 )
 
+_SHELL_COMPOSITION_TOKENS: frozenset[str] = frozenset({
+    "$",
+    "|",
+    "||",
+    ";",
+    "&",
+    "&&",
+    "<",
+    "<(",
+    "<<",
+    "<>",
+})
+
+_SHELL_OUTPUT_REDIRECT_TOKENS: frozenset[str] = frozenset({
+    ">",
+    ">>",
+    ">|",
+})
+
 _SECRET_PATH_FILENAMES: frozenset[str] = frozenset({
     ".env",
     ".netrc",
@@ -719,6 +739,9 @@ _SECRET_PATH_FILENAMES: frozenset[str] = frozenset({
     "id_ed25519",
     "credentials",
     "credential",
+})
+
+_GENERIC_SECRET_PATH_FILENAMES: frozenset[str] = frozenset({
     "secret",
     "secrets",
     "token",
@@ -781,12 +804,41 @@ def _has_shell_composition(command: str) -> bool:
     return any(pattern in command for pattern in _SHELL_COMPOSITION_PATTERNS)
 
 
+def _split_shell_tokens(command: str) -> list[str] | None:
+    """Split a simple shell command while preserving quoted message operands."""
+
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        return list(lexer)
+    except ValueError:
+        return None
+
+
+def _classify_shell_composition_tokens(tokens: list[str]) -> RiskClass | None:
+    """Classify unquoted shell operators without inspecting quoted strings."""
+
+    if any(token in _SHELL_OUTPUT_REDIRECT_TOKENS for token in tokens):
+        return RiskClass.WRITE
+    if any(
+        token in _SHELL_COMPOSITION_TOKENS or "`" in token
+        for token in tokens
+    ):
+        return RiskClass.UNKNOWN
+    return None
+
+
 def _path_token_is_secret(path_token: str) -> bool:
     """Return True when a shell path token targets a secret or credential file."""
 
     normalized = path_token.strip("'\"`").replace("\\", "/")
     if not normalized:
         return False
+    path_like = (
+        "/" in normalized
+        or normalized.startswith(".")
+        or normalized.startswith("~")
+    )
     resolved = posixpath.normpath(normalized)
     segments = [
         segment.lower()
@@ -800,6 +852,8 @@ def _path_token_is_secret(path_token: str) -> bool:
     basename = segments[-1]
     if basename in _SECRET_PATH_FILENAMES:
         return True
+    if basename in _GENERIC_SECRET_PATH_FILENAMES:
+        return path_like
     if basename in _SHELL_PROFILE_BASENAMES:
         return True
     if basename.startswith(_SECRET_PATH_PREFIXES) or basename.endswith(_SECRET_PATH_SUFFIXES):
@@ -807,17 +861,27 @@ def _path_token_is_secret(path_token: str) -> bool:
     return False
 
 
-def _shell_command_references_secret_or_system_path(command: str) -> bool:
+def _shell_tokens_reference_secret_or_system_path(tokens: list[str]) -> bool:
     # claim-check: allow bounded hook classifier secret/system path deny boundary.
-    """Return True when a simple shell command references blocked secret/system paths."""
+    """Return True when command path operands target blocked secret/system paths."""
 
-    lowered = command.lower()
-    if "/etc/" in lowered or lowered.startswith("/etc"):
-        return True
-    for token in command.split():
+    for token in tokens:
+        lowered = token.lower()
+        if lowered == "/etc" or lowered.startswith("/etc/"):
+            return True
         if _path_token_is_secret(token):
             return True
     return False
+
+
+def _shell_command_references_secret_or_system_path(command: str) -> bool:
+    # claim-check: allow "blocked" describes tested classifier boundary, not universal safety.
+    """Return True when a simple shell command references blocked paths."""
+
+    tokens = _split_shell_tokens(command)
+    if tokens is None:
+        return False
+    return _shell_tokens_reference_secret_or_system_path(tokens)
 
 
 def _is_package_manager_mutation(tokens: list[str]) -> bool:
@@ -923,6 +987,32 @@ def _classify_alembic_command(tokens: list[str]) -> RiskClass | None:
     if len(tokens) >= 2 and tokens[1] in {"upgrade", "downgrade", "stamp", "revision"}:
         return RiskClass.WRITE
     return RiskClass.UNKNOWN
+
+
+def _classify_native_shell_mutation(tokens: list[str]) -> RiskClass | None:
+    """Classify native command names/flags that mutate or delete local state."""
+
+    if not tokens:
+        return None
+    command = tokens[0].lower()
+    lower_tokens = [token.lower() for token in tokens]
+    if command in {"rm", "rmdir", "unlink", "shred", "wipe"}:
+        return RiskClass.DESTRUCTIVE
+    if command in {"mv", "cp", "mkdir", "touch", "chmod", "chown", "ln", "dd"}:
+        return RiskClass.WRITE
+    if command == "find":
+        if "-delete" in lower_tokens:
+            return RiskClass.DESTRUCTIVE
+        if "-exec" in lower_tokens:
+            return RiskClass.WRITE
+    if command in {"sed", "perl"}:
+        if any(token == "-i" or token.startswith("-i") or token.startswith("-pi") for token in lower_tokens):
+            return RiskClass.WRITE
+    if command == "curl" and any(token in {"-o", "--output"} for token in lower_tokens):
+        return RiskClass.WRITE
+    if command == "wget" and any(token in {"-o", "-O".lower()} for token in lower_tokens):
+        return RiskClass.WRITE
+    return None
 
 
 def _git_checkout_is_path_restore(raw_tokens: list[str]) -> bool:
@@ -1114,20 +1204,13 @@ def classify_native_shell_command(command: str) -> RiskClass:
     stripped = command.strip()
     if not stripped:
         return RiskClass.UNKNOWN
-    lowered = stripped.lower()
-
-    if _shell_command_references_secret_or_system_path(lowered):
-        return RiskClass.DESTRUCTIVE
-
-    if any(tok in lowered for tok in _SHELL_DESTRUCTIVE_TOKENS):
-        return RiskClass.DESTRUCTIVE
-    if any(tok in lowered for tok in _SHELL_MUTATION_TOKENS):
-        return RiskClass.WRITE
-
-    if _has_shell_composition(lowered):
+    if "\n" in stripped or "\r" in stripped:
         return RiskClass.UNKNOWN
 
-    raw_tokens = stripped.split()
+    raw_tokens = _split_shell_tokens(stripped)
+    if raw_tokens is None:
+        return RiskClass.UNKNOWN
+
     if _leading_env_assignments_are_secret(raw_tokens):
         return RiskClass.DESTRUCTIVE
 
@@ -1135,6 +1218,13 @@ def classify_native_shell_command(command: str) -> RiskClass:
     lower_tokens = [token.lower() for token in tokens]
     if not tokens:
         return RiskClass.UNKNOWN
+
+    composition_risk = _classify_shell_composition_tokens(tokens)
+    if composition_risk is not None:
+        return composition_risk
+
+    if _shell_tokens_reference_secret_or_system_path(tokens):
+        return RiskClass.DESTRUCTIVE
 
     if _is_package_manager_mutation(lower_tokens):
         return RiskClass.WRITE
@@ -1153,6 +1243,10 @@ def classify_native_shell_command(command: str) -> RiskClass:
 
     if lower_tokens[0] == "git":
         return _classify_git_command(tokens)
+
+    native_mutation_risk = _classify_native_shell_mutation(tokens)
+    if native_mutation_risk is not None:
+        return native_mutation_risk
 
     if lower_tokens[0] in _SHELL_READONLY_FIRST_TOKEN:
         return RiskClass.READ
