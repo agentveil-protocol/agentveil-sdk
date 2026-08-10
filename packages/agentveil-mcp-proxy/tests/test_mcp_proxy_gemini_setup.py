@@ -32,6 +32,7 @@ def _install_fast_gemini_setup_fakes(monkeypatch, *, proxy_command: str) -> None
 
     monkeypatch.setattr(proxy_cli, "init_proxy", fake_init_proxy)
     monkeypatch.setattr(proxy_cli, "_resolve_setup_proxy_command", lambda: proxy_command)
+    monkeypatch.setattr(proxy_cli, "_best_effort_console_attach_credential", lambda **_kwargs: None)
     monkeypatch.setattr(
         "agentveil_mcp_proxy.approval.server.ensure_managed_approval_center_for_cli",
         lambda **_kwargs: SimpleNamespace(

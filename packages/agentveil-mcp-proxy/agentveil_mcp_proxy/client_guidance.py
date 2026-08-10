@@ -80,6 +80,13 @@ NATIVE_FILE_WRITE_REDIRECT_INSTRUCTION = (
     "Do not retry, request another approval, inspect raw configuration, or bypass "
     "through native tools. The route must be restored before a new attempt."
 )
+# claim-check: allow hook denial copy covered by route-unavailable negative tests.
+NATIVE_FILE_WRITE_ROUTE_UNAVAILABLE_INSTRUCTION = (
+    "Direct native file mutation was blocked before mutation. "  # claim-check: allow tested hook denial copy.
+    "The managed AgentVeil write route is not currently available for this project. "
+    "Stop and tell the user to restore the project connection before retrying. "
+    "Do not bypass through native tools."
+)
 # claim-check: allow hook denial copy verified by native shell guidance tests.
 NATIVE_SHELL_HARD_BLOCK_INSTRUCTION = (
     "Direct native shell use was blocked for a bounded security reason. "  # claim-check: allow tested hook denial copy.
@@ -516,11 +523,14 @@ def native_hook_deny_instruction(
     *,
     native_tool: str,
     risk_class: str | None = None,
+    redirect_route_ready: bool = True,
 ) -> str:
     """Return bounded deny guidance for one native hook denial."""
 
     if native_tool in _NATIVE_FILE_WRITE_DENY_TOOLS:
-        return NATIVE_FILE_WRITE_REDIRECT_INSTRUCTION
+        if redirect_route_ready:
+            return NATIVE_FILE_WRITE_REDIRECT_INSTRUCTION
+        return NATIVE_FILE_WRITE_ROUTE_UNAVAILABLE_INSTRUCTION
     if risk_class in {"destructive", "production", "financial"}:  # claim-check: allow bounded risk class labels.
         return NATIVE_SHELL_HARD_BLOCK_INSTRUCTION
     return NATIVE_SHELL_NO_MCP_ROUTE_INSTRUCTION
@@ -760,6 +770,7 @@ __all__ = [
     "MCP_ROUTE_UNAVAILABLE_USER_MESSAGE",
     "NATIVE_CONTROLLED_MCP_REDIRECT_INSTRUCTION",
     "NATIVE_FILE_WRITE_REDIRECT_INSTRUCTION",
+    "NATIVE_FILE_WRITE_ROUTE_UNAVAILABLE_INSTRUCTION",
     "NATIVE_SHELL_HARD_BLOCK_INSTRUCTION",
     "NATIVE_SHELL_NO_MCP_ROUTE_INSTRUCTION",
     "NATIVE_REDIRECT_AGENT_CONTEXT_PREFIX",

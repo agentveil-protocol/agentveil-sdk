@@ -16,7 +16,7 @@ import datetime as _dt
 import hashlib
 import json
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -36,7 +36,9 @@ from agentveil_mcp_proxy.client_guidance import (
     format_native_redirect_agent_surface,
     maybe_register_native_redirect_for_hook_deny,
     native_hook_deny_instruction,
+    native_write_redirect_supported,
 )
+from agentveil_mcp_proxy.hook_policy import HookDisposition, resolve_hook_disposition
 from agentveil_mcp_proxy.policy import (
     PolicyDecision,
     PolicyEngine,
@@ -70,6 +72,7 @@ class HookDecision:
     reason_code: str
     context: ToolCallContext
     evaluation: PolicyEvaluation
+    disposition: HookDisposition = HookDisposition.HARD_BLOCK
 
 
 def _tool_name(payload: Mapping[str, Any]) -> str:
@@ -216,6 +219,7 @@ def decide(payload: Mapping[str, Any], engine: PolicyEngine) -> HookDecision:
             reason_code="controlled_route_passthrough",
             context=context,
             evaluation=evaluation,
+            disposition=HookDisposition.ALLOW,
         )
     if evaluation.decision in (PolicyDecision.ALLOW, PolicyDecision.OBSERVE):
         hook_action = "allow"
@@ -226,6 +230,7 @@ def decide(payload: Mapping[str, Any], engine: PolicyEngine) -> HookDecision:
         reason_code=_reason_code(evaluation, hook_action),
         context=context,
         evaluation=evaluation,
+        disposition=resolve_hook_disposition(evaluation),
     )
 
 
@@ -246,6 +251,7 @@ def format_hook_output(
         instruction = native_hook_deny_instruction(
             native_tool=decision.context.tool,
             risk_class=decision.evaluation.risk_class.value,
+            redirect_route_ready=decision.disposition is HookDisposition.REDIRECT,
         )
         reason = f"{reason}. {instruction}"
     reason = format_native_redirect_agent_surface(reason, redirect_origin)
@@ -310,14 +316,6 @@ def process_hook(
 ) -> HookDecision:
     engine = PolicyEngine(config or default_proxy_config_for_hook())
     decision = decide(payload, engine)
-    record = build_evidence_record(payload, decision)
-    if evidence_path is not None:
-        write_evidence(record, evidence_path)
-    if decision.hook_action == "deny":
-        if detached_upload:
-            best_effort_spawn_hook_denied_summary(record, runtime_home=home)
-        else:
-            best_effort_upload_hook_denied_summary(record, home=home)
     redirect_origin = maybe_register_native_redirect_for_hook_deny(
         hook_action=decision.hook_action,
         native_server=decision.context.server,
@@ -327,6 +325,27 @@ def process_hook(
         tool_input=_tool_input(payload),
         home=home,
     )
+    if decision.hook_action == "deny":
+        disposition = resolve_hook_disposition(
+            decision.evaluation,
+            native_write_redirect_supported=native_write_redirect_supported(
+                native_tool=decision.context.tool,
+            ),
+            redirect_route_ready=redirect_origin is not None,
+        )
+        decision = replace(
+            decision,
+            disposition=disposition,
+            reason_code="managed_route_redirect" if disposition is HookDisposition.REDIRECT else "risky_blocked",
+        )
+    record = build_evidence_record(payload, decision)
+    if evidence_path is not None:
+        write_evidence(record, evidence_path)
+    if decision.hook_action == "deny":
+        if detached_upload:
+            best_effort_spawn_hook_denied_summary(record, runtime_home=home)
+        else:
+            best_effort_upload_hook_denied_summary(record, home=home)
     output = format_hook_output(decision, redirect_origin=redirect_origin)
     if output is not None:
         (out or sys.stdout).write(output + "\n")

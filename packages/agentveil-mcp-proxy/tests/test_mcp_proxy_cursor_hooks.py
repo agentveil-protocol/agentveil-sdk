@@ -44,8 +44,8 @@ def test_native_write_denied_with_generic_redirect(tmp_path: Path) -> None:
     assert decision.hook_action == "deny"
     response = json.loads(out.getvalue())
     assert response["permission"] == "deny"
-    assert "write_file" in response["agent_message"]
-    assert cursor_hooks.NATIVE_REDIRECT_INSTRUCTION in response["agent_message"]
+    assert "write_file" not in response["agent_message"]
+    assert "managed AgentVeil write route is not currently available" in response["agent_message"]
 
 
 def test_shell_python_m_pytest_allowed_end_to_end(tmp_path: Path) -> None:
@@ -60,6 +60,18 @@ def test_shell_python_m_pytest_allowed_end_to_end(tmp_path: Path) -> None:
     )
     assert decision.hook_action == "allow"
     assert json.loads(out.getvalue())["permission"] == "allow"
+
+
+def test_cursor_main_allows_bounded_local_git_command(tmp_path: Path) -> None:
+    stdin = StringIO(json.dumps({"command": "git status --short"}))
+    stdout = StringIO()
+
+    assert cursor_hooks.main(
+        ["--workspace", str(tmp_path), "--hook-event", "beforeShellExecution"],
+        stdin=stdin,
+        stdout=stdout,
+    ) == 0
+    assert json.loads(stdout.getvalue())["permission"] == "allow"
 
 
 def test_shell_git_checkout_path_restore_denied_end_to_end(tmp_path: Path) -> None:
@@ -209,7 +221,7 @@ def test_native_write_deny_registers_durable_origin_and_agent_surface_context(tm
     fixture = publish_live_hook_binding(home, downstream=downstream)
     try:
         out = StringIO()
-        cursor_hooks.process_hook(
+        decision = cursor_hooks.process_hook(
             {
                 "hook_event": "preToolUse",
                 "tool_name": "Write",
@@ -223,6 +235,7 @@ def test_native_write_deny_registers_durable_origin_and_agent_surface_context(tm
         payload = json.loads(out.getvalue())
         redirect_context = parse_redirect_context_from_cursor_hook_output(payload)
         assert redirect_context is not None
+        assert decision.disposition.value == "redirect"
         original_id = redirect_context["original_request_id"]
         meta = durable_original_metadata(home, original_id)
         assert meta is not None
@@ -240,7 +253,7 @@ def test_native_edit_deny_has_no_verified_redirect_context(tmp_path: Path) -> No
     fixture = publish_live_hook_binding(home, downstream=downstream)
     try:
         out = StringIO()
-        cursor_hooks.process_hook(
+        decision = cursor_hooks.process_hook(
             {
                 "hook_event": "preToolUse",
                 "tool_name": "Edit",
@@ -252,6 +265,7 @@ def test_native_edit_deny_has_no_verified_redirect_context(tmp_path: Path) -> No
         )
         payload = json.loads(out.getvalue())
         assert parse_redirect_context_from_cursor_hook_output(payload) is None
+        assert decision.disposition.value == "hard_block"
     finally:
         fixture.lease.close()
 
@@ -259,7 +273,7 @@ def test_native_edit_deny_has_no_verified_redirect_context(tmp_path: Path) -> No
 def test_native_write_deny_without_live_binding_has_no_verified_context(tmp_path: Path) -> None:
     home, _sandbox, _downstream = init_redirect_contract_home(tmp_path)
     out = StringIO()
-    cursor_hooks.process_hook(
+    decision = cursor_hooks.process_hook(
         {
             "hook_event": "preToolUse",
             "tool_name": "Write",
@@ -271,6 +285,7 @@ def test_native_write_deny_without_live_binding_has_no_verified_context(tmp_path
     )
     payload = json.loads(out.getvalue())
     assert parse_redirect_context_from_cursor_hook_output(payload) is None
+    assert decision.disposition.value == "hard_block"
 
 
 def test_cursor_hook_denied_uploads_bounded_decision_summary(monkeypatch, tmp_path: Path) -> None:

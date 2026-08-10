@@ -21,7 +21,7 @@ from agentveil_mcp_proxy.cli import init_proxy, run_proxy
 from agentveil_mcp_proxy.client_guidance import (
     MCP_ROUTE_UNAVAILABLE_NEXT_STEP,
     MCP_ROUTE_UNAVAILABLE_USER_MESSAGE,
-    NATIVE_CONTROLLED_MCP_REDIRECT_INSTRUCTION,
+    NATIVE_FILE_WRITE_ROUTE_UNAVAILABLE_INSTRUCTION,
 )
 from agentveil_mcp_proxy.passthrough import (
     DownstreamConfig,
@@ -691,12 +691,10 @@ def test_native_deny_uses_common_unavailable_recovery_guidance(
     decision = module.process_hook(payload, **kwargs)
     assert decision.hook_action == "deny"
     reason = _extract_deny_text(module, out.getvalue())
-    assert NATIVE_CONTROLLED_MCP_REDIRECT_INSTRUCTION in reason
+    assert NATIVE_FILE_WRITE_ROUTE_UNAVAILABLE_INSTRUCTION in reason
     lowered = reason.lower()
     assert "stop and tell the user" in lowered
-    assert "do not retry" in lowered
-    assert "request another approval" in lowered
-    assert "inspect raw configuration" in lowered
+    assert "restore the project connection" in lowered
     assert "bypass through native tools" in lowered
     assert "then retry the same protected action" not in lowered
     assert "after approval, retry the same mcp tool call once" not in lowered

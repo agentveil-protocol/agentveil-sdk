@@ -2071,7 +2071,7 @@ def test_cli_setup_status_home_routes_to_wizard(tmp_path, capsys):
     # --home routes to the adaptive wizard, NOT the connector status.
     home = tmp_path / "avp-home"
     home.mkdir()
-    rc = main(["setup", "status", "--home", str(home), "--json"])
+    main(["setup", "status", "--home", str(home), "--json"])
     out = capsys.readouterr().out
     payload = json.loads(out)
     # wizard output must not carry the connector-only keys
@@ -2194,8 +2194,6 @@ def test_cli_setup_claude_code_starts_center_with_passphrase_without_url_leak(
     monkeypatch,
     capsys,
 ):
-    from agentveil_mcp_proxy.approval.server import ensure_managed_approval_center_for_cli
-
     passphrase_file = tmp_path / "passphrase.txt"
     passphrase_file.write_text(TEST_PASSPHRASE, encoding="utf-8")
     seen: dict[str, object] = {}
@@ -2266,8 +2264,6 @@ def test_cli_setup_claude_code_choose_folder_uses_selected_project(
     monkeypatch,
     capsys,
 ):
-    from agentveil_mcp_proxy.approval.server import ensure_managed_approval_center_for_cli
-
     selected = tmp_path / "Selected Project"
     selected.mkdir()
     seen: dict[str, object] = {}
@@ -2455,8 +2451,6 @@ def test_cli_setup_claude_code_fails_when_center_not_running(
     monkeypatch,
     capsys,
 ):
-    from agentveil_mcp_proxy.approval.server import ensure_managed_approval_center_for_cli
-
     def fake_init_proxy(**kwargs):
         home = kwargs["home"]
         (home / "mcp-proxy").mkdir(parents=True, exist_ok=True)
@@ -4421,6 +4415,7 @@ def test_console_setup_attach_acquires_credential_and_uploads_status(
 
     avp_home = tmp_path / "avp-home"
     monkeypatch.setenv("AVP_HOME", str(avp_home))
+    real_attach_credential = proxy_cli._best_effort_console_attach_credential
     isolated_home = tmp_path / "home"
     _isolate_cli_home(monkeypatch, isolated_home)
     proxy_command = _make_proxy_command(tmp_path)
@@ -4434,6 +4429,11 @@ def test_console_setup_attach_acquires_credential_and_uploads_status(
     monkeypatch.setattr(
         "agentveil_mcp_proxy.cli.console_login_lock",
         lambda home=None: _null_context(),
+    )
+    monkeypatch.setattr(
+        proxy_cli,
+        "_best_effort_console_attach_credential",
+        real_attach_credential,
     )
     monkeypatch.setattr(
         "agentveil_mcp_proxy.console_project_status_client.sync_project_status",
@@ -4574,6 +4574,7 @@ def test_console_attach_on_setup_for_connectors(
 
     avp_home = tmp_path / "avp-home"
     monkeypatch.setenv("AVP_HOME", str(avp_home))
+    real_attach_credential = proxy_cli._best_effort_console_attach_credential
     project = tmp_path / "checkout-service"
     project.mkdir()
     attach = _FakeAttachClient()
@@ -4630,6 +4631,11 @@ def test_console_attach_on_setup_for_connectors(
         _isolate_cli_home(monkeypatch, isolated_home)
         proxy_command = _make_proxy_command(tmp_path)
         _install_fast_codex_setup_fakes(monkeypatch, proxy_command=proxy_command)
+        monkeypatch.setattr(
+            proxy_cli,
+            "_best_effort_console_attach_credential",
+            real_attach_credential,
+        )
         setup = [*setup_argv, "--project-dir", str(project), "--json"]
         status = [*status_argv, "--project-dir", str(project), "--json"]
     elif client == "claude-code":
@@ -4663,6 +4669,11 @@ def test_console_attach_on_setup_for_connectors(
         monkeypatch.setenv("HOME", str(isolated_home))
         proxy_command = _make_proxy_command(tmp_path)
         _install_fast_gemini_setup_fakes(monkeypatch, proxy_command=proxy_command)
+        monkeypatch.setattr(
+            proxy_cli,
+            "_best_effort_console_attach_credential",
+            real_attach_credential,
+        )
         setup = [*setup_argv, "--project-dir", str(project), "--json"]
         status = [*status_argv, "--project-dir", str(project), "--json"]
 
