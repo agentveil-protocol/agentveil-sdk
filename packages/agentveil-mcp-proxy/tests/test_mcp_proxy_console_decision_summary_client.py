@@ -44,6 +44,7 @@ from agentveil_mcp_proxy.console_decision_summary_client import (
     wait_for_hook_denied_uploads_for_tests,
 )
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore, ApprovalStatus, PendingApproval
+from agentveil_mcp_proxy.passthrough import McpPassthrough
 from agentveil_mcp_proxy.policy import (
     PolicyDecision,
     PolicyEvaluation,
@@ -886,6 +887,28 @@ def test_manager_observer_receives_executed_terminal_record(tmp_path):
     assert payload.decision == "allowed"
     server.stop()
     store.close()
+
+
+def test_passthrough_finalizes_controlled_metadata_before_terminal_notification():
+    calls: list[str] = []
+
+    class _Manager:
+        def record_execution_result(self, *_args, **_kwargs):
+            calls.append("notify")
+
+    proxy = object.__new__(McpPassthrough)
+    proxy.approval_manager = _Manager()
+    proxy._annotate_executed_controlled_path = (  # type: ignore[method-assign]
+        lambda *_args, **_kwargs: calls.append("annotate")
+    )
+
+    proxy._record_approval_result(
+        ApprovalOutcome(EVENT_ID, ApprovalStatus.APPROVED.value, "approved"),
+        {"jsonrpc": "2.0", "id": 1, "result": {}},
+        downstream_tool_call_seen=True,
+    )
+
+    assert calls == ["annotate", "notify"]
 
 
 def test_manager_observer_swallows_exceptions(tmp_path):
