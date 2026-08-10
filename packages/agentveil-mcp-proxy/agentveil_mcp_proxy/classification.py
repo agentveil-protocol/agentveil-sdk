@@ -130,6 +130,9 @@ _FILESYSTEM_READ_TOOL_RISK_CLASSES: Mapping[str, RiskClass] = {
     "instruction_surface_status": RiskClass.READ,
     "local_proof": RiskClass.READ,
 }
+_FILESYSTEM_WRITE_TOOL_RISK_CLASSES: Mapping[str, RiskClass] = {
+    "apply_patch": RiskClass.WRITE,
+}
 
 # Python package-manager MCP tool surface. Ecosystem scope: pip only.
 # GitHub MCP-style tool catalog for routed GitHub pack behavior. Tool names
@@ -518,6 +521,8 @@ def infer_action_family(tool: str) -> str:
     if "." in tool:
         return tool.rsplit(".", 1)[0]
     lowered = tool.lower()
+    if lowered == "apply_patch":
+        return "write"
     for prefix in (
         "get_",
         "list_",
@@ -549,6 +554,10 @@ def infer_risk_class(
     filesystem_read_risk = _FILESYSTEM_READ_TOOL_RISK_CLASSES.get(tool)
     if filesystem_read_risk is not None:
         return filesystem_read_risk
+
+    filesystem_write_risk = _FILESYSTEM_WRITE_TOOL_RISK_CLASSES.get(tool)
+    if filesystem_write_risk is not None:
+        return filesystem_write_risk
 
     git_risk = _GIT_TOOL_RISK_CLASSES.get(tool)
     if git_risk is not None:
@@ -824,6 +833,8 @@ def _split_shell_tokens(command: str) -> list[str] | None:
 def _classify_shell_composition_tokens(tokens: list[str]) -> RiskClass | None:
     """Classify unquoted shell operators without inspecting quoted strings."""
 
+    if _is_bounded_stderr_devnull_redirect(tokens):
+        return None
     if any(token in _SHELL_OUTPUT_REDIRECT_TOKENS for token in tokens):
         return RiskClass.WRITE
     if any(
@@ -832,6 +843,14 @@ def _classify_shell_composition_tokens(tokens: list[str]) -> RiskClass | None:
     ):
         return RiskClass.UNKNOWN
     return None
+
+
+def _is_bounded_stderr_devnull_redirect(tokens: list[str]) -> bool:
+    """Allow exactly one trailing ``2>/dev/null`` on an otherwise simple read."""
+
+    return tokens[-3:] == ["2", ">", "/dev/null"] and not any(
+        token in _SHELL_COMPOSITION_TOKENS for token in tokens[:-3]
+    )
 
 
 def _split_bounded_shell_segments(tokens: list[str]) -> list[list[str]] | None:
@@ -1022,6 +1041,8 @@ def _classify_agentveil_cli_command(tokens: list[str]) -> RiskClass | None:
     if tokens[1:] == ["--version"]:
         return RiskClass.READ
     if len(tokens) >= 3 and tokens[1:3] == ["setup", "status"]:
+        return RiskClass.READ
+    if tokens[1:] == ["events", "--help"]:
         return RiskClass.READ
     return RiskClass.UNKNOWN
 
@@ -1317,9 +1338,13 @@ def classify_native_shell_command(command: str) -> RiskClass:
     if raw_tokens is None:
         return RiskClass.UNKNOWN
 
+    bounded_stderr_redirect = _is_bounded_stderr_devnull_redirect(raw_tokens)
     composition_risk = _classify_shell_composition_tokens(raw_tokens)
     if composition_risk is not None:
         return composition_risk
+
+    if bounded_stderr_redirect:
+        raw_tokens = raw_tokens[:-3]
 
     segments = _split_bounded_shell_segments(raw_tokens)
     if segments is None:

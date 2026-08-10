@@ -29,6 +29,7 @@ from agentveil_mcp_proxy.console_credentials import (
     CREDENTIAL_SCOPE,
     CredentialError,
     StoredCredential,
+    console_credential_home_for_runtime,
     load_credential,
 )
 from agentveil_mcp_proxy.evidence import ApprovalStatus, PendingApproval
@@ -694,12 +695,11 @@ def _hook_denied_worker_environment(
     runtime_home: Path | None,
 ) -> tuple[dict[str, str], Path | None]:
     env = dict(os.environ)
-    credential_home: Path | None = None
+    credential_home = console_credential_home_for_runtime(runtime_home)
     configured_home = env.get("AVP_HOME")
     if configured_home and runtime_home is not None:
         if Path(configured_home).expanduser() == runtime_home.expanduser():
             env.pop("AVP_HOME", None)
-            credential_home = Path("~/.avp").expanduser()
     return env, credential_home
 
 
@@ -776,7 +776,7 @@ def _decode_response_object(
     response: RawResponse,
     *,
     request: DecisionSummaryPayload,
-) -> None:
+) -> str:
     if response.status != 200:
         raise DecisionSummaryClientError("unexpected_status")
     if len(response.content_types) != 1:
@@ -814,6 +814,7 @@ def _decode_response_object(
     status = _require_response_string(parsed["status"])
     if status not in _ACK_STATUSES:
         raise DecisionSummaryClientError("malformed_body")
+    return status
 
 
 class ConsoleDecisionSummaryClient:
@@ -831,7 +832,7 @@ class ConsoleDecisionSummaryClient:
         payload: DecisionSummaryPayload,
         *,
         bearer_token: str,
-    ) -> None:
+    ) -> str:
         body_obj = payload_to_request_body(payload)
         body = json.dumps(body_obj, sort_keys=True, separators=(",", ":")).encode(
             "utf-8"
@@ -855,7 +856,7 @@ class ConsoleDecisionSummaryClient:
             )
         except TransportError as exc:
             raise DecisionSummaryClientError("transport_failed") from exc
-        _decode_response_object(response, request=payload)
+        return _decode_response_object(response, request=payload)
 
 
 def _resolve_credential(
@@ -893,12 +894,11 @@ def sync_decision_summary(
     client = ConsoleDecisionSummaryClient(transport=transport)
     try:
         assert credential is not None
-        client.upload(payload, bearer_token=credential.token)
+        return client.upload(payload, bearer_token=credential.token)
     except DecisionSummaryClientError as exc:
         if exc.code in {"transport_failed", "unexpected_status"}:
             return "unavailable"
         return "rejected"
-    return "accepted"
 
 
 class ConsoleDecisionSummaryDispatcher:
@@ -977,16 +977,19 @@ class ConsoleDecisionSummaryDispatcher:
             except queue.Empty:
                 return
 
-    def _remember_event(self, event_id: str) -> bool:
+    def _event_seen(self, event_id: str) -> bool:
+        with self._lock:
+            return event_id in self._seen_event_ids
+
+    def _remember_event(self, event_id: str) -> None:
         with self._lock:
             if event_id in self._seen_event_ids:
-                return False
+                return
             self._seen_event_ids.add(event_id)
             self._seen_order.append(event_id)
             if len(self._seen_order) > _MAX_DEDUP_KEYS:
                 oldest = self._seen_order.pop(0)
                 self._seen_event_ids.discard(oldest)
-            return True
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -1007,16 +1010,18 @@ class ConsoleDecisionSummaryDispatcher:
         payload = build_decision_summary_payload(record)
         if payload is None:
             return
-        if not self._remember_event(payload.event_id):
+        if self._event_seen(payload.event_id):
             return
         if self._stop.is_set():
             return
-        self._upload_fn(
+        outcome = self._upload_fn(
             payload,
             home=self._home,
             load_credential_fn=self._load_credential_fn,
             transport=self._transport,
         )
+        if outcome in _ACK_STATUSES:
+            self._remember_event(payload.event_id)
 
 
 def attach_terminal_evidence_observer(

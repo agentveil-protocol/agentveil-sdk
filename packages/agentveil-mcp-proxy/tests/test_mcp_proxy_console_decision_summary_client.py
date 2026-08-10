@@ -21,6 +21,7 @@ from agentveil_mcp_proxy.console_credentials import (
     CREDENTIAL_SCOPE,
     CredentialError,
     StoredCredential,
+    console_credential_home_for_runtime,
 )
 from agentveil_mcp_proxy.console_decision_summary_client import (
     CONSOLE_ORIGIN,
@@ -43,6 +44,7 @@ from agentveil_mcp_proxy.console_decision_summary_client import (
     wait_for_hook_denied_uploads_for_tests,
 )
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore, ApprovalStatus, PendingApproval
+from agentveil_mcp_proxy.passthrough import McpPassthrough
 from agentveil_mcp_proxy.policy import (
     PolicyDecision,
     PolicyEvaluation,
@@ -422,14 +424,43 @@ def test_sync_accepts_backend_shaped_response():
     }
 
 
-def test_duplicate_ack_is_accepted():
+def test_duplicate_ack_is_preserved():
     transport = BackendEchoTransport(status="duplicate")
     result = sync_decision_summary(
         _payload(),
         load_credential_fn=_load_credential_ok,
         transport=transport,
     )
-    assert result == "accepted"
+    assert result == "duplicate"
+
+
+def test_project_runtime_uses_global_console_credential_home(monkeypatch, tmp_path):
+    runtime_home = tmp_path / "project-home"
+    monkeypatch.setenv("AVP_HOME", str(runtime_home))
+    assert console_credential_home_for_runtime(runtime_home) == (
+        tmp_path.home() / ".avp"
+    )
+
+
+def test_canonical_project_runtime_uses_global_credential_without_env(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.delenv("AVP_HOME", raising=False)
+    runtime_home = tmp_path / "project" / ".avp"
+    assert console_credential_home_for_runtime(runtime_home) == (
+        tmp_path.home() / ".avp"
+    )
+
+
+def test_non_project_runtime_keeps_explicit_console_credential_home(
+    monkeypatch,
+    tmp_path,
+):
+    configured_home = tmp_path / "configured-home"
+    explicit_home = tmp_path / "explicit-home"
+    monkeypatch.setenv("AVP_HOME", str(configured_home))
+    assert console_credential_home_for_runtime(explicit_home) == explicit_home
 
 
 @pytest.mark.parametrize("status_code", [301, 401, 403, 404, 409, 429, 500])
@@ -707,6 +738,72 @@ def test_dispatcher_deduplicates_duplicate_notifications(tmp_path):
         dispatcher.stop()
 
 
+@pytest.mark.parametrize("first_outcome", ["unavailable", "rejected"])
+def test_dispatcher_retries_same_event_after_unacked_upload(tmp_path, first_outcome):
+    uploads: list[str] = []
+    outcomes = iter([first_outcome, "accepted"])
+
+    def _upload(payload, *, home=None, load_credential_fn=None, transport=None):
+        uploads.append(payload.event_id)
+        return next(outcomes)
+
+    dispatcher = ConsoleDecisionSummaryDispatcher(
+        home=tmp_path,
+        load_credential_fn=_load_credential_ok,
+        upload_fn=_upload,
+        queue_capacity=4,
+    )
+    dispatcher.start()
+    try:
+        record = _record(request_id=f"retry-after-{first_outcome}")
+        dispatcher.notify_terminal_record(record)
+        deadline = time.monotonic() + 2.0
+        while len(uploads) < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        dispatcher.notify_terminal_record(record)
+        deadline = time.monotonic() + 2.0
+        while len(uploads) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        dispatcher.notify_terminal_record(record)
+        time.sleep(0.1)
+        assert uploads == [record.request_id, record.request_id]
+    finally:
+        dispatcher.stop()
+
+
+def test_dispatcher_retries_same_event_after_upload_exception(tmp_path):
+    uploads: list[str] = []
+
+    def _upload(payload, *, home=None, load_credential_fn=None, transport=None):
+        uploads.append(payload.event_id)
+        if len(uploads) == 1:
+            raise RuntimeError("bounded upload failure")
+        return "duplicate"
+
+    dispatcher = ConsoleDecisionSummaryDispatcher(
+        home=tmp_path,
+        load_credential_fn=_load_credential_ok,
+        upload_fn=_upload,
+        queue_capacity=4,
+    )
+    dispatcher.start()
+    try:
+        record = _record(request_id="retry-after-exception")
+        dispatcher.notify_terminal_record(record)
+        deadline = time.monotonic() + 2.0
+        while len(uploads) < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        dispatcher.notify_terminal_record(record)
+        deadline = time.monotonic() + 2.0
+        while len(uploads) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        dispatcher.notify_terminal_record(record)
+        time.sleep(0.1)
+        assert uploads == [record.request_id, record.request_id]
+    finally:
+        dispatcher.stop()
+
+
 def test_dispatcher_queue_full_is_bounded(tmp_path):
     dispatcher = ConsoleDecisionSummaryDispatcher(
         home=tmp_path,
@@ -790,6 +887,28 @@ def test_manager_observer_receives_executed_terminal_record(tmp_path):
     assert payload.decision == "allowed"
     server.stop()
     store.close()
+
+
+def test_passthrough_finalizes_controlled_metadata_before_terminal_notification():
+    calls: list[str] = []
+
+    class _Manager:
+        def record_execution_result(self, *_args, **_kwargs):
+            calls.append("notify")
+
+    proxy = object.__new__(McpPassthrough)
+    proxy.approval_manager = _Manager()
+    proxy._annotate_executed_controlled_path = (  # type: ignore[method-assign]
+        lambda *_args, **_kwargs: calls.append("annotate")
+    )
+
+    proxy._record_approval_result(
+        ApprovalOutcome(EVENT_ID, ApprovalStatus.APPROVED.value, "approved"),
+        {"jsonrpc": "2.0", "id": 1, "result": {}},
+        downstream_tool_call_seen=True,
+    )
+
+    assert calls == ["annotate", "notify"]
 
 
 def test_manager_observer_swallows_exceptions(tmp_path):

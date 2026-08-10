@@ -4009,12 +4009,12 @@ class McpPassthrough:
     ) -> None:
         if outcome is None or self.approval_manager is None:
             return
-        self.approval_manager.record_execution_result(
+        self._annotate_executed_controlled_path(
             outcome,
             response,
             downstream_tool_call_seen=downstream_tool_call_seen,
         )
-        self._annotate_executed_controlled_path(
+        self.approval_manager.record_execution_result(
             outcome,
             response,
             downstream_tool_call_seen=downstream_tool_call_seen,

@@ -80,6 +80,12 @@ NATIVE_FILE_WRITE_REDIRECT_INSTRUCTION = (
     "Do not retry, request another approval, inspect raw configuration, or bypass "
     "through native tools. The route must be restored before a new attempt."
 )
+NATIVE_PATCH_REDIRECT_INSTRUCTION = (
+    "Direct native patch use was stopped before mutation. "
+    "Call the AgentVeil controlled MCP tool apply_patch with the same single-file patch "
+    "and bounded path, preserving the same path, content, and intent and the redirect_context exactly. "
+    "If that route is unavailable, stop and tell the user. Do not bypass through native tools."
+)
 # claim-check: allow hook denial copy covered by route-unavailable negative tests.
 NATIVE_FILE_WRITE_ROUTE_UNAVAILABLE_INSTRUCTION = (
     "Direct native file mutation was blocked before mutation. "  # claim-check: allow tested hook denial copy.
@@ -106,6 +112,7 @@ OWNER_CLAIMS_DIRNAME = "owner_claims"
 NATIVE_REDIRECT_AGENT_CONTEXT_PREFIX = "redirect_context="
 NATIVE_REDIRECT_ORIGIN_REASON = "native_hook_denied"
 NATIVE_REDIRECT_FOLLOW_UP_TOOL = "write_file"
+NATIVE_PATCH_REDIRECT_FOLLOW_UP_TOOL = "apply_patch"
 NATIVE_REDIRECT_PLAYBOOK_ID = "request_approval"
 _PRODUCT_ROUTE_PROFILE_ROOT_ENV = "PRODUCT_ROUTE_PROFILE_ROOT"
 _PRODUCT_ROUTE_WORKSPACE_DIRNAME = "workspace"
@@ -491,6 +498,15 @@ def normalize_native_write_arguments(
 ) -> dict[str, Any] | None:
     """Canonicalize native Write args onto bounded write_file keys."""
 
+    patch_value = tool_input.get("patch")
+    if isinstance(patch_value, str):
+        patch_path = _single_file_patch_path(patch_value)
+        if patch_path is None:
+            return None
+        if workspace_root is not None:
+            patch_path = _normalize_relative_workspace_path(patch_path, workspace_root)
+        return {"path": patch_path, "patch": patch_value}
+
     normalized: dict[str, Any] = {}
     for key, value in tool_input.items():
         if isinstance(value, str):
@@ -513,6 +529,31 @@ def normalize_native_write_arguments(
     return normalized
 
 
+def _single_file_patch_path(patch: str) -> str | None:
+    """Return the sole target path from a bounded Codex patch envelope."""
+
+    if len(patch.encode("utf-8")) > 262_144:
+        return None
+    lines = patch.splitlines()
+    if not lines or lines[0] != "*** Begin Patch" or lines[-1] != "*** End Patch":
+        return None
+    headers = [
+        line
+        for line in lines[1:-1]
+        if line.startswith(("*** Add File: ", "*** Update File: ", "*** Delete File: "))
+    ]
+    if len(headers) != 1 or any(line.startswith("*** Move to: ") for line in lines):
+        return None
+    path = headers[0].split(": ", 1)[1].strip()
+    return path or None
+
+
+def _native_redirect_follow_up_tool(native_tool: str) -> str:
+    if native_tool in {"apply_patch", "ApplyPatch"}:
+        return NATIVE_PATCH_REDIRECT_FOLLOW_UP_TOOL
+    return NATIVE_REDIRECT_FOLLOW_UP_TOOL
+
+
 def native_write_redirect_supported(*, native_tool: str) -> bool:
     """Return True when a connector-native tool maps to canonical native write."""
 
@@ -529,6 +570,8 @@ def native_hook_deny_instruction(
 
     if native_tool in _NATIVE_FILE_WRITE_DENY_TOOLS:
         if redirect_route_ready:
+            if native_tool in {"apply_patch", "ApplyPatch"}:
+                return NATIVE_PATCH_REDIRECT_INSTRUCTION
             return NATIVE_FILE_WRITE_REDIRECT_INSTRUCTION
         return NATIVE_FILE_WRITE_ROUTE_UNAVAILABLE_INSTRUCTION
     if risk_class in {"destructive", "production", "financial"}:  # claim-check: allow bounded risk class labels.
@@ -701,7 +744,8 @@ def register_native_redirect_origin(
         project_scope_fingerprint=binding.project_scope_fingerprint,
     )
     metadata["native_hook_denied"] = True
-    metadata["follow_up_tool"] = NATIVE_REDIRECT_FOLLOW_UP_TOOL
+    follow_up_tool = _native_redirect_follow_up_tool(native_tool)
+    metadata["follow_up_tool"] = follow_up_tool
     metadata_jcs = json.dumps(metadata, separators=(",", ":"), sort_keys=True)
     from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore
 
@@ -733,7 +777,7 @@ def register_native_redirect_origin(
         original_request_id=original_request_id,
         redirect_context=redirect_context,
         redirect_playbook_id=NATIVE_REDIRECT_PLAYBOOK_ID,
-        follow_up_tool=NATIVE_REDIRECT_FOLLOW_UP_TOOL,
+        follow_up_tool=follow_up_tool,
     )
 
 

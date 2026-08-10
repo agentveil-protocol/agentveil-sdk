@@ -50,6 +50,7 @@ QUICKSTART_FILESYSTEM_TOOL_NAMES: tuple[str, ...] = (
     "instruction_surface_status",
     "local_proof",
     "write_file",
+    "apply_patch",
     "delete_file",
     "rmdir_tree",
     "move_file",
@@ -88,7 +89,7 @@ def test_product_route_catalog_matches_existing_pack_constants() -> None:
 
 def test_product_route_catalog_is_complete_and_deduplicated() -> None:
     assert len(PRODUCT_ROUTE_TOOL_CATALOG) == len(set(PRODUCT_ROUTE_TOOL_CATALOG))
-    assert len(PRODUCT_ROUTE_TOOL_CATALOG) == 71
+    assert len(PRODUCT_ROUTE_TOOL_CATALOG) == 72
     assert PRODUCT_ROUTE_TOOL_CATALOG.count("instruction_surface_status") == 1
     assert product_route_tool_pack("instruction_surface_status") == "filesystem"
 

@@ -128,8 +128,8 @@ def test_catalog_contract_unchanged_after_schema_compaction() -> None:
     expected_packs = {row["name"]: row["pack"] for row in expected_tools}
     actual_names = list(PRODUCT_ROUTE_TOOL_CATALOG)
 
-    assert contract["catalog_count"] == 71
-    assert len(actual_names) == 71
+    assert contract["catalog_count"] == 72
+    assert len(actual_names) == 72
     assert actual_names == expected_names
     assert {
         name: PRODUCT_ROUTE_TOOL_PACK[name]
@@ -143,7 +143,8 @@ def test_tools_list_and_schema_bytes_shrink_vs_baseline() -> None:
     baseline = _load_size_baseline()
     measured = measure_product_route_tools_list_size()
 
-    assert measured["tool_count"] == baseline["tool_count"] == 71
+    assert measured["tool_count"] == 72
+    assert baseline["tool_count"] == 71
     assert measured["tools_list_bytes"] < int(baseline["tools_list_bytes"])
     assert measured["schema_bytes"] < int(baseline["schema_bytes"])
     assert measured["github_schema_bytes"] < int(baseline["github_schema_bytes"])

@@ -802,6 +802,13 @@ def test_classify_native_shell_allows_bounded_read_chains_and_diagnostics() -> N
         is RiskClass.READ
     )
     assert classify_native_shell_command("agentveil-mcp-proxy --version") is RiskClass.READ
+    assert classify_native_shell_command("agentveil-mcp-proxy events --help") is RiskClass.READ
+    assert (
+        classify_native_shell_command(
+            "rg --files .codex/agentveil .agentveil 2>/dev/null"
+        )
+        is RiskClass.READ
+    )
     assert (
         classify_native_shell_command(
             "agentveil-mcp-proxy --version && "
@@ -823,3 +830,19 @@ def test_classify_native_shell_read_chain_fails_closed_on_unsafe_segment() -> No
     assert classify_native_shell_command("sed -e '1,40p' README.md") is RiskClass.UNKNOWN
     assert classify_native_shell_command("git status | tee status.txt") is RiskClass.UNKNOWN
     assert classify_native_shell_command("git status > status.txt") is RiskClass.WRITE
+    assert classify_native_shell_command("rg token > status.txt") is RiskClass.WRITE
+    assert classify_native_shell_command("rg token 2> errors.txt") is RiskClass.WRITE
+
+
+def test_apply_patch_controlled_tool_is_a_filesystem_write() -> None:
+    from agentveil_mcp_proxy.classification import infer_action_family, infer_risk_class
+
+    assert infer_action_family("apply_patch") == "write"
+    assert (
+        infer_risk_class(
+            "product.apply_patch",
+            tool="apply_patch",
+            arguments={"path": "src/app.py", "patch": "sha256:bounded"},
+        )
+        is RiskClass.WRITE
+    )

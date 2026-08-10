@@ -61,6 +61,7 @@ FILESYSTEM_PRODUCT_TOOLS: Final[tuple[str, ...]] = (
     "instruction_surface_status",
     "local_proof",
     "write_file",
+    "apply_patch",
     "delete_file",
     "rmdir_tree",
     "move_file",

@@ -212,6 +212,7 @@ _FILESYSTEM_TOOL_NAMES = frozenset({
     "list_workspace",
     "instruction_surface_status",
     "write_file",
+    "apply_patch",
     "read_file",
     "get_file_info",
     "delete_file",
@@ -1061,6 +1062,7 @@ def rich_approval_action_semantics_label(tool_name: str) -> str:
         "create_symlink": "Create symlink",
         "rmdir_tree": "Remove directory",
         "write_file": "File change",
+        "apply_patch": "File change",
     }
     if normalized in explicit:
         return explicit[normalized]
