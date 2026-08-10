@@ -8,7 +8,6 @@ import re
 import sqlite3
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -78,6 +77,11 @@ class _StdoutCollector:
                 return item
         return None
 
+    def tail(self, limit: int = 4000) -> str:
+        return "\n".join(json.dumps(item, sort_keys=True) for item in self._responses)[
+            -limit:
+        ]
+
 
 class _TextCollector:
     def __init__(self, stream) -> None:
@@ -113,6 +117,31 @@ def _wait_for_managed_center_start(
     raise AssertionError(
         "run_proxy did not start managed center: "
         f"{stderr_collector.tail().strip()}"
+    )
+
+
+def _wait_for_response(
+    *,
+    proc: subprocess.Popen,
+    collector: _StdoutCollector,
+    stderr_collector: _TextCollector,
+    request_id: str,
+    timeout: float,
+) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise AssertionError(
+                f"run_proxy exited before {request_id} response with code "
+                f"{proc.returncode}: {stderr_collector.tail().strip()}"
+            )
+        response = collector.response_by_id(request_id)
+        if response is not None:
+            return response
+        time.sleep(0.05)
+    raise AssertionError(
+        f"run_proxy did not emit {request_id} response. "
+        f"stdout_tail={collector.tail()} stderr_tail={stderr_collector.tail()}"
     )
 
 
@@ -238,17 +267,44 @@ def test_run_proxy_cancelled_request_shows_terminal_managed_center_page(
                 "arguments": {},
             }},
         ]
-        for message in messages[:4]:
-            proc.stdin.write(_json_line(message))
-            proc.stdin.flush()
-            if message.get("id") == "e2e-cancel-write":
-                break
-            time.sleep(0.05)
+        proc.stdin.write(_json_line(messages[0]))
+        proc.stdin.flush()
+        init_response = _wait_for_response(
+            proc=proc,
+            collector=collector,
+            stderr_collector=stderr_collector,
+            request_id="init-1",
+            timeout=10.0,
+        )
+        assert "result" in init_response
+
+        proc.stdin.write(_json_line(messages[1]))
+        proc.stdin.flush()
+        proc.stdin.write(_json_line(messages[2]))
+        proc.stdin.flush()
+        list_response = _wait_for_response(
+            proc=proc,
+            collector=collector,
+            stderr_collector=stderr_collector,
+            request_id="list-1",
+            timeout=10.0,
+        )
+        assert "result" in list_response
+
+        proc.stdin.write(_json_line(messages[3]))
+        proc.stdin.flush()
 
         deadline = time.monotonic() + 30.0
         while time.monotonic() < deadline and _pending_count(home) == 0:
+            if proc.poll() is not None:
+                raise AssertionError(
+                    "run_proxy exited before pending approval with code "
+                    f"{proc.returncode}: {stderr_collector.tail().strip()}"
+                )
             time.sleep(0.05)
-        assert _pending_count(home) > 0
+        assert _pending_count(home) > 0, (
+            f"stdout_tail={collector.tail()} stderr_tail={stderr_collector.tail()}"
+        )
 
         proc.stdin.write(_json_line(messages[4]))
         proc.stdin.flush()
