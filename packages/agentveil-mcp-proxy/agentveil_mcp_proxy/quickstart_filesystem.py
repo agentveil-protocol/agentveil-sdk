@@ -35,6 +35,7 @@ _INSTRUCTION_SURFACE_BASENAMES = frozenset({
     ".cursorrules",
 })
 QUICKSTART_READ_POOL_SIZE = 20
+CONTROLLED_PATCH_MAX_BYTES = 262_144
 READ_ONLY_TOOL_NAMES = frozenset({
     "read_file",
     "get_file_info",
@@ -328,6 +329,22 @@ def _tools() -> list[dict[str, Any]]:
                     "content": {"type": "string"},
                 },
                 "required": ["path", "content"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "apply_patch",
+            "description": (
+                "Apply one bounded Codex patch envelope to one UTF-8 file under "
+                "the quickstart sandbox root. Multi-file, move, and binary patches are rejected."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "patch": {"type": "string", "maxLength": CONTROLLED_PATCH_MAX_BYTES},
+                },
+                "required": ["path", "patch"],
                 "additionalProperties": False,
             },
         },
@@ -1912,6 +1929,113 @@ def _safe_symlink_target(root: Path, link_path: Path, target: str) -> None:
         raise ValueError("symlink target escapes quickstart sandbox")
 
 
+def _parse_single_file_patch(patch: str) -> tuple[str, str, list[str]]:
+    if len(patch.encode("utf-8")) > CONTROLLED_PATCH_MAX_BYTES:
+        raise ValueError("patch exceeds bounded size")
+    lines = patch.splitlines()
+    if not lines or lines[0] != "*** Begin Patch" or lines[-1] != "*** End Patch":
+        raise ValueError("invalid patch envelope")
+    operation_index = -1
+    operation = ""
+    path = ""
+    for index, line in enumerate(lines[1:-1], start=1):
+        for prefix, kind in (
+            ("*** Add File: ", "add"),
+            ("*** Update File: ", "update"),
+            ("*** Delete File: ", "delete"),
+        ):
+            if line.startswith(prefix):
+                if operation_index >= 0:
+                    raise ValueError("patch must target exactly one file")
+                operation_index = index
+                operation = kind
+                path = line[len(prefix) :].strip()
+        if line.startswith("*** Move to: "):
+            raise ValueError("patch move is unsupported")
+    if operation_index < 0 or not path:
+        raise ValueError("patch must target exactly one file")
+    body = lines[operation_index + 1 : -1]
+    if any(line.startswith("*** ") for line in body):
+        raise ValueError("unsupported patch directive")
+    return operation, path, body
+
+
+def _find_unique_line_sequence(
+    haystack: list[str],
+    needle: list[str],
+    *,
+    start: int,
+) -> int:
+    if not needle:
+        return start
+    matches = [
+        index
+        for index in range(start, len(haystack) - len(needle) + 1)
+        if haystack[index : index + len(needle)] == needle
+    ]
+    if len(matches) != 1:
+        raise ValueError("patch context is missing or ambiguous")
+    return matches[0]
+
+
+def _apply_update_patch(original: str, body: list[str]) -> str:
+    source = original.splitlines()
+    if "\r\n" in original and "\n" in original.replace("\r\n", ""):
+        raise ValueError("mixed line endings are unsupported")
+    newline = "\r\n" if "\r\n" in original else "\n"
+    trailing_newline = original.endswith(("\n", "\r\n"))
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    for line in body:
+        if line.startswith("@@"):
+            if current:
+                chunks.append(current)
+                current = []
+            continue
+        if not line or line[0] not in {" ", "+", "-"}:
+            raise ValueError("invalid patch hunk")
+        current.append(line)
+    if current:
+        chunks.append(current)
+    if not chunks:
+        raise ValueError("patch update requires at least one hunk")
+
+    cursor = 0
+    for chunk in chunks:
+        old_lines = [line[1:] for line in chunk if line[0] in {" ", "-"}]
+        new_lines = [line[1:] for line in chunk if line[0] in {" ", "+"}]
+        index = _find_unique_line_sequence(source, old_lines, start=cursor)
+        source[index : index + len(old_lines)] = new_lines
+        cursor = index + len(new_lines)
+    rendered = newline.join(source)
+    if trailing_newline:
+        rendered += newline
+    return rendered
+
+
+def _controlled_patch_plan(root: Path, patch: str) -> tuple[str, list[str], str | None]:
+    operation, path, body = _parse_single_file_patch(patch)
+    parts, target = _resolved_mutation_parts(root, path)
+    if operation == "add":
+        if target.exists():
+            raise ValueError("patch add target already exists")
+        if any(not line.startswith("+") for line in body):
+            raise ValueError("invalid patch add body")
+        content = "\n".join(line[1:] for line in body)
+        if body:
+            content += "\n"
+        return operation, parts, content
+    if not target.is_file():
+        raise ValueError("patch target is not a file")
+    if operation == "delete":
+        raise ValueError("patch delete is unsupported")
+    try:
+        original = target.read_bytes().decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("patch target must be UTF-8 text") from exc
+    return operation, parts, _apply_update_patch(original, body)
+
+
 def _handle_tools_call(root: Path, request_id: Any, params: Mapping[str, Any]) -> dict[str, Any]:
     name = params.get("name")
     arguments = params.get("arguments", {})
@@ -1992,6 +2116,30 @@ def _handle_tools_call(root: Path, request_id: Any, params: Mapping[str, Any]) -
         return _response(
             request_id,
             {"content": [{"type": "text", "text": f"wrote {display_path}"}]},
+        )
+    if name == "apply_patch":
+        path = arguments.get("path")
+        patch = arguments.get("patch")
+        if not isinstance(path, str) or not path:
+            return _error(request_id, -32602, "path must be a non-empty string")
+        if not isinstance(patch, str) or not patch:
+            return _error(request_id, -32602, "patch must be a non-empty string")
+        try:
+            _operation, patch_path, _body = _parse_single_file_patch(patch)
+            if _path_parts(path) != _path_parts(patch_path):
+                return _error(request_id, -32602, "patch path does not match bounded target")
+            operation, parts, content = _controlled_patch_plan(root, patch)
+            assert content is not None
+            _write_file_at(root, parts, content)
+        except ValueError as exc:
+            return _error(request_id, -32602, str(exc))
+        except OSError as exc:
+            if _is_symlink_errno(exc):
+                return _error(request_id, -32602, str(_deny_symlink_race()))
+            return _error(request_id, -32602, "filesystem mutation failed")
+        return _response(
+            request_id,
+            {"content": [{"type": "text", "text": "applied bounded patch"}]},
         )
     if name == "delete_file":
         path = arguments.get("path")

@@ -1087,7 +1087,7 @@ def _init_product_route_home(
     _patch_no_agent(monkeypatch)
     if stabilize_identity:
         _stabilize_manager_identity(monkeypatch)
-    assert len(PRODUCT_ROUTE_TOOL_CATALOG) == 71
+    assert len(PRODUCT_ROUTE_TOOL_CATALOG) == 72
     return home, profile_root
 
 
@@ -1359,6 +1359,75 @@ def test_product_route_native_hook_registers_durable_origin_and_verified_follow_
         assert follow_meta.get("original_request_id") == original_id
         assert _redirect_lineage_claim_count(home) == 1
         assert _pending_approval_prompts(home) == 1
+    finally:
+        worker.join(timeout=2)
+
+
+def test_product_route_codex_patch_redirect_reaches_verified_approval(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from agentveil_mcp_proxy import codex_hook
+    from agentveil_mcp_proxy.client_guidance import (
+        parse_redirect_context_from_codex_hook_output,
+    )
+
+    home, profile_root = _init_product_route_home(tmp_path, monkeypatch)
+    workspace = profile_root / "workspace"
+    target = workspace / "patch-target.txt"
+    target.write_text("before\n", encoding="utf-8")
+    patch = (
+        "*** Begin Patch\n"
+        "*** Update File: patch-target.txt\n"
+        "@@\n-before\n+after\n"
+        "*** End Patch"
+    )
+    deferred_in = _QueuedStdin(_json_line({
+        "jsonrpc": "2.0",
+        "id": "tools-list",
+        "method": "tools/list",
+        "params": {},
+    }))
+    worker, client_out = _start_live_product_route_proxy(home, deferred_in)
+    deadline = time.monotonic() + 15.0
+    try:
+        _wait_for_response_count(client_out, 1, deadline=deadline)
+        assert _live_binding_exists(home)
+        hook_out = io.StringIO()
+        decision = codex_hook.process_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": "sess-product-route",
+                "cwd": str(workspace),
+                "tool_name": "apply_patch",
+                "tool_input": {"patch": patch},
+            },
+            home=home,
+            out=hook_out,
+        )
+        assert decision.disposition.value == "redirect"
+        redirect_context = parse_redirect_context_from_codex_hook_output(
+            json.loads(hook_out.getvalue())
+        )
+        assert redirect_context is not None
+        deferred_in.queue_line(_tool_call_args(
+            "apply_patch",
+            {
+                "path": "patch-target.txt",
+                "patch": patch,
+                "redirect_context": redirect_context,
+            },
+            call_id="follow-patch",
+        ))
+        response = _wait_for_response_count(client_out, 2, deadline=deadline)[1]
+        assert response["error"]["data"]["status"] == "approval_required"
+        assert target.read_text(encoding="utf-8") == "before\n"
+        record_id = response["error"]["data"]["record_id"]
+        follow_meta = _metadata_for(home, record_id)
+        assert follow_meta is not None
+        assert follow_meta.get("redirect_role") == "follow_up"
+        assert follow_meta.get("lineage_status") == "verified"
+        assert _redirect_lineage_claim_count(home) == 1
     finally:
         worker.join(timeout=2)
 

@@ -111,7 +111,7 @@ REDIRECT_PLAYBOOKS: dict[str, RedirectPlaybookSpec] = {
     _REDIRECT_REQUEST_APPROVAL: RedirectPlaybookSpec(
         redirect_playbook_id=_REDIRECT_REQUEST_APPROVAL,
         supports_follow_up=True,
-        allowed_follow_up_tools=("write_file",),
+        allowed_follow_up_tools=("write_file", "apply_patch"),
         target_bound=True,
     ),
     _REDIRECT_STOP_AND_CLASSIFY: RedirectPlaybookSpec(

@@ -34,8 +34,12 @@ from agentveil_mcp_proxy.client_guidance import (
 def test_native_file_write_tools_get_controlled_write_redirect(native_tool: str) -> None:
     assert native_write_redirect_supported(native_tool=native_tool)
     message = native_hook_deny_instruction(native_tool=native_tool, risk_class="write")
-    assert message == NATIVE_FILE_WRITE_REDIRECT_INSTRUCTION
-    assert "write_file" in message
+    if native_tool in {"ApplyPatch", "apply_patch"}:
+        assert "controlled MCP tool apply_patch" in message
+        assert "single-file patch" in message
+    else:
+        assert message == NATIVE_FILE_WRITE_REDIRECT_INSTRUCTION
+        assert "write_file" in message
     assert "controlled MCP tool" in message
     assert "same path, content, and intent" in message
 

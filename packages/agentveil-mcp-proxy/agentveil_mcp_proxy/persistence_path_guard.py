@@ -17,6 +17,7 @@ INSTRUCTION_SURFACE_RISK_MESSAGE = (
 INSTRUCTION_SURFACE_RULE_ID = "instruction_surface_detected"
 _WRITE_PATH_TOOL_LEAVES = frozenset({
     "write_file",
+    "apply_patch",
     "edit_file",
     "move_file",
     "copy_file",

@@ -247,18 +247,60 @@ def test_codex_native_write_registers_durable_origin_and_agent_surface_context(t
         fixture.lease.close()
 
 
-def test_codex_apply_patch_has_no_verified_redirect_context(tmp_path):
+def test_codex_apply_patch_registers_verified_redirect_context(tmp_path):
     home, _sandbox, downstream = init_redirect_contract_home(tmp_path)
     fixture = publish_live_hook_binding(home, downstream=downstream)
     try:
         out = io.StringIO()
         decision = codex_hook.process_hook(
-            _payload("apply_patch", {"patch": "*** Begin Patch\n*** End Patch"}),
+            _payload(
+                "apply_patch",
+                {
+                    "patch": (
+                        "*** Begin Patch\n"
+                        "*** Update File: note.txt\n"
+                        "@@\n-old\n+new\n"
+                        "*** End Patch"
+                    )
+                },
+            ),
             home=home,
             out=out,
         )
         payload = json.loads(out.getvalue())
-        assert parse_redirect_context_from_codex_hook_output(payload) is None
+        redirect_context = parse_redirect_context_from_codex_hook_output(payload)
+        assert redirect_context is not None
+        assert decision.disposition.value == "redirect"
+        reason = _deny_reason(out.getvalue())
+        assert "MCP tool apply_patch" in reason
+        meta = durable_original_metadata(home, redirect_context["original_request_id"])
+        assert meta is not None
+        assert meta["follow_up_tool"] == "apply_patch"
+    finally:
+        fixture.lease.close()
+
+
+def test_codex_multi_file_apply_patch_fails_closed_without_redirect(tmp_path):
+    home, _sandbox, downstream = init_redirect_contract_home(tmp_path)
+    fixture = publish_live_hook_binding(home, downstream=downstream)
+    try:
+        out = io.StringIO()
+        decision = codex_hook.process_hook(
+            _payload(
+                "apply_patch",
+                {
+                    "patch": (
+                        "*** Begin Patch\n"
+                        "*** Add File: one.txt\n+one\n"
+                        "*** Add File: two.txt\n+two\n"
+                        "*** End Patch"
+                    )
+                },
+            ),
+            home=home,
+            out=out,
+        )
+        assert parse_redirect_context_from_codex_hook_output(json.loads(out.getvalue())) is None
         assert decision.disposition.value == "hard_block"
     finally:
         fixture.lease.close()

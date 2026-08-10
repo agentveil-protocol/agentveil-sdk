@@ -188,6 +188,135 @@ def test_quickstart_write_file_requires_approval_before_mutation(tmp_path, monke
     _assert_no_local_path_leaks(out.getvalue(), json.dumps(metadata))
 
 
+def test_controlled_apply_patch_updates_one_file_and_rejects_unsafe_forms(tmp_path):
+    from agentveil_mcp_proxy.quickstart_filesystem import _handle_tools_call
+
+    sandbox = tmp_path / "sandbox"
+    _seed_sandbox_file(sandbox, "src/app.py", "before\nkeep\n")
+    patch = (
+        "*** Begin Patch\n"
+        "*** Update File: src/app.py\n"
+        "@@\n"
+        "-before\n"
+        "+after\n"
+        " keep\n"
+        "*** End Patch"
+    )
+    response = _handle_tools_call(
+        sandbox,
+        "patch-1",
+        {"name": "apply_patch", "arguments": {"path": "src/app.py", "patch": patch}},
+    )
+    assert "result" in response
+    assert (sandbox / "src/app.py").read_text(encoding="utf-8") == "after\nkeep\n"
+
+    before = (sandbox / "src/app.py").read_text(encoding="utf-8")
+    mismatch = _handle_tools_call(
+        sandbox,
+        "patch-2",
+        {"name": "apply_patch", "arguments": {"path": "other.py", "patch": patch}},
+    )
+    assert mismatch["error"]["message"] == "patch path does not match bounded target"
+    assert (sandbox / "src/app.py").read_text(encoding="utf-8") == before
+
+
+def test_controlled_apply_patch_rejects_ambiguous_context_and_symlink_escape(tmp_path):
+    from agentveil_mcp_proxy.quickstart_filesystem import _handle_tools_call
+
+    sandbox = tmp_path / "sandbox"
+    outside = tmp_path / "outside"
+    _seed_sandbox_file(sandbox, "duplicate.txt", "same\nsame\n")
+    outside.mkdir()
+    (sandbox / "escape").symlink_to(outside, target_is_directory=True)
+
+    ambiguous_patch = (
+        "*** Begin Patch\n*** Update File: duplicate.txt\n@@\n-same\n+changed\n*** End Patch"
+    )
+    ambiguous = _handle_tools_call(
+        sandbox,
+        "patch-ambiguous",
+        {
+            "name": "apply_patch",
+            "arguments": {"path": "duplicate.txt", "patch": ambiguous_patch},
+        },
+    )
+    assert ambiguous["error"]["message"] == "patch context is missing or ambiguous"
+    assert (sandbox / "duplicate.txt").read_text(encoding="utf-8") == "same\nsame\n"
+
+    escape_patch = (
+        "*** Begin Patch\n*** Add File: escape/new.txt\n+denied\n*** End Patch"
+    )
+    escaped = _handle_tools_call(
+        sandbox,
+        "patch-escape",
+        {
+            "name": "apply_patch",
+            "arguments": {"path": "escape/new.txt", "patch": escape_patch},
+        },
+    )
+    assert "escape" in escaped["error"]["message"]
+    assert not (outside / "new.txt").exists()
+
+
+def test_controlled_apply_patch_fails_closed_on_delete_move_multi_file_and_size(tmp_path):
+    from agentveil_mcp_proxy.quickstart_filesystem import (
+        CONTROLLED_PATCH_MAX_BYTES,
+        _handle_tools_call,
+    )
+
+    sandbox = tmp_path / "sandbox"
+    _seed_sandbox_file(sandbox, "keep.txt", "keep\n")
+    patches = (
+        "*** Begin Patch\n*** Delete File: keep.txt\n*** End Patch",
+        (
+            "*** Begin Patch\n*** Update File: keep.txt\n*** Move to: moved.txt\n"
+            "@@\n-keep\n+changed\n*** End Patch"
+        ),
+        (
+            "*** Begin Patch\n*** Add File: one.txt\n+one\n"
+            "*** Add File: two.txt\n+two\n*** End Patch"
+        ),
+        (
+            "*** Begin Patch\n*** Add File: large.txt\n+"
+            + ("x" * CONTROLLED_PATCH_MAX_BYTES)
+            + "\n*** End Patch"
+        ),
+    )
+    for index, patch in enumerate(patches):
+        path = "keep.txt" if index < 2 else ("one.txt" if index == 2 else "large.txt")
+        response = _handle_tools_call(
+            sandbox,
+            f"patch-deny-{index}",
+            {"name": "apply_patch", "arguments": {"path": path, "patch": patch}},
+        )
+        assert "error" in response
+    assert (sandbox / "keep.txt").read_text(encoding="utf-8") == "keep\n"
+    assert not (sandbox / "moved.txt").exists()
+    assert not (sandbox / "one.txt").exists()
+    assert not (sandbox / "two.txt").exists()
+    assert not (sandbox / "large.txt").exists()
+
+
+def test_controlled_apply_patch_preserves_crlf(tmp_path):
+    from agentveil_mcp_proxy.quickstart_filesystem import _handle_tools_call
+
+    sandbox = tmp_path / "sandbox"
+    target = sandbox / "windows.txt"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"before\r\nkeep\r\n")
+    patch = (
+        "*** Begin Patch\n*** Update File: windows.txt\n@@\n"
+        "-before\n+after\n keep\n*** End Patch"
+    )
+    response = _handle_tools_call(
+        sandbox,
+        "patch-crlf",
+        {"name": "apply_patch", "arguments": {"path": "windows.txt", "patch": patch}},
+    )
+    assert "result" in response
+    assert target.read_bytes() == b"after\r\nkeep\r\n"
+
+
 def test_quickstart_delete_file_blocked_before_mutation(tmp_path, monkeypatch):
     home = tmp_path / "home"
     sandbox = tmp_path / "sandbox"
