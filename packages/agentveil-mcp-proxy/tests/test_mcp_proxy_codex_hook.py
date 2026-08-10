@@ -29,6 +29,36 @@ def _payload(tool_name: str, tool_input: dict | None = None) -> dict:
     }
 
 
+def test_detached_hook_refreshes_codex_console_status(tmp_path, monkeypatch) -> None:
+    calls = []
+    home = tmp_path / ".avp"
+    monkeypatch.setattr(
+        codex_hook,
+        "best_effort_spawn_hook_project_status",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    decision = codex_hook.process_hook(
+        _payload(
+            "Bash",
+            {
+                "command": "agentveil-mcp-proxy --version && "
+                "agentveil-mcp-proxy setup status --client codex --json"
+            },
+        ),
+        home=home,
+        out=io.StringIO(),
+        detached_upload=True,
+    )
+
+    assert decision.hook_action == "allow"
+    assert calls == [{
+        "connector": "codex",
+        "project_dir": tmp_path,
+        "runtime_home": home,
+    }]
+
+
 def _deny_reason(raw: str) -> str:
     payload = json.loads(raw)
     return payload["hookSpecificOutput"]["permissionDecisionReason"]

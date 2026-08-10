@@ -787,3 +787,39 @@ def test_classify_native_shell_git_commit_and_switch_bounded_grammar() -> None:
         classify_native_shell_command("PYTHONPATH=.:packages pytest -q t")
         is RiskClass.READ
     )
+
+
+def test_classify_native_shell_allows_bounded_read_chains_and_diagnostics() -> None:
+    from agentveil_mcp_proxy.classification import classify_native_shell_command
+
+    assert classify_native_shell_command("sed -n '1,40p' README.md") is RiskClass.READ
+    assert (
+        classify_native_shell_command("perl -ne 'print if /status/' README.md")
+        is RiskClass.UNKNOWN
+    )
+    assert (
+        classify_native_shell_command("git status --short && git diff --check")
+        is RiskClass.READ
+    )
+    assert classify_native_shell_command("agentveil-mcp-proxy --version") is RiskClass.READ
+    assert (
+        classify_native_shell_command(
+            "agentveil-mcp-proxy --version && "
+            "agentveil-mcp-proxy setup status --client codex --json"
+        )
+        is RiskClass.READ
+    )
+
+
+def test_classify_native_shell_read_chain_fails_closed_on_unsafe_segment() -> None:
+    from agentveil_mcp_proxy.classification import classify_native_shell_command
+
+    assert (
+        classify_native_shell_command("git status --short && git reset --hard")
+        is RiskClass.DESTRUCTIVE
+    )
+    assert classify_native_shell_command("sed -i '' README.md") is RiskClass.WRITE
+    assert classify_native_shell_command("sed -n 'w leaked.txt' README.md") is RiskClass.UNKNOWN
+    assert classify_native_shell_command("sed -e '1,40p' README.md") is RiskClass.UNKNOWN
+    assert classify_native_shell_command("git status | tee status.txt") is RiskClass.UNKNOWN
+    assert classify_native_shell_command("git status > status.txt") is RiskClass.WRITE

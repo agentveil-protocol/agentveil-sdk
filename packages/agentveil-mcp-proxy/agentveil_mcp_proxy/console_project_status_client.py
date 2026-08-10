@@ -11,9 +11,14 @@ response failures return bounded non-secret result codes without raising.
 from __future__ import annotations
 
 import json
+import os
 import re
 import socket
 import ssl
+import subprocess
+import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -47,6 +52,9 @@ _REQUEST_TIMEOUT_SECONDS = 3.0
 _MAX_RESPONSE_BYTES = 16 * 1024
 _SCHEMA_VERSION = "1"
 _SCOPE_STATEMENT = "Configured project routes only"
+HOOK_STATUS_REFRESH_WORKER_ENV = "AGENTVEIL_HOOK_STATUS_REFRESH_WORKER"
+_HOOK_STATUS_REFRESH_INTERVAL_SECONDS = 60.0
+_HOOK_STATUS_REFRESH_MARKER = ".console-hook-status-refresh"
 
 _CONNECTORS = frozenset({"codex", "claude-code", "cursor", "gemini-cli"})
 _CONNECTION_STATES = frozenset({"connected", "disconnected", "stale", "error"})
@@ -581,14 +589,98 @@ def sync_project_status(
     return "accepted"
 
 
+def _hook_status_worker_environment(
+    runtime_home: Path,
+) -> tuple[dict[str, str], Path | None]:
+    env = os.environ.copy()
+    env[HOOK_STATUS_REFRESH_WORKER_ENV] = "1"
+    credential_home: Path | None = None
+    configured_home = env.get("AVP_HOME")
+    if configured_home:
+        try:
+            if Path(configured_home).expanduser() == runtime_home.expanduser():
+                env.pop("AVP_HOME", None)
+                credential_home = Path("~/.avp").expanduser()
+        except OSError:
+            return env, None
+    return env, credential_home
+
+
+def best_effort_spawn_hook_project_status(
+    *,
+    connector: str,
+    project_dir: Path,
+    runtime_home: Path | None,
+    load_credential_fn: LoadCredential = load_credential,
+    popen: Callable[..., Any] = subprocess.Popen,
+    clock: Clock = time.time,
+) -> None:
+    """Detach a throttled status refresh after a real connector hook event."""
+
+    try:
+        if connector not in _CONNECTORS or runtime_home is None:
+            return
+        project = project_dir.expanduser().resolve(strict=True)
+        home = runtime_home.expanduser().resolve(strict=True)
+        if not project.is_dir() or not home.is_dir():
+            return
+
+        env, credential_home = _hook_status_worker_environment(home)
+        _, skip = _resolve_credential(
+            home=credential_home,
+            load_credential_fn=load_credential_fn,
+        )
+        if skip is not None:
+            return
+
+        marker = home / _HOOK_STATUS_REFRESH_MARKER
+        try:
+            if clock() - marker.stat().st_mtime < _HOOK_STATUS_REFRESH_INTERVAL_SECONDS:
+                return
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return
+
+        command = [
+            sys.executable,
+            "-m",
+            "agentveil_mcp_proxy.cli",
+            "setup",
+            "status",
+            "--client",
+            connector,
+        ]
+        if connector == "cursor":
+            command.extend(["--workspace", str(project)])
+        else:
+            command.extend(["--project-dir", str(project)])
+        command.append("--json")
+        process = popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            start_new_session=True,
+        )
+        marker.touch(mode=0o600, exist_ok=True)
+        marker.chmod(0o600)
+        threading.Thread(target=process.wait, daemon=True).start()
+    except Exception:
+        return
+
+
 __all__ = [
     "CONSOLE_ORIGIN",
+    "HOOK_STATUS_REFRESH_WORKER_ENV",
     "ConsoleProjectStatusClient",
     "ProjectStatusClientError",
     "ProjectStatusSummary",
     "RawResponse",
     "Transport",
     "TransportError",
+    "best_effort_spawn_hook_project_status",
     "build_project_status_summary",
     "normalize_connector_status",
     "normalize_package_version",

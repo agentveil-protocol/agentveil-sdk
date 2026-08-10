@@ -827,11 +827,27 @@ def _classify_shell_composition_tokens(tokens: list[str]) -> RiskClass | None:
     if any(token in _SHELL_OUTPUT_REDIRECT_TOKENS for token in tokens):
         return RiskClass.WRITE
     if any(
-        token in _SHELL_COMPOSITION_TOKENS or "`" in token
+        token in _SHELL_COMPOSITION_TOKENS - {"&&", "||", ";"} or "`" in token
         for token in tokens
     ):
         return RiskClass.UNKNOWN
     return None
+
+
+def _split_bounded_shell_segments(tokens: list[str]) -> list[list[str]] | None:
+    """Split simple sequential shell forms; pipes/background remain unsupported."""
+
+    segments: list[list[str]] = [[]]
+    for token in tokens:
+        if token in {"&&", "||", ";"}:
+            if not segments[-1]:
+                return None
+            segments.append([])
+            continue
+        segments[-1].append(token)
+    if not segments[-1]:
+        return None
+    return segments
 
 
 def _path_token_is_secret(path_token: str) -> bool:
@@ -996,6 +1012,37 @@ def _classify_alembic_command(tokens: list[str]) -> RiskClass | None:
     if len(tokens) >= 2 and tokens[1] in {"upgrade", "downgrade", "stamp", "revision"}:
         return RiskClass.WRITE
     return RiskClass.UNKNOWN
+
+
+def _classify_agentveil_cli_command(tokens: list[str]) -> RiskClass | None:
+    """Classify bounded AgentVeil diagnostics used by setup and support flows."""
+
+    if not tokens or tokens[0] != "agentveil-mcp-proxy":
+        return None
+    if tokens[1:] == ["--version"]:
+        return RiskClass.READ
+    if len(tokens) >= 3 and tokens[1:3] == ["setup", "status"]:
+        return RiskClass.READ
+    return RiskClass.UNKNOWN
+
+
+_SED_PRINT_SCRIPT_RE = re.compile(r"^[0-9]+(?:,[0-9]+)?p$")
+
+
+def _classify_sed_command(tokens: list[str]) -> RiskClass | None:
+    """Allow numeric-range print and leave other sed programs unknown."""
+
+    if not tokens or tokens[0] != "sed":
+        return None
+    if any(token == "-i" or token.startswith("-i") for token in tokens[1:]):
+        return RiskClass.WRITE
+    if len(tokens) < 4 or tokens[1] != "-n":
+        return RiskClass.UNKNOWN
+    if not _SED_PRINT_SCRIPT_RE.fullmatch(tokens[2]):
+        return RiskClass.UNKNOWN
+    if any(token.startswith("-") for token in tokens[3:]):
+        return RiskClass.UNKNOWN
+    return RiskClass.READ
 
 
 def _classify_native_shell_mutation(tokens: list[str]) -> RiskClass | None:
@@ -1200,6 +1247,56 @@ def _classify_git_command(raw_tokens: list[str]) -> RiskClass:
     return RiskClass.UNKNOWN
 
 
+def _classify_simple_native_shell_tokens(raw_tokens: list[str]) -> RiskClass:
+    """Classify one shell command with no composition operators."""
+
+    if _leading_env_assignments_are_secret(raw_tokens):
+        return RiskClass.DESTRUCTIVE
+
+    tokens = _strip_leading_env_assignments(raw_tokens)
+    lower_tokens = [token.lower() for token in tokens]
+    if not tokens:
+        return RiskClass.UNKNOWN
+
+    if _shell_tokens_reference_secret_or_system_path(tokens):
+        return RiskClass.DESTRUCTIVE
+
+    if _is_package_manager_mutation(lower_tokens):
+        return RiskClass.WRITE
+
+    ruff_risk = _classify_ruff_command(lower_tokens)
+    if ruff_risk is not None:
+        return ruff_risk
+
+    python_module_risk = _classify_python_module_invocation(lower_tokens)
+    if python_module_risk is not None:
+        return python_module_risk
+
+    alembic_risk = _classify_alembic_command(lower_tokens)
+    if alembic_risk is not None:
+        return alembic_risk
+
+    agentveil_cli_risk = _classify_agentveil_cli_command(lower_tokens)
+    if agentveil_cli_risk is not None:
+        return agentveil_cli_risk
+
+    sed_risk = _classify_sed_command(lower_tokens)
+    if sed_risk is not None:
+        return sed_risk
+
+    if lower_tokens[0] == "git":
+        return _classify_git_command(tokens)
+
+    native_mutation_risk = _classify_native_shell_mutation(tokens)
+    if native_mutation_risk is not None:
+        return native_mutation_risk
+
+    if lower_tokens[0] in _SHELL_READONLY_FIRST_TOKEN:
+        return RiskClass.READ
+
+    return RiskClass.UNKNOWN
+
+
 def classify_native_shell_command(command: str) -> RiskClass:
     """Classify a native shell command for hook policy evaluation.
 
@@ -1220,46 +1317,20 @@ def classify_native_shell_command(command: str) -> RiskClass:
     if raw_tokens is None:
         return RiskClass.UNKNOWN
 
-    if _leading_env_assignments_are_secret(raw_tokens):
-        return RiskClass.DESTRUCTIVE
-
-    tokens = _strip_leading_env_assignments(raw_tokens)
-    lower_tokens = [token.lower() for token in tokens]
-    if not tokens:
-        return RiskClass.UNKNOWN
-
-    composition_risk = _classify_shell_composition_tokens(tokens)
+    composition_risk = _classify_shell_composition_tokens(raw_tokens)
     if composition_risk is not None:
         return composition_risk
 
-    if _shell_tokens_reference_secret_or_system_path(tokens):
-        return RiskClass.DESTRUCTIVE
-
-    if _is_package_manager_mutation(lower_tokens):
-        return RiskClass.WRITE
-
-    ruff_risk = _classify_ruff_command(lower_tokens)
-    if ruff_risk is not None:
-        return ruff_risk
-
-    python_module_risk = _classify_python_module_invocation(lower_tokens)
-    if python_module_risk is not None:
-        return python_module_risk
-
-    alembic_risk = _classify_alembic_command(lower_tokens)
-    if alembic_risk is not None:
-        return alembic_risk
-
-    if lower_tokens[0] == "git":
-        return _classify_git_command(tokens)
-
-    native_mutation_risk = _classify_native_shell_mutation(tokens)
-    if native_mutation_risk is not None:
-        return native_mutation_risk
-
-    if lower_tokens[0] in _SHELL_READONLY_FIRST_TOKEN:
+    segments = _split_bounded_shell_segments(raw_tokens)
+    if segments is None:
+        return RiskClass.UNKNOWN
+    risks = [_classify_simple_native_shell_tokens(segment) for segment in segments]
+    # claim-check: allow bounded predicate; each segment is independently classified and negative-tested.
+    if all(risk is RiskClass.READ for risk in risks):
         return RiskClass.READ
-
+    for risk in risks:
+        if risk is not RiskClass.READ:
+            return risk
     return RiskClass.UNKNOWN
 
 
