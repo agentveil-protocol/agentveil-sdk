@@ -126,18 +126,44 @@ def credential_home(home: Path | None = None) -> Path:
     return Path(os.environ.get("AVP_HOME", "~/.avp")).expanduser()
 
 
+def _expanduser_or_self(path: Path) -> Path:
+    try:
+        return path.expanduser()
+    except RuntimeError:
+        return path
+
+
+def _global_console_credential_home() -> Path | None:
+    try:
+        return Path("~/.avp").expanduser()
+    except RuntimeError:
+        for env_name in ("USERPROFILE", "HOME"):
+            value = os.environ.get(env_name)
+            if value:
+                return Path(value) / ".avp"
+        home_drive = os.environ.get("HOMEDRIVE")
+        home_path = os.environ.get("HOMEPATH")
+        if home_drive and home_path:
+            return Path(f"{home_drive}{home_path}") / ".avp"
+        return None
+
+
 def console_credential_home_for_runtime(runtime_home: Path | None) -> Path | None:
     """Keep one user Console credential outside a project-scoped runtime home."""
 
     if runtime_home is None:
         return None
-    expanded_runtime_home = Path(runtime_home).expanduser()
-    global_home = Path("~/.avp").expanduser()
-    if expanded_runtime_home.name == ".avp" and expanded_runtime_home != global_home:
+    expanded_runtime_home = _expanduser_or_self(Path(runtime_home))
+    global_home = _global_console_credential_home()
+    if (
+        global_home is not None
+        and expanded_runtime_home.name == ".avp"
+        and expanded_runtime_home != global_home
+    ):
         return global_home
     configured_home = os.environ.get("AVP_HOME")
-    if configured_home is not None:
-        if Path(configured_home).expanduser() == expanded_runtime_home:
+    if configured_home is not None and global_home is not None:
+        if _expanduser_or_self(Path(configured_home)) == expanded_runtime_home:
             return global_home
     return expanded_runtime_home
 
