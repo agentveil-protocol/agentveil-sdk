@@ -24,7 +24,7 @@ CANONICAL_CONTRACT_PATH = (
     / "installed_provider_activation_handoff_v1.json"
 )
 SDK_VERSION = "0.7.23"
-PROXY_VERSION = "0.7.39"
+PROXY_VERSION = "0.7.40"
 PACKAGE_NAME = "agentveil-private-policy"
 PACKAGE_VERSION = "0.1.0"
 MODULE_NAME = PACKAGE_NAME.replace("-", "_")
