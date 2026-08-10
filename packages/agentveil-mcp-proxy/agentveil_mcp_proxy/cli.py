@@ -207,6 +207,7 @@ from agentveil_mcp_proxy.runtime_gate import RuntimeGateClient
 from agentveil_mcp_proxy.console_credentials import (
     CredentialError,
     console_login_lock,
+    console_credential_home_for_runtime,
     delete_credential,
     load_credential,
     save_credential,
@@ -3023,7 +3024,10 @@ def run_proxy(
             approval_grant_private_key_seed=approval_grant_private_key_seed,
             approval_grant_agent_did=approval_grant_agent_did,
         )
-        decision_summary_dispatcher = ConsoleDecisionSummaryDispatcher(home=paths.home)
+        console_credential_home = console_credential_home_for_runtime(paths.home)
+        decision_summary_dispatcher = ConsoleDecisionSummaryDispatcher(
+            home=console_credential_home
+        )
         decision_summary_dispatcher.start()
         if decision_summary_dispatcher.is_active:
             attach_terminal_evidence_observer(
@@ -3031,7 +3035,7 @@ def run_proxy(
                 decision_summary_dispatcher,
             )
         approval_summary_dispatcher = ConsoleApprovalSummaryDispatcher(
-            home=paths.home,
+            home=console_credential_home,
             snapshot_source=lambda: build_approval_summary_snapshot(evidence_store),
         )
         approval_summary_dispatcher.start()

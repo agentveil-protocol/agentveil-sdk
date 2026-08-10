@@ -126,6 +126,22 @@ def credential_home(home: Path | None = None) -> Path:
     return Path(os.environ.get("AVP_HOME", "~/.avp")).expanduser()
 
 
+def console_credential_home_for_runtime(runtime_home: Path | None) -> Path | None:
+    """Keep one user Console credential outside a project-scoped runtime home."""
+
+    if runtime_home is None:
+        return None
+    expanded_runtime_home = Path(runtime_home).expanduser()
+    global_home = Path("~/.avp").expanduser()
+    if expanded_runtime_home.name == ".avp" and expanded_runtime_home != global_home:
+        return global_home
+    configured_home = os.environ.get("AVP_HOME")
+    if configured_home is not None:
+        if Path(configured_home).expanduser() == expanded_runtime_home:
+            return global_home
+    return expanded_runtime_home
+
+
 def credential_path(home: Path | None = None) -> Path:
     """Return the single Console device-token path under the AVP home."""
 

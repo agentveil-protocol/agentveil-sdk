@@ -559,7 +559,8 @@ def test_run_auto_deny_requires_headless(tmp_path):
 
 
 def test_run_proxy_starts_and_stops_decision_summary_dispatcher(tmp_path, monkeypatch):
-    home = tmp_path / "avp-home"
+    home = tmp_path / "project" / ".avp"
+    monkeypatch.delenv("AVP_HOME", raising=False)
     init_proxy(home=home, agent_name="proxy", plaintext=True)
     config = json.loads((home / "mcp-proxy" / "config.json").read_text(encoding="utf-8"))
     config["downstream"] = {
@@ -569,12 +570,14 @@ def test_run_proxy_starts_and_stops_decision_summary_dispatcher(tmp_path, monkey
     }
     (home / "mcp-proxy" / "config.json").write_text(json.dumps(config), encoding="utf-8")
     lifecycle = {"decision_started": 0, "decision_stopped": 0, "approval_started": 0, "approval_stopped": 0}
+    dispatcher_homes = {}
 
     class RecordingDecisionDispatcher:
         is_active = True
 
         def __init__(self, **kwargs):
             self.kwargs = kwargs
+            dispatcher_homes["decision"] = kwargs["home"]
 
         def start(self):
             lifecycle["decision_started"] += 1
@@ -590,6 +593,7 @@ def test_run_proxy_starts_and_stops_decision_summary_dispatcher(tmp_path, monkey
 
         def __init__(self, **kwargs):
             self.kwargs = kwargs
+            dispatcher_homes["approval"] = kwargs["home"]
 
         def start(self):
             lifecycle["approval_started"] += 1
@@ -622,6 +626,11 @@ def test_run_proxy_starts_and_stops_decision_summary_dispatcher(tmp_path, monkey
         "decision_stopped": 1,
         "approval_started": 1,
         "approval_stopped": 1,
+    }
+    expected_console_home = tmp_path.home() / ".avp"
+    assert dispatcher_homes == {
+        "decision": expected_console_home,
+        "approval": expected_console_home,
     }
 
 
