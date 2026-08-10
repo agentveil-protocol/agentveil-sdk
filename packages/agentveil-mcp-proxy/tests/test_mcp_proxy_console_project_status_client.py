@@ -21,6 +21,7 @@ from agentveil_mcp_proxy.console_project_status_client import (
     ProjectStatusSummary,
     RawResponse,
     TransportError,
+    best_effort_spawn_hook_project_status,
     build_project_status_summary,
     normalize_connector_status,
     normalize_package_version,
@@ -166,6 +167,117 @@ class BackendEchoTransport:
 
 def _load_credential_ok(home=None):
     return StoredCredential(scope=CREDENTIAL_SCOPE, token=TOKEN)
+
+
+class _FakeProcess:
+    def wait(self):
+        return 0
+
+
+@pytest.mark.parametrize("connector", ["codex", "claude-code", "cursor", "gemini-cli"])
+def test_hook_status_refresh_spawns_bounded_connector_status_worker(
+    connector, tmp_path, monkeypatch
+):
+    project = tmp_path / "project"
+    runtime_home = project / (".agentveil" if connector == "cursor" else ".avp")
+    runtime_home.mkdir(parents=True)
+    monkeypatch.setenv("AVP_HOME", str(runtime_home))
+    calls = []
+    credential_homes = []
+
+    def _load(home=None):
+        credential_homes.append(home)
+        return StoredCredential(scope=CREDENTIAL_SCOPE, token=TOKEN)
+
+    def _popen(command, **kwargs):
+        calls.append((command, kwargs))
+        return _FakeProcess()
+
+    best_effort_spawn_hook_project_status(
+        connector=connector,
+        project_dir=project,
+        runtime_home=runtime_home,
+        load_credential_fn=_load,
+        popen=_popen,
+        clock=lambda: 1000.0,
+    )
+
+    assert len(calls) == 1
+    command, kwargs = calls[0]
+    assert command[:5] == [
+        command[0],
+        "-m",
+        "agentveil_mcp_proxy.cli",
+        "setup",
+        "status",
+    ]
+    assert command[5:7] == ["--client", connector]
+    path_flag = "--workspace" if connector == "cursor" else "--project-dir"
+    assert command[7:9] == [path_flag, str(project.resolve())]
+    assert command[-1] == "--json"
+    assert kwargs["stdin"] is not None
+    assert kwargs["stdout"] is not None
+    assert kwargs["stderr"] is not None
+    assert kwargs["start_new_session"] is True
+    assert "AVP_HOME" not in kwargs["env"]
+    assert kwargs["env"]["AGENTVEIL_HOOK_STATUS_REFRESH_WORKER"] == "1"
+    assert credential_homes == [Path("~/.avp").expanduser()]
+    assert (runtime_home / ".console-hook-status-refresh").stat().st_mode & 0o777 == 0o600
+
+
+def test_hook_status_refresh_requires_credential_and_throttles(tmp_path):
+    project = tmp_path / "project"
+    runtime_home = project / ".avp"
+    runtime_home.mkdir(parents=True)
+    calls = []
+
+    best_effort_spawn_hook_project_status(
+        connector="codex",
+        project_dir=project,
+        runtime_home=runtime_home,
+        load_credential_fn=lambda home=None: None,
+        popen=lambda *args, **kwargs: calls.append(1),
+    )
+    assert calls == []
+
+    def popen(*args, **kwargs):
+        calls.append(1)
+        return _FakeProcess()
+
+    best_effort_spawn_hook_project_status(
+        connector="codex",
+        project_dir=project,
+        runtime_home=runtime_home,
+        load_credential_fn=_load_credential_ok,
+        popen=popen,
+    )
+    best_effort_spawn_hook_project_status(
+        connector="codex",
+        project_dir=project,
+        runtime_home=runtime_home,
+        load_credential_fn=_load_credential_ok,
+        popen=popen,
+    )
+    assert calls == [1]
+
+
+def test_hook_status_refresh_spawn_failure_isolated_and_retryable(tmp_path):
+    project = tmp_path / "project"
+    runtime_home = project / ".avp"
+    runtime_home.mkdir(parents=True)
+
+    def _failed_popen(*args, **kwargs):
+        raise OSError("bounded test failure")
+
+    best_effort_spawn_hook_project_status(
+        connector="codex",
+        project_dir=project,
+        runtime_home=runtime_home,
+        load_credential_fn=_load_credential_ok,
+        popen=_failed_popen,
+    )
+
+    assert not (runtime_home / ".console-hook-status-refresh").exists()
 
 
 @pytest.mark.parametrize("connector", ["codex", "claude-code", "cursor", "gemini-cli"])

@@ -28,6 +28,9 @@ from agentveil_mcp_proxy.console_decision_summary_client import (
     best_effort_spawn_hook_denied_summary,
     best_effort_upload_hook_denied_summary,
 )
+from agentveil_mcp_proxy.console_project_status_client import (
+    best_effort_spawn_hook_project_status,
+)
 from agentveil_mcp_proxy.client_guidance import (
     NativeRedirectOrigin,
     format_native_redirect_agent_surface,
@@ -361,6 +364,12 @@ def process_hook(
             best_effort_spawn_hook_denied_summary(record, runtime_home=home)
         else:
             best_effort_upload_hook_denied_summary(record, home=home)
+    if detached_upload:
+        best_effort_spawn_hook_project_status(
+            connector="gemini-cli",
+            project_dir=home.parent if home is not None else Path.cwd(),
+            runtime_home=home,
+        )
     output = format_hook_output(decision, redirect_origin=redirect_origin)
     if output is not None:
         (out or sys.stdout).write(output + "\n")

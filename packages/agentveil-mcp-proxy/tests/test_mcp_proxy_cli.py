@@ -4531,6 +4531,50 @@ def test_console_status_replaces_rejected_credential_and_retries(monkeypatch):
     assert len(sync_calls) == 2
 
 
+def test_hook_status_worker_never_opens_attach_or_repairs_credential(monkeypatch):
+    attach_calls = []
+    delete_calls = []
+    sync_calls = []
+    monkeypatch.setenv("AGENTVEIL_HOOK_STATUS_REFRESH_WORKER", "1")
+    monkeypatch.setattr(
+        proxy_cli,
+        "_best_effort_console_attach_credential",
+        lambda: attach_calls.append(True),
+    )
+    monkeypatch.setattr(
+        proxy_cli,
+        "delete_credential",
+        lambda: delete_calls.append(True) or True,
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_project_status_client.sync_project_status",
+        lambda **kwargs: sync_calls.append(kwargs) or "credential_rejected",
+    )
+
+    proxy_cli._best_effort_console_project_status_sync(
+        connector="codex",
+        connector_status={"status": "protected"},
+        project_dir=Path("/tmp/project"),
+    )
+
+    assert len(sync_calls) == 1
+    assert attach_calls == []
+    assert delete_calls == []
+
+
+def test_hook_status_worker_skips_free_builder_install(monkeypatch):
+    calls = []
+    monkeypatch.setenv("AGENTVEIL_HOOK_STATUS_REFRESH_WORKER", "1")
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_free_builder_client.sync_free_builder_install",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    proxy_cli._best_effort_console_free_builder_sync(home=Path("/tmp/project/.avp"))
+
+    assert calls == []
+
+
 @pytest.mark.parametrize(
     ("client", "setup_argv", "status_argv", "connector"),
     [

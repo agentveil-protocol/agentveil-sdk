@@ -56,6 +56,36 @@ def _payload(tool_name: str, tool_input: dict | None = None, **extra) -> dict:
     }
 
 
+def test_detached_hook_refreshes_claude_console_status(tmp_path, monkeypatch) -> None:
+    calls = []
+    home = tmp_path / ".avp"
+    monkeypatch.setattr(
+        claude_hook,
+        "best_effort_spawn_hook_project_status",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    decision = process_hook(
+        _payload(
+            "Bash",
+            {
+                "command": "agentveil-mcp-proxy --version && "
+                "agentveil-mcp-proxy setup status --client claude-code --json"
+            },
+        ),
+        home=home,
+        out=io.StringIO(),
+        detached_upload=True,
+    )
+
+    assert decision.hook_action == "allow"
+    assert calls == [{
+        "connector": "claude-code",
+        "project_dir": tmp_path,
+        "runtime_home": home,
+    }]
+
+
 # ----- classifier basics -----------------------------------------------------
 
 
@@ -254,9 +284,6 @@ def test_corrective2_composition_repro_denied_end_to_end(command: str) -> None:
         "echo $(whoami)",            # command substitution
         "echo `whoami`",            # backtick substitution
         "ls | grep foo",            # pipe
-        "echo a; echo b",           # semicolon chain
-        "true && echo ok",          # && chain
-        "false || echo fallback",   # || chain
         "cat <(echo x)",            # process substitution (read side)
         "diff <(ls a) <(ls b)",     # process substitution
         "echo x > file",            # redirect (also caught by mutation token)
@@ -267,9 +294,32 @@ def test_corrective2_composition_repro_denied_end_to_end(command: str) -> None:
     ],
 )
 def test_corrective2_each_composition_metachar_denied(command: str) -> None:
-    """Each individual composition metacharacter maps to deny."""
+    """Unsafe composition metacharacters map to deny."""
     risk = classify_claude_tool("Bash", {"command": command})
     assert risk is not RiskClass.READ, f"{command!r} classified READ ({risk})"
+    engine = PolicyEngine(default_proxy_config_for_hook())
+    decision = decide(_payload("Bash", {"command": command}), engine)
+    assert decision.hook_action == "deny"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo a; echo b",
+        "true && echo ok",
+        "false || echo fallback",
+    ],
+)
+def test_bounded_read_only_shell_chains_are_allowed(command: str) -> None:
+    assert classify_claude_tool("Bash", {"command": command}) is RiskClass.READ
+
+
+def test_shell_chain_with_destructive_segment_is_denied() -> None:
+    command = "git status && git reset --hard"
+    assert (
+        classify_claude_tool("Bash", {"command": command})
+        is RiskClass.DESTRUCTIVE
+    )
     engine = PolicyEngine(default_proxy_config_for_hook())
     decision = decide(_payload("Bash", {"command": command}), engine)
     assert decision.hook_action == "deny"

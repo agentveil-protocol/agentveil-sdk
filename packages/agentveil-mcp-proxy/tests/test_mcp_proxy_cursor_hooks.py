@@ -62,6 +62,35 @@ def test_shell_python_m_pytest_allowed_end_to_end(tmp_path: Path) -> None:
     assert json.loads(out.getvalue())["permission"] == "allow"
 
 
+def test_detached_hook_refreshes_cursor_console_status(tmp_path, monkeypatch) -> None:
+    calls = []
+    home = tmp_path / ".agentveil"
+    monkeypatch.setattr(
+        cursor_hooks,
+        "best_effort_spawn_hook_project_status",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    decision = cursor_hooks.process_hook(
+        {
+            "hook_event": "beforeShellExecution",
+            "command": "agentveil-mcp-proxy --version && "
+            "agentveil-mcp-proxy setup status --client cursor --json",
+        },
+        workspace=tmp_path,
+        home=home,
+        out=StringIO(),
+        detached_upload=True,
+    )
+
+    assert decision.hook_action == "allow"
+    assert calls == [{
+        "connector": "cursor",
+        "project_dir": tmp_path,
+        "runtime_home": home,
+    }]
+
+
 def test_cursor_main_allows_bounded_local_git_command(tmp_path: Path) -> None:
     stdin = StringIO(json.dumps({"command": "git status --short"}))
     stdout = StringIO()

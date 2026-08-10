@@ -1673,9 +1673,14 @@ def _best_effort_console_project_status_sync(
     """Upload status, repairing one rejected Console credential via attach."""
 
     from agentveil_mcp_proxy import __version__ as package_version
-    from agentveil_mcp_proxy.console_project_status_client import sync_project_status
+    from agentveil_mcp_proxy.console_project_status_client import (
+        HOOK_STATUS_REFRESH_WORKER_ENV,
+        sync_project_status,
+    )
 
-    _best_effort_console_attach_credential()
+    detached_hook_worker = os.environ.get(HOOK_STATUS_REFRESH_WORKER_ENV) == "1"
+    if not detached_hook_worker:
+        _best_effort_console_attach_credential()
     try:
         result = sync_project_status(
             connector=connector,
@@ -1687,6 +1692,8 @@ def _best_effort_console_project_status_sync(
     except Exception:
         return
     if result != "credential_rejected":
+        return
+    if detached_hook_worker:
         return
     try:
         if not delete_credential():
@@ -1708,6 +1715,13 @@ def _best_effort_console_project_status_sync(
 
 def _best_effort_console_free_builder_sync(*, home: Path | None = None) -> None:
     """Best-effort Console free Builder preview install when credential allows."""
+
+    from agentveil_mcp_proxy.console_project_status_client import (
+        HOOK_STATUS_REFRESH_WORKER_ENV,
+    )
+
+    if os.environ.get(HOOK_STATUS_REFRESH_WORKER_ENV) == "1":
+        return
 
     from agentveil_mcp_proxy.console_free_builder_client import sync_free_builder_install
 

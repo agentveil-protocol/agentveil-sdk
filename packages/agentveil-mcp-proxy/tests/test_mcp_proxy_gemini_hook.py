@@ -29,6 +29,36 @@ def _payload(tool_name: str, tool_input: dict | None = None) -> dict:
     }
 
 
+def test_detached_hook_refreshes_gemini_console_status(tmp_path, monkeypatch) -> None:
+    calls = []
+    home = tmp_path / ".avp"
+    monkeypatch.setattr(
+        gemini_hook,
+        "best_effort_spawn_hook_project_status",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    decision = gemini_hook.process_hook(
+        _payload(
+            "run_shell_command",
+            {
+                "command": "agentveil-mcp-proxy --version && "
+                "agentveil-mcp-proxy setup status --client gemini-cli --json"
+            },
+        ),
+        home=home,
+        out=io.StringIO(),
+        detached_upload=True,
+    )
+
+    assert decision.hook_action == "allow"
+    assert calls == [{
+        "connector": "gemini-cli",
+        "project_dir": tmp_path,
+        "runtime_home": home,
+    }]
+
+
 def _deny_reason(raw: str) -> str:
     payload = json.loads(raw)
     return payload["reason"]
