@@ -11,6 +11,7 @@ import queue
 import threading
 import time
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -451,6 +452,26 @@ def test_canonical_project_runtime_uses_global_credential_without_env(
     assert console_credential_home_for_runtime(runtime_home) == (
         tmp_path.home() / ".avp"
     )
+
+
+def test_project_runtime_uses_home_fallback_when_global_home_cannot_expand(
+    monkeypatch,
+    tmp_path,
+):
+    runtime_home = tmp_path / "project" / ".avp"
+    fallback_home = tmp_path / "isolated-home"
+    monkeypatch.delenv("USERPROFILE", raising=False)
+    monkeypatch.setenv("HOME", str(fallback_home))
+    original_expanduser = Path.expanduser
+
+    def fail_global_home_expand(path: Path) -> Path:
+        if str(path) == "~/.avp":
+            raise RuntimeError("Could not determine home directory.")
+        return original_expanduser(path)
+
+    monkeypatch.setattr(Path, "expanduser", fail_global_home_expand)
+
+    assert console_credential_home_for_runtime(runtime_home) == fallback_home / ".avp"
 
 
 def test_non_project_runtime_keeps_explicit_console_credential_home(
