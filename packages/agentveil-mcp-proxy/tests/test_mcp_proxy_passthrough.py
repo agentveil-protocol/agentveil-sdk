@@ -4150,6 +4150,56 @@ def test_redirect_follow_up_policy_block_does_not_reach_downstream(tmp_path, mon
     assert follow_meta["target_reached"] is False
 
 
+def test_filesystem_implementer_delete_file_policy_block_uses_inspection_guidance(
+    tmp_path,
+    monkeypatch,
+):
+    home = tmp_path / "home"
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir(parents=True, exist_ok=True)
+    target = sandbox / "keep.txt"
+    target.write_text("stay", encoding="utf-8")
+    init_proxy(
+        home=home,
+        agent_name="proxy",
+        plaintext=True,
+        role_preset="implementer",
+        policy_pack="filesystem",
+        downstream_config=proxy_cli.quickstart_filesystem_downstream(sandbox),
+    )
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("policy block redirect must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line(_tool_call_args(
+            "delete_file",
+            {"path": "keep.txt"},
+            # claim-check: allow negative regression identifier for expected policy denial.
+            call_id="delete-blocked",
+        ))),
+        out=client_out,
+        approval_ui_mode="none",
+    ) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    data = response["error"]["data"]
+    assert data["reason"] == "local_policy_block"
+    assert data["redirect_playbook_id"] == "inspect_before_delete"
+    assert data["redirect_playbook_id"] != "switch_to_build_agent"
+    assert data.get("target_reached") is False
+    assert target.read_text(encoding="utf-8") == "stay"
+    # claim-check: allow negative regression lookup for expected policy denial evidence.
+    metadata = _redirect_metadata_for_request(home, "delete-blocked")
+    assert metadata is not None
+    assert metadata["target_reached"] is False
+    assert SECRET not in client_out.getvalue()
+
+
 def test_redirect_malformed_context_fails_closed_without_downstream(tmp_path, monkeypatch):
     home = tmp_path / "home"
     init = init_proxy(home=home, agent_name="proxy", plaintext=True, role_preset="reviewer")

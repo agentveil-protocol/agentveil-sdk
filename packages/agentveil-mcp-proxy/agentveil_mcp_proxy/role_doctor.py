@@ -11,6 +11,11 @@ from typing import Any, Literal, Mapping
 
 from agentveil_mcp_proxy.classification import ClassifiedToolCall
 from agentveil_mcp_proxy.policy import RiskClass
+from agentveil_mcp_proxy.redirect_playbooks import (
+    PLAYBOOK_SPECS,
+    RedirectPlaybook,
+    build_risk_family_guidance,
+)
 from agentveil_mcp_proxy.role_presets import ROLE_PRESET_NAMES, resolve_role_preset
 
 _ROLE_AUTHORITY_REASON = "role_authority_denied"
@@ -181,6 +186,28 @@ def _preset_label(preset_name: str) -> str:
     return labels.get(preset_name, preset_name.replace("_", " ").title())
 
 
+def _deny_guidance_from_risk_family(
+    classification: ClassifiedToolCall,
+    *,
+    reason: str,
+) -> DenyGuidance:
+    """Return bounded deny guidance from risk-family playbooks for policy blocks."""
+
+    rf_guidance = build_risk_family_guidance(classification, outcome="block", reason=reason)
+    spec = PLAYBOOK_SPECS[RedirectPlaybook(rf_guidance.redirect_playbook_id)]
+    explanation = "Action denied by MCP proxy policy."
+    redirect = RedirectGuidance(
+        next_step=spec.safe_first_step,
+        suggested_next_step_id=rf_guidance.redirect_playbook_id,
+        redirect_playbook_id=rf_guidance.redirect_playbook_id,
+    )
+    return DenyGuidance(
+        message=explanation,
+        explanation=explanation,
+        redirect=redirect,
+    )
+
+
 def build_deny_guidance(
     classification: ClassifiedToolCall,
     *,
@@ -226,6 +253,8 @@ def build_deny_guidance(
             explanation=explanation,
             redirect=redirect,
         )
+    if reason == "local_policy_block":
+        return _deny_guidance_from_risk_family(classification, reason=reason)
     explanation = "Action denied by MCP proxy policy."
     redirect = RedirectGuidance(
         next_step="Review local policy or switch to an allowed role preset.",
