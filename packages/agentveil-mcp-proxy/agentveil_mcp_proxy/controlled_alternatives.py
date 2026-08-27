@@ -286,6 +286,7 @@ class ControlledAlternativeProviderResult:
     rollback_available: bool
     error_code: str | None = None
     bounded_summary: str | None = None
+    quarantine_entry_id: str | None = None
 
     def __repr__(self) -> str:
         return (
@@ -298,7 +299,8 @@ class ControlledAlternativeProviderResult:
             f"target_reached={self.target_reached!r}, "
             f"rollback_available={self.rollback_available!r}, "
             f"error_code={self.error_code!r}, "
-            "bounded_summary='***')"
+            "bounded_summary='***', "
+            "quarantine_entry_id='***')"
         )
 
     def __str__(self) -> str:
@@ -407,6 +409,47 @@ def _require_st_dev(value: Any) -> int:
     return value
 
 
+_RESULT_QUARANTINE_ENTRY_ID_ALPHABET = frozenset("0123456789abcdef")
+_STAGE_DELETE_ALTERNATIVE_ID = "filesystem.stage_delete.v1"
+
+
+def _require_result_quarantine_entry_id(value: Any) -> str:
+    if not isinstance(value, str) or len(value) != 32:
+        raise ControlledAlternativeValidationError(ERROR_REQUEST_MALFORMED)
+    if len(value.encode("utf-8")) > MAX_QUARANTINE_ENTRY_ID_BYTES:
+        raise ControlledAlternativeValidationError(ERROR_REQUEST_MALFORMED)
+    if any(char not in _RESULT_QUARANTINE_ENTRY_ID_ALPHABET for char in value):
+        raise ControlledAlternativeValidationError(ERROR_REQUEST_MALFORMED)
+    return value
+
+
+def _validate_result_quarantine_entry_id(
+    payload: Mapping[str, Any],
+    *,
+    alternative_id: str,
+    result_status: str,
+    target_reached: bool,
+    rollback_available: bool,
+) -> str | None:
+    present = "quarantine_entry_id" in payload
+    entry_id = None
+    if present:
+        entry_id = _require_result_quarantine_entry_id(payload["quarantine_entry_id"])
+    stage_delete = alternative_id == _STAGE_DELETE_ALTERNATIVE_ID
+    if stage_delete and not target_reached and rollback_available:
+        raise ControlledAlternativeValidationError(ERROR_REQUEST_MALFORMED)
+    if stage_delete and result_status == "success" and target_reached and not rollback_available:
+        raise ControlledAlternativeValidationError(ERROR_REQUEST_MALFORMED)
+    required = stage_delete and target_reached and rollback_available
+    if required:
+        if entry_id is None:
+            raise ControlledAlternativeValidationError(ERROR_REQUEST_MALFORMED)
+        return entry_id
+    if present:
+        raise ControlledAlternativeValidationError(ERROR_REQUEST_MALFORMED)
+    return None
+
+
 def _bounded_absolute_normalized_path(value: Any) -> str:
     if not isinstance(value, str) or value != value.strip() or not value:
         raise ControlledAlternativeValidationError(ERROR_REQUEST_MALFORMED)
@@ -461,6 +504,8 @@ def _result_mapping(
             mapping["error_code"] = raw.error_code
         if raw.bounded_summary is not None:
             mapping["bounded_summary"] = raw.bounded_summary
+        if raw.quarantine_entry_id is not None:
+            mapping["quarantine_entry_id"] = raw.quarantine_entry_id
         return mapping
     return _require_mapping(raw, error_code=ERROR_REQUEST_MALFORMED)
 
@@ -799,6 +844,7 @@ def validate_provider_result(
         "rollback_available",
         "error_code",
         "bounded_summary",
+        "quarantine_entry_id",
     })
     _assert_no_authority_keys(payload)
     _assert_no_extra_keys(payload, allowed, error_code=ERROR_REQUEST_MALFORMED)
@@ -859,6 +905,13 @@ def validate_provider_result(
             max_bytes=MAX_BOUNDED_SUMMARY_BYTES,
             error_code=ERROR_REQUEST_MALFORMED,
         )
+    quarantine_entry_id = _validate_result_quarantine_entry_id(
+        payload,
+        alternative_id=alternative_id,
+        result_status=result_status,
+        target_reached=target_reached,
+        rollback_available=rollback_available,
+    )
 
     return ControlledAlternativeProviderResult(
         contract_version=contract_version,
@@ -870,6 +923,7 @@ def validate_provider_result(
         rollback_available=rollback_available,
         error_code=error_code,
         bounded_summary=bounded_summary,
+        quarantine_entry_id=quarantine_entry_id,
     )
 
 

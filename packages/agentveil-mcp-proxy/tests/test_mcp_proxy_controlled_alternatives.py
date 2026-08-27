@@ -85,6 +85,7 @@ else:
     NON_NORMALIZED_ROOT = "/Users/customer/project/./nested"
 
 SECRET_PATCH = "password=super-secret-value"
+QUARANTINE_ENTRY_ID_CANARY = "cafebabedeadbeef0123456789abcdef"
 ROUTE_CANARY = "route-secret-9f3a"
 SUMMARY_CANARY = "customer-summary-should-not-leak"
 STDEV_CANARY = 424242
@@ -216,6 +217,7 @@ def _assert_bounded_error(
         OUTSIDE_ROOT,
         RELATIVE_ROOT,
         NON_NORMALIZED_ROOT,
+        QUARANTINE_ENTRY_ID_CANARY,
         *extra_canaries,
     ):
         assert canary not in rendered
@@ -237,6 +239,8 @@ def test_constants_match_ca0_contract() -> None:
         "git.prepare_local_change.v1",
     )
     assert ca_mod.MAX_RESOURCE_LOCATOR_FIELDS == 8
+    assert ca_mod.MAX_RESULT_TOP_LEVEL_KEYS == 12
+    assert ca_mod.MAX_QUARANTINE_ENTRY_ID_BYTES == 64
 
 
 @pytest.mark.parametrize("alternative_id, raw_input", list(FAMILY_INPUTS.items()))
@@ -316,7 +320,19 @@ def test_sensitive_repr_surfaces_are_redacted() -> None:
             "bounded_summary": SUMMARY_CANARY,
         }
     )
-    for value in (local_input, locator, request, bounded, result):
+    staged = validate_provider_result(
+        {
+            "contract_version": "1",
+            "alternative_id": "filesystem.stage_delete.v1",
+            "operation_ref": "op-1",
+            "result_status": "success",
+            "outcome_class_candidate": "COMPLETED_WITH_ALTERNATIVE",
+            "target_reached": True,
+            "rollback_available": True,
+            "quarantine_entry_id": QUARANTINE_ENTRY_ID_CANARY,
+        }
+    )
+    for value in (local_input, locator, request, bounded, result, staged):
         rendered = f"{value!r}{value}"
         assert SECRET_PATH not in rendered
         assert SECRET_PATCH not in rendered
@@ -324,6 +340,7 @@ def test_sensitive_repr_surfaces_are_redacted() -> None:
         assert STATE_ROOT not in rendered
         assert ROUTE_CANARY not in rendered
         assert SUMMARY_CANARY not in rendered
+        assert QUARANTINE_ENTRY_ID_CANARY not in rendered
         assert str(STDEV_CANARY) not in rendered
         assert not hasattr(value, "to_dict")
 
@@ -590,9 +607,11 @@ def test_validate_provider_result_status_and_authority_semantics() -> None:
             "outcome_class_candidate": "COMPLETED_WITH_ALTERNATIVE",
             "target_reached": True,
             "rollback_available": True,
+            "quarantine_entry_id": QUARANTINE_ENTRY_ID_CANARY,
         }
     )
     assert success.result_status == "success"
+    assert success.quarantine_entry_id == QUARANTINE_ENTRY_ID_CANARY
 
     with pytest.raises(ControlledAlternativeValidationError) as missing_code:
         validate_provider_result(
@@ -665,17 +684,36 @@ def _valid_result_dataclass(**overrides: object) -> ControlledAlternativeProvide
         "rollback_available": True,
         "error_code": None,
         "bounded_summary": None,
+        "quarantine_entry_id": QUARANTINE_ENTRY_ID_CANARY,
     }
     payload.update(overrides)
     return ControlledAlternativeProviderResult(**payload)  # type: ignore[arg-type]
+
+
+def _result_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "contract_version": "1",
+        "alternative_id": "filesystem.stage_delete.v1",
+        "operation_ref": "op-1",
+        "result_status": "success",
+        "outcome_class_candidate": "COMPLETED_WITH_ALTERNATIVE",
+        "target_reached": True,
+        "rollback_available": True,
+        "quarantine_entry_id": QUARANTINE_ENTRY_ID_CANARY,
+    }
+    payload.update(overrides)
+    return payload
 
 
 def test_validate_provider_result_accepts_and_rechecks_dataclass() -> None:
     accepted = validate_provider_result(_valid_result_dataclass())
     assert accepted.result_status == "success"
     assert accepted.error_code is None
+    assert accepted.quarantine_entry_id == QUARANTINE_ENTRY_ID_CANARY
     round_trip = validate_provider_result(accepted)
     assert round_trip.result_status == "success"
+    assert round_trip.quarantine_entry_id == QUARANTINE_ENTRY_ID_CANARY
+    assert QUARANTINE_ENTRY_ID_CANARY not in f"{accepted!r}{accepted}{round_trip!r}{round_trip}"
 
     with pytest.raises(ControlledAlternativeValidationError) as bad_contract:
         validate_provider_result(_valid_result_dataclass(contract_version="999"))
@@ -697,6 +735,7 @@ def test_validate_provider_result_accepts_and_rechecks_dataclass() -> None:
             rollback_available=False,
             error_code="internal_error",
             bounded_summary=SUMMARY_CANARY,
+            quarantine_entry_id=None,
         )
     )
     rendered = f"{summary!r}{summary}"
@@ -712,6 +751,196 @@ def test_validate_provider_result_accepts_and_rechecks_dataclass() -> None:
     _assert_bounded_error(leaking, ERROR_CONTRACT_INCOMPATIBLE)
     assert SUMMARY_CANARY not in str(leaking.value)
     assert SUMMARY_CANARY not in repr(leaking.value)
+    assert QUARANTINE_ENTRY_ID_CANARY not in str(leaking.value)
+
+
+@pytest.mark.parametrize("result_status, outcome, extra", [
+    ("success", "COMPLETED_WITH_ALTERNATIVE", {}),
+    ("error", "ALTERNATIVE_UNAVAILABLE", {"error_code": "mechanism_verification_failed"}),
+    ("unavailable", "ALTERNATIVE_UNAVAILABLE", {"error_code": "atomic_relocation_unavailable"}),
+])
+def test_stage_delete_true_true_requires_and_preserves_quarantine_id(
+    result_status: str,
+    outcome: str,
+    extra: dict[str, str],
+) -> None:
+    mapping = _result_payload(
+        result_status=result_status,
+        outcome_class_candidate=outcome,
+        **extra,
+    )
+    parsed = validate_provider_result(mapping)
+    assert parsed.result_status == result_status
+    assert parsed.target_reached is True
+    assert parsed.rollback_available is True
+    assert parsed.quarantine_entry_id == QUARANTINE_ENTRY_ID_CANARY
+    assert parsed.error_code == extra.get("error_code")
+    rendered = f"{parsed!r}{parsed}"
+    assert QUARANTINE_ENTRY_ID_CANARY not in rendered
+    again = validate_provider_result(parsed)
+    assert again.quarantine_entry_id == QUARANTINE_ENTRY_ID_CANARY
+    assert again.result_status == result_status
+
+
+@pytest.mark.parametrize("result_status, outcome", [
+    ("error", "ALTERNATIVE_UNAVAILABLE"),
+    ("unavailable", "ALTERNATIVE_UNAVAILABLE"),
+])
+def test_stage_delete_true_true_failure_still_requires_error_code(
+    result_status: str,
+    outcome: str,
+) -> None:
+    payload = _result_payload(
+        result_status=result_status,
+        outcome_class_candidate=outcome,
+    )
+    with pytest.raises(ControlledAlternativeValidationError) as missing:
+        validate_provider_result(payload)
+    _assert_bounded_error(missing, ERROR_REQUEST_MALFORMED)
+
+
+def test_stage_delete_false_false_forbids_quarantine_id() -> None:
+    payload = _result_payload(
+        result_status="error",
+        outcome_class_candidate="ALTERNATIVE_UNAVAILABLE",
+        target_reached=False,
+        rollback_available=False,
+        error_code="internal_error",
+    )
+    del payload["quarantine_entry_id"]
+    accepted = validate_provider_result(payload)
+    assert accepted.quarantine_entry_id is None
+    assert accepted.result_status == "error"
+
+    payload["quarantine_entry_id"] = QUARANTINE_ENTRY_ID_CANARY
+    with pytest.raises(ControlledAlternativeValidationError) as forbidden:
+        validate_provider_result(payload)
+    _assert_bounded_error(forbidden, ERROR_REQUEST_MALFORMED)
+
+
+@pytest.mark.parametrize("with_id", [False, True])
+def test_stage_delete_false_true_is_malformed(with_id: bool) -> None:
+    payload = _result_payload(
+        result_status="error",
+        outcome_class_candidate="ALTERNATIVE_UNAVAILABLE",
+        target_reached=False,
+        rollback_available=True,
+        error_code="internal_error",
+    )
+    if not with_id:
+        del payload["quarantine_entry_id"]
+    with pytest.raises(ControlledAlternativeValidationError) as malformed:
+        validate_provider_result(payload)
+    _assert_bounded_error(malformed, ERROR_REQUEST_MALFORMED)
+
+
+@pytest.mark.parametrize("with_id", [False, True])
+def test_stage_delete_success_true_false_is_malformed(with_id: bool) -> None:
+    payload = _result_payload(target_reached=True, rollback_available=False)
+    if not with_id:
+        del payload["quarantine_entry_id"]
+    with pytest.raises(ControlledAlternativeValidationError) as malformed:
+        validate_provider_result(payload)
+    _assert_bounded_error(malformed, ERROR_REQUEST_MALFORMED)
+
+
+@pytest.mark.parametrize("result_status", ["error", "unavailable"])
+def test_stage_delete_failure_true_false_forbids_id_and_stays_failure(
+    result_status: str,
+) -> None:
+    payload = _result_payload(
+        result_status=result_status,
+        outcome_class_candidate="ALTERNATIVE_UNAVAILABLE",
+        target_reached=True,
+        rollback_available=False,
+        error_code="mechanism_verification_failed",
+    )
+    del payload["quarantine_entry_id"]
+    parsed = validate_provider_result(payload)
+    assert parsed.result_status == result_status
+    assert parsed.quarantine_entry_id is None
+    assert parsed.error_code == "mechanism_verification_failed"
+    payload["quarantine_entry_id"] = QUARANTINE_ENTRY_ID_CANARY
+    with pytest.raises(ControlledAlternativeValidationError) as forbidden:
+        validate_provider_result(payload)
+    _assert_bounded_error(forbidden, ERROR_REQUEST_MALFORMED)
+
+
+@pytest.mark.parametrize(
+    "alternative_id",
+    [item for item in CONTROLLED_ALTERNATIVE_IDS if item != "filesystem.stage_delete.v1"],
+)
+def test_other_alternative_results_forbid_quarantine_id(alternative_id: str) -> None:
+    payload = _result_payload(alternative_id=alternative_id)
+    with pytest.raises(ControlledAlternativeValidationError) as forbidden:
+        validate_provider_result(payload)
+    _assert_bounded_error(forbidden, ERROR_REQUEST_MALFORMED)
+    del payload["quarantine_entry_id"]
+    parsed = validate_provider_result(payload)
+    assert parsed.alternative_id == alternative_id
+    assert parsed.quarantine_entry_id is None
+
+
+def test_stage_delete_true_true_rejects_absent_quarantine_id() -> None:
+    payload = _result_payload()
+    del payload["quarantine_entry_id"]
+    with pytest.raises(ControlledAlternativeValidationError) as missing:
+        validate_provider_result(payload)
+    _assert_bounded_error(missing, ERROR_REQUEST_MALFORMED)
+    with pytest.raises(ControlledAlternativeValidationError) as missing_dc:
+        validate_provider_result(_valid_result_dataclass(quarantine_entry_id=None))
+    _assert_bounded_error(missing_dc, ERROR_REQUEST_MALFORMED)
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        None,
+        True,
+        1,
+        "",
+        "a" * 31,
+        "a" * 33,
+        "a" * 64,
+        "A" * 32,
+        "g" * 32,
+        "a" * 31 + "/",
+        "a" * 31 + "\\",
+        ".." + "a" * 30,
+        "a" * 31 + " ",
+        " " + "a" * 31,
+    ],
+)
+def test_stage_delete_rejects_malformed_quarantine_ids(bad_value: object) -> None:
+    payload = _result_payload(quarantine_entry_id=bad_value)
+    with pytest.raises(ControlledAlternativeValidationError) as malformed:
+        validate_provider_result(payload)
+    extra = (bad_value,) if isinstance(bad_value, str) and bad_value else ()
+    _assert_bounded_error(malformed, ERROR_REQUEST_MALFORMED, *extra)
+
+
+def test_result_dataclass_cannot_bypass_quarantine_id_validation() -> None:
+    with pytest.raises(ControlledAlternativeValidationError) as malformed:
+        validate_provider_result(
+            _valid_result_dataclass(quarantine_entry_id="A" * 32)
+        )
+    _assert_bounded_error(malformed, ERROR_REQUEST_MALFORMED, "A" * 32)
+    with pytest.raises(ControlledAlternativeValidationError) as wrong_family:
+        validate_provider_result(
+            _valid_result_dataclass(
+                alternative_id="filesystem.restore_staged.v1",
+            )
+        )
+    _assert_bounded_error(wrong_family, ERROR_REQUEST_MALFORMED)
+    with pytest.raises(ControlledAlternativeValidationError) as invalid_tuple:
+        validate_provider_result(
+            _valid_result_dataclass(
+                target_reached=False,
+                rollback_available=True,
+                quarantine_entry_id=None,
+            )
+        )
+    _assert_bounded_error(invalid_tuple, ERROR_REQUEST_MALFORMED)
 
 
 def test_validate_provider_descriptor_rejects_bypass_and_missing_fields() -> None:
