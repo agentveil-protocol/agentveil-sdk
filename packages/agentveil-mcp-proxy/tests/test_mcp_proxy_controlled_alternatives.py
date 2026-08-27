@@ -6,6 +6,8 @@ import json
 import os
 import subprocess
 import sys
+import types
+import zipfile
 from importlib.metadata import Distribution
 from pathlib import Path
 
@@ -40,11 +42,27 @@ from agentveil_mcp_proxy.controlled_alternatives import (
     validate_provider_result,
     validate_resource_locator,
 )
+from agentveil_mcp_proxy.paid_install import (
+    FreeBuilderInstallError,
+    FreeBuilderWheelExpectations,
+    install_state_path,
+    install_wheel_to_vendor,
+    run_free_builder_install_flow,
+    sha256_hex,
+    vendor_root,
+    verify_free_builder_wheel_artifact,
+    write_install_state,
+)
 from agentveil_mcp_proxy.paid_provider import (
+    INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP,
+    INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME,
+    PAID_PROVIDER_ENTRYPOINT_GROUP,
     PUBLIC_PAID_PROVIDER_CONTRACT_VERSION,
     STATUS_ACTIVE,
     STATUS_MISSING,
     PaidProviderSnapshot,
+    discover_paid_provider,
+    set_paid_provider_loader,
 )
 
 SECRET_PATH = "/Users/customer/project/secret.txt"
@@ -827,6 +845,7 @@ def test_importlib_metadata_discovery_reports_missing_duplicate_and_load_failed(
         return []
 
     monkeypatch.setattr(ca_mod, "entry_points", _missing)
+    monkeypatch.setenv("AVP_HOME", str(tmp_path / "empty-home"))
     missing = discover_controlled_alternative_provider(_active_paid_snapshot())
     assert missing.available is False
     assert missing.error_code == ERROR_DISCOVERY_ENTRYPOINT_MISSING
@@ -873,3 +892,441 @@ def test_importlib_metadata_discovery_reports_missing_duplicate_and_load_failed(
     assert load_failed.available is False
     assert load_failed.error_code == ERROR_DISCOVERY_ENTRYPOINT_LOAD_FAILED
     assert "cannot load" not in str(load_failed)
+
+
+VENDORED_CA_PACKAGE_NAME = "agentveil-private-policy"
+VENDORED_CA_PACKAGE_VERSION = "0.1.0"
+VENDORED_CA_MODULE_NAME = VENDORED_CA_PACKAGE_NAME.replace("-", "_")
+
+VENDORED_CA_PROVIDER_SOURCE = '''
+class _Provider:
+    calls = []
+
+    def descriptor(self):
+        self.calls.append("descriptor")
+        return {
+            "provider_id": "private_v1",
+            "contract_version": "1",
+            "profile_id": "controlled_alternatives_coding_v1",
+            "alternative_ids": [
+                "filesystem.stage_delete.v1",
+                "filesystem.restore_staged.v1",
+                "filesystem.cleanup_staged.v1",
+                "protected_write.prepare_patch.v1",
+                "git.prepare_local_change.v1",
+            ],
+        }
+
+    def propose(self, request):
+        self.calls.append("propose")
+        raise RuntimeError("CA1B_PHASE_CANARY")
+
+    def execute(self, request):
+        self.calls.append("execute")
+        raise RuntimeError("CA1B_PHASE_CANARY")
+
+    def verify(self, request):
+        self.calls.append("verify")
+        raise RuntimeError("CA1B_PHASE_CANARY")
+
+def build_provider():
+    return _Provider()
+'''
+
+
+def _controlled_alternative_entry_points_text(*, target: str) -> str:
+    return (
+        f"[{CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP}]\n"
+        f"private_v1 = {target}\n"
+    )
+
+
+def _build_controlled_alternative_wheel(
+    tmp_path: Path,
+    *,
+    source: str = VENDORED_CA_PROVIDER_SOURCE,
+    entry_points: str | None = None,
+) -> bytes:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    wheel_path = tmp_path / f"{VENDORED_CA_PACKAGE_NAME}-{VENDORED_CA_PACKAGE_VERSION}.whl"
+    if entry_points is None:
+        entry_points = _controlled_alternative_entry_points_text(
+            target=f"{VENDORED_CA_MODULE_NAME}.controlled_provider:build_provider",
+        )
+    with zipfile.ZipFile(wheel_path, "w") as archive:
+        archive.writestr(f"{VENDORED_CA_MODULE_NAME}/__init__.py", "provider_id = 'private_v1'\n")
+        archive.writestr(f"{VENDORED_CA_MODULE_NAME}/controlled_provider.py", source)
+        archive.writestr(
+            f"{VENDORED_CA_MODULE_NAME}-{VENDORED_CA_PACKAGE_VERSION}.dist-info/METADATA",
+            f"Name: {VENDORED_CA_PACKAGE_NAME}\nVersion: {VENDORED_CA_PACKAGE_VERSION}\n",
+        )
+        archive.writestr(
+            f"{VENDORED_CA_MODULE_NAME}-{VENDORED_CA_PACKAGE_VERSION}.dist-info/entry_points.txt",
+            entry_points,
+        )
+        archive.writestr(
+            f"{VENDORED_CA_MODULE_NAME}-{VENDORED_CA_PACKAGE_VERSION}.dist-info/WHEEL",
+            "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        )
+    return wheel_path.read_bytes()
+
+
+def _install_active_controlled_alternative_vendor(home: Path, *, wheel_bytes: bytes) -> None:
+    metadata = verify_free_builder_wheel_artifact(
+        wheel_bytes,
+        expectations=FreeBuilderWheelExpectations(
+            artifact_hash=sha256_hex(wheel_bytes),
+            artifact_size_bytes=len(wheel_bytes),
+            package_name=VENDORED_CA_PACKAGE_NAME,
+            package_version=VENDORED_CA_PACKAGE_VERSION,
+        ),
+    )
+    vendor_dir = vendor_root(home) / f"{metadata.package_name}-{metadata.package_version}"
+    wheel_path = home / "paid" / "cache" / f"{metadata.package_name}-{metadata.package_version}.whl"
+    wheel_path.parent.mkdir(parents=True, exist_ok=True)
+    wheel_path.write_bytes(wheel_bytes)
+    install_wheel_to_vendor(
+        home=home,
+        wheel_path=wheel_path,
+        target_dir=vendor_dir,
+        expected_package_name=metadata.package_name,
+        expected_package_version=metadata.package_version,
+        require_empty_target=True,
+    )
+    write_install_state(
+        install_state_path(home),
+        {
+            "status": STATUS_ACTIVE,
+            "provider_id": CONTROLLED_ALTERNATIVE_PROVIDER_ID,
+            "package_name": metadata.package_name,
+            "package_version": metadata.package_version,
+            "public_fallback_available": True,
+            "error_code": None,
+            "last_installed_at": "2026-08-08T12:00:00+00:00",
+            "install_safety_state": "verified",
+            "install_safety_reason": None,
+        },
+    )
+
+
+def _no_global_controlled_entries(*, group: str | None = None, **_kwargs):
+    assert group == CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP
+    return []
+
+
+def test_discover_controlled_alternative_from_active_vendored_free_builder_install(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    monkeypatch.setattr(ca_mod, "entry_points", _no_global_controlled_entries)
+    wheel_bytes = _build_controlled_alternative_wheel(tmp_path / "wheel")
+    _install_active_controlled_alternative_vendor(home, wheel_bytes=wheel_bytes)
+
+    result = discover_controlled_alternative_provider(_active_paid_snapshot())
+    assert result.available is True
+    assert result.error_code is None
+    assert result.descriptor is not None
+    assert result.descriptor.provider_id == "private_v1"
+    assert result.descriptor.alternative_ids == CONTROLLED_ALTERNATIVE_IDS
+    assert SECRET_PATH not in repr(result)
+    vendor_dir = vendor_root(home) / f"{VENDORED_CA_PACKAGE_NAME}-{VENDORED_CA_PACKAGE_VERSION}"
+    assert str(vendor_dir.resolve()) not in sys.path
+    assert not any(
+        key == VENDORED_CA_MODULE_NAME or key.startswith(f"{VENDORED_CA_MODULE_NAME}.")
+        for key in sys.modules
+    )
+
+
+def test_global_duplicate_and_load_failure_do_not_use_vendored_controlled_alternative(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    wheel_bytes = _build_controlled_alternative_wheel(tmp_path / "wheel")
+    _install_active_controlled_alternative_vendor(home, wheel_bytes=wheel_bytes)
+
+    first = _write_disposable_distribution(
+        tmp_path / "one",
+        dist_name="ca1b-one",
+        module_name="ca1b_one_provider",
+        source=COMPATIBLE_PROVIDER_SOURCE,
+    )
+    second = _write_disposable_distribution(
+        tmp_path / "two",
+        dist_name="ca1b-two",
+        module_name="ca1b_two_provider",
+        source=COMPATIBLE_PROVIDER_SOURCE,
+    )
+    duplicates = _entry_points_from_dist(first) + _entry_points_from_dist(second)
+
+    def _duplicate(*, group: str | None = None, **_kwargs):
+        assert group == CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP
+        return duplicates
+
+    monkeypatch.setattr(ca_mod, "entry_points", _duplicate)
+    duplicate = discover_controlled_alternative_provider(_active_paid_snapshot())
+    assert duplicate.available is False
+    assert duplicate.error_code == ERROR_DISCOVERY_DUPLICATE_ENTRYPOINT
+
+    broken = _write_disposable_distribution(
+        tmp_path / "broken",
+        dist_name="ca1b-broken",
+        module_name="ca1b_broken_provider",
+        source="def build_provider():\n    raise RuntimeError('CA1B_GLOBAL_LOAD_CANARY')\n",
+    )
+
+    def _broken(*, group: str | None = None, **_kwargs):
+        assert group == CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP
+        return _entry_points_from_dist(broken)
+
+    monkeypatch.setattr(ca_mod, "entry_points", _broken)
+    load_failed = discover_controlled_alternative_provider(_active_paid_snapshot())
+    assert load_failed.available is False
+    assert load_failed.error_code == ERROR_DISCOVERY_ENTRYPOINT_LOAD_FAILED
+    assert "CA1B_GLOBAL_LOAD_CANARY" not in str(load_failed)
+    assert "CA1B_GLOBAL_LOAD_CANARY" not in repr(load_failed)
+
+
+def test_vendored_controlled_alternative_failures_map_to_bounded_ca1_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    monkeypatch.setattr(ca_mod, "entry_points", _no_global_controlled_entries)
+
+    missing_wheel = _build_controlled_alternative_wheel(
+        tmp_path / "missing",
+        entry_points="[agentveil_mcp_proxy.paid_providers]\nprivate_v1 = agentveil_private_policy.controlled_provider:build_provider\n",
+    )
+    _install_active_controlled_alternative_vendor(home, wheel_bytes=missing_wheel)
+    missing = discover_controlled_alternative_provider(_active_paid_snapshot())
+    assert missing.available is False
+    assert missing.error_code == ERROR_DISCOVERY_ENTRYPOINT_MISSING
+
+    factory_home = tmp_path / "factory-home"
+    monkeypatch.setenv("AVP_HOME", str(factory_home))
+    canary = "CA1B_FACTORY_CANARY"
+    factory_wheel = _build_controlled_alternative_wheel(
+        tmp_path / "factory",
+        source=f"def build_provider():\n    raise RuntimeError({canary!r})\n",
+    )
+    _install_active_controlled_alternative_vendor(factory_home, wheel_bytes=factory_wheel)
+    factory_failed = discover_controlled_alternative_provider(_active_paid_snapshot())
+    assert factory_failed.available is False
+    assert factory_failed.error_code == ERROR_DISCOVERY_ENTRYPOINT_LOAD_FAILED
+    assert canary not in str(factory_failed)
+    assert canary not in repr(factory_failed)
+
+    malformed_home = tmp_path / "malformed-home"
+    monkeypatch.setenv("AVP_HOME", str(malformed_home))
+    malformed_wheel = _build_controlled_alternative_wheel(
+        tmp_path / "malformed",
+        entry_points=(
+            f"[{CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP}]\n"
+            "private_v1 = not-a-valid-target\n"
+        ),
+    )
+    _install_active_controlled_alternative_vendor(malformed_home, wheel_bytes=malformed_wheel)
+    malformed = discover_controlled_alternative_provider(_active_paid_snapshot())
+    assert malformed.available is False
+    assert malformed.error_code == ERROR_DISCOVERY_ENTRYPOINT_LOAD_FAILED
+    assert "not-a-valid-target" not in str(malformed)
+    assert "not-a-valid-target" not in repr(malformed)
+
+
+FREE_BUILDER_CREDENTIAL = "ca1b-free-builder-credential"
+PAID_PROVIDER_SOURCE = """
+class _Provider:
+    provider_id = "private_v1"
+    provider_contract_version = "1"
+
+    def status(self):
+        return {
+            "provider_present": True,
+            "provider_id": self.provider_id,
+            "provider_contract_version": self.provider_contract_version,
+            "status": "active",
+            "private_provider_enabled": True,
+            "public_fallback_available": True,
+            "summary": "Vendored provider active.",
+            "error_code": None,
+        }
+
+    def activate(self, *, license_key):
+        del license_key
+        return self.status()
+
+    def deactivate(self):
+        return {
+            "provider_present": False,
+            "provider_id": None,
+            "provider_contract_version": self.provider_contract_version,
+            "status": "missing",
+            "private_provider_enabled": False,
+            "public_fallback_available": True,
+            "summary": None,
+            "error_code": None,
+        }
+
+def build_vendored_provider():
+    return _Provider()
+"""
+HANDOFF_HOOK_SOURCE = """
+def run_activation_handoff(request):
+    return {
+        "contract_version": "1",
+        "status": "active",
+        "public_fallback_available": True,
+        "summary": "Installed hook completed.",
+        "error_code": None,
+    }
+"""
+
+
+def _assembled_entry_points_text(*, include_paid_provider: bool = True) -> str:
+    lines = [
+        f"[{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP}]",
+        f"{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME} = {VENDORED_CA_MODULE_NAME}.handoff_hook:run_activation_handoff",
+        "",
+        f"[{CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP}]",
+        f"private_v1 = {VENDORED_CA_MODULE_NAME}.controlled_provider:build_provider",
+    ]
+    if include_paid_provider:
+        lines.extend(
+            [
+                "",
+                f"[{PAID_PROVIDER_ENTRYPOINT_GROUP}]",
+                f"private_v1 = {VENDORED_CA_MODULE_NAME}.vendored_provider:build_vendored_provider",
+            ]
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _build_assembled_free_builder_wheel(
+    tmp_path: Path,
+    *,
+    include_paid_provider: bool = True,
+    controlled_source: str = VENDORED_CA_PROVIDER_SOURCE,
+) -> tuple[bytes, str]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    wheel_path = tmp_path / f"{VENDORED_CA_PACKAGE_NAME}-{VENDORED_CA_PACKAGE_VERSION}.whl"
+    with zipfile.ZipFile(wheel_path, "w") as archive:
+        archive.writestr(f"{VENDORED_CA_MODULE_NAME}/__init__.py", "provider_id = 'private_v1'\n")
+        archive.writestr(f"{VENDORED_CA_MODULE_NAME}/handoff_hook.py", HANDOFF_HOOK_SOURCE)
+        archive.writestr(f"{VENDORED_CA_MODULE_NAME}/controlled_provider.py", controlled_source)
+        if include_paid_provider:
+            archive.writestr(f"{VENDORED_CA_MODULE_NAME}/vendored_provider.py", PAID_PROVIDER_SOURCE)
+        archive.writestr(
+            f"{VENDORED_CA_MODULE_NAME}-{VENDORED_CA_PACKAGE_VERSION}.dist-info/METADATA",
+            f"Name: {VENDORED_CA_PACKAGE_NAME}\nVersion: {VENDORED_CA_PACKAGE_VERSION}\n",
+        )
+        archive.writestr(
+            f"{VENDORED_CA_MODULE_NAME}-{VENDORED_CA_PACKAGE_VERSION}.dist-info/entry_points.txt",
+            _assembled_entry_points_text(include_paid_provider=include_paid_provider),
+        )
+        archive.writestr(
+            f"{VENDORED_CA_MODULE_NAME}-{VENDORED_CA_PACKAGE_VERSION}.dist-info/WHEEL",
+            "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        )
+    wheel_bytes = wheel_path.read_bytes()
+    return wheel_bytes, sha256_hex(wheel_bytes)
+
+
+def _free_builder_expectations(wheel_bytes: bytes, artifact_hash: str) -> FreeBuilderWheelExpectations:
+    return FreeBuilderWheelExpectations(
+        artifact_hash=artifact_hash,
+        artifact_size_bytes=len(wheel_bytes),
+        package_name=VENDORED_CA_PACKAGE_NAME,
+        package_version=VENDORED_CA_PACKAGE_VERSION,
+    )
+
+
+def test_run_free_builder_install_flow_discovers_controlled_alternative(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    monkeypatch.setattr(ca_mod, "entry_points", _no_global_controlled_entries)
+    set_paid_provider_loader(None)
+    wheel_bytes, artifact_hash = _build_assembled_free_builder_wheel(tmp_path / "wheel")
+    before_path = list(sys.path)
+    sentinel = types.ModuleType(VENDORED_CA_MODULE_NAME)
+    monkeypatch.setitem(sys.modules, VENDORED_CA_MODULE_NAME, sentinel)
+
+    result = run_free_builder_install_flow(
+        wheel_bytes=wheel_bytes,
+        home=home,
+        activation_credential=FREE_BUILDER_CREDENTIAL,
+        expectations=_free_builder_expectations(wheel_bytes, artifact_hash),
+    )
+    assert result.install_state["status"] == STATUS_ACTIVE
+    install_payload = json.loads(install_state_path(home).read_text(encoding="utf-8"))
+    assert install_payload["status"] == STATUS_ACTIVE
+    assert install_payload["package_name"] == VENDORED_CA_PACKAGE_NAME
+    assert install_payload["package_version"] == VENDORED_CA_PACKAGE_VERSION
+    vendor_dir = vendor_root(home) / f"{VENDORED_CA_PACKAGE_NAME}-{VENDORED_CA_PACKAGE_VERSION}"
+    assert vendor_dir.is_dir()
+    assert not vendor_dir.is_symlink()
+    assert (home / "paid" / "cache" / f"{VENDORED_CA_PACKAGE_NAME}-{VENDORED_CA_PACKAGE_VERSION}.whl").is_file()
+
+    paid_snapshot = discover_paid_provider()
+    assert paid_snapshot.status == STATUS_ACTIVE
+    assert paid_snapshot.private_provider_enabled is True
+    from agentveil_mcp_proxy.paid_install import resolve_vendored_controlled_alternative_provider
+
+    provider, resolve_error = resolve_vendored_controlled_alternative_provider(home=home)
+    assert resolve_error is None
+    assert provider is not None
+    assert getattr(provider, "calls", None) == []
+
+    controlled = discover_controlled_alternative_provider(paid_snapshot)
+    assert controlled.available is True
+    assert controlled.error_code is None
+    assert controlled.descriptor is not None
+    assert controlled.descriptor.alternative_ids == CONTROLLED_ALTERNATIVE_IDS
+    assert FREE_BUILDER_CREDENTIAL not in repr(controlled)
+    assert str(home) not in repr(controlled)
+    assert str(vendor_dir.resolve()) not in sys.path
+    assert sys.path == before_path
+    assert sys.modules.get(VENDORED_CA_MODULE_NAME) is sentinel
+
+
+def test_run_free_builder_install_flow_restores_prior_state_when_provider_inactive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    prior = {
+        "status": STATUS_MISSING,
+        "provider_id": CONTROLLED_ALTERNATIVE_PROVIDER_ID,
+        "package_name": VENDORED_CA_PACKAGE_NAME,
+        "package_version": VENDORED_CA_PACKAGE_VERSION,
+        "public_fallback_available": True,
+        "error_code": None,
+        "last_installed_at": "2026-08-01T00:00:00+00:00",
+        "install_safety_state": "verified",
+        "install_safety_reason": None,
+    }
+    write_install_state(install_state_path(home), prior)
+    prior_bytes = install_state_path(home).read_bytes()
+    wheel_bytes, artifact_hash = _build_assembled_free_builder_wheel(
+        tmp_path / "wheel",
+        include_paid_provider=False,
+    )
+    with pytest.raises(FreeBuilderInstallError, match="provider_not_active"):
+        run_free_builder_install_flow(
+            wheel_bytes=wheel_bytes,
+            home=home,
+            activation_credential=FREE_BUILDER_CREDENTIAL,
+            expectations=_free_builder_expectations(wheel_bytes, artifact_hash),
+        )
+    assert install_state_path(home).read_bytes() == prior_bytes
+    vendor_dir = vendor_root(home) / f"{VENDORED_CA_PACKAGE_NAME}-{VENDORED_CA_PACKAGE_VERSION}"
+    assert not vendor_dir.exists()
+    assert FREE_BUILDER_CREDENTIAL not in install_state_path(home).read_text(encoding="utf-8")

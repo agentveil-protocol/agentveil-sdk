@@ -885,11 +885,38 @@ def _resolve_provider() -> tuple[ControlledAlternativeProvider | None, str | Non
         ]
     except Exception:
         return None, ERROR_DISCOVERY_ENTRYPOINT_LOAD_FAILED
-    if len(matches) == 0:
-        return None, ERROR_DISCOVERY_ENTRYPOINT_MISSING
     if len(matches) > 1:
         return None, ERROR_DISCOVERY_DUPLICATE_ENTRYPOINT
-    return _load_named_entry_point(matches[0])
+    if len(matches) == 1:
+        return _load_named_entry_point(matches[0])
+    return _resolve_vendored_controlled_alternative_provider()
+
+
+def _map_vendored_controlled_alternative_error(code: str) -> str:
+    if code in {"vendored_provider_missing", "handoff_hook_missing"}:
+        return ERROR_DISCOVERY_ENTRYPOINT_MISSING
+    if code in {"vendored_provider_multiple", "handoff_hook_multiple"}:
+        return ERROR_DISCOVERY_DUPLICATE_ENTRYPOINT
+    return ERROR_DISCOVERY_ENTRYPOINT_LOAD_FAILED
+
+
+def _resolve_vendored_controlled_alternative_provider() -> tuple[
+    ControlledAlternativeProvider | None,
+    str | None,
+]:
+    try:
+        from agentveil_mcp_proxy.paid_install import (
+            resolve_vendored_controlled_alternative_provider,
+        )
+
+        provider, error = resolve_vendored_controlled_alternative_provider()
+    except Exception:
+        return None, ERROR_DISCOVERY_ENTRYPOINT_LOAD_FAILED
+    if error is not None:
+        return None, _map_vendored_controlled_alternative_error(error)
+    if provider is None:
+        return None, ERROR_DISCOVERY_ENTRYPOINT_MISSING
+    return provider, None
 
 
 def discover_controlled_alternative_provider(

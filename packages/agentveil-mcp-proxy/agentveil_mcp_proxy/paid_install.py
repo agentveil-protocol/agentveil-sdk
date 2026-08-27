@@ -1253,6 +1253,126 @@ def resolve_vendored_paid_provider(*, home: Path | None = None) -> Any | None:
         return None
 
 
+_CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP = (
+    "agentveil_mcp_proxy.controlled_alternative_providers"
+)
+_CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_NAME = PROVIDER_ID
+
+
+def discover_exact_vendored_controlled_alternative_provider_entry(
+    vendor_dir: Path,
+    *,
+    package_name: str,
+    package_version: str,
+) -> tuple[str, str]:
+    """Discover the exact private_v1 controlled-alternative entry from one vendor dir."""
+
+    dist_info_dir = _find_exact_dist_info_dir(
+        vendor_dir,
+        package_name=package_name,
+        package_version=package_version,
+    )
+    _read_bounded_dist_info_file(
+        dist_info_dir,
+        "METADATA",
+        max_bytes=MAX_HANDOFF_DIST_INFO_METADATA_BYTES,
+    )
+    entry_points_text = _read_bounded_dist_info_file(
+        dist_info_dir,
+        "entry_points.txt",
+        max_bytes=MAX_HANDOFF_ENTRY_POINTS_BYTES,
+    )
+    grouped = parse_vendored_entry_points(entry_points_text)
+    candidates = grouped.get(_CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP, [])
+    compatible = [
+        (name, target)
+        for name, target in candidates
+        if name == _CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_NAME and target
+    ]
+    if not compatible:
+        raise PaidInstallError(ERROR_VENDORED_PROVIDER_MISSING, exit_code=1)
+    if len(compatible) > 1:
+        raise PaidInstallError(ERROR_VENDORED_PROVIDER_MULTIPLE, exit_code=1)
+    _, target = compatible[0]
+    try:
+        return assert_handoff_entrypoint_target(target)
+    except ValueError:
+        raise PaidInstallError(ERROR_VENDORED_PROVIDER_MALFORMED, exit_code=1)
+
+
+def _bounded_controlled_alternative_vendored_error(code: str) -> str:
+    if code in {ERROR_VENDORED_PROVIDER_MISSING, ERROR_HANDOFF_HOOK_MISSING}:
+        return ERROR_VENDORED_PROVIDER_MISSING
+    if code in {ERROR_VENDORED_PROVIDER_MULTIPLE, ERROR_HANDOFF_HOOK_MULTIPLE}:
+        return ERROR_VENDORED_PROVIDER_MULTIPLE
+    if code in {ERROR_HANDOFF_HOOK_IMPORT_FAILED, ERROR_HANDOFF_HOOK_EXCEPTION}:
+        return ERROR_HANDOFF_HOOK_IMPORT_FAILED
+    return ERROR_VENDORED_PROVIDER_MALFORMED
+
+
+def resolve_vendored_controlled_alternative_provider(
+    *,
+    home: Path | None = None,
+) -> tuple[Any | None, str | None]:
+    """Load the exact vendored private_v1 controlled alternative provider object."""
+
+    resolved_home = (home or Path(os.environ.get("AVP_HOME", "~/.avp"))).expanduser()
+    try:
+        _assert_trusted_home_path(resolved_home, resolved_home / "paid")
+    except PaidInstallError:
+        return None, ERROR_VENDORED_PROVIDER_MISSING
+
+    install_state = load_install_state(install_state_path(resolved_home))
+    if install_state is None or install_state.get("status") != STATUS_ACTIVE:
+        return None, ERROR_VENDORED_PROVIDER_MISSING
+
+    provider_id = install_state.get("provider_id")
+    package_name = install_state.get("package_name")
+    package_version = install_state.get("package_version")
+    if provider_id != PROVIDER_ID:
+        return None, ERROR_VENDORED_PROVIDER_MISSING
+    if not isinstance(package_name, str) or not isinstance(package_version, str):
+        return None, ERROR_VENDORED_PROVIDER_MISSING
+
+    try:
+        expected_package_name = validate_bounded_package_name(package_name)
+        expected_package_version = validate_bounded_package_version(package_version)
+    except PaidInstallError:
+        return None, ERROR_VENDORED_PROVIDER_MALFORMED
+
+    vendor_dir = _vendor_live_dir(
+        resolved_home,
+        package_name=expected_package_name,
+        package_version=expected_package_version,
+    )
+    if not vendor_dir.is_dir():
+        return None, ERROR_VENDORED_PROVIDER_MISSING
+
+    try:
+        _assert_non_symlink_vendor_path(resolved_home, vendor_dir)
+        module_path, attr_name = discover_exact_vendored_controlled_alternative_provider_entry(
+            vendor_dir,
+            package_name=expected_package_name,
+            package_version=expected_package_version,
+        )
+        factory = load_vendored_hook_callable(
+            vendor_dir,
+            home=resolved_home,
+            module_path=module_path,
+            attr_name=attr_name,
+        )
+        loaded = factory()
+        provider = loaded() if callable(loaded) else loaded
+        if provider is None:
+            return None, ERROR_HANDOFF_HOOK_IMPORT_FAILED
+        return provider, None
+    except PaidInstallError as exc:
+        raw = str(exc.args[0]) if exc.args else ERROR_VENDORED_PROVIDER_MALFORMED
+        return None, _bounded_controlled_alternative_vendored_error(raw)
+    except Exception:
+        return None, ERROR_HANDOFF_HOOK_IMPORT_FAILED
+
+
 def _module_origin_under_vendor(module: Any, vendor_root: Path) -> bool:
     file_path = getattr(module, "__file__", None)
     if isinstance(file_path, str) and file_path:
