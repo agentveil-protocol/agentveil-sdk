@@ -142,6 +142,10 @@ from agentveil_mcp_proxy.client_connect import (
     format_connect_payload,
     is_connect_all_target,
 )
+from agentveil_mcp_proxy.controlled_alternatives_runtime import (
+    bind_controlled_alternative_runtime,
+)
+from agentveil_mcp_proxy.paid_provider import discover_paid_provider
 from agentveil_mcp_proxy.passthrough import DownstreamConfig, McpPassthrough, PassthroughError
 from agentveil_mcp_proxy.paid_activation import (
     PaidActivationError,
@@ -3052,11 +3056,17 @@ def run_proxy(
             agent_cls=AVPAgent,
             passphrase=identity_passphrase,
         )
+        controlled_runtime = bind_controlled_alternative_runtime(
+            home=paths.home,
+            downstream=dict(config.downstream),
+            paid_snapshot=discover_paid_provider(),
+        )
         passthrough = McpPassthrough(
             downstream,
             classifier=classifier,
             runtime_gate_factory=runtime_gate_factory,
             approval_manager=approval_manager,
+            controlled_runtime=controlled_runtime,
         )
         previous_handlers = _install_run_proxy_signal_handlers(client_in)
         try:

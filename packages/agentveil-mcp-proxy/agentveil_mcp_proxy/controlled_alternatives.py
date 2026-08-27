@@ -11,7 +11,7 @@ paths in CA1.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 from importlib.metadata import entry_points
 from typing import Any, Callable, Mapping, Protocol
@@ -312,6 +312,7 @@ class ControlledAlternativeDiscoveryResult:
     available: bool
     descriptor: ControlledAlternativeProviderDescriptor | None = None
     error_code: str | None = None
+    provider: Any = field(default=None, repr=False, compare=False)
 
 
 class ControlledAlternativeProvider(Protocol):
@@ -1046,7 +1047,11 @@ def discover_controlled_alternative_provider(
             available=False,
             error_code=ERROR_DESCRIPTOR_INVALID,
         )
-    return ControlledAlternativeDiscoveryResult(available=True, descriptor=descriptor)
+    return ControlledAlternativeDiscoveryResult(
+        available=True,
+        descriptor=descriptor,
+        provider=provider,
+    )
 
 
 def _input_schema_for_alternative(alternative_id: str) -> dict[str, Any]:

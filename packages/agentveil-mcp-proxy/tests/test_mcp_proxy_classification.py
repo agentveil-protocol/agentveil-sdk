@@ -15,6 +15,7 @@ from agentveil_mcp_proxy.classification import (
     extract_resource,
     infer_risk_class,
     sha256_jcs,
+    sha256_text,
 )
 from agentveil_mcp_proxy.passthrough import DownstreamConfig, McpPassthrough
 from agentveil_mcp_proxy.policy import PolicyDecision, ProxyConfig, RiskClass, builtin_policy_pack
@@ -955,3 +956,64 @@ def test_native_shell_matrix_privacy_deny_cases_do_not_echo_secret_operands() ->
     assert risk is RiskClass.DESTRUCTIVE
     assert secret not in repr(risk)
     assert secret not in risk.value
+
+
+def test_controlled_alternative_tool_classifies_by_nested_id() -> None:
+    from agentveil_mcp_proxy.controlled_alternatives import GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME
+
+    classifier = ToolCallClassifier(_config(), server_name="downstream")
+    staged = classifier.classify(
+        tool=GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+        arguments={"alternative_id": "filesystem.stage_delete.v1", "input": {"path": "notes.txt"}},
+    )
+    assert staged.risk_class is RiskClass.WRITE
+    assert staged.action_family == "write"
+    assert "notes.txt" not in f"{staged.resource}"
+    cleanup = classifier.classify(
+        tool=GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+        arguments={
+            "alternative_id": "filesystem.cleanup_staged.v1",
+            "input": {"quarantine_entry_id": "cafebabedeadbeef0123456789abcdef"},
+        },
+    )
+    assert cleanup.risk_class is RiskClass.DESTRUCTIVE
+    assert cleanup.action_family == "delete"
+    protect = ToolCallClassifier(_config(), server_name="downstream")
+    asked = protect.classify(
+        tool=GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+        arguments={"alternative_id": "filesystem.stage_delete.v1", "input": {"path": "notes.txt"}},
+    )
+    assert asked.policy_evaluation.decision is PolicyDecision.ASK_BACKEND
+    assert asked.risk_class is RiskClass.WRITE
+    other = classifier.classify(
+        tool=GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+        arguments={"alternative_id": "filesystem.stage_delete.v1", "input": {"path": "other.txt"}},
+    )
+    assert staged.resource_hash != other.resource_hash
+    assert staged.resource_hash == sha256_text("path:notes.txt")
+    assert other.resource_hash == sha256_text("path:other.txt")
+    assert "notes.txt" not in json.dumps(staged.backend_metadata())
+    assert "notes.txt" not in json.dumps(staged.local_evidence_metadata())
+    first_cleanup = cleanup.resource_hash
+    second_cleanup = classifier.classify(
+        tool=GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+        arguments={
+            "alternative_id": "filesystem.cleanup_staged.v1",
+            "input": {"quarantine_entry_id": "aa" * 16},
+        },
+    )
+    assert first_cleanup != second_cleanup.resource_hash
+    assert second_cleanup.resource_hash == sha256_text("quarantine_entry_id:" + ("aa" * 16))
+    worktree = classifier.classify(
+        tool=GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+        arguments={"alternative_id": "filesystem.stage_delete.v1", "input": {"worktree_path": "wt-a"}},
+    )
+    other_worktree = classifier.classify(
+        tool=GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+        arguments={"alternative_id": "filesystem.stage_delete.v1", "input": {"worktree_path": "wt-b"}},
+    )
+    assert worktree.resource_hash == sha256_text("worktree_path:wt-a")
+    assert worktree.resource_hash != other_worktree.resource_hash
+    assert "wt-a" not in json.dumps(worktree.backend_metadata())
+    assert "cafebabedeadbeef0123456789abcdef" not in f"{cleanup!r}"
+    assert "cafebabedeadbeef0123456789abcdef" not in json.dumps(cleanup.backend_metadata())

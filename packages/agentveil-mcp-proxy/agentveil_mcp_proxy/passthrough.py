@@ -51,6 +51,15 @@ from agentveil_mcp_proxy.classification import (
     infer_action_family,
     sha256_jcs,
 )
+from agentveil_mcp_proxy.controlled_alternatives import GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME
+from agentveil_mcp_proxy.controlled_alternatives_runtime import (
+    ControlledAlternativeRuntimeBinding,
+    alternative_id_from_arguments,
+    controlled_alternative_catalog_collision,
+    execute_controlled_alternative,
+    inject_controlled_alternative_tool,
+    local_mcp_result,
+)
 from agentveil_mcp_proxy.evidence import (
     ApprovalEvidenceDuplicateError,
     ApprovalEvidenceError,
@@ -1155,6 +1164,7 @@ class McpPassthrough:
         on_tool_call: Callable[[ClassifiedToolCall], None] | None = None,
         runtime_gate_factory: Callable[[], Any] | None = None,
         approval_manager: Any | None = None,
+        controlled_runtime: ControlledAlternativeRuntimeBinding | None = None,
     ):
         self.downstream = downstream
         self.cwd = cwd
@@ -1162,6 +1172,8 @@ class McpPassthrough:
         self.on_tool_call = on_tool_call
         self.runtime_gate_factory = runtime_gate_factory
         self.approval_manager = approval_manager
+        self.controlled_runtime = controlled_runtime
+        self._controlled_catalog_collision = False
         self.config = getattr(classifier, "config", None)
         self.process: subprocess.Popen[str] | None = None
         self._stdout_thread: threading.Thread | None = None
@@ -1613,7 +1625,7 @@ class McpPassthrough:
                 return [local_proof_response] if has_id else []
             # Known-unavailable must not mask local validation/diagnostics above.
             # Attempt one bounded reconnect immediately before approval paths.
-            if method == "tools/call" and has_id:
+            if method == "tools/call" and has_id and not self._is_controlled_alternative_call(message):
                 known_unavailable = self._ensure_downstream_ready_for_routed_call(
                     message,
                     request_id,
@@ -1685,6 +1697,31 @@ class McpPassthrough:
                 return cancelled_responses
             if policy_error is not None:
                 return [policy_error] if has_id else []
+            if (
+                self._is_controlled_alternative_call(message)
+                and approval_outcome is not None
+                and approval_outcome.approved
+                and isinstance(classification, ClassifiedToolCall)
+            ):
+                session_error = self._session_integrity_block_response(
+                    classification,
+                    request_id,
+                    approval_outcome,
+                )
+                if session_error is not None:
+                    self._record_approval_error(
+                        approval_outcome,
+                        session_error["error"]["data"].get("reason", "session_integrity_mismatch"),
+                    )
+                    return [session_error] if has_id else []
+            controlled_response = self._controlled_alternative_tool_response(
+                message,
+                request_id,
+                classification,
+                approval_outcome,
+            )
+            if controlled_response is not None:
+                return [controlled_response] if has_id else []
             claim_error = self._finalize_redirect_lineage_claim(
                 request_id,
                 classification,
@@ -2042,6 +2079,7 @@ class McpPassthrough:
                 break
             time.sleep(0.01)
         self._tool_schemas.clear()
+        list_response = self._inject_controlled_alternative_list(list_response)
         self._tool_schemas.update_from_response(list_response)
         self._sync_downstream_surface_quarantine()
         self._downstream_generation += 1
@@ -2699,6 +2737,7 @@ class McpPassthrough:
                 return None
             response = self._request_downstream_tools_list()
             if response is not None:
+                response = self._inject_controlled_alternative_list(response)
                 self._tool_schemas.update_from_response(response)
                 self._sync_downstream_surface_quarantine()
             if self._tool_schemas.is_advertised(tool):
@@ -2831,6 +2870,7 @@ class McpPassthrough:
                 return schema
             response = self._request_downstream_tools_list()
             if response is not None:
+                response = self._inject_controlled_alternative_list(response)
                 self._tool_schemas.update_from_response(response)
                 self._sync_downstream_surface_quarantine()
             return self._tool_schemas.get(tool)
@@ -3751,6 +3791,165 @@ class McpPassthrough:
             data=unsupported_data,
         ), None
 
+    def _is_controlled_alternative_call(self, message: Mapping[str, Any]) -> bool:
+        if message.get("method") != "tools/call":
+            return False
+        params = message.get("params")
+        if not isinstance(params, Mapping):
+            return False
+        return params.get("name") == GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME
+
+    def _inject_controlled_alternative_list(self, response: Any) -> Any:
+        if self.controlled_runtime is None:
+            self._controlled_catalog_collision = False
+            return response
+        if controlled_alternative_catalog_collision(response):
+            self._controlled_catalog_collision = True
+            return response
+        self._controlled_catalog_collision = False
+        return inject_controlled_alternative_tool(response, self.controlled_runtime)
+
+    def _controlled_alternative_tool_response(
+        self,
+        message: Mapping[str, Any],
+        request_id: Any,
+        classification: ClassifiedToolCall | None,
+        approval_outcome: ApprovalOutcome | None = None,
+    ) -> dict[str, Any] | None:
+        if not self._is_controlled_alternative_call(message):
+            return None
+        binding = self.controlled_runtime
+        if binding is None or self._controlled_catalog_collision:
+            self._record_security_event({
+                "type": "unknown_tool_call",
+                "action": "blocked_pre_approval",
+                "reason": "unknown_tool",
+                "risk_class": "tool_identity_violation",
+                "tool": GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+            })
+            return _blocked_error(
+                request_id,
+                # claim-check: allow "blocked" is existing JSON-RPC error vocabulary.
+                "blocked by MCP proxy: tool not advertised by downstream",
+                reason="unknown_tool",
+            )
+        params = message.get("params")
+        arguments = params.get("arguments") if isinstance(params, Mapping) else {}
+        if not isinstance(arguments, Mapping):
+            arguments = {}
+        if alternative_id_from_arguments(arguments) == "filesystem.cleanup_staged.v1":
+            if not self._cleanup_authority_is_bound(classification, approval_outcome):
+                return local_mcp_result(
+                    request_id,
+                    {
+                        "mechanism_status": "error",
+                        "error_code": "request_malformed",
+                        "target_reached": False,
+                        "rollback_available": False,
+                        "verification_level": "not_verified",
+                    },
+                )
+        pre_session = getattr(self.approval_manager, "session_id", None)
+        pre_approved = None if approval_outcome is None else bool(approval_outcome.approved)
+
+        def _post_propose_recheck() -> dict[str, Any] | None:
+            if classification is None or self.classifier is None:
+                return None
+            fresh = self.classifier.classify_jsonrpc(message)
+            if fresh is None:
+                return None
+            post_session = getattr(self.approval_manager, "session_id", None)
+            alternative = alternative_id_from_arguments(arguments)
+            if alternative == "filesystem.cleanup_staged.v1":
+                post_approved = self._cleanup_authority_is_bound(fresh, approval_outcome)
+            else:
+                post_approved = (
+                    None if approval_outcome is None else bool(approval_outcome.approved)
+                )
+            return {
+                "route_id": binding.route_id,
+                "action_hash": classification.action_hash,
+                "recheck_action_hash": fresh.action_hash,
+                "resource_hash": classification.resource_hash,
+                "recheck_resource_hash": fresh.resource_hash,
+                "payload_hash": classification.payload_hash,
+                "recheck_payload_hash": fresh.payload_hash,
+                "policy_context_hash": classification.policy_evaluation.policy_context_hash,
+                "recheck_policy_context_hash": fresh.policy_evaluation.policy_context_hash,
+                "policy_decision": classification.policy_evaluation.decision.value,
+                "recheck_policy_decision": fresh.policy_evaluation.decision.value,
+                "session_id": pre_session,
+                "recheck_session_id": post_session,
+                "approved": pre_approved,
+                "recheck_approved": post_approved,
+            }
+        payload = execute_controlled_alternative(
+            binding=binding,
+            arguments=arguments,
+            recheck=_post_propose_recheck,
+        )
+        return local_mcp_result(request_id, payload)
+
+    @staticmethod
+    def _cleanup_record_matches_classification(
+        record: Any,
+        classification: ClassifiedToolCall,
+    ) -> bool:
+        payload_hash = getattr(record, "payload_hash", None)
+        resource_hash = getattr(record, "resource_hash", None)
+        tool_name = getattr(record, "tool_name", None)
+        if not isinstance(payload_hash, str) or not payload_hash:
+            return False
+        if not isinstance(resource_hash, str) or not resource_hash:
+            return False
+        if tool_name not in {None, classification.tool}:
+            return False
+        if payload_hash != classification.payload_hash:
+            return False
+        if resource_hash != classification.resource_hash:
+            return False
+        return True
+
+    def _cleanup_authority_is_bound(
+        self,
+        classification: ClassifiedToolCall | None,
+        approval_outcome: ApprovalOutcome | None,
+    ) -> bool:
+        if approval_outcome is None or not approval_outcome.approved:
+            return False
+        if not isinstance(classification, ClassifiedToolCall):
+            return False
+        store = self._controlled_path_store()
+        if store is None:
+            return False
+        record = store.get_pending(approval_outcome.request_id)
+        if record is None:
+            return False
+        if not self._cleanup_record_matches_classification(record, classification):
+            return False
+        anchor = self._session_integrity_anchor_record(record)
+        if anchor is None:
+            return False
+        if not self._cleanup_record_matches_classification(anchor, classification):
+            return False
+        anchor_status = getattr(anchor, "status", None)
+        if isinstance(anchor_status, str) and anchor_status:
+            if anchor_status != ApprovalStatus.APPROVED.value:
+                return False
+        metadata = parse_action_gate_metadata(anchor)
+        if not isinstance(metadata, Mapping):
+            return False
+        alternative_id = metadata.get("controlled_alternative_id")
+        route = metadata.get("project_scope_fingerprint")
+        binding = self.controlled_runtime
+        if alternative_id != "filesystem.cleanup_staged.v1":
+            return False
+        if binding is None or route != binding.route_id:
+            return False
+        if not isinstance(route, str) or not route:
+            return False
+        return True
+
     def _local_proof_tool_response(
         self,
         message: Mapping[str, Any],
@@ -4465,6 +4664,12 @@ class McpPassthrough:
         )
         if scope_fp is not None:
             metadata["project_scope_fingerprint"] = scope_fp
+        alternative_id = classification.controlled_alternative_id
+        if isinstance(alternative_id, str) and alternative_id:
+            metadata["controlled_alternative_id"] = alternative_id
+        binding = self.controlled_runtime
+        if binding is not None:
+            metadata["project_scope_fingerprint"] = binding.route_id
         try:
             store.annotate_controlled_path_metadata(
                 outcome.request_id,
@@ -4967,6 +5172,7 @@ class McpPassthrough:
                     self._increment_unsolicited_downstream_responses()
                     return
                 if self._inflight_methods.get(response_key) == "tools/list":
+                    response = self._inject_controlled_alternative_list(response)
                     self._tool_schemas.update_from_response(response)
                 self._responses.setdefault(response_key, []).append(response)
                 self._prune_pending_responses_locked()

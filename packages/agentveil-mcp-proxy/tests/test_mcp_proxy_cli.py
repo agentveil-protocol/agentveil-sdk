@@ -4740,3 +4740,32 @@ def test_console_attach_on_setup_for_connectors(
     assert main(status) == 0
     capsys.readouterr()
     assert len(sync_calls) == 2
+
+
+def test_run_proxy_provider_absent_does_not_bind_controlled_runtime(tmp_path, monkeypatch):
+    home = tmp_path / "project" / ".avp"
+    monkeypatch.delenv("AVP_HOME", raising=False)
+    init_proxy(home=home, agent_name="proxy", plaintext=True)
+    config = json.loads((home / "mcp-proxy" / "config.json").read_text(encoding="utf-8"))
+    config["downstream"] = {
+        "name": "idle",
+        "command": sys.executable,
+        "args": ["-c", "import time; time.sleep(3600)"],
+    }
+    (home / "mcp-proxy" / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    captured = {}
+    real = proxy_cli.McpPassthrough
+
+    class CapturingPassthrough(real):
+        def __init__(self, *args, **kwargs):
+            captured["controlled_runtime"] = kwargs.get("controlled_runtime")
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(proxy_cli, "McpPassthrough", CapturingPassthrough)
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(""),
+        out=io.StringIO(),
+        approval_ui_mode="none",
+    ) == 0
+    assert captured.get("controlled_runtime") is None
