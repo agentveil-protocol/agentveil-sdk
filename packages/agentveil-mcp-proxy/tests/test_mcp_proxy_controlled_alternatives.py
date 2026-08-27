@@ -65,7 +65,25 @@ from agentveil_mcp_proxy.paid_provider import (
     set_paid_provider_loader,
 )
 
-SECRET_PATH = "/Users/customer/project/secret.txt"
+if os.name == "nt":
+    WORKSPACE_ROOT = r"C:\Users\customer\project"
+    STATE_ROOT = r"C:\Users\customer\project\.agentveil"
+    SECRET_PATH = r"C:\Users\customer\project\secret.txt"
+    SIBLING_WORKSPACE = r"C:\Users\customer\app"
+    SIBLING_STATE_ROOT = r"C:\Users\customer\app-other"
+    OUTSIDE_ROOT = r"C:\Users\other\workspace"
+    RELATIVE_ROOT = r"Users\customer\project"
+    NON_NORMALIZED_ROOT = r"C:\Users\customer\project\.\nested"
+else:
+    WORKSPACE_ROOT = "/Users/customer/project"
+    STATE_ROOT = "/Users/customer/project/.agentveil"
+    SECRET_PATH = "/Users/customer/project/secret.txt"
+    SIBLING_WORKSPACE = "/Users/customer/app"
+    SIBLING_STATE_ROOT = "/Users/customer/app-other"
+    OUTSIDE_ROOT = "/Users/other/workspace"
+    RELATIVE_ROOT = "Users/customer/project"
+    NON_NORMALIZED_ROOT = "/Users/customer/project/./nested"
+
 SECRET_PATCH = "password=super-secret-value"
 ROUTE_CANARY = "route-secret-9f3a"
 SUMMARY_CANARY = "customer-summary-should-not-leak"
@@ -80,38 +98,53 @@ FAMILY_INPUTS: dict[str, dict[str, str]] = {
     "git.prepare_local_change.v1": {"worktree_path": "repo"},
 }
 
+def _trusted_roots() -> dict[str, str]:
+    return {"workspace_root": WORKSPACE_ROOT, "state_root": STATE_ROOT}
+
+
 FAMILY_LOCATORS: dict[str, dict[str, object]] = {
     "filesystem.stage_delete.v1": {
         "locator_kind": "filesystem_path",
         "normalized_path": SECRET_PATH,
         "route_id": ROUTE_CANARY,
         "st_dev": STDEV_CANARY,
+        **_trusted_roots(),
     },
     "filesystem.restore_staged.v1": {
         "locator_kind": "quarantine_entry",
         "quarantine_entry_id": "qe-1",
         "route_id": ROUTE_CANARY,
         "st_dev": STDEV_CANARY,
+        **_trusted_roots(),
     },
     "filesystem.cleanup_staged.v1": {
         "locator_kind": "quarantine_entry",
         "quarantine_entry_id": "qe-1",
         "route_id": ROUTE_CANARY,
         "st_dev": STDEV_CANARY,
+        **_trusted_roots(),
     },
     "protected_write.prepare_patch.v1": {
         "locator_kind": "protected_write_target",
         "normalized_path": SECRET_PATH,
         "route_id": ROUTE_CANARY,
         "st_dev": STDEV_CANARY,
+        **_trusted_roots(),
     },
     "git.prepare_local_change.v1": {
         "locator_kind": "git_worktree",
         "normalized_path": SECRET_PATH,
         "route_id": ROUTE_CANARY,
         "st_dev": STDEV_CANARY,
+        **_trusted_roots(),
     },
 }
+
+
+def _family_locator(alternative_id: str, **overrides: object) -> dict[str, object]:
+    payload = dict(FAMILY_LOCATORS[alternative_id])
+    payload.update(overrides)
+    return payload
 
 
 def _active_paid_snapshot(*, private_enabled: bool = True) -> PaidProviderSnapshot:
@@ -165,11 +198,27 @@ def _reset_provider_loader() -> None:
     set_controlled_alternative_provider_loader(None)
 
 
-def _assert_bounded_error(exc_info: pytest.ExceptionInfo, code: str) -> None:
+def _assert_bounded_error(
+    exc_info: pytest.ExceptionInfo,
+    code: str,
+    *extra_canaries: str,
+) -> None:
     assert exc_info.type is ControlledAlternativeValidationError
     assert str(exc_info.value) == code
-    assert SECRET_PATH not in str(exc_info.value)
-    assert SECRET_PATCH not in str(exc_info.value)
+    rendered = str(exc_info.value)
+    for canary in (
+        SECRET_PATH,
+        SECRET_PATCH,
+        WORKSPACE_ROOT,
+        STATE_ROOT,
+        SIBLING_WORKSPACE,
+        SIBLING_STATE_ROOT,
+        OUTSIDE_ROOT,
+        RELATIVE_ROOT,
+        NON_NORMALIZED_ROOT,
+        *extra_canaries,
+    ):
+        assert canary not in rendered
 
 
 def test_constants_match_ca0_contract() -> None:
@@ -187,6 +236,7 @@ def test_constants_match_ca0_contract() -> None:
         "protected_write.prepare_patch.v1",
         "git.prepare_local_change.v1",
     )
+    assert ca_mod.MAX_RESOURCE_LOCATOR_FIELDS == 8
 
 
 @pytest.mark.parametrize("alternative_id, raw_input", list(FAMILY_INPUTS.items()))
@@ -270,6 +320,8 @@ def test_sensitive_repr_surfaces_are_redacted() -> None:
         rendered = f"{value!r}{value}"
         assert SECRET_PATH not in rendered
         assert SECRET_PATCH not in rendered
+        assert WORKSPACE_ROOT not in rendered
+        assert STATE_ROOT not in rendered
         assert ROUTE_CANARY not in rendered
         assert SUMMARY_CANARY not in rendered
         assert str(STDEV_CANARY) not in rendered
@@ -280,8 +332,12 @@ def test_sensitive_repr_surfaces_are_redacted() -> None:
 def test_validate_provider_request_accepts_locator_matrix(alternative_id: str) -> None:
     request = validate_provider_request(_request_payload(alternative_id))
     assert request.alternative_id == alternative_id
+    assert request.resource_locator.workspace_root == WORKSPACE_ROOT
+    assert request.resource_locator.state_root == STATE_ROOT
     assert request.resource_locator.st_dev == STDEV_CANARY
     assert SECRET_PATH not in repr(request)
+    assert WORKSPACE_ROOT not in repr(request)
+    assert STATE_ROOT not in repr(request)
     assert ROUTE_CANARY not in repr(request)
     if alternative_id == "protected_write.prepare_patch.v1":
         assert request.bounded_local_input is not None
@@ -295,32 +351,27 @@ def test_validate_provider_request_accepts_locator_matrix(alternative_id: str) -
 def test_locator_and_request_reject_cross_field_mismatches() -> None:
     with pytest.raises(ControlledAlternativeValidationError) as bool_dev:
         validate_resource_locator(
-            {
-                "locator_kind": "filesystem_path",
-                "normalized_path": "notes.txt",
-                "route_id": "route-1",
-                "st_dev": True,
-            },
+            _family_locator("filesystem.stage_delete.v1", st_dev=True),
             alternative_id="filesystem.stage_delete.v1",
         )
     _assert_bounded_error(bool_dev, ERROR_REQUEST_MALFORMED)
 
     with pytest.raises(ControlledAlternativeValidationError) as missing_path:
         validate_resource_locator(
-            {"locator_kind": "filesystem_path", "route_id": "route-1", "st_dev": 1},
+            {
+                "locator_kind": "filesystem_path",
+                "workspace_root": WORKSPACE_ROOT,
+                "state_root": STATE_ROOT,
+                "route_id": "route-1",
+                "st_dev": 1,
+            },
             alternative_id="filesystem.stage_delete.v1",
         )
     _assert_bounded_error(missing_path, ERROR_REQUEST_MALFORMED)
 
     with pytest.raises(ControlledAlternativeValidationError) as extra_field:
         validate_resource_locator(
-            {
-                "locator_kind": "filesystem_path",
-                "normalized_path": "notes.txt",
-                "route_id": "route-1",
-                "st_dev": 1,
-                "quarantine_entry_id": "qe-1",
-            },
+            _family_locator("filesystem.stage_delete.v1", quarantine_entry_id="qe-1"),
             alternative_id="filesystem.stage_delete.v1",
         )
     _assert_bounded_error(extra_field, ERROR_REQUEST_MALFORMED)
@@ -363,6 +414,122 @@ def test_locator_and_request_reject_cross_field_mismatches() -> None:
     _assert_bounded_error(patch_on_delete, ERROR_REQUEST_MALFORMED)
 
 
+@pytest.mark.parametrize("alternative_id", list(CONTROLLED_ALTERNATIVE_IDS))
+def test_locator_requires_and_preserves_trusted_roots(alternative_id: str) -> None:
+    locator = validate_resource_locator(
+        FAMILY_LOCATORS[alternative_id],
+        alternative_id=alternative_id,
+    )
+    assert locator.workspace_root == WORKSPACE_ROOT
+    assert locator.state_root == STATE_ROOT
+    rendered = f"{locator!r}{locator}"
+    assert WORKSPACE_ROOT not in rendered
+    assert STATE_ROOT not in rendered
+    assert SECRET_PATH not in rendered
+    assert ROUTE_CANARY not in rendered
+    assert str(STDEV_CANARY) not in rendered
+    if alternative_id in {
+        "filesystem.restore_staged.v1",
+        "filesystem.cleanup_staged.v1",
+    }:
+        assert locator.normalized_path is None
+    else:
+        assert locator.normalized_path == SECRET_PATH
+
+
+@pytest.mark.parametrize("missing_key", ["workspace_root", "state_root"])
+@pytest.mark.parametrize("alternative_id", list(CONTROLLED_ALTERNATIVE_IDS))
+def test_locator_rejects_missing_trusted_roots(missing_key: str, alternative_id: str) -> None:
+    payload = _family_locator(alternative_id)
+    del payload[missing_key]
+    with pytest.raises(ControlledAlternativeValidationError) as missing:
+        validate_resource_locator(payload, alternative_id=alternative_id)
+    _assert_bounded_error(missing, ERROR_REQUEST_MALFORMED)
+
+
+@pytest.mark.parametrize("bad_value", [None, True, False, 1, "", "x" * 5000])
+@pytest.mark.parametrize("root_key", ["workspace_root", "state_root"])
+def test_locator_rejects_wrong_type_empty_and_oversized_roots(
+    bad_value: object,
+    root_key: str,
+) -> None:
+    if isinstance(bad_value, str) and len(bad_value) == 5000:
+        bad_value = os.path.join(WORKSPACE_ROOT, bad_value)
+    with pytest.raises(ControlledAlternativeValidationError) as malformed:
+        validate_resource_locator(
+            _family_locator("filesystem.stage_delete.v1", **{root_key: bad_value}),
+            alternative_id="filesystem.stage_delete.v1",
+        )
+    extra = (bad_value,) if isinstance(bad_value, str) and bad_value else ()
+    _assert_bounded_error(malformed, ERROR_REQUEST_MALFORMED, *extra)
+
+
+def test_locator_rejects_relative_and_non_normalized_roots() -> None:
+    for root_key, bad_value in (
+        ("workspace_root", RELATIVE_ROOT),
+        ("state_root", RELATIVE_ROOT),
+        ("workspace_root", NON_NORMALIZED_ROOT),
+        ("state_root", NON_NORMALIZED_ROOT),
+    ):
+        with pytest.raises(ControlledAlternativeValidationError) as malformed:
+            validate_resource_locator(
+                _family_locator("filesystem.stage_delete.v1", **{root_key: bad_value}),
+                alternative_id="filesystem.stage_delete.v1",
+            )
+        _assert_bounded_error(malformed, ERROR_REQUEST_MALFORMED)
+
+
+def test_locator_rejects_equal_outside_and_sibling_prefix_state_roots() -> None:
+    for bad_state in (WORKSPACE_ROOT, OUTSIDE_ROOT, SIBLING_STATE_ROOT):
+        with pytest.raises(ControlledAlternativeValidationError) as malformed:
+            validate_resource_locator(
+                _family_locator("filesystem.stage_delete.v1", state_root=bad_state),
+                alternative_id="filesystem.stage_delete.v1",
+            )
+        _assert_bounded_error(malformed, ERROR_REQUEST_MALFORMED)
+
+    sibling_locator = _family_locator(
+        "filesystem.stage_delete.v1",
+        workspace_root=SIBLING_WORKSPACE,
+        state_root=SIBLING_STATE_ROOT,
+        normalized_path=os.path.join(SIBLING_WORKSPACE, "notes.txt"),
+    )
+    with pytest.raises(ControlledAlternativeValidationError) as sibling:
+        validate_resource_locator(
+            sibling_locator,
+            alternative_id="filesystem.stage_delete.v1",
+        )
+    _assert_bounded_error(sibling, ERROR_REQUEST_MALFORMED)
+
+
+def test_quarantine_locator_forbids_normalized_path_and_still_requires_roots() -> None:
+    with pytest.raises(ControlledAlternativeValidationError) as forbidden_path:
+        validate_resource_locator(
+            _family_locator("filesystem.restore_staged.v1", normalized_path=SECRET_PATH),
+            alternative_id="filesystem.restore_staged.v1",
+        )
+    _assert_bounded_error(forbidden_path, ERROR_REQUEST_MALFORMED)
+
+    payload = _family_locator("filesystem.cleanup_staged.v1")
+    del payload["workspace_root"]
+    with pytest.raises(ControlledAlternativeValidationError) as missing_root:
+        validate_resource_locator(payload, alternative_id="filesystem.cleanup_staged.v1")
+    _assert_bounded_error(missing_root, ERROR_REQUEST_MALFORMED)
+
+
+def test_locator_rejects_ninth_field_beyond_eight_field_bound() -> None:
+    payload = _family_locator(
+        "filesystem.stage_delete.v1",
+        correlation_token="tok-1",
+        extra_one="x",
+        extra_two="y",
+    )
+    assert len(payload) == 9
+    with pytest.raises(ControlledAlternativeValidationError) as overflow:
+        validate_resource_locator(payload, alternative_id="filesystem.stage_delete.v1")
+    _assert_bounded_error(overflow, ERROR_REQUEST_MALFORMED, "tok-1", "extra_one")
+
+
 @pytest.mark.parametrize(
     "alternative_id",
     [
@@ -394,8 +561,12 @@ def test_protected_provider_payload_is_patch_only() -> None:
     assert accepted.bounded_local_input.patch == SECRET_PATCH
     assert not hasattr(accepted.bounded_local_input, "path")
     assert accepted.resource_locator.normalized_path == SECRET_PATH
+    assert accepted.resource_locator.workspace_root == WORKSPACE_ROOT
+    assert accepted.resource_locator.state_root == STATE_ROOT
     assert SECRET_PATCH not in repr(accepted.bounded_local_input)
     assert SECRET_PATH not in repr(accepted)
+    assert WORKSPACE_ROOT not in repr(accepted)
+    assert STATE_ROOT not in repr(accepted)
 
     with pytest.raises(ControlledAlternativeValidationError) as raw_path:
         validate_provider_request(

@@ -10,6 +10,7 @@ paths in CA1.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from functools import wraps
 from importlib.metadata import entry_points
@@ -82,7 +83,7 @@ AUTHORITY_FORBIDDEN_REQUEST_KEYS = frozenset({
 AUTHORITY_FORBIDDEN_RESULT_KEYS = AUTHORITY_FORBIDDEN_REQUEST_KEYS
 
 MAX_GENERIC_INPUT_FIELDS = 8
-MAX_RESOURCE_LOCATOR_FIELDS = 6
+MAX_RESOURCE_LOCATOR_FIELDS = 8
 MAX_NORMALIZED_PATH_BYTES = 4096
 MAX_ROUTE_ID_BYTES = 128
 MAX_QUARANTINE_ENTRY_ID_BYTES = 64
@@ -112,34 +113,36 @@ _LOCAL_INPUT_REQUIRED_KEYS: dict[str, frozenset[str]] = {
     "git.prepare_local_change.v1": frozenset({"worktree_path"}),
 }
 
+_TRUSTED_ROOT_FIELDS = frozenset({"workspace_root", "state_root"})
+
 _LOCATOR_SPECS: dict[str, dict[str, Any]] = {
     "filesystem.stage_delete.v1": {
         "kind": "filesystem_path",
-        "required": frozenset({"locator_kind", "normalized_path", "route_id", "st_dev"}),
+        "required": frozenset({"locator_kind", "normalized_path", "route_id", "st_dev"}) | _TRUSTED_ROOT_FIELDS,
         "optional": frozenset({"correlation_token"}),
         "forbidden": frozenset({"quarantine_entry_id"}),
     },
     "filesystem.restore_staged.v1": {
         "kind": "quarantine_entry",
-        "required": frozenset({"locator_kind", "quarantine_entry_id", "route_id", "st_dev"}),
+        "required": frozenset({"locator_kind", "quarantine_entry_id", "route_id", "st_dev"}) | _TRUSTED_ROOT_FIELDS,
         "optional": frozenset({"correlation_token"}),
         "forbidden": frozenset({"normalized_path"}),
     },
     "filesystem.cleanup_staged.v1": {
         "kind": "quarantine_entry",
-        "required": frozenset({"locator_kind", "quarantine_entry_id", "route_id", "st_dev"}),
+        "required": frozenset({"locator_kind", "quarantine_entry_id", "route_id", "st_dev"}) | _TRUSTED_ROOT_FIELDS,
         "optional": frozenset({"correlation_token"}),
         "forbidden": frozenset({"normalized_path"}),
     },
     "protected_write.prepare_patch.v1": {
         "kind": "protected_write_target",
-        "required": frozenset({"locator_kind", "normalized_path", "route_id", "st_dev"}),
+        "required": frozenset({"locator_kind", "normalized_path", "route_id", "st_dev"}) | _TRUSTED_ROOT_FIELDS,
         "optional": frozenset({"correlation_token"}),
         "forbidden": frozenset({"quarantine_entry_id"}),
     },
     "git.prepare_local_change.v1": {
         "kind": "git_worktree",
-        "required": frozenset({"locator_kind", "normalized_path", "route_id", "st_dev"}),
+        "required": frozenset({"locator_kind", "normalized_path", "route_id", "st_dev"}) | _TRUSTED_ROOT_FIELDS,
         "optional": frozenset({"correlation_token"}),
         "forbidden": frozenset({"quarantine_entry_id"}),
     },
@@ -215,6 +218,8 @@ class ControlledAlternativeBoundedLocalInput:
 @dataclass(frozen=True)
 class ControlledAlternativeResourceLocator:
     locator_kind: str
+    workspace_root: str
+    state_root: str
     normalized_path: str | None = None
     quarantine_entry_id: str | None = None
     route_id: str | None = None
@@ -225,6 +230,8 @@ class ControlledAlternativeResourceLocator:
         return (
             "ControlledAlternativeResourceLocator("
             f"locator_kind={self.locator_kind!r}, "
+            "workspace_root='***', "
+            "state_root='***', "
             "normalized_path='***', "
             "quarantine_entry_id='***', "
             "route_id='***', "
@@ -400,6 +407,30 @@ def _require_st_dev(value: Any) -> int:
     return value
 
 
+def _bounded_absolute_normalized_path(value: Any) -> str:
+    if not isinstance(value, str) or value != value.strip() or not value:
+        raise ControlledAlternativeValidationError(ERROR_REQUEST_MALFORMED)
+    if len(value.encode("utf-8")) > MAX_NORMALIZED_PATH_BYTES:
+        raise ControlledAlternativeValidationError(ERROR_REQUEST_MALFORMED)
+    if not os.path.isabs(value) or os.path.normpath(value) != value:
+        raise ControlledAlternativeValidationError(ERROR_REQUEST_MALFORMED)
+    return value
+
+
+def _path_is_inside(inner: str, outer: str, *, strict: bool) -> bool:
+    inner_drive, inner_tail = os.path.splitdrive(os.path.normcase(inner))
+    outer_drive, outer_tail = os.path.splitdrive(os.path.normcase(outer))
+    if inner_drive != outer_drive:
+        return False
+    inner_parts = tuple(part for part in inner_tail.split(os.sep) if part)
+    outer_parts = tuple(part for part in outer_tail.split(os.sep) if part)
+    if inner_parts[: len(outer_parts)] != outer_parts:
+        return False
+    if len(inner_parts) == len(outer_parts):
+        return not strict
+    return True
+
+
 def _descriptor_mapping(
     raw: Mapping[str, Any] | ControlledAlternativeProviderDescriptor,
 ) -> Mapping[str, Any]:
@@ -511,9 +542,21 @@ def validate_resource_locator(
     if locator_kind != spec["kind"] or locator_kind not in LOCATOR_KINDS:
         raise ControlledAlternativeValidationError(ERROR_REQUEST_MALFORMED)
 
+    workspace_root = _bounded_absolute_normalized_path(
+        _require_key(payload, "workspace_root", error_code=ERROR_REQUEST_MALFORMED),
+    )
+    state_root = _bounded_absolute_normalized_path(
+        _require_key(payload, "state_root", error_code=ERROR_REQUEST_MALFORMED),
+    )
+    if not _path_is_inside(state_root, workspace_root, strict=True):
+        raise ControlledAlternativeValidationError(ERROR_REQUEST_MALFORMED)
+
     normalized_path = None
     if "normalized_path" in payload:
-        normalized_path = _bounded_local_text(payload["normalized_path"], max_bytes=MAX_NORMALIZED_PATH_BYTES)
+        normalized_path = _bounded_local_text(
+            payload["normalized_path"],
+            max_bytes=MAX_NORMALIZED_PATH_BYTES,
+        )
     quarantine_entry_id = None
     if "quarantine_entry_id" in payload:
         quarantine_entry_id = _bounded_local_text(
@@ -533,6 +576,8 @@ def validate_resource_locator(
         )
     return ControlledAlternativeResourceLocator(
         locator_kind=locator_kind,
+        workspace_root=workspace_root,
+        state_root=state_root,
         normalized_path=normalized_path,
         quarantine_entry_id=quarantine_entry_id,
         route_id=route_id,
