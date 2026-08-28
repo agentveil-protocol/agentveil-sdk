@@ -508,3 +508,63 @@ def test_codex_controlled_mcp_route_still_allows_without_guidance() -> None:
     )
     assert decision.hook_action == "allow"
     assert out.getvalue() == ""
+
+
+def test_codex_trusted_static_exact_delete_is_hard_block_with_available_suggestion(tmp_path: Path) -> None:
+    home, sandbox, _downstream = init_redirect_contract_home(tmp_path)
+    out = io.StringIO()
+    decision = codex_hook.process_hook(
+        _payload(
+            "apply_patch",
+            {"patch": "*** Begin Patch\n*** Delete File: notes.txt\n*** End Patch"},
+        ),
+        home=home,
+        out=out,
+    )
+    payload = json.loads(out.getvalue())
+    reason = _deny_reason(out.getvalue())
+    assert decision.hook_action == "deny"
+    assert decision.disposition.value == "hard_block"
+    assert decision.reason_code == "risky_blocked"
+    assert parse_redirect_context_from_codex_hook_output(payload) is None
+    assert "suggestion_status=available" in reason
+    assert "alternative.id=filesystem.stage_delete.v1" in reason
+    assert "alternative.input.path=notes.txt" in reason
+    assert "not currently available" not in reason
+    assert "redirect_context=" not in reason
+    assert str(home) not in reason
+    assert str(sandbox) not in reason
+
+
+def test_codex_trusted_static_ambiguous_stays_unavailable_without_broken_route_copy(tmp_path: Path) -> None:
+    home, _sandbox, _downstream = init_redirect_contract_home(tmp_path)
+    out = io.StringIO()
+    decision = codex_hook.process_hook(
+        _payload("Bash", {"command": "rm notes.txt extra.txt"}),
+        home=home,
+        out=out,
+    )
+    reason = _deny_reason(out.getvalue())
+    assert decision.hook_action == "deny"
+    assert decision.disposition.value == "hard_block"
+    assert "alternative=null" in reason
+    assert "filesystem.stage_delete.v1" not in reason
+    assert "not currently available" not in reason
+
+
+def test_codex_allow_does_not_read_static_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home, _sandbox, _downstream = init_redirect_contract_home(tmp_path)
+    calls: list[object] = []
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.codex_hook.trusted_static_controlled_route_ready",
+        lambda **kwargs: calls.append(kwargs) or True,
+    )
+    out = io.StringIO()
+    decision = codex_hook.process_hook(
+        _payload("Bash", {"command": "git status --short"}),
+        home=home,
+        out=out,
+    )
+    assert decision.hook_action == "allow"
+    assert calls == []
+    assert out.getvalue() == ""

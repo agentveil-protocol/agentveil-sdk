@@ -1136,3 +1136,41 @@ def test_claude_controlled_mcp_route_still_allows() -> None:
     )
     assert decision.hook_action == "allow"
     assert out.getvalue() == ""
+
+
+def test_claude_trusted_static_exact_delete_is_hard_block_with_available_suggestion(tmp_path: Path) -> None:
+    home, sandbox, _downstream = init_redirect_contract_home(tmp_path)
+    out = io.StringIO()
+    decision = claude_hook.process_hook(
+        _payload("Bash", {"command": "rm notes.txt"}),
+        home=home,
+        out=out,
+    )
+    reason = json.loads(out.getvalue())["hookSpecificOutput"]["permissionDecisionReason"]
+    assert decision.hook_action == "deny"
+    assert decision.disposition.value == "hard_block"
+    assert parse_redirect_context_from_claude_hook_output(json.loads(out.getvalue())) is None
+    assert "suggestion_status=available" in reason
+    assert "alternative.id=filesystem.stage_delete.v1" in reason
+    assert "alternative.input.path=notes.txt" in reason
+    assert "not currently available" not in reason
+    assert str(home) not in reason
+    assert str(sandbox) not in reason
+
+
+def test_claude_allow_does_not_read_static_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home, _sandbox, _downstream = init_redirect_contract_home(tmp_path)
+    calls: list[object] = []
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.claude_hook.trusted_static_controlled_route_ready",
+        lambda **kwargs: calls.append(kwargs) or True,
+    )
+    out = io.StringIO()
+    decision = claude_hook.process_hook(
+        _payload("Read", {"file_path": "notes.txt"}),
+        home=home,
+        out=out,
+    )
+    assert decision.hook_action == "allow"
+    assert calls == []
+    assert out.getvalue() == ""

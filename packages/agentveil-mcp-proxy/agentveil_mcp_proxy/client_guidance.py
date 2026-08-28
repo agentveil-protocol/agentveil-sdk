@@ -10,6 +10,7 @@ import json
 import os
 import secrets
 import shlex
+import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -105,6 +106,13 @@ NATIVE_SHELL_NO_MCP_ROUTE_INSTRUCTION = (
     "Direct native shell use was blocked before mutation. "  # claim-check: allow tested hook denial copy.
     "No controlled MCP route exists for this shell action. "
     "Stop and tell the user. Do not retry through native shell."
+)
+# claim-check: allow hook denial copy for trusted static-route suggestion tests.
+NATIVE_STATIC_CONTROLLED_ROUTE_INSTRUCTION = (
+    "Direct native action was denied before mutation. "  # claim-check: allow tested hook denial copy.
+    "A trusted project-local AgentVeil route is configured. "
+    "The Controlled Alternative suggestion is non-authorizing. "
+    "It does not create redirect_context, lineage, or start Proxy execution."
 )
 NATIVE_CONTROLLED_MCP_REDIRECT_INSTRUCTION = NATIVE_FILE_WRITE_REDIRECT_INSTRUCTION
 
@@ -287,6 +295,103 @@ def trusted_downstream_from_proxy_home(proxy_home: Path) -> Mapping[str, Any] | 
         return None
     downstream = payload.get("downstream")
     return downstream if isinstance(downstream, Mapping) else None
+
+
+def _canonical_existing_dir(value: object) -> Path | None:
+    if not isinstance(value, Path):
+        return None
+    try:
+        resolved = value.expanduser().resolve()
+    except OSError:
+        return None
+    if not resolved.is_absolute() or not resolved.is_dir():
+        return None
+    return resolved
+
+
+def _lstat_no_follow(path: Path) -> os.stat_result | None:
+    try:
+        return os.lstat(path)
+    except OSError:
+        return None
+
+
+def _is_real_directory(path: Path) -> bool:
+    info = _lstat_no_follow(path)
+    if info is None:
+        return False
+    if stat.S_ISLNK(info.st_mode):
+        return False
+    return stat.S_ISDIR(info.st_mode)
+
+
+def _is_real_regular_file(path: Path) -> bool:
+    info = _lstat_no_follow(path)
+    if info is None:
+        return False
+    if stat.S_ISLNK(info.st_mode):
+        return False
+    if not stat.S_ISREG(info.st_mode):
+        return False
+    nlink = getattr(info, "st_nlink", None)
+    if type(nlink) is int and nlink != 1:
+        return False
+    return True
+
+
+def _path_equal_or_contained(child: Path, parent: Path) -> bool:
+    try:
+        return child == parent or child.is_relative_to(parent)
+    except (OSError, ValueError):
+        return False
+
+
+def trusted_static_controlled_route_ready(
+    *,
+    home: Path | None,
+    project_root: Path | None,
+) -> bool:
+    """Return True when a trusted project-local persisted route may be suggested.
+
+    Read-only. Does not grant REDIRECT, create origin/context/lineage, or execute.
+    Caller/model input is not a readiness source.
+    """
+
+    if not isinstance(home, Path) or not isinstance(project_root, Path):
+        return False
+    try:
+        home_path = home.expanduser()
+        project_path = project_root.expanduser()
+    except OSError:
+        return False
+    proxy_dir = home_path / "mcp-proxy"
+    config_path = proxy_dir / "config.json"
+    if not _is_real_directory(home_path):
+        return False
+    if not _is_real_directory(proxy_dir):
+        return False
+    if not _is_real_regular_file(config_path):
+        return False
+    home_resolved = _canonical_existing_dir(home_path)
+    project_resolved = _canonical_existing_dir(project_path)
+    if home_resolved is None or project_resolved is None:
+        return False
+    if home_resolved.parent != project_resolved:
+        return False
+    downstream = trusted_downstream_from_proxy_home(home_path)
+    if not isinstance(downstream, Mapping):
+        return False
+    name = downstream.get("name")
+    if type(name) is not str or not name.strip():
+        return False
+    startup = downstream_startup_fingerprint(downstream)
+    if type(startup) is not str or not startup.strip():
+        return False
+    workspace_root = trusted_project_workspace_root_from_downstream(downstream)
+    workspace_resolved = _canonical_existing_dir(workspace_root)
+    if workspace_resolved is None:
+        return False
+    return _path_equal_or_contained(workspace_resolved, project_resolved)
 
 
 def build_hook_runtime_binding(
@@ -1100,6 +1205,7 @@ def select_controlled_alternative_suggestion(
     intent: NativeActionIntent,
     *,
     redirect_route_ready: bool = False,
+    static_route_ready: bool = False,
 ) -> NativeControlledGuidanceEnvelope:
     """Select the exact stage-delete alternative or return unavailable. No authority."""
 
@@ -1114,7 +1220,8 @@ def select_controlled_alternative_suggestion(
         and isinstance(intent.relative_path, str)
         and intent.reason == "exact_single_target_delete"
     )
-    if exact and redirect_route_ready:
+    suggestion_ready = redirect_route_ready is True or static_route_ready is True
+    if exact and suggestion_ready:
         envelope = NativeControlledGuidanceEnvelope(
             schema_version=NATIVE_CONTROLLED_GUIDANCE_SCHEMA_VERSION,
             suggestion_status="available",
@@ -1146,10 +1253,12 @@ def build_native_controlled_guidance_envelope(
     native_tool: str,
     tool_input: Mapping[str, Any] | None = None,
     redirect_route_ready: bool = False,
+    static_route_ready: bool = False,
 ) -> NativeControlledGuidanceEnvelope:
     return select_controlled_alternative_suggestion(
         normalize_native_action(native_tool=native_tool, tool_input=tool_input),
         redirect_route_ready=redirect_route_ready,
+        static_route_ready=static_route_ready,
     )
 
 
@@ -1191,20 +1300,27 @@ def native_hook_deny_instruction(
     native_tool: str,
     risk_class: str | None = None,
     redirect_route_ready: bool = True,
+    static_route_ready: bool = False,
     tool_input: Mapping[str, Any] | None = None,
 ) -> str:
     """Return bounded deny guidance for one native hook denial."""
 
+    live_ready = redirect_route_ready is True
+    static_ready = static_route_ready is True
     if native_tool in _NATIVE_FILE_WRITE_DENY_TOOLS:
-        if redirect_route_ready:
+        if live_ready:
             if native_tool in {"apply_patch", "ApplyPatch"}:
                 base = NATIVE_PATCH_REDIRECT_INSTRUCTION
             else:
                 base = NATIVE_FILE_WRITE_REDIRECT_INSTRUCTION
+        elif static_ready:
+            base = NATIVE_STATIC_CONTROLLED_ROUTE_INSTRUCTION
         else:
             base = NATIVE_FILE_WRITE_ROUTE_UNAVAILABLE_INSTRUCTION
     elif risk_class in {"destructive", "production", "financial"}:  # claim-check: allow bounded risk class labels.
         base = NATIVE_SHELL_HARD_BLOCK_INSTRUCTION
+    elif static_ready:
+        base = NATIVE_STATIC_CONTROLLED_ROUTE_INSTRUCTION
     else:
         base = NATIVE_SHELL_NO_MCP_ROUTE_INSTRUCTION
     if tool_input is None:
@@ -1212,7 +1328,8 @@ def native_hook_deny_instruction(
     envelope = build_native_controlled_guidance_envelope(
         native_tool=native_tool,
         tool_input=tool_input,
-        redirect_route_ready=redirect_route_ready,
+        redirect_route_ready=live_ready,
+        static_route_ready=static_ready,
     )
     return f"{base} {format_native_controlled_guidance_text(envelope)}"
 
@@ -1458,6 +1575,7 @@ __all__ = [
     "NATIVE_FILE_WRITE_ROUTE_UNAVAILABLE_INSTRUCTION",
     "NATIVE_SHELL_HARD_BLOCK_INSTRUCTION",
     "NATIVE_SHELL_NO_MCP_ROUTE_INSTRUCTION",
+    "NATIVE_STATIC_CONTROLLED_ROUTE_INSTRUCTION",
     "NATIVE_REDIRECT_AGENT_CONTEXT_PREFIX",
     "NATIVE_REDIRECT_FOLLOW_UP_TOOL",
     "NATIVE_REDIRECT_ORIGIN_REASON",
@@ -1497,6 +1615,7 @@ __all__ = [
     "resolve_proxy_home",
     "supported_client_pack_ids",
     "trusted_downstream_from_proxy_home",
+    "trusted_static_controlled_route_ready",
     "trusted_project_workspace_root_from_downstream",
     "write_hook_runtime_binding",
 ]

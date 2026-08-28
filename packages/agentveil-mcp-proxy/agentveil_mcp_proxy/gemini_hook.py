@@ -35,6 +35,7 @@ from agentveil_mcp_proxy.client_guidance import (
     format_native_redirect_agent_surface,
     maybe_register_native_redirect_for_hook_deny,
     native_hook_deny_instruction,
+    trusted_static_controlled_route_ready,
 )
 from agentveil_mcp_proxy.hook_policy import (
     AGENTVEIL_CONTROLLED_MCP_SERVER_ALIASES,
@@ -256,6 +257,7 @@ def format_hook_output(
     *,
     redirect_origin: NativeRedirectOrigin | None = None,
     tool_input: Mapping[str, Any] | None = None,
+    static_route_ready: bool = False,
 ) -> str | None:
     if decision.hook_action == "allow":
         return json.dumps({"decision": "allow"})
@@ -270,6 +272,7 @@ def format_hook_output(
             native_tool=decision.context.tool,
             risk_class=decision.evaluation.risk_class.value,
             redirect_route_ready=decision.disposition is HookDisposition.REDIRECT,
+            static_route_ready=static_route_ready,
             tool_input=tool_input if isinstance(tool_input, Mapping) else {},
         )
         reason = f"{reason}. {instruction}"
@@ -371,6 +374,14 @@ def process_hook(
         decision,
         redirect_origin=redirect_origin,
         tool_input=_tool_input(payload),
+        static_route_ready=(
+            trusted_static_controlled_route_ready(
+                home=home,
+                project_root=home.parent if home is not None else None,
+            )
+            if decision.hook_action == "deny"
+            else False
+        ),
     )
     if output is not None:
         (out or sys.stdout).write(output + "\n")

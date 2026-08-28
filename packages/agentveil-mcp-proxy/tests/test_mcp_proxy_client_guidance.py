@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -17,6 +19,7 @@ from agentveil_mcp_proxy.client_guidance import (
     NATIVE_FILE_WRITE_ROUTE_UNAVAILABLE_INSTRUCTION,
     NATIVE_SHELL_HARD_BLOCK_INSTRUCTION,
     NATIVE_SHELL_NO_MCP_ROUTE_INSTRUCTION,
+    NATIVE_STATIC_CONTROLLED_ROUTE_INSTRUCTION,
     ControlledAlternativeSuggestion,
     NativeActionIntent,
     NativeControlledGuidanceEnvelope,
@@ -28,7 +31,9 @@ from agentveil_mcp_proxy.client_guidance import (
     native_write_redirect_supported,
     normalize_native_action,
     select_controlled_alternative_suggestion,
+    trusted_static_controlled_route_ready,
 )
+from redirect_hook_contract_fixtures import init_redirect_contract_home
 
 
 @pytest.mark.parametrize(
@@ -616,3 +621,221 @@ def test_renderer_reconstructs_nested_alternative_and_rejects_forged_id() -> Non
                 "action_family": "filesystem",
             }
         )
+
+
+def _rewrite_downstream(home: Path, downstream: dict) -> None:
+    path = home / "mcp-proxy" / "config.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["downstream"] = downstream
+    path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+
+def test_static_route_ready_makes_exact_suggestion_available_without_live() -> None:
+    intent = normalize_native_action(
+        native_tool="apply_patch",
+        tool_input={"patch": _EXACT_DELETE_PATCH},
+    )
+    envelope = select_controlled_alternative_suggestion(
+        intent,
+        redirect_route_ready=False,
+        static_route_ready=True,
+    )
+    _assert_available_envelope(envelope)
+    message = native_hook_deny_instruction(
+        native_tool="apply_patch",
+        risk_class="write",
+        redirect_route_ready=False,
+        static_route_ready=True,
+        tool_input={"patch": _EXACT_DELETE_PATCH},
+    )
+    assert message.startswith(NATIVE_STATIC_CONTROLLED_ROUTE_INSTRUCTION)
+    assert "suggestion_status=available" in message
+    assert "alternative.input.path=notes.txt" in message
+    assert "not currently available" not in message
+    assert "redirect_context=" not in message
+    assert "verified" not in message.lower()
+
+
+def test_static_route_ready_keeps_ambiguous_intent_unavailable() -> None:
+    envelope = build_native_controlled_guidance_envelope(
+        native_tool="Bash",
+        tool_input={"command": "rm notes.txt extra.txt"},
+        redirect_route_ready=False,
+        static_route_ready=True,
+    )
+    _assert_unavailable(envelope, reason="multi_target", leaks=("notes.txt extra.txt",))
+    message = native_hook_deny_instruction(
+        native_tool="Bash",
+        risk_class="write",
+        redirect_route_ready=False,
+        static_route_ready=True,
+        tool_input={"command": "rm notes.txt extra.txt"},
+    )
+    assert message.startswith(NATIVE_STATIC_CONTROLLED_ROUTE_INSTRUCTION)
+    assert "alternative=null" in message
+    assert "not currently available" not in message
+    assert "No controlled MCP route exists" not in message
+
+
+def test_trusted_static_controlled_route_ready_matrix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home, sandbox, downstream = init_redirect_contract_home(tmp_path)
+    project = home.parent
+    assert trusted_static_controlled_route_ready(home=home, project_root=project) is True
+    assert trusted_static_controlled_route_ready(home=None, project_root=project) is False
+    assert trusted_static_controlled_route_ready(home=home, project_root=None) is False
+    assert trusted_static_controlled_route_ready(home=True, project_root=project) is False  # type: ignore[arg-type]
+    assert trusted_static_controlled_route_ready(home=home, project_root=1.0) is False  # type: ignore[arg-type]
+    assert trusted_static_controlled_route_ready(home=str(home), project_root=project) is False  # type: ignore[arg-type]
+
+    monkeypatch.setenv("AGENTVEIL_HOME", str(home))
+    assert trusted_static_controlled_route_ready(home=None, project_root=project) is False
+
+    missing = tmp_path / "missing-home"
+    missing.mkdir()
+    assert trusted_static_controlled_route_ready(home=missing, project_root=project) is False
+
+    (home / "mcp-proxy" / "config.json").write_text("{", encoding="utf-8")
+    assert trusted_static_controlled_route_ready(home=home, project_root=project) is False
+
+    home, sandbox, downstream = init_redirect_contract_home(tmp_path / "fresh")
+    project = home.parent
+    (home / "mcp-proxy" / "config.json").unlink()
+    assert trusted_static_controlled_route_ready(home=home, project_root=project) is False
+
+    home, sandbox, downstream = init_redirect_contract_home(tmp_path / "named")
+    project = home.parent
+    broken = dict(downstream)
+    broken["name"] = ""
+    _rewrite_downstream(home, broken)
+    assert trusted_static_controlled_route_ready(home=home, project_root=project) is False
+
+    home, sandbox, downstream = init_redirect_contract_home(tmp_path / "startup")
+    project = home.parent
+    no_command = dict(downstream)
+    no_command.pop("command", None)
+    _rewrite_downstream(home, no_command)
+    assert trusted_static_controlled_route_ready(home=home, project_root=project) is False
+
+    home, sandbox, downstream = init_redirect_contract_home(tmp_path / "nows")
+    project = home.parent
+    no_workspace = dict(downstream)
+    no_workspace["args"] = list(downstream["args"][:1])
+    _rewrite_downstream(home, no_workspace)
+    assert trusted_static_controlled_route_ready(home=home, project_root=project) is False
+
+    sibling = tmp_path / "sibling-project"
+    home, sandbox, downstream = init_redirect_contract_home(sibling)
+    assert trusted_static_controlled_route_ready(home=home, project_root=tmp_path) is False
+
+    home, sandbox, downstream = init_redirect_contract_home(tmp_path / "outside")
+    project = home.parent
+    outside = tmp_path / "outside-workspace"
+    outside.mkdir()
+    escaped = dict(downstream)
+    escaped["args"] = [*list(downstream["args"][:-1]), str(outside)]
+    _rewrite_downstream(home, escaped)
+    assert trusted_static_controlled_route_ready(home=home, project_root=project) is False
+
+    home, sandbox, downstream = init_redirect_contract_home(tmp_path / "escape-src")
+    proj = tmp_path / "sym-project"
+    proj.mkdir()
+    linked_home = proj / "home"
+    linked_home.symlink_to(home)
+    assert trusted_static_controlled_route_ready(home=linked_home, project_root=proj) is False
+
+    home, sandbox, downstream = init_redirect_contract_home(tmp_path / "wslink")
+    project = home.parent
+    outside_ws = tmp_path / "wslink-outside"
+    outside_ws.mkdir()
+    sandbox.rmdir()
+    sandbox.symlink_to(outside_ws)
+    assert trusted_static_controlled_route_ready(home=home, project_root=project) is False
+
+
+_OUTSIDE_CANARY_BYTES = b"outside-canary-static-route-v1\n"
+
+
+def _outside_canary(path: Path) -> tuple[bytes, int]:
+    path.write_bytes(_OUTSIDE_CANARY_BYTES)
+    os.chmod(path, 0o640)
+    return path.read_bytes(), stat.S_IMODE(path.stat().st_mode)
+
+
+def _assert_canary_unchanged(path: Path, *, payload: bytes, mode: int) -> None:
+    assert path.read_bytes() == payload
+    assert stat.S_IMODE(path.stat().st_mode) == mode
+
+
+def test_trusted_static_route_rejects_symlink_and_hardlink_custody(tmp_path: Path) -> None:
+    canary = tmp_path / "outside-canary.bin"
+    payload, mode = _outside_canary(canary)
+
+    home, _sandbox, _downstream = init_redirect_contract_home(tmp_path / "normal")
+    assert trusted_static_controlled_route_ready(home=home, project_root=home.parent) is True
+    _assert_canary_unchanged(canary, payload=payload, mode=mode)
+
+    home, _sandbox, _downstream = init_redirect_contract_home(tmp_path / "in-project-home")
+    project = home.parent
+    alias = project / "home-alias"
+    alias.symlink_to(home)
+    assert trusted_static_controlled_route_ready(home=alias, project_root=project) is False
+    assert trusted_static_controlled_route_ready(home=home, project_root=project) is True
+    _assert_canary_unchanged(canary, payload=payload, mode=mode)
+
+    home, _sandbox, _downstream = init_redirect_contract_home(tmp_path / "external-home")
+    proj = tmp_path / "external-home-project"
+    proj.mkdir()
+    linked_home = proj / "home"
+    linked_home.symlink_to(home)
+    assert trusted_static_controlled_route_ready(home=linked_home, project_root=proj) is False
+    _assert_canary_unchanged(canary, payload=payload, mode=mode)
+
+    home, _sandbox, _downstream = init_redirect_contract_home(tmp_path / "proxy-dir")
+    project = home.parent
+    proxy = home / "mcp-proxy"
+    real_proxy = home / "mcp-proxy-real"
+    proxy.rename(real_proxy)
+    proxy.symlink_to(real_proxy)
+    assert trusted_static_controlled_route_ready(home=home, project_root=project) is False
+    _assert_canary_unchanged(canary, payload=payload, mode=mode)
+
+    home, _sandbox, _downstream = init_redirect_contract_home(tmp_path / "config-symlink")
+    project = home.parent
+    config = home / "mcp-proxy" / "config.json"
+    config.unlink()
+    config.symlink_to(canary)
+    assert trusted_static_controlled_route_ready(home=home, project_root=project) is False
+    _assert_canary_unchanged(canary, payload=payload, mode=mode)
+
+    home, _sandbox, _downstream = init_redirect_contract_home(tmp_path / "config-hardlink")
+    project = home.parent
+    config = home / "mcp-proxy" / "config.json"
+    config.unlink()
+    os.link(canary, config)
+    assert trusted_static_controlled_route_ready(home=home, project_root=project) is False
+    _assert_canary_unchanged(canary, payload=payload, mode=mode)
+
+    home, sandbox, _downstream = init_redirect_contract_home(tmp_path / "workspace-escape")
+    project = home.parent
+    outside_ws = tmp_path / "workspace-escape-outside"
+    outside_ws.mkdir()
+    sandbox.rmdir()
+    sandbox.symlink_to(outside_ws)
+    assert trusted_static_controlled_route_ready(home=home, project_root=project) is False
+    _assert_canary_unchanged(canary, payload=payload, mode=mode)
+
+
+def test_static_suggestion_does_not_leak_config_or_absolute_paths(tmp_path: Path) -> None:
+    home, sandbox, _downstream = init_redirect_contract_home(tmp_path)
+    message = native_hook_deny_instruction(
+        native_tool="apply_patch",
+        risk_class="write",
+        redirect_route_ready=False,
+        static_route_ready=trusted_static_controlled_route_ready(home=home, project_root=home.parent),
+        tool_input={"patch": _EXACT_DELETE_PATCH},
+    )
+    assert "suggestion_status=available" in message
+    assert str(home) not in message
+    assert str(sandbox) not in message
+    assert _CANARY_ABS not in message
+    assert "secret-canary-token" not in message

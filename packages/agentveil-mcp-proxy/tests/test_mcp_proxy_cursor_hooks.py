@@ -724,3 +724,48 @@ def test_cursor_ambiguous_shell_stays_deny_without_alternative(tmp_path: Path) -
     assert "filesystem.stage_delete.v1" not in response["agent_message"]
     assert "/tmp/workspace" not in response["agent_message"]
     assert "/tmp/workspace" not in dumped
+
+
+def test_cursor_trusted_static_exact_delete_is_hard_block_with_available_suggestion(tmp_path: Path) -> None:
+    home, sandbox, _downstream = init_redirect_contract_home(tmp_path)
+    out = StringIO()
+    decision = cursor_hooks.process_hook(
+        {
+            "hook_event": "preToolUse",
+            "tool_name": "ApplyPatch",
+            "tool_input": {"patch": "*** Begin Patch\n*** Delete File: notes.txt\n*** End Patch"},
+        },
+        workspace=tmp_path,
+        home=home,
+        out=out,
+    )
+    response = json.loads(out.getvalue())
+    message = response["agent_message"]
+    assert decision.hook_action == "deny"
+    assert decision.disposition.value == "hard_block"
+    assert parse_redirect_context_from_cursor_hook_output(response) is None
+    assert "suggestion_status=available" in message
+    assert "alternative.id=filesystem.stage_delete.v1" in message
+    assert "alternative.input.path=notes.txt" in message
+    assert "not currently available" not in message
+    assert str(home) not in message
+    assert str(sandbox) not in message
+
+
+def test_cursor_allow_does_not_read_static_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home, _sandbox, _downstream = init_redirect_contract_home(tmp_path)
+    calls: list[object] = []
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.cursor_hooks.trusted_static_controlled_route_ready",
+        lambda **kwargs: calls.append(kwargs) or True,
+    )
+    out = StringIO()
+    decision = cursor_hooks.process_hook(
+        {"hook_event": "preToolUse", "tool_name": "Read", "tool_input": {"path": "notes.txt"}},
+        workspace=tmp_path,
+        home=home,
+        out=out,
+    )
+    assert decision.hook_action == "allow"
+    assert calls == []
+    assert json.loads(out.getvalue()) == {"permission": "allow"}
