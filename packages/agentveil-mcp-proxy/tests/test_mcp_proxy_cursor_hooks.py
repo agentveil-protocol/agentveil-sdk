@@ -652,3 +652,75 @@ def test_cursor_shell_classifier_matches_shared_matrix(command: str, expected: R
         )
         is expected
     )
+
+
+def test_cursor_exact_delete_tool_hard_block_has_null_alternative(tmp_path: Path) -> None:
+    out = StringIO()
+    decision = cursor_hooks.process_hook(
+        {"hook_event": "preToolUse", "tool_name": "Delete", "tool_input": {"path": "notes.txt"}},
+        workspace=tmp_path,
+        out=out,
+    )
+    response = json.loads(out.getvalue())
+    assert decision.hook_action == "deny"
+    assert decision.disposition.value == "hard_block"
+    assert response["permission"] == "deny"
+    assert "alternative=null" in response["agent_message"]
+    assert "filesystem.stage_delete.v1" not in response["agent_message"]
+
+
+def test_cursor_apply_patch_delete_with_binding_is_redirect_and_available(tmp_path: Path) -> None:
+    home, _sandbox, downstream = init_redirect_contract_home(tmp_path)
+    fixture = publish_live_hook_binding(home, downstream=downstream)
+    try:
+        out = StringIO()
+        decision = cursor_hooks.process_hook(
+            {
+                "hook_event": "preToolUse",
+                "tool_name": "ApplyPatch",
+                "tool_input": {"patch": "*** Begin Patch\n*** Delete File: notes.txt\n*** End Patch"},
+            },
+            workspace=tmp_path,
+            home=home,
+            out=out,
+        )
+        response = json.loads(out.getvalue())
+        assert decision.hook_action == "deny"
+        assert decision.disposition.value == "redirect"
+        assert decision.reason_code == "managed_route_redirect"
+        assert "suggestion_status=available" in response["agent_message"]
+        assert "alternative.id=filesystem.stage_delete.v1" in response["agent_message"]
+        assert "alternative.input.path=notes.txt" in response["agent_message"]
+    finally:
+        fixture.lease.close()
+
+
+def test_cursor_exact_shell_delete_uses_shell_canonicalize_but_stays_unavailable(tmp_path: Path) -> None:
+    out = StringIO()
+    decision = cursor_hooks.process_hook(
+        {"hook_event": "beforeShellExecution", "command": "rm notes.txt"},
+        workspace=tmp_path,
+        out=out,
+    )
+    response = json.loads(out.getvalue())
+    assert decision.hook_action == "deny"
+    assert decision.disposition.value == "hard_block"
+    assert "alternative=null" in response["agent_message"]
+    assert "filesystem.stage_delete.v1" not in response["agent_message"]
+
+
+def test_cursor_ambiguous_shell_stays_deny_without_alternative(tmp_path: Path) -> None:
+    out = StringIO()
+    decision = cursor_hooks.process_hook(
+        {"hook_event": "beforeShellExecution", "command": "rm -rf /tmp/workspace"},
+        workspace=tmp_path,
+        evidence_path=tmp_path / "evidence.jsonl",
+        out=out,
+    )
+    response = json.loads(out.getvalue())
+    dumped = (tmp_path / "evidence.jsonl").read_text(encoding="utf-8")
+    assert decision.hook_action == "deny"
+    assert "alternative=null" in response["agent_message"]
+    assert "filesystem.stage_delete.v1" not in response["agent_message"]
+    assert "/tmp/workspace" not in response["agent_message"]
+    assert "/tmp/workspace" not in dumped

@@ -427,3 +427,84 @@ def test_codex_hook_denied_remains_denied_when_upload_fails(monkeypatch):
 @pytest.mark.parametrize("command,expected", NATIVE_SHELL_COMMAND_MATRIX)
 def test_codex_shell_classifier_matches_shared_matrix(command: str, expected: RiskClass) -> None:
     assert classify_codex_tool("Bash", {"command": command}) is expected
+
+
+def test_codex_exact_delete_patch_renders_common_stage_delete_and_stays_deny(tmp_path) -> None:
+    home, _sandbox, downstream = init_redirect_contract_home(tmp_path)
+    fixture = publish_live_hook_binding(home, downstream=downstream)
+    try:
+        out = io.StringIO()
+        decision = codex_hook.process_hook(
+            _payload(
+                "apply_patch",
+                {"patch": "*** Begin Patch\n*** Delete File: notes.txt\n*** End Patch"},
+            ),
+            home=home,
+            out=out,
+        )
+        reason = _deny_reason(out.getvalue())
+        assert decision.hook_action == "deny"
+        assert decision.disposition.value == "redirect"
+        assert decision.reason_code == "managed_route_redirect"
+        assert "suggestion_status=available" in reason
+        assert "alternative.id=filesystem.stage_delete.v1" in reason
+        assert "alternative.tool_contract=agentveil_controlled_alternative" in reason
+        assert "alternative.input.path=notes.txt" in reason
+        assert "target_reached=false" in reason
+    finally:
+        fixture.lease.close()
+
+
+def test_codex_exact_delete_patch_without_binding_is_hard_block_unavailable() -> None:
+    out = io.StringIO()
+    decision = codex_hook.process_hook(
+        _payload(
+            "apply_patch",
+            {"patch": "*** Begin Patch\n*** Delete File: notes.txt\n*** End Patch"},
+        ),
+        out=out,
+    )
+    reason = _deny_reason(out.getvalue())
+    assert decision.hook_action == "deny"
+    assert decision.disposition.value == "hard_block"
+    assert "alternative=null" in reason
+    assert "filesystem.stage_delete.v1" not in reason
+    assert "managed AgentVeil write route is not currently available" in reason
+    out = io.StringIO()
+    decision = codex_hook.process_hook(_payload("Bash", {"command": "rm notes.txt"}), out=out)
+    reason = _deny_reason(out.getvalue())
+    assert decision.hook_action == "deny"
+    assert decision.disposition.value == "hard_block"
+    assert "alternative=null" in reason
+    assert "filesystem.stage_delete.v1" not in reason
+
+
+def test_codex_ambiguous_delete_is_unavailable_and_does_not_leak(tmp_path: Path) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    out = io.StringIO()
+    decision = codex_hook.process_hook(
+        _payload("Bash", {"command": "rm -rf /tmp/workspace"}),
+        evidence_path=evidence,
+        out=out,
+    )
+    reason = _deny_reason(out.getvalue())
+    dumped = evidence.read_text(encoding="utf-8")
+    assert decision.hook_action == "deny"
+    assert "alternative=null" in reason
+    assert "filesystem.stage_delete.v1" not in reason
+    assert "/tmp/workspace" not in reason
+    assert "/tmp/workspace" not in dumped
+    assert "rm -rf" not in dumped
+
+
+def test_codex_controlled_mcp_route_still_allows_without_guidance() -> None:
+    out = io.StringIO()
+    decision = codex_hook.process_hook(
+        _payload(
+            "mcp__agentveil-mcp-proxy__agentveil_controlled_alternative",
+            {"alternative_id": "filesystem.stage_delete.v1", "input": {"path": "notes.txt"}},
+        ),
+        out=out,
+    )
+    assert decision.hook_action == "allow"
+    assert out.getvalue() == ""

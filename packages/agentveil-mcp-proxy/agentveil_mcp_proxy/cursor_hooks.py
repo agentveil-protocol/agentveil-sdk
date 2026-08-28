@@ -404,14 +404,17 @@ def format_cursor_hook_response(
     decision: HookDecision,
     *,
     redirect_origin: NativeRedirectOrigin | None = None,
+    tool_input: Mapping[str, Any] | None = None,
+    native_tool: str | None = None,
 ) -> dict[str, Any]:
     if decision.hook_action == "allow":
         return {"permission": "allow"}
     if decision.context.server == CURSOR_SERVER_LABEL:
         agent_message = native_hook_deny_instruction(
-            native_tool=decision.context.tool,
+            native_tool=native_tool if isinstance(native_tool, str) and native_tool else decision.context.tool,
             risk_class=decision.evaluation.risk_class.value,
             redirect_route_ready=decision.disposition is HookDisposition.REDIRECT,
+            tool_input=tool_input if isinstance(tool_input, Mapping) else {},
         )
     else:
         agent_message = (
@@ -480,13 +483,20 @@ def process_hook(
     engine = PolicyEngine(config)
     decision = decide(payload, engine, workspace=workspace)
     tool_input = payload.get("tool_input") or payload.get("arguments") or {}
+    if not isinstance(tool_input, Mapping):
+        tool_input = {}
+    else:
+        tool_input = dict(tool_input)
+    command = payload.get("command")
+    if isinstance(command, str) and command and "command" not in tool_input:
+        tool_input["command"] = command
     redirect_origin = maybe_register_native_redirect_for_hook_deny(
         hook_action=decision.hook_action,
         native_server=decision.context.server,
         native_tool=decision.context.tool,
         action_family=decision.context.action_family or "",
         risk_class=decision.evaluation.risk_class.value,
-        tool_input=tool_input if isinstance(tool_input, Mapping) else {},
+        tool_input=tool_input,
         home=home,
     )
     if decision.hook_action == "deny":
@@ -515,7 +525,16 @@ def process_hook(
             project_dir=workspace,
             runtime_home=home,
         )
-    response = format_cursor_hook_response(decision, redirect_origin=redirect_origin)
+    response = format_cursor_hook_response(
+        decision,
+        redirect_origin=redirect_origin,
+        tool_input=tool_input,
+        native_tool=(
+            "Shell"
+            if str(payload.get("hook_event") or "") == "beforeShellExecution"
+            else decision.context.tool
+        ),
+    )
     if out is None:
         out = sys.stdout
     out.write(json.dumps(response) + "\n")

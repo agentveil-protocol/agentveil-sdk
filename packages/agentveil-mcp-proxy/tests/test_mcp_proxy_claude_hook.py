@@ -1097,3 +1097,42 @@ def test_claude_hook_redirect_does_not_upload_decision_summary(monkeypatch, tmp_
 @pytest.mark.parametrize("command,expected", NATIVE_SHELL_COMMAND_MATRIX)
 def test_claude_shell_classifier_matches_shared_matrix(command: str, expected: RiskClass) -> None:
     assert classify_claude_tool("Bash", {"command": command}) is expected
+
+
+def test_claude_exact_shell_delete_hard_block_has_null_alternative() -> None:
+    out = io.StringIO()
+    decision = claude_hook.process_hook(
+        _payload("Bash", {"command": "rm notes.txt"}),
+        out=out,
+    )
+    reason = json.loads(out.getvalue())["hookSpecificOutput"]["permissionDecisionReason"]
+    assert decision.hook_action == "deny"
+    assert decision.disposition.value == "hard_block"
+    assert "alternative=null" in reason
+    assert "filesystem.stage_delete.v1" not in reason
+
+
+def test_claude_write_does_not_select_stage_delete() -> None:
+    out = io.StringIO()
+    decision = claude_hook.process_hook(
+        _payload("Write", {"file_path": "notes.txt", "content": "x"}),
+        out=out,
+    )
+    reason = json.loads(out.getvalue())["hookSpecificOutput"]["permissionDecisionReason"]
+    assert decision.hook_action == "deny"
+    assert "alternative=null" in reason
+    assert "filesystem.stage_delete.v1" not in reason
+    assert "notes.txt" not in reason
+
+
+def test_claude_controlled_mcp_route_still_allows() -> None:
+    out = io.StringIO()
+    decision = claude_hook.process_hook(
+        _payload(
+            f"mcp__{AGENTVEIL_CONTROLLED_MCP_SERVER}__agentveil_controlled_alternative",
+            {"alternative_id": "filesystem.stage_delete.v1", "input": {"path": "notes.txt"}},
+        ),
+        out=out,
+    )
+    assert decision.hook_action == "allow"
+    assert out.getvalue() == ""

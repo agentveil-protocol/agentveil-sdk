@@ -364,3 +364,46 @@ def test_gemini_hook_redirect_does_not_upload_decision_summary(monkeypatch, tmp_
 @pytest.mark.parametrize("command,expected", NATIVE_SHELL_COMMAND_MATRIX)
 def test_gemini_shell_classifier_matches_shared_matrix(command: str, expected: RiskClass) -> None:
     assert classify_gemini_tool("run_shell_command", {"command": command}) is expected
+
+
+def test_gemini_exact_shell_delete_hard_block_has_null_alternative() -> None:
+    out = io.StringIO()
+    decision = gemini_hook.process_hook(
+        _payload("run_shell_command", {"command": "rm notes.txt"}),
+        out=out,
+    )
+    reason = _deny_reason(out.getvalue())
+    assert decision.hook_action == "deny"
+    assert decision.disposition.value == "hard_block"
+    assert "alternative=null" in reason
+    assert "filesystem.stage_delete.v1" not in reason
+
+
+def test_gemini_write_file_does_not_select_stage_delete() -> None:
+    out = io.StringIO()
+    decision = gemini_hook.process_hook(
+        _payload("write_file", {"path": "notes.txt", "content": "x"}),
+        out=out,
+    )
+    reason = _deny_reason(out.getvalue())
+    assert decision.hook_action == "deny"
+    assert "alternative=null" in reason
+    assert "filesystem.stage_delete.v1" not in reason
+
+
+def test_gemini_renderer_matches_shared_unavailable_envelope_for_hard_block() -> None:
+    from agentveil_mcp_proxy.client_guidance import (
+        build_native_controlled_guidance_envelope,
+        format_native_controlled_guidance_text,
+    )
+
+    envelope = build_native_controlled_guidance_envelope(
+        native_tool="run_shell_command",
+        tool_input={"command": "rm notes.txt"},
+        redirect_route_ready=False,
+    )
+    shared = format_native_controlled_guidance_text(envelope)
+    out = io.StringIO()
+    gemini_hook.process_hook(_payload("run_shell_command", {"command": "rm notes.txt"}), out=out)
+    assert shared in _deny_reason(out.getvalue())
+    assert "alternative=null" in shared

@@ -236,6 +236,7 @@ def format_hook_output(
     decision: HookDecision,
     *,
     redirect_origin: NativeRedirectOrigin | None = None,
+    tool_input: Mapping[str, Any] | None = None,
 ) -> str | None:
     if decision.hook_action == "allow":
         return None
@@ -250,6 +251,7 @@ def format_hook_output(
             native_tool=decision.context.tool,
             risk_class=decision.evaluation.risk_class.value,
             redirect_route_ready=decision.disposition is HookDisposition.REDIRECT,
+            tool_input=tool_input if isinstance(tool_input, Mapping) else {},
         )
         reason = f"{reason}. {instruction}"
     reason = format_native_redirect_agent_surface(reason, redirect_origin)
@@ -349,7 +351,11 @@ def process_hook(
             project_dir=home.parent if home is not None else Path.cwd(),
             runtime_home=home,
         )
-    output = format_hook_output(decision, redirect_origin=redirect_origin)
+    output = format_hook_output(
+        decision,
+        redirect_origin=redirect_origin,
+        tool_input=_tool_input(payload),
+    )
     if output is not None:
         (out or sys.stdout).write(output + "\n")
     return decision
