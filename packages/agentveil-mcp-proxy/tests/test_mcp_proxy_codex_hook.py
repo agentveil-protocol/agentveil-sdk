@@ -447,9 +447,12 @@ def test_codex_exact_delete_patch_renders_common_stage_delete_and_stays_deny(tmp
         assert decision.disposition.value == "redirect"
         assert decision.reason_code == "managed_route_redirect"
         assert "suggestion_status=available" in reason
-        assert "alternative.id=filesystem.stage_delete.v1" in reason
-        assert "alternative.tool_contract=agentveil_controlled_alternative" in reason
+        assert "alternative.tool_contract=agentveil_stage_delete" in reason
         assert "alternative.input.path=notes.txt" in reason
+        assert "alternative.id=" not in reason
+        assert "redirect_context=" in reason
+        assert "controlled_stage_delete" in reason
+        assert "agentveil_stage_delete" in reason
         assert "target_reached=false" in reason
     finally:
         fixture.lease.close()
@@ -528,7 +531,9 @@ def test_codex_trusted_static_exact_delete_is_hard_block_with_available_suggesti
     assert decision.reason_code == "risky_blocked"
     assert parse_redirect_context_from_codex_hook_output(payload) is None
     assert "suggestion_status=available" in reason
-    assert "alternative.id=filesystem.stage_delete.v1" in reason
+    assert "alternative.tool_contract=agentveil_stage_delete" in reason
+    assert "alternative.input.path=notes.txt" in reason
+    assert "alternative.id=" not in reason
     assert "alternative.input.path=notes.txt" in reason
     assert "not currently available" not in reason
     assert "redirect_context=" not in reason

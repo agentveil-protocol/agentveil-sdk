@@ -423,7 +423,9 @@ def test_gemini_trusted_static_exact_delete_is_hard_block_with_available_suggest
     assert decision.disposition.value == "hard_block"
     assert parse_redirect_context_from_gemini_hook_output(payload) is None
     assert "suggestion_status=available" in reason
-    assert "alternative.id=filesystem.stage_delete.v1" in reason
+    assert "alternative.tool_contract=agentveil_stage_delete" in reason
+    assert "alternative.input.path=notes.txt" in reason
+    assert "alternative.id=" not in reason
     assert "alternative.input.path=notes.txt" in reason
     assert "not currently available" not in reason
     assert str(home) not in reason

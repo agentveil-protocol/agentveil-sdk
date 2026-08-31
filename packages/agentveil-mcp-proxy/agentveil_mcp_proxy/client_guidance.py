@@ -32,6 +32,7 @@ from agentveil_mcp_proxy.client_packs import (
     normalize_client_pack_ids,
 )
 from agentveil_mcp_proxy.control_artifacts import write_atomic_control_file
+from agentveil_mcp_proxy.controlled_alternatives import SEMANTIC_STAGE_DELETE_TOOL_NAME
 from agentveil_mcp_proxy.policy import build_redirect_automation_metadata
 from agentveil_mcp_proxy.role_doctor import (
     REDIRECT_LINEAGE_MAX_AGE_SECONDS,
@@ -124,6 +125,7 @@ NATIVE_REDIRECT_ORIGIN_REASON = "native_hook_denied"
 NATIVE_REDIRECT_FOLLOW_UP_TOOL = "write_file"
 NATIVE_PATCH_REDIRECT_FOLLOW_UP_TOOL = "apply_patch"
 NATIVE_REDIRECT_PLAYBOOK_ID = "request_approval"
+NATIVE_CONTROLLED_STAGE_DELETE_PLAYBOOK_ID = "controlled_stage_delete"
 _PRODUCT_ROUTE_PROFILE_ROOT_ENV = "PRODUCT_ROUTE_PROFILE_ROOT"
 _PRODUCT_ROUTE_WORKSPACE_DIRNAME = "workspace"
 _CANONICAL_NATIVE_WRITE_TOOLS = frozenset({
@@ -663,7 +665,7 @@ def _native_redirect_follow_up_tool(native_tool: str) -> str:
 
 NATIVE_CONTROLLED_GUIDANCE_SCHEMA_VERSION = 1
 NATIVE_CONTROLLED_ALTERNATIVE_ID_STAGE_DELETE = "filesystem.stage_delete.v1"
-NATIVE_CONTROLLED_ALTERNATIVE_TOOL_CONTRACT = "agentveil_controlled_alternative"
+NATIVE_CONTROLLED_ALTERNATIVE_TOOL_CONTRACT = "agentveil_stage_delete"
 _MAX_EXACT_RELATIVE_PATH_BYTES = 4096
 _MAX_NATIVE_GUIDANCE_PAYLOAD_BYTES = 262_144
 _MAX_NATIVE_TOOL_CHARS = 128
@@ -873,7 +875,7 @@ class ControlledAlternativeSuggestion:
             raise ValueError("only filesystem.stage_delete.v1 is selectable")
         tool_contract = _require_exact_str(self.tool_contract, label="tool_contract")
         if tool_contract != NATIVE_CONTROLLED_ALTERNATIVE_TOOL_CONTRACT:
-            raise ValueError("tool_contract must be the logical controlled-alternative contract")
+            raise ValueError("tool_contract must be the semantic stage-delete MCP tool")
         if not isinstance(self.input, Mapping):
             raise ValueError("alternative input must be a mapping")
         keys = tuple(self.input.keys())
@@ -1282,7 +1284,6 @@ def format_native_controlled_guidance_text(envelope: NativeControlledGuidanceEnv
             f"schema_version={mapping['schema_version']} "
             "suggestion_status=available "
             f"reason={mapping['reason']} "
-            f"alternative.id={alternative.id} "
             f"alternative.tool_contract={alternative.tool_contract} "
             f"alternative.input.path={path}."
         )
@@ -1431,6 +1432,25 @@ def maybe_register_native_redirect_for_hook_deny(
         return None
     if native_server in {"agentveil-mcp-proxy", "agentveil_mcp_proxy"}:
         return None
+    intent = normalize_native_action(native_tool=native_tool, tool_input=tool_input)
+    if (
+        intent.confidence == "exact"
+        and intent.operation == "delete"
+        and intent.action_family == "filesystem"
+        and isinstance(intent.relative_path, str)
+    ):
+        proxy_home = resolve_proxy_home(home=home)
+        if proxy_home is not None:
+            exact_origin = register_exact_delete_redirect_origin(
+                proxy_home=proxy_home,
+                native_server=native_server,
+                native_tool=native_tool,
+                relative_path=intent.relative_path,
+                action_family=action_family or intent.action_family,
+                risk_class=risk_class,
+            )
+            if exact_origin is not None:
+                return exact_origin
     if not native_write_redirect_supported(native_tool=native_tool):
         return None
     proxy_home = resolve_proxy_home(home=home)
@@ -1443,6 +1463,88 @@ def maybe_register_native_redirect_for_hook_deny(
         action_family=action_family,
         risk_class=risk_class,
         tool_input=tool_input,
+    )
+
+
+def register_exact_delete_redirect_origin(
+    *,
+    proxy_home: Path,
+    native_server: str,
+    native_tool: str,
+    relative_path: str,
+    action_family: str,
+    risk_class: str,
+    now_timestamp: int | None = None,
+) -> NativeRedirectOrigin | None:
+    binding = resolve_live_hook_runtime_binding(proxy_home, now_timestamp=now_timestamp)
+    if binding is None:
+        return None
+    downstream = trusted_downstream_from_proxy_home(proxy_home)
+    if downstream is None:
+        return None
+    workspace_root = trusted_project_workspace_root_from_downstream(downstream)
+    workspace_root_hash = canonical_project_workspace_root_hash(workspace_root)
+    if workspace_root is None or workspace_root_hash != binding.project_workspace_root_hash:
+        return None
+    path, reason = _bounded_exact_relative_path(relative_path)
+    if path is None or reason != "exact_single_target_delete":
+        return None
+    resource_plain = f"path:{path}"
+    resource_hash = sha256_text(resource_plain)
+    payload_hash = sha256_jcs({"path": path})
+    created_at = now_timestamp or int(time.time())
+    original_request_id = f"native-{secrets.token_urlsafe(12)}"
+    follow_up_tool = SEMANTIC_STAGE_DELETE_TOOL_NAME
+    metadata = build_redirect_automation_metadata(
+        fixture_id="native-hook",
+        tool_name=native_tool,
+        policy_decision="block",
+        policy_rule_id=None,
+        approval_status="blocked",  # claim-check: allow bounded evidence status for tested native deny.
+        execution_status="blocked",  # claim-check: allow bounded evidence status for tested native deny.
+        target_reached=False,
+        request_id=original_request_id,
+        payload_hash=payload_hash,
+        action_family=action_family,
+        redirect_role=REDIRECT_ROLE_ORIGINAL,
+        redirect_playbook_id=NATIVE_CONTROLLED_STAGE_DELETE_PLAYBOOK_ID,
+        original_request_id=original_request_id,
+        project_scope_fingerprint=binding.project_scope_fingerprint,
+    )
+    metadata["native_hook_denied"] = True
+    metadata["follow_up_tool"] = follow_up_tool
+    metadata_jcs = json.dumps(metadata, separators=(",", ":"), sort_keys=True)
+    from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore
+
+    evidence_path = proxy_home / "mcp-proxy" / "evidence.sqlite"
+    with ApprovalEvidenceStore(evidence_path) as store:
+        store.record_terminal_deny(
+            request_id=original_request_id,
+            session_id=binding.session_id,
+            client_id=binding.client_id,
+            downstream_server=binding.downstream_server,
+            tool_name=native_tool,
+            risk_class=risk_class,
+            resource_hash=resource_hash,
+            payload_hash=payload_hash,
+            policy_id="native-hook-redirect",
+            policy_rule_id=None,
+            policy_context_hash=hashlib.sha256(
+                f"{native_server}:{native_tool}:{action_family}:{resource_hash}".encode("utf-8")
+            ).hexdigest(),
+            created_at=created_at,
+            reason=NATIVE_REDIRECT_ORIGIN_REASON,
+            action_gate_metadata_jcs=metadata_jcs,
+        )
+    redirect_context = redirect_context_stub(
+        original_request_id=original_request_id,
+        redirect_playbook_id=NATIVE_CONTROLLED_STAGE_DELETE_PLAYBOOK_ID,
+    )
+    return NativeRedirectOrigin(
+        original_request_id=original_request_id,
+        redirect_context=redirect_context,
+        redirect_playbook_id=NATIVE_CONTROLLED_STAGE_DELETE_PLAYBOOK_ID,
+        follow_up_tool=follow_up_tool,
     )
 
 
@@ -1570,6 +1672,7 @@ __all__ = [
     "NATIVE_CONTROLLED_ALTERNATIVE_ID_STAGE_DELETE",
     "NATIVE_CONTROLLED_ALTERNATIVE_TOOL_CONTRACT",
     "NATIVE_CONTROLLED_GUIDANCE_SCHEMA_VERSION",
+    "NATIVE_CONTROLLED_STAGE_DELETE_PLAYBOOK_ID",
     "NATIVE_CONTROLLED_MCP_REDIRECT_INSTRUCTION",
     "NATIVE_FILE_WRITE_REDIRECT_INSTRUCTION",
     "NATIVE_FILE_WRITE_ROUTE_UNAVAILABLE_INSTRUCTION",
@@ -1610,6 +1713,7 @@ __all__ = [
     "parse_redirect_context_from_codex_hook_output",
     "parse_redirect_context_from_cursor_hook_output",
     "parse_redirect_context_from_gemini_hook_output",
+    "register_exact_delete_redirect_origin",
     "register_native_redirect_origin",
     "resolve_live_hook_runtime_binding",
     "resolve_proxy_home",

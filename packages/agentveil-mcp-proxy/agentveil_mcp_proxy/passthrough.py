@@ -51,14 +51,23 @@ from agentveil_mcp_proxy.classification import (
     infer_action_family,
     sha256_jcs,
 )
-from agentveil_mcp_proxy.controlled_alternatives import GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME
+from agentveil_mcp_proxy.controlled_alternatives import (
+    ControlledAlternativeValidationError,
+    GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+    is_controlled_alternative_tool_name,
+    is_semantic_controlled_alternative_tool,
+    normalize_semantic_tool_call,
+)
 from agentveil_mcp_proxy.controlled_alternatives_runtime import (
+    ControlledAlternativeExecutionAbort,
     ControlledAlternativeRuntimeBinding,
     alternative_id_from_arguments,
     controlled_alternative_catalog_collision,
     execute_controlled_alternative,
     inject_controlled_alternative_tool,
     local_mcp_result,
+    normalize_controlled_alternative_arguments,
+    semantic_tool_is_projected,
 )
 from agentveil_mcp_proxy.evidence import (
     ApprovalEvidenceDuplicateError,
@@ -1602,6 +1611,9 @@ class McpPassthrough:
             if redirect_error is not None:
                 return [redirect_error] if has_id else []
             message = self._message_without_redirect_context(message)
+            semantic_precheck = self._semantic_controlled_precheck_response(message, request_id)
+            if semantic_precheck is not None:
+                return [semantic_precheck] if has_id else []
             invalid_error = self._invalid_arguments_error(message, request_id)
             if invalid_error is not None:
                 return [invalid_error] if has_id else []
@@ -2717,6 +2729,8 @@ class McpPassthrough:
         tool = params.get("name")
         if not isinstance(tool, str) or not tool:
             return None
+        if is_controlled_alternative_tool_name(tool):
+            return None
         if self._tool_schemas.is_advertised(tool):
             return None
         # During outage / reconnect an empty advertised cache may be mid-refresh.
@@ -2794,6 +2808,8 @@ class McpPassthrough:
                 "invalid tool call params",
                 data={"status": "invalid_tool_call_params", "reason": "missing_tool_name"},
             )
+        if is_controlled_alternative_tool_name(tool):
+            return None
         schema = self._ensure_tool_schema(tool)
         if schema is None:
             self._record_schema_unavailable_event(tool)
@@ -3797,7 +3813,66 @@ class McpPassthrough:
         params = message.get("params")
         if not isinstance(params, Mapping):
             return False
-        return params.get("name") == GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME
+        tool_name = params.get("name")
+        return isinstance(tool_name, str) and is_controlled_alternative_tool_name(tool_name)
+
+    def _semantic_controlled_precheck_response(
+        self,
+        message: Mapping[str, Any],
+        request_id: Any,
+    ) -> dict[str, Any] | None:
+        if message.get("method") != "tools/call":
+            return None
+        params = message.get("params")
+        if not isinstance(params, Mapping):
+            return None
+        tool_name = params.get("name")
+        if not isinstance(tool_name, str) or not is_semantic_controlled_alternative_tool(tool_name):
+            return None
+        arguments = params.get("arguments", {})
+        if not isinstance(arguments, Mapping):
+            arguments = {}
+        binding = self.controlled_runtime
+        if binding is None or self._controlled_catalog_collision:
+            self._record_security_event({
+                "type": "unknown_tool_call",
+                "action": "blocked_pre_approval",
+                "reason": "unknown_tool",
+                "risk_class": "tool_identity_violation",
+                "tool": tool_name,
+            })
+            return _blocked_error(
+                request_id,
+                "blocked by MCP proxy: tool not advertised by downstream",  # claim-check: allow bounded local unknown-tool error.
+                reason="unknown_tool",
+            )
+        if not semantic_tool_is_projected(binding, tool_name):
+            self._record_security_event({
+                "type": "unknown_tool_call",
+                "action": "blocked_pre_approval",
+                "reason": "unknown_tool",
+                "risk_class": "tool_identity_violation",
+                "tool": tool_name,
+            })
+            return _blocked_error(
+                request_id,
+                "blocked by MCP proxy: tool not advertised by downstream",  # claim-check: allow bounded local unknown-tool error.
+                reason="unknown_tool",
+            )
+        try:
+            normalize_semantic_tool_call(tool_name, arguments)
+        except ControlledAlternativeValidationError:
+            return local_mcp_result(
+                request_id,
+                {
+                    "mechanism_status": "error",
+                    "error_code": "request_malformed",
+                    "target_reached": False,
+                    "rollback_available": False,
+                    "verification_level": "not_verified",
+                },
+            )
+        return None
 
     def _inject_controlled_alternative_list(self, response: Any) -> Any:
         if self.controlled_runtime is None:
@@ -3820,12 +3895,14 @@ class McpPassthrough:
             return None
         binding = self.controlled_runtime
         if binding is None or self._controlled_catalog_collision:
+            params = message.get("params")
+            tool_name = params.get("name") if isinstance(params, Mapping) else GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME
             self._record_security_event({
                 "type": "unknown_tool_call",
                 "action": "blocked_pre_approval",
                 "reason": "unknown_tool",
                 "risk_class": "tool_identity_violation",
-                "tool": GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+                "tool": tool_name,
             })
             return _blocked_error(
                 request_id,
@@ -3834,10 +3911,24 @@ class McpPassthrough:
                 reason="unknown_tool",
             )
         params = message.get("params")
+        tool_name = params.get("name") if isinstance(params, Mapping) else GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME
         arguments = params.get("arguments") if isinstance(params, Mapping) else {}
         if not isinstance(arguments, Mapping):
             arguments = {}
-        if alternative_id_from_arguments(arguments) == "filesystem.cleanup_staged.v1":
+        try:
+            normalized_arguments = normalize_controlled_alternative_arguments(tool_name, arguments)
+        except ControlledAlternativeValidationError:
+            return local_mcp_result(
+                request_id,
+                {
+                    "mechanism_status": "error",
+                    "error_code": "request_malformed",
+                    "target_reached": False,
+                    "rollback_available": False,
+                    "verification_level": "not_verified",
+                },
+            )
+        if alternative_id_from_arguments(normalized_arguments) == "filesystem.cleanup_staged.v1":
             if not self._cleanup_authority_is_bound(classification, approval_outcome):
                 return local_mcp_result(
                     request_id,
@@ -3859,7 +3950,7 @@ class McpPassthrough:
             if fresh is None:
                 return None
             post_session = getattr(self.approval_manager, "session_id", None)
-            alternative = alternative_id_from_arguments(arguments)
+            alternative = alternative_id_from_arguments(normalized_arguments)
             if alternative == "filesystem.cleanup_staged.v1":
                 post_approved = self._cleanup_authority_is_bound(fresh, approval_outcome)
             else:
@@ -3883,12 +3974,53 @@ class McpPassthrough:
                 "approved": pre_approved,
                 "recheck_approved": post_approved,
             }
-        payload = execute_controlled_alternative(
-            binding=binding,
-            arguments=arguments,
-            recheck=_post_propose_recheck,
-        )
-        return local_mcp_result(request_id, payload)
+
+        def _before_execute_claim() -> None:
+            if not (
+                is_semantic_controlled_alternative_tool(tool_name)
+                and self._active_redirect_context is not None
+            ):
+                return
+            claim_error = self._finalize_redirect_lineage_claim(
+                request_id,
+                classification,
+            )
+            if claim_error is not None:
+                raise ControlledAlternativeExecutionAbort(claim_error)
+
+        try:
+            payload = execute_controlled_alternative(
+                binding=binding,
+                arguments=normalized_arguments,
+                recheck=_post_propose_recheck,
+                before_execute=_before_execute_claim,
+            )
+        except ControlledAlternativeExecutionAbort as exc:
+            if exc.abort_response is not None:
+                return exc.abort_response
+            return local_mcp_result(
+                request_id,
+                {
+                    "mechanism_status": "error",
+                    "error_code": "request_malformed",
+                    "target_reached": False,
+                    "rollback_available": False,
+                    "verification_level": "not_verified",
+                },
+            )
+        response = local_mcp_result(request_id, payload)
+        if (
+            is_semantic_controlled_alternative_tool(tool_name)
+            and self._active_redirect_lineage_claimed
+            and isinstance(classification, ClassifiedToolCall)
+        ):
+            self._record_controlled_alternative_redirect_follow_up(
+                classification,
+                request_id,
+                payload,
+                response,
+            )
+        return response
 
     @staticmethod
     def _cleanup_record_matches_classification(
@@ -4871,6 +5003,66 @@ class McpPassthrough:
         except ApprovalEvidenceError:
             return
         manager._notify_terminal_evidence(updated)
+
+    def _record_controlled_alternative_redirect_follow_up(
+        self,
+        classification: ClassifiedToolCall,
+        request_id: Any,
+        payload: Mapping[str, Any],
+        response: dict[str, Any],
+    ) -> None:
+        """Persist verified redirect lineage for one local semantic follow-up."""
+
+        if not self._active_redirect_lineage_claimed:
+            return
+        redirect_context = self._active_redirect_context
+        if redirect_context is None:
+            return
+        if payload.get("mechanism_status") != "success" or payload.get("target_reached") is not True:
+            return
+        store = self._controlled_path_store()
+        manager = self.approval_manager
+        if store is None or manager is None:
+            return
+        request_id_text = str(request_id) if request_id is not None else str(uuid.uuid4())
+        metadata = build_redirect_automation_metadata(
+            fixture_id=self._controlled_path_fixture_id(classification),
+            tool_name=classification.tool,
+            policy_decision=classification.policy_evaluation.decision.value,
+            policy_rule_id=classification.policy_evaluation.policy_rule_id,
+            approval_status=ApprovalStatus.EXECUTED.value,
+            execution_status=ApprovalStatus.EXECUTED.value,
+            target_reached=True,
+            request_id=request_id_text,
+            request_chain=[redirect_context.original_request_id, request_id_text],
+            payload_hash=classification.payload_hash,
+            redirect_role=REDIRECT_ROLE_FOLLOW_UP,
+            redirect_playbook_id=redirect_context.redirect_playbook_id,
+            redirect_parent_request_id=redirect_context.original_request_id,
+            original_request_id=redirect_context.original_request_id,
+            **self._least_agency_metadata_fields(classification),
+        )
+        metadata = self._apply_verified_lineage_metadata(metadata)
+        try:
+            store.record_allow_execution(
+                request_id=request_id_text,
+                session_id=getattr(manager, "session_id", None) or str(uuid.uuid4()),
+                client_id=getattr(manager, "client_id", None),
+                downstream_server=classification.server,
+                tool_name=classification.tool,
+                action_class=classification.risk_class.value,
+                risk_class=classification.risk_class.value,
+                resource_hash=classification.resource_hash,
+                payload_hash=classification.payload_hash,
+                policy_id=classification.policy_evaluation.policy_id,
+                policy_rule_id=classification.policy_evaluation.policy_rule_id,
+                policy_context_hash=classification.policy_evaluation.policy_context_hash,
+                created_at=int(time.time()),
+                result_hash=sha256_jcs(response.get("result", {})),
+                action_gate_metadata_jcs=self._metadata_jcs(metadata, classification),
+            )
+        except ApprovalEvidenceError:
+            return
 
     def _record_allow_controlled_path_if_needed(
         self,

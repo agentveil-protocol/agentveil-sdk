@@ -155,9 +155,9 @@ def _assert_available_envelope(envelope: NativeControlledGuidanceEnvelope) -> No
     assert "schema_version=1" in text
     assert "suggestion_status=available" in text
     assert "reason=exact_single_target_delete" in text
-    assert "alternative.id=filesystem.stage_delete.v1" in text
-    assert "alternative.tool_contract=agentveil_controlled_alternative" in text
+    assert "alternative.tool_contract=agentveil_stage_delete" in text
     assert "alternative.input.path=notes.txt" in text
+    assert "alternative.id=" not in text
     assert "non-authorizing" in text
     for word in _AUTHORITY_WORDS:
         assert word not in text
@@ -371,7 +371,7 @@ def test_envelope_from_mapping_rejects_authority_and_invalid_available() -> None
     with pytest.raises(ValueError):
         ControlledAlternativeSuggestion(
             id="filesystem.stage_delete.v1",
-            tool_contract="agentveil_controlled_alternative",
+            tool_contract="agentveil_stage_delete",
             input={"path": _CANARY_ABS},
         )
     with pytest.raises(ValueError):
@@ -839,3 +839,30 @@ def test_static_suggestion_does_not_leak_config_or_absolute_paths(tmp_path: Path
     assert str(sandbox) not in message
     assert _CANARY_ABS not in message
     assert "secret-canary-token" not in message
+
+
+def test_exact_delete_live_redirect_registers_controlled_stage_delete(tmp_path: Path) -> None:
+    from agentveil_mcp_proxy.client_guidance import (
+        NATIVE_CONTROLLED_STAGE_DELETE_PLAYBOOK_ID,
+        register_exact_delete_redirect_origin,
+    )
+    from agentveil_mcp_proxy.controlled_alternatives import SEMANTIC_STAGE_DELETE_TOOL_NAME
+    from redirect_hook_contract_fixtures import publish_live_hook_binding
+
+    home, _sandbox, downstream = init_redirect_contract_home(tmp_path)
+    fixture = publish_live_hook_binding(home, downstream=downstream)
+    try:
+        origin = register_exact_delete_redirect_origin(
+            proxy_home=home,
+            native_server="codex",
+            native_tool="apply_patch",
+            relative_path="notes.txt",
+            action_family="filesystem",
+            risk_class="write",
+        )
+        assert origin is not None
+        assert origin.redirect_playbook_id == NATIVE_CONTROLLED_STAGE_DELETE_PLAYBOOK_ID
+        assert origin.follow_up_tool == SEMANTIC_STAGE_DELETE_TOOL_NAME
+        assert origin.redirect_context["redirect_playbook_id"] == "controlled_stage_delete"
+    finally:
+        fixture.lease.close()

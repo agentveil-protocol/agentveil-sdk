@@ -689,7 +689,9 @@ def test_cursor_apply_patch_delete_with_binding_is_redirect_and_available(tmp_pa
         assert decision.disposition.value == "redirect"
         assert decision.reason_code == "managed_route_redirect"
         assert "suggestion_status=available" in response["agent_message"]
-        assert "alternative.id=filesystem.stage_delete.v1" in response["agent_message"]
+        assert "alternative.tool_contract=agentveil_stage_delete" in response["agent_message"]
+        assert "alternative.input.path=notes.txt" in response["agent_message"]
+        assert "alternative.id=" not in response["agent_message"]
         assert "alternative.input.path=notes.txt" in response["agent_message"]
     finally:
         fixture.lease.close()
@@ -745,7 +747,9 @@ def test_cursor_trusted_static_exact_delete_is_hard_block_with_available_suggest
     assert decision.disposition.value == "hard_block"
     assert parse_redirect_context_from_cursor_hook_output(response) is None
     assert "suggestion_status=available" in message
-    assert "alternative.id=filesystem.stage_delete.v1" in message
+    assert "alternative.tool_contract=agentveil_stage_delete" in message
+    assert "alternative.input.path=notes.txt" in message
+    assert "alternative.id=" not in message
     assert "alternative.input.path=notes.txt" in message
     assert "not currently available" not in message
     assert str(home) not in message

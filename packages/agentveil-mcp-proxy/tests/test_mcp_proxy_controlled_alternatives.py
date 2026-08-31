@@ -29,12 +29,23 @@ from agentveil_mcp_proxy.controlled_alternatives import (
     ERROR_REQUEST_MALFORMED,
     ERROR_RESULT_UNSAFE,
     GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+    SEMANTIC_CLEANUP_STAGED_TOOL_NAME,
+    SEMANTIC_RESTORE_STAGED_TOOL_NAME,
+    SEMANTIC_STAGE_DELETE_TOOL_NAME,
+    SEMANTIC_TOOL_BY_ALTERNATIVE_ID,
     ControlledAlternativeBoundedLocalInput,
     ControlledAlternativeProviderDescriptor,
     ControlledAlternativeProviderResult,
     ControlledAlternativeValidationError,
     build_controlled_alternative_tool_schema,
+    build_semantic_controlled_alternative_tool_schema,
+    build_semantic_controlled_alternative_tool_schemas,
     discover_controlled_alternative_provider,
+    is_controlled_alternative_tool_name,
+    is_semantic_controlled_alternative_tool,
+    normalize_semantic_tool_call,
+    semantic_alternative_id_for_tool,
+    semantic_tool_name_for_alternative_id,
     set_controlled_alternative_provider_loader,
     validate_controlled_alternative_local_input,
     validate_provider_descriptor,
@@ -1730,3 +1741,71 @@ def test_run_free_builder_install_flow_restores_prior_state_when_provider_inacti
     vendor_dir = vendor_root(home) / f"{VENDORED_CA_PACKAGE_NAME}-{VENDORED_CA_PACKAGE_VERSION}"
     assert not vendor_dir.exists()
     assert FREE_BUILDER_CREDENTIAL not in install_state_path(home).read_text(encoding="utf-8")
+
+
+def test_semantic_tool_constants_and_mapping() -> None:
+    assert SEMANTIC_STAGE_DELETE_TOOL_NAME == "agentveil_stage_delete"
+    assert SEMANTIC_RESTORE_STAGED_TOOL_NAME == "agentveil_restore_staged"
+    assert SEMANTIC_CLEANUP_STAGED_TOOL_NAME == "agentveil_cleanup_staged"
+    assert semantic_alternative_id_for_tool(SEMANTIC_STAGE_DELETE_TOOL_NAME) == (
+        "filesystem.stage_delete.v1"
+    )
+    assert is_semantic_controlled_alternative_tool(SEMANTIC_STAGE_DELETE_TOOL_NAME)
+    assert is_controlled_alternative_tool_name(GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME)
+    assert is_controlled_alternative_tool_name(SEMANTIC_STAGE_DELETE_TOOL_NAME)
+    assert not is_semantic_controlled_alternative_tool(GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME)
+
+
+def test_semantic_schemas_project_exact_three_filesystem_tools() -> None:
+    jsonschema = pytest.importorskip("jsonschema")
+    descriptor = validate_provider_descriptor(_valid_descriptor_payload())
+    schemas = build_semantic_controlled_alternative_tool_schemas(descriptor)
+    assert [schema["name"] for schema in schemas] == [
+        SEMANTIC_STAGE_DELETE_TOOL_NAME,
+        SEMANTIC_RESTORE_STAGED_TOOL_NAME,
+        SEMANTIC_CLEANUP_STAGED_TOOL_NAME,
+    ]
+    stage = schemas[0]
+    assert stage["inputSchema"]["additionalProperties"] is False
+    assert "alternative_id" not in json.dumps(stage["inputSchema"])
+    jsonschema.validate({"path": "notes.txt"}, stage["inputSchema"])
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({"path": "notes.txt", "alternative_id": "x"}, stage["inputSchema"])
+
+
+def test_normalize_semantic_tool_call_maps_to_generic_shape() -> None:
+    mapped = normalize_semantic_tool_call(
+        SEMANTIC_STAGE_DELETE_TOOL_NAME,
+        {"path": "notes.txt"},
+    )
+    assert mapped == {
+        "alternative_id": "filesystem.stage_delete.v1",
+        "input": {"path": "notes.txt"},
+    }
+
+
+def test_normalize_semantic_tool_call_rejects_malformed_input() -> None:
+    with pytest.raises(ControlledAlternativeValidationError) as exc:
+        normalize_semantic_tool_call(SEMANTIC_STAGE_DELETE_TOOL_NAME, {"path": "notes.txt", "extra": 1})
+    _assert_bounded_error(exc, ERROR_REQUEST_MALFORMED)
+    with pytest.raises(ControlledAlternativeValidationError) as wrong_type:
+        normalize_semantic_tool_call(SEMANTIC_RESTORE_STAGED_TOOL_NAME, {"quarantine_entry_id": 123})
+    _assert_bounded_error(wrong_type, ERROR_REQUEST_MALFORMED)
+
+
+def test_semantic_mapping_is_immutable_and_total() -> None:
+    with pytest.raises(TypeError):
+        SEMANTIC_TOOL_BY_ALTERNATIVE_ID["filesystem.stage_delete.v1"] = "mutated"  # type: ignore[index]
+    assert not hasattr(ca_mod, "_SEMANTIC_TOOL_BY_ALTERNATIVE_ID_RAW")
+    for name, value in vars(ca_mod).items():
+        if name.startswith("_SEMANTIC") and isinstance(value, dict):
+            pytest.fail(f"mutable semantic backing dict exposed: {name}")
+    assert semantic_alternative_id_for_tool(1) is None
+    assert semantic_alternative_id_for_tool("unknown") is None
+    assert semantic_tool_name_for_alternative_id(1) is None
+    assert semantic_tool_name_for_alternative_id("unknown") is None
+    with pytest.raises(ControlledAlternativeValidationError) as unknown_alt:
+        build_semantic_controlled_alternative_tool_schema("unknown")
+    _assert_bounded_error(unknown_alt, ERROR_DESCRIPTOR_INVALID)
+    stage = build_semantic_controlled_alternative_tool_schema("filesystem.stage_delete.v1")
+    assert "file or directory" in stage["description"]

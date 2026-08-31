@@ -24,11 +24,16 @@ from agentveil_mcp_proxy.controlled_alternatives import (
     CONTROLLED_ALTERNATIVES_PROFILE_ID,
     ERROR_REQUEST_MALFORMED,
     GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+    RESERVED_CONTROLLED_ALTERNATIVE_TOOL_NAMES,
     ControlledAlternativeProvider,
     ControlledAlternativeProviderResult,
     ControlledAlternativeValidationError,
     build_controlled_alternative_tool_schema,
+    build_semantic_controlled_alternative_tool_schemas,
     discover_controlled_alternative_provider,
+    is_semantic_controlled_alternative_tool,
+    normalize_semantic_tool_call,
+    semantic_alternative_id_for_tool,
     validate_controlled_alternative_local_input,
     validate_provider_request,
     validate_provider_result,
@@ -48,6 +53,14 @@ _WRITE_ALTERNATIVES = frozenset({_STAGE_DELETE, _RESTORE})
 _JSONRPC_VERSION = "2.0"
 
 
+class ControlledAlternativeExecutionAbort(Exception):
+    """Stop before provider execute after successful propose and re-check."""
+
+    def __init__(self, abort_response: Any = None) -> None:
+        self.abort_response = abort_response
+        super().__init__()
+
+
 @dataclass(frozen=True)
 class ControlledAlternativeRuntimeBinding:
     """Process-lifetime local binding for one compatible installed provider."""
@@ -59,6 +72,7 @@ class ControlledAlternativeRuntimeBinding:
     state_root: str = field(repr=False)
     route_id: str = field(repr=False)
     st_dev: int = field(repr=False)
+    semantic_schemas: tuple[dict[str, Any], ...] = ()
 
 
 def bind_controlled_alternative_runtime(
@@ -100,10 +114,12 @@ def bind_controlled_alternative_runtime(
         if not isinstance(route_id, str) or not route_id:
             return None
         schema = build_controlled_alternative_tool_schema(discovered.descriptor)
+        semantic_schemas = build_semantic_controlled_alternative_tool_schemas(discovered.descriptor)
         return ControlledAlternativeRuntimeBinding(
             provider=discovered.provider,
             descriptor=discovered.descriptor,
             schema=schema,
+            semantic_schemas=semantic_schemas,
             workspace_root=workspace_root,
             state_root=state_root,
             route_id=route_id,
@@ -114,7 +130,7 @@ def bind_controlled_alternative_runtime(
 
 
 def controlled_alternative_catalog_collision(response: Any) -> bool:
-    """Return True when downstream already advertises the generic tool name."""
+    """Return True when downstream already advertises a reserved controlled tool name."""
 
     if not isinstance(response, dict):
         return False
@@ -125,7 +141,8 @@ def controlled_alternative_catalog_collision(response: Any) -> bool:
     if not isinstance(tools, list):
         return False
     return any(
-        isinstance(tool, Mapping) and tool.get("name") == GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME
+        isinstance(tool, Mapping)
+        and tool.get("name") in RESERVED_CONTROLLED_ALTERNATIVE_TOOL_NAMES
         for tool in tools
     )
 
@@ -134,7 +151,7 @@ def inject_controlled_alternative_tool(
     response: Any,
     binding: ControlledAlternativeRuntimeBinding | None,
 ) -> Any:
-    """Append the generic tool to a tools/list-shaped response when bound."""
+    """Append generic and semantic controlled tools to a tools/list-shaped response."""
 
     if binding is None or not isinstance(response, dict):
         return response
@@ -151,11 +168,19 @@ def inject_controlled_alternative_tool(
         for tool in tools
         if isinstance(tool, Mapping) and isinstance(tool.get("name"), str)
     }
-    if GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME in names:
+    additions = [dict(binding.schema), *[dict(schema) for schema in binding.semantic_schemas]]
+    appended = list(tools)
+    for schema in additions:
+        name = schema.get("name")
+        if not isinstance(name, str) or name in names:
+            continue
+        appended.append(schema)
+        names.add(name)
+    if appended == tools:
         return response
     injected = dict(response)
     injected_result = dict(result)
-    injected_result["tools"] = [*tools, dict(binding.schema)]
+    injected_result["tools"] = appended
     injected["result"] = injected_result
     return injected
 
@@ -165,6 +190,59 @@ def alternative_id_from_arguments(arguments: Mapping[str, Any] | None) -> str | 
         return None
     value = arguments.get("alternative_id")
     return value if isinstance(value, str) and value else None
+
+
+def alternative_id_from_tool_call(tool_name: str, arguments: Mapping[str, Any] | None) -> str | None:
+    if tool_name == GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME:
+        return alternative_id_from_arguments(arguments)
+    if is_semantic_controlled_alternative_tool(tool_name):
+        return semantic_alternative_id_for_tool(tool_name)
+    return None
+
+
+def normalize_controlled_alternative_arguments(
+    tool_name: str,
+    arguments: Mapping[str, Any],
+) -> dict[str, Any]:
+    if tool_name == GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME:
+        if not isinstance(arguments, Mapping):
+            raise ControlledAlternativeValidationError(ERROR_REQUEST_MALFORMED)
+        return dict(arguments)
+    if is_semantic_controlled_alternative_tool(tool_name):
+        return normalize_semantic_tool_call(tool_name, arguments)
+    raise ControlledAlternativeValidationError(ERROR_REQUEST_MALFORMED)
+
+
+def semantic_resource_label(tool_name: str, arguments: Mapping[str, Any]) -> str | None:
+    if not is_semantic_controlled_alternative_tool(tool_name):
+        return None
+    for key in ("path", "quarantine_entry_id", "worktree_path"):
+        value = arguments.get(key)
+        if isinstance(value, str) and value:
+            return f"{key}:redacted"
+    return None
+
+
+def semantic_resource_exact(tool_name: str, arguments: Mapping[str, Any]) -> str | None:
+    if not is_semantic_controlled_alternative_tool(tool_name):
+        return None
+    for key in ("path", "quarantine_entry_id", "worktree_path"):
+        value = arguments.get(key)
+        if isinstance(value, str) and value:
+            return f"{key}:{value}"
+    return None
+
+
+def semantic_tool_is_projected(
+    binding: ControlledAlternativeRuntimeBinding,
+    tool_name: str,
+) -> bool:
+    if not is_semantic_controlled_alternative_tool(tool_name):
+        return False
+    return any(
+        isinstance(schema.get("name"), str) and schema.get("name") == tool_name
+        for schema in binding.semantic_schemas
+    )
 
 
 def nested_resource_exact(arguments: Mapping[str, Any]) -> str | None:
@@ -243,6 +321,7 @@ def execute_controlled_alternative(
     arguments: Mapping[str, Any],
     invocation_phase: str = "execute",
     recheck: Callable[[], Mapping[str, Any] | None] | None = None,
+    before_execute: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Run propose → re-check → execute → verify and project a bounded result."""
 
@@ -284,6 +363,8 @@ def execute_controlled_alternative(
         snapshot = recheck()
         if not _recheck_authorized(snapshot, binding):
             raise ControlledAlternativeValidationError(ERROR_REQUEST_MALFORMED)
+        if callable(before_execute):
+            before_execute()
         executed = _invoke_phase(
             binding,
             "execute",
@@ -330,6 +411,8 @@ def execute_controlled_alternative(
             verified=True,
             normalized_path=path if isinstance(path, str) else None,
         )
+    except ControlledAlternativeExecutionAbort:
+        raise
     except ControlledAlternativeValidationError as exc:
         return {
             "mechanism_status": "error",

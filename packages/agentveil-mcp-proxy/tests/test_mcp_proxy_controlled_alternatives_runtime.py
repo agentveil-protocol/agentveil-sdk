@@ -16,7 +16,11 @@ from agentveil_mcp_proxy.controlled_alternatives import (
     CONTROLLED_ALTERNATIVE_PROVIDER_ID,
     CONTROLLED_ALTERNATIVES_PROFILE_ID,
     GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+    SEMANTIC_CLEANUP_STAGED_TOOL_NAME,
+    SEMANTIC_RESTORE_STAGED_TOOL_NAME,
+    SEMANTIC_STAGE_DELETE_TOOL_NAME,
     build_controlled_alternative_tool_schema,
+    build_semantic_controlled_alternative_tool_schemas,
     validate_provider_descriptor,
 )
 from agentveil_mcp_proxy.controlled_alternatives_runtime import (
@@ -43,6 +47,11 @@ def _descriptor():
         "profile_id": CONTROLLED_ALTERNATIVES_PROFILE_ID,
         "alternative_ids": list(CONTROLLED_ALTERNATIVE_IDS),
     })
+
+
+def _expected_controlled_tool_names(descriptor) -> list[str]:
+    semantic = [schema["name"] for schema in build_semantic_controlled_alternative_tool_schemas(descriptor)]
+    return [GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME, *semantic]
 
 
 class _FakeProvider:
@@ -147,8 +156,8 @@ class _FakeProvider:
 def _binding(tmp_path: Path) -> ControlledAlternativeRuntimeBinding:
     workspace = tmp_path / "workspace"
     home = workspace / ".avp"
-    workspace.mkdir(exist_ok=True)
-    home.mkdir(exist_ok=True)
+    workspace.mkdir(parents=True, exist_ok=True)
+    home.mkdir(parents=True, exist_ok=True)
     (workspace / SECRET_PATH).write_text("secret-bytes", encoding="utf-8")
     provider = _FakeProvider(workspace)
     descriptor = _descriptor()
@@ -160,6 +169,7 @@ def _binding(tmp_path: Path) -> ControlledAlternativeRuntimeBinding:
         state_root=str(home.resolve()),
         route_id="sha256:" + ("ab" * 32),
         st_dev=workspace.stat().st_dev,
+        semantic_schemas=build_semantic_controlled_alternative_tool_schemas(descriptor),
     )
 
 
@@ -225,7 +235,7 @@ def test_inject_and_stage_restore_cleanup(tmp_path: Path) -> None:
         binding,
     )
     names = [tool["name"] for tool in listed["result"]["tools"]]
-    assert names == ["read_file", GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME]
+    assert names == ["read_file", *_expected_controlled_tool_names(_descriptor())]
     secret = Path(binding.workspace_root) / SECRET_PATH
     staged = execute_controlled_alternative(
         binding=binding,
@@ -505,7 +515,7 @@ def _bound_passthrough(tmp_path: Path, *, mode: str = "observe", approval_manage
         controlled_runtime=binding,
     )
     passthrough._tool_schemas.update_from_response(
-        {"result": {"tools": [binding.schema, {"name": "read_file"}]}}
+        {"result": {"tools": [binding.schema, *binding.semantic_schemas, {"name": "read_file"}]}}
     )
     return binding, passthrough
 
@@ -1164,7 +1174,7 @@ def test_isolated_vendored_853adf5_wheel_stage_restore(
     )
     assert [tool["name"] for tool in listed["result"]["tools"]] == [
         "read_file",
-        GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+        *_expected_controlled_tool_names(_descriptor()),
     ]
     passthrough._tool_schemas.update_from_response(listed)
     forwarded = passthrough._downstream_tool_calls_forwarded
@@ -1267,3 +1277,694 @@ def test_direct_allow_classes_do_not_call_provider_and_stay_within_baseline(
         completion_budget = max(base["completion"]["p95"] * 0.05, 10.0)
         assert current["pre_result"]["p95"] <= base["pre_result"]["p95"] + pre_budget
         assert current["completion"]["p95"] <= base["completion"]["p95"] + completion_budget
+
+
+def _semantic_line(call_id: str, tool_name: str, arguments: dict) -> str:
+    return json.dumps({
+        "jsonrpc": "2.0",
+        "id": call_id,
+        "method": "tools/call",
+        "params": {"name": tool_name, "arguments": arguments},
+    })
+
+
+def test_semantic_stage_delete_passthrough_never_forwards(tmp_path: Path) -> None:
+    binding, passthrough = _bound_passthrough(tmp_path)
+    passthrough._tool_schemas.update_from_response(
+        {"result": {"tools": [binding.schema, *binding.semantic_schemas, {"name": "read_file"}]}}
+    )
+    before = passthrough._downstream_tool_calls_forwarded
+    responses = passthrough.handle_client_line(
+        _semantic_line("sem-stage", SEMANTIC_STAGE_DELETE_TOOL_NAME, {"path": SECRET_PATH})
+    )
+    assert passthrough._downstream_tool_calls_forwarded == before
+    body = json.loads(responses[0]["result"]["content"][0]["text"])
+    assert body["mechanism_status"] == "success"
+    assert body["quarantine_entry_id"] == QUARANTINE_ID
+
+
+def test_forged_semantic_call_without_binding_never_forwards() -> None:
+    passthrough = McpPassthrough(DownstreamConfig(command="python", args=(), name="plain"))
+    passthrough._tool_schemas.update_from_response(
+        {"result": {"tools": [{"name": "read_file"}]}}
+    )
+    before = passthrough._downstream_tool_calls_forwarded
+    responses = passthrough.handle_client_line(
+        _semantic_line("forge-sem", SEMANTIC_STAGE_DELETE_TOOL_NAME, {"path": SECRET_PATH})
+    )
+    assert passthrough._downstream_tool_calls_forwarded == before
+    assert responses[0]["error"]["data"]["reason"] == "unknown_tool"
+
+
+def test_semantic_catalog_collision_blocks_injection(tmp_path: Path) -> None:
+    binding = _binding(tmp_path)
+    listed = inject_controlled_alternative_tool(
+        {"result": {"tools": [{"name": SEMANTIC_STAGE_DELETE_TOOL_NAME}]}},
+        binding,
+    )
+    assert [tool["name"] for tool in listed["result"]["tools"]] == [SEMANTIC_STAGE_DELETE_TOOL_NAME]
+
+
+def test_malformed_semantic_call_returns_bounded_local_error(tmp_path: Path) -> None:
+    binding, passthrough = _bound_passthrough(tmp_path)
+    passthrough._tool_schemas.update_from_response(
+        {"result": {"tools": [*binding.semantic_schemas]}}
+    )
+    responses = passthrough.handle_client_line(
+        _semantic_line("bad-sem", SEMANTIC_STAGE_DELETE_TOOL_NAME, {"path": SECRET_PATH, "extra": 1})
+    )
+    body = json.loads(responses[0]["result"]["content"][0]["text"])
+    assert body["mechanism_status"] == "error"
+    assert body["error_code"] == "request_malformed"
+    assert binding.provider.calls == []
+
+
+def test_malformed_semantic_cleanup_has_zero_approval_provider_downstream(tmp_path: Path) -> None:
+    manager = _DecisionManager("pending")
+    binding, passthrough = _bound_passthrough(tmp_path, mode="protect", approval_manager=manager)
+    before_downstream = passthrough._downstream_tool_calls_forwarded
+    responses = passthrough.handle_client_line(
+        _semantic_line(
+            "bad-cleanup",
+            SEMANTIC_CLEANUP_STAGED_TOOL_NAME,
+            {"quarantine_entry_id": QUARANTINE_ID, "extra": 1},
+        )
+    )
+    body = json.loads(responses[0]["result"]["content"][0]["text"])
+    assert body["mechanism_status"] == "error"
+    assert body["error_code"] == "request_malformed"
+    assert manager.requests == 0
+    assert binding.provider.calls == []
+    assert passthrough._downstream_tool_calls_forwarded == before_downstream
+
+
+def test_absent_binding_semantic_cleanup_has_zero_approval_provider_downstream() -> None:
+    manager = _DecisionManager("pending")
+    passthrough = McpPassthrough(
+        DownstreamConfig(command="python", args=(), name="plain"),
+        classifier=ToolCallClassifier(_config(mode="protect"), server_name="plain"),
+        approval_manager=manager,
+        controlled_runtime=None,
+    )
+    before_downstream = passthrough._downstream_tool_calls_forwarded
+    responses = passthrough.handle_client_line(
+        _semantic_line(
+            "absent-cleanup",
+            SEMANTIC_CLEANUP_STAGED_TOOL_NAME,
+            {"quarantine_entry_id": QUARANTINE_ID},
+        )
+    )
+    assert responses[0]["error"]["data"]["reason"] == "unknown_tool"
+    assert manager.requests == 0
+    assert passthrough._downstream_tool_calls_forwarded == before_downstream
+
+
+def test_unprojected_semantic_cleanup_has_zero_approval_provider_downstream(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    manager = _DecisionManager("pending")
+    binding = _binding(tmp_path)
+    projected = tuple(
+        schema
+        for schema in binding.semantic_schemas
+        if schema.get("name") != SEMANTIC_CLEANUP_STAGED_TOOL_NAME
+    )
+    binding = replace(binding, semantic_schemas=projected)
+    passthrough = McpPassthrough(
+        DownstreamConfig(command="python", args=(), name="plain"),
+        classifier=ToolCallClassifier(_config(mode="protect"), server_name="plain"),
+        approval_manager=manager,
+        controlled_runtime=binding,
+    )
+    passthrough._tool_schemas.update_from_response(
+        {"result": {"tools": [binding.schema, *binding.semantic_schemas]}}
+    )
+    before_downstream = passthrough._downstream_tool_calls_forwarded
+    responses = passthrough.handle_client_line(
+        _semantic_line(
+            "unproj-cleanup",
+            SEMANTIC_CLEANUP_STAGED_TOOL_NAME,
+            {"quarantine_entry_id": QUARANTINE_ID},
+        )
+    )
+    assert responses[0]["error"]["data"]["reason"] == "unknown_tool"
+    assert manager.requests == 0
+    assert binding.provider.calls == []
+    assert passthrough._downstream_tool_calls_forwarded == before_downstream
+
+
+def test_semantic_restore_and_cleanup_happy_paths(tmp_path: Path) -> None:
+    binding, passthrough = _bound_passthrough(tmp_path)
+    staged = passthrough.handle_client_line(
+        _semantic_line("sem-stage", SEMANTIC_STAGE_DELETE_TOOL_NAME, {"path": SECRET_PATH})
+    )
+    staged_body = json.loads(staged[0]["result"]["content"][0]["text"])
+    assert staged_body["mechanism_status"] == "success"
+    qid = staged_body["quarantine_entry_id"]
+    restored = passthrough.handle_client_line(
+        _semantic_line("sem-restore", SEMANTIC_RESTORE_STAGED_TOOL_NAME, {"quarantine_entry_id": qid})
+    )
+    restored_body = json.loads(restored[0]["result"]["content"][0]["text"])
+    assert restored_body["mechanism_status"] == "success"
+    from agentveil_mcp_proxy.evidence import ApprovalStatus
+
+    manager = _DecisionManager(ApprovalStatus.APPROVED.value, bind=True)
+    cleanup_binding, cleanup_pt = _bound_passthrough(tmp_path, mode="observe", approval_manager=manager)
+    manager.metadata_jcs = _cleanup_metadata_jcs(cleanup_binding)
+    cleaned = cleanup_pt.handle_client_line(
+        _semantic_line("sem-cleanup", SEMANTIC_CLEANUP_STAGED_TOOL_NAME, {"quarantine_entry_id": qid})
+    )
+    cleaned_body = json.loads(cleaned[0]["result"]["content"][0]["text"])
+    assert cleaned_body["mechanism_status"] == "success"
+    assert manager.requests == 1
+    assert [item for item in cleanup_binding.provider.calls if item.startswith("execute:")] == [
+        f"execute:{CLEANUP}",
+    ]
+
+
+class _LineageManager:
+    def __init__(
+        self,
+        store,
+        *,
+        session_id: str = "sess-sem-lineage",
+        client_id: str = "client-sem-lineage",
+    ) -> None:
+        self.evidence_store = store
+        self.session_id = session_id
+        self.client_id = client_id
+        self.requests = 0
+
+    def request_approval(self, *_args, **_kwargs):
+        self.requests += 1
+        raise AssertionError("semantic redirect lineage tests must not request approval")
+
+
+def _redirect_lineage_claim_count(store_path: Path) -> int:
+    import sqlite3
+
+    if not store_path.exists():
+        return 0
+    with sqlite3.connect(store_path) as conn:
+        row = conn.execute("SELECT COUNT(*) FROM redirect_lineage_claims").fetchone()
+    return int(row[0])
+
+
+def _follow_up_metadata(store_path: Path, request_id: str) -> dict | None:
+    import sqlite3
+
+    if not store_path.exists():
+        return None
+    with sqlite3.connect(store_path) as conn:
+        row = conn.execute(
+            "SELECT action_gate_metadata_jcs FROM pending_approvals WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+    if row is None or not isinstance(row[0], str) or not row[0]:
+        return None
+    parsed = json.loads(row[0])
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _seed_controlled_stage_delete_origin(
+    store,
+    manager: _LineageManager,
+    binding: ControlledAlternativeRuntimeBinding,
+    classifier: ToolCallClassifier,
+    *,
+    original_request_id: str = "orig-sem-delete",
+    path: str = SECRET_PATH,
+    created_at: int | None = None,
+) -> str:
+    from agentveil_mcp_proxy.client_guidance import (
+        NATIVE_CONTROLLED_STAGE_DELETE_PLAYBOOK_ID,
+        NATIVE_REDIRECT_ORIGIN_REASON,
+    )
+    from agentveil_mcp_proxy.classification import sha256_text
+    from agentveil_mcp_proxy.policy import build_redirect_automation_metadata
+
+    classified = classifier.classify(
+        tool=SEMANTIC_STAGE_DELETE_TOOL_NAME,
+        arguments={"path": path},
+    )
+    assert classified is not None
+    metadata = build_redirect_automation_metadata(
+        fixture_id="semantic-lineage",
+        tool_name="apply_patch",
+        policy_decision="block",
+        policy_rule_id=None,
+        approval_status="blocked",  # claim-check: allow tested bounded evidence status.
+        execution_status="blocked",  # claim-check: allow tested bounded evidence status.
+        target_reached=False,
+        request_id=original_request_id,
+        payload_hash=classified.payload_hash,
+        action_family="filesystem",
+        redirect_role="original",
+        redirect_playbook_id=NATIVE_CONTROLLED_STAGE_DELETE_PLAYBOOK_ID,
+        original_request_id=original_request_id,
+        project_scope_fingerprint=binding.route_id,
+    )
+    metadata["native_hook_denied"] = True
+    metadata["follow_up_tool"] = SEMANTIC_STAGE_DELETE_TOOL_NAME
+    metadata_jcs = json.dumps(metadata, separators=(",", ":"), sort_keys=True)
+    store.record_terminal_deny(
+        request_id=original_request_id,
+        session_id=manager.session_id,
+        client_id=manager.client_id,
+        downstream_server=classified.server,
+        tool_name="apply_patch",
+        risk_class="write",
+        resource_hash=classified.resource_hash,
+        payload_hash=classified.payload_hash,
+        policy_id="semantic-lineage-test",
+        policy_rule_id=None,
+        policy_context_hash=sha256_text("semantic-lineage-test").removeprefix("sha256:"),
+        created_at=created_at or int(time.time()),
+        reason=NATIVE_REDIRECT_ORIGIN_REASON,
+        action_gate_metadata_jcs=metadata_jcs,
+    )
+    return original_request_id
+
+
+def _semantic_redirect_line(
+    call_id: str,
+    tool_name: str,
+    arguments: dict,
+    *,
+    original_request_id: str,
+    playbook_id: str = "controlled_stage_delete",
+) -> str:
+    payload = dict(arguments)
+    payload["redirect_context"] = {
+        "original_request_id": original_request_id,
+        "redirect_playbook_id": playbook_id,
+    }
+    return _semantic_line(call_id, tool_name, payload)
+
+
+def _lineage_passthrough(
+    tmp_path: Path,
+    store,
+    manager: _LineageManager,
+):
+    binding = _binding(tmp_path)
+    classifier = ToolCallClassifier(_config(mode="observe"), server_name="plain")
+    passthrough = McpPassthrough(
+        DownstreamConfig(command="python", args=(), name="plain"),
+        classifier=classifier,
+        approval_manager=manager,
+        controlled_runtime=binding,
+    )
+    passthrough._tool_schemas.update_from_response(
+        {"result": {"tools": [binding.schema, *binding.semantic_schemas, {"name": "read_file"}]}}
+    )
+    passthrough._current_project_scope_fingerprint = lambda **_kwargs: binding.route_id  # type: ignore[method-assign]
+    return binding, passthrough, classifier, store.db_path
+
+
+def test_semantic_redirect_context_records_verified_lineage_and_single_execute(tmp_path: Path) -> None:
+    from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore
+
+    store = ApprovalEvidenceStore(tmp_path / "evidence.sqlite")
+    manager = _LineageManager(store)
+    binding, passthrough, classifier, store_path = _lineage_passthrough(tmp_path, store, manager)
+    original_request_id = _seed_controlled_stage_delete_origin(
+        store,
+        manager,
+        binding,
+        classifier,
+    )
+    responses = passthrough.handle_client_line(
+        _semantic_redirect_line(
+            "sem-lineage",
+            SEMANTIC_STAGE_DELETE_TOOL_NAME,
+            {"path": SECRET_PATH},
+            original_request_id=original_request_id,
+        )
+    )
+    body = json.loads(responses[0]["result"]["content"][0]["text"])
+    assert body["mechanism_status"] == "success"
+    assert manager.requests == 0
+    assert passthrough._downstream_tool_calls_forwarded == 0
+    assert [item for item in binding.provider.calls if item.startswith("execute:")] == [f"execute:{STAGE}"]
+    assert store_path is not None
+    assert _redirect_lineage_claim_count(store_path) == 1
+    follow_meta = _follow_up_metadata(store_path, "sem-lineage")
+    assert follow_meta is not None
+    assert follow_meta.get("lineage_status") == "verified"
+    assert follow_meta.get("original_request_id") == original_request_id
+    assert follow_meta.get("redirect_playbook_id") == "controlled_stage_delete"
+
+
+def test_semantic_redirect_replay_and_invalid_contexts_execute_zero(tmp_path: Path) -> None:
+    from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore
+    from agentveil_mcp_proxy.role_doctor import INVALID_REDIRECT_CONTEXT, REDIRECT_LINEAGE_MAX_AGE_SECONDS
+
+    store = ApprovalEvidenceStore(tmp_path / "evidence.sqlite")
+    manager = _LineageManager(store)
+    binding, passthrough, classifier, store_path = _lineage_passthrough(tmp_path, store, manager)
+    original_request_id = _seed_controlled_stage_delete_origin(
+        store,
+        manager,
+        binding,
+        classifier,
+    )
+    line = _semantic_redirect_line(
+        "sem-replay",
+        SEMANTIC_STAGE_DELETE_TOOL_NAME,
+        {"path": SECRET_PATH},
+        original_request_id=original_request_id,
+    )
+    first = passthrough.handle_client_line(line)
+    assert json.loads(first[0]["result"]["content"][0]["text"])["mechanism_status"] == "success"
+    execute_after_first = [item for item in binding.provider.calls if item.startswith("execute:")]
+    replay = passthrough.handle_client_line(line)
+    assert "error" in replay[0]
+    assert replay[0]["error"]["data"]["reason"] == INVALID_REDIRECT_CONTEXT
+    assert [item for item in binding.provider.calls if item.startswith("execute:")] == execute_after_first
+
+    wrong_tool = passthrough.handle_client_line(
+        _semantic_redirect_line(
+            "sem-wrong-tool",
+            SEMANTIC_RESTORE_STAGED_TOOL_NAME,
+            {"quarantine_entry_id": QUARANTINE_ID},
+            original_request_id=original_request_id,
+        )
+    )
+    assert "error" in wrong_tool[0]
+    assert wrong_tool[0]["error"]["data"]["reason"] in {
+        INVALID_REDIRECT_CONTEXT,
+        "unsupported_redirect_playbook",
+    }
+
+    wrong_target_store = ApprovalEvidenceStore(tmp_path / "evidence-target.sqlite")
+    wrong_target_manager = _LineageManager(wrong_target_store)
+    wrong_target_binding, wrong_target_pt, wrong_target_cls, _ = _lineage_passthrough(
+        tmp_path / "target",
+        wrong_target_store,
+        wrong_target_manager,
+    )
+    other_origin = _seed_controlled_stage_delete_origin(
+        wrong_target_store,
+        wrong_target_manager,
+        wrong_target_binding,
+        wrong_target_cls,
+        path="other.txt",
+    )
+    wrong_target = wrong_target_pt.handle_client_line(
+        _semantic_redirect_line(
+            "sem-wrong-target",
+            SEMANTIC_STAGE_DELETE_TOOL_NAME,
+            {"path": SECRET_PATH},
+            original_request_id=other_origin,
+        )
+    )
+    assert "error" in wrong_target[0]
+
+    original_session_manager = _LineageManager(store, session_id="sess-sem-lineage")
+    wrong_session_manager = _LineageManager(store, session_id="sess-other")
+    wrong_session_binding, wrong_session_pt, wrong_session_cls, _ = _lineage_passthrough(
+        tmp_path / "session",
+        store,
+        wrong_session_manager,
+    )
+    session_origin = _seed_controlled_stage_delete_origin(
+        store,
+        original_session_manager,
+        wrong_session_binding,
+        wrong_session_cls,
+        original_request_id="orig-sem-session",
+    )
+    wrong_session_pt._current_project_scope_fingerprint = lambda **_kwargs: wrong_session_binding.route_id  # type: ignore[method-assign]
+    wrong_session = wrong_session_pt.handle_client_line(
+        _semantic_redirect_line(
+            "sem-wrong-session",
+            SEMANTIC_STAGE_DELETE_TOOL_NAME,
+            {"path": SECRET_PATH},
+            original_request_id=session_origin,
+        )
+    )
+    assert "error" in wrong_session[0]
+
+    wrong_route_store = ApprovalEvidenceStore(tmp_path / "evidence-route.sqlite")
+    wrong_route_manager = _LineageManager(wrong_route_store)
+    wrong_route_binding, wrong_route_pt, wrong_route_cls, _ = _lineage_passthrough(
+        tmp_path / "route",
+        wrong_route_store,
+        wrong_route_manager,
+    )
+    wrong_route_pt._current_project_scope_fingerprint = lambda **_kwargs: "sha256:" + ("cd" * 32)  # type: ignore[method-assign]
+    route_origin = _seed_controlled_stage_delete_origin(
+        wrong_route_store,
+        wrong_route_manager,
+        wrong_route_binding,
+        wrong_route_cls,
+        original_request_id="orig-sem-route",
+    )
+    wrong_route = wrong_route_pt.handle_client_line(
+        _semantic_redirect_line(
+            "sem-wrong-route",
+            SEMANTIC_STAGE_DELETE_TOOL_NAME,
+            {"path": SECRET_PATH},
+            original_request_id=route_origin,
+        )
+    )
+    assert "error" in wrong_route[0]
+
+    stale_store = ApprovalEvidenceStore(tmp_path / "evidence-stale.sqlite")
+    stale_manager = _LineageManager(stale_store)
+    stale_binding, stale_pt, stale_cls, _ = _lineage_passthrough(
+        tmp_path / "stale",
+        stale_store,
+        stale_manager,
+    )
+    stale_origin = _seed_controlled_stage_delete_origin(
+        stale_store,
+        stale_manager,
+        stale_binding,
+        stale_cls,
+        created_at=int(time.time()) - REDIRECT_LINEAGE_MAX_AGE_SECONDS - 5,
+    )
+    stale = stale_pt.handle_client_line(
+        _semantic_redirect_line(
+            "sem-stale",
+            SEMANTIC_STAGE_DELETE_TOOL_NAME,
+            {"path": SECRET_PATH},
+            original_request_id=stale_origin,
+        )
+    )
+    assert "error" in stale[0]
+
+    forged = passthrough.handle_client_line(
+        _semantic_redirect_line(
+            "sem-forged",
+            SEMANTIC_STAGE_DELETE_TOOL_NAME,
+            {"path": SECRET_PATH},
+            original_request_id="missing-origin",
+        )
+    )
+    assert "error" in forged[0]
+    assert store_path is not None
+    assert _redirect_lineage_claim_count(store_path) == 1
+
+
+def test_semantic_catalog_collision_with_redirect_context_has_zero_effects(tmp_path: Path) -> None:
+    from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore
+
+    store = ApprovalEvidenceStore(tmp_path / "evidence.sqlite")
+    manager = _LineageManager(store)
+    binding, passthrough, classifier, store_path = _lineage_passthrough(tmp_path, store, manager)
+    original_request_id = _seed_controlled_stage_delete_origin(
+        store,
+        manager,
+        binding,
+        classifier,
+    )
+    passthrough._controlled_catalog_collision = True
+    before_downstream = passthrough._downstream_tool_calls_forwarded
+    responses = passthrough.handle_client_line(
+        _semantic_redirect_line(
+            "sem-collision",
+            SEMANTIC_STAGE_DELETE_TOOL_NAME,
+            {"path": SECRET_PATH},
+            original_request_id=original_request_id,
+        )
+    )
+    assert responses[0]["error"]["data"]["reason"] == "unknown_tool"
+    assert manager.requests == 0
+    assert binding.provider.calls == []
+    assert passthrough._downstream_tool_calls_forwarded == before_downstream
+    assert store_path is not None
+    assert _redirect_lineage_claim_count(store_path) == 0
+
+
+def test_semantic_redirect_errors_do_not_leak_private_paths(tmp_path: Path) -> None:
+    from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore
+
+    store = ApprovalEvidenceStore(tmp_path / "evidence.sqlite")
+    manager = _LineageManager(store)
+    binding, passthrough, classifier, _store_path = _lineage_passthrough(tmp_path, store, manager)
+    original_request_id = _seed_controlled_stage_delete_origin(
+        store,
+        manager,
+        binding,
+        classifier,
+    )
+    passthrough.handle_client_line(
+        _semantic_redirect_line(
+            "sem-privacy",
+            SEMANTIC_STAGE_DELETE_TOOL_NAME,
+            {"path": SECRET_PATH},
+            original_request_id=original_request_id,
+        )
+    )
+    replay = passthrough.handle_client_line(
+        _semantic_redirect_line(
+            "sem-privacy-replay",
+            SEMANTIC_STAGE_DELETE_TOOL_NAME,
+            {"path": SECRET_PATH},
+            original_request_id=original_request_id,
+        )
+    )
+    error_blob = json.dumps(replay) + json.dumps(list(passthrough.security_events)) + repr(passthrough)
+    assert SECRET_PATH not in error_blob
+    assert str(binding.workspace_root) not in error_blob
+    assert str(binding.state_root) not in error_blob
+
+
+def test_semantic_redirect_propose_failure_does_not_claim_lineage(tmp_path: Path) -> None:
+    from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore
+
+    store = ApprovalEvidenceStore(tmp_path / "evidence.sqlite")
+    manager = _LineageManager(store)
+    binding, passthrough, classifier, store_path = _lineage_passthrough(tmp_path, store, manager)
+    binding.provider.fail_mode = "raise"
+    original_request_id = _seed_controlled_stage_delete_origin(
+        store,
+        manager,
+        binding,
+        classifier,
+    )
+    responses = passthrough.handle_client_line(
+        _semantic_redirect_line(
+            "sem-propose-fail",
+            SEMANTIC_STAGE_DELETE_TOOL_NAME,
+            {"path": SECRET_PATH},
+            original_request_id=original_request_id,
+        )
+    )
+    body = json.loads(responses[0]["result"]["content"][0]["text"])
+    assert body["mechanism_status"] == "error"
+    assert any(item.startswith("propose:") for item in binding.provider.calls)
+    assert not any(item.startswith("execute:") for item in binding.provider.calls)
+    assert store_path is not None
+    assert _redirect_lineage_claim_count(store_path) == 0
+
+
+def test_semantic_redirect_recheck_drift_does_not_claim_lineage(tmp_path: Path) -> None:
+    from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore
+
+    store = ApprovalEvidenceStore(tmp_path / "evidence.sqlite")
+    manager = _LineageManager(store)
+    binding, passthrough, classifier, store_path = _lineage_passthrough(tmp_path, store, manager)
+    original_request_id = _seed_controlled_stage_delete_origin(
+        store,
+        manager,
+        binding,
+        classifier,
+    )
+    original_classify = passthrough.classifier.classify_jsonrpc
+
+    def drifting_classify(message):
+        classified = original_classify(message)
+        if classified is None:
+            return None
+        if any(item.startswith("propose:") for item in binding.provider.calls):
+            return replace(classified, action_hash="sha256:" + ("dd" * 32))
+        return classified
+
+    passthrough.classifier.classify_jsonrpc = drifting_classify
+    responses = passthrough.handle_client_line(
+        _semantic_redirect_line(
+            "sem-recheck-drift",
+            SEMANTIC_STAGE_DELETE_TOOL_NAME,
+            {"path": SECRET_PATH},
+            original_request_id=original_request_id,
+        )
+    )
+    body = json.loads(responses[0]["result"]["content"][0]["text"])
+    assert body["mechanism_status"] == "error"
+    assert any(item.startswith("propose:") for item in binding.provider.calls)
+    assert not any(item.startswith("execute:") for item in binding.provider.calls)
+    assert store_path is not None
+    assert _redirect_lineage_claim_count(store_path) == 0
+
+
+def test_semantic_redirect_claim_failure_after_recheck_has_zero_execute(tmp_path: Path) -> None:
+    from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore
+    from agentveil_mcp_proxy.role_doctor import INVALID_REDIRECT_CONTEXT
+
+    store = ApprovalEvidenceStore(tmp_path / "evidence.sqlite")
+    manager = _LineageManager(store)
+    binding, passthrough, classifier, store_path = _lineage_passthrough(tmp_path, store, manager)
+    original_request_id = _seed_controlled_stage_delete_origin(
+        store,
+        manager,
+        binding,
+        classifier,
+    )
+    real_finalize = passthrough._finalize_redirect_lineage_claim
+
+    def failing_finalize(request_id, classification):
+        return passthrough._redirect_context_error_response(
+            request_id,
+            reason=INVALID_REDIRECT_CONTEXT,
+            message="invalid redirect_context",
+        )
+
+    passthrough._finalize_redirect_lineage_claim = failing_finalize  # type: ignore[method-assign]
+    responses = passthrough.handle_client_line(
+        _semantic_redirect_line(
+            "sem-claim-fail",
+            SEMANTIC_STAGE_DELETE_TOOL_NAME,
+            {"path": SECRET_PATH},
+            original_request_id=original_request_id,
+        )
+    )
+    assert "error" in responses[0]
+    assert responses[0]["error"]["data"]["reason"] == INVALID_REDIRECT_CONTEXT
+    assert any(item.startswith("propose:") for item in binding.provider.calls)
+    assert not any(item.startswith("execute:") for item in binding.provider.calls)
+    assert store_path is not None
+    assert _redirect_lineage_claim_count(store_path) == 0
+    passthrough._finalize_redirect_lineage_claim = real_finalize  # type: ignore[method-assign]
+
+
+def test_semantic_redirect_replay_claims_once_executes_once(tmp_path: Path) -> None:
+    from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore
+    from agentveil_mcp_proxy.role_doctor import INVALID_REDIRECT_CONTEXT
+
+    store = ApprovalEvidenceStore(tmp_path / "evidence.sqlite")
+    manager = _LineageManager(store)
+    binding, passthrough, classifier, store_path = _lineage_passthrough(tmp_path, store, manager)
+    original_request_id = _seed_controlled_stage_delete_origin(
+        store,
+        manager,
+        binding,
+        classifier,
+    )
+    line = _semantic_redirect_line(
+        "sem-once",
+        SEMANTIC_STAGE_DELETE_TOOL_NAME,
+        {"path": SECRET_PATH},
+        original_request_id=original_request_id,
+    )
+    first = passthrough.handle_client_line(line)
+    assert json.loads(first[0]["result"]["content"][0]["text"])["mechanism_status"] == "success"
+    execute_count = len([item for item in binding.provider.calls if item.startswith("execute:")])
+    claim_count = _redirect_lineage_claim_count(store_path)
+    replay = passthrough.handle_client_line(line)
+    assert "error" in replay[0]
+    assert replay[0]["error"]["data"]["reason"] == INVALID_REDIRECT_CONTEXT
+    assert len([item for item in binding.provider.calls if item.startswith("execute:")]) == execute_count
+    assert _redirect_lineage_claim_count(store_path) == claim_count == 1

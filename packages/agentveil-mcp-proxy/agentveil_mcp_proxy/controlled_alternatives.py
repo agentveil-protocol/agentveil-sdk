@@ -14,6 +14,7 @@ import os
 from dataclasses import dataclass, field
 from functools import wraps
 from importlib.metadata import entry_points
+from types import MappingProxyType
 from typing import Any, Callable, Mapping, Protocol
 
 from agentveil_mcp_proxy.paid_provider import (
@@ -31,6 +32,41 @@ CONTROLLED_ALTERNATIVE_PROVIDER_ID = "private_v1"
 CONTROLLED_ALTERNATIVE_PROVIDER_CONTRACT_VERSION = "1"
 CONTROLLED_ALTERNATIVES_PROFILE_ID = "controlled_alternatives_coding_v1"
 GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME = "agentveil_controlled_alternative"
+SEMANTIC_STAGE_DELETE_TOOL_NAME = "agentveil_stage_delete"
+SEMANTIC_RESTORE_STAGED_TOOL_NAME = "agentveil_restore_staged"
+SEMANTIC_CLEANUP_STAGED_TOOL_NAME = "agentveil_cleanup_staged"
+
+_SEMANTIC_ALTERNATIVE_DESCRIPTIONS: Mapping[str, str] = MappingProxyType({
+    "filesystem.stage_delete.v1": (
+        "Stage one bounded workspace file or directory for controlled deletion "
+        "through AgentVeil."
+    ),
+    "filesystem.restore_staged.v1": (
+        "Restore one staged quarantine entry back into the workspace."
+    ),
+    "filesystem.cleanup_staged.v1": (
+        "Permanently clean up one staged quarantine entry after explicit approval."
+    ),
+})
+SEMANTIC_TOOL_BY_ALTERNATIVE_ID: Mapping[str, str] = MappingProxyType({
+    "filesystem.stage_delete.v1": SEMANTIC_STAGE_DELETE_TOOL_NAME,
+    "filesystem.restore_staged.v1": SEMANTIC_RESTORE_STAGED_TOOL_NAME,
+    "filesystem.cleanup_staged.v1": SEMANTIC_CLEANUP_STAGED_TOOL_NAME,
+})
+SEMANTIC_ALTERNATIVE_ID_BY_TOOL: Mapping[str, str] = MappingProxyType({
+    tool_name: alternative_id
+    for alternative_id, tool_name in SEMANTIC_TOOL_BY_ALTERNATIVE_ID.items()
+})
+SEMANTIC_CONTROLLED_ALTERNATIVE_TOOL_NAMES: frozenset[str] = frozenset(
+    SEMANTIC_ALTERNATIVE_ID_BY_TOOL
+)
+FILESYSTEM_SEMANTIC_ALTERNATIVE_IDS: frozenset[str] = frozenset(
+    SEMANTIC_TOOL_BY_ALTERNATIVE_ID
+)
+RESERVED_CONTROLLED_ALTERNATIVE_TOOL_NAMES: frozenset[str] = frozenset({
+    GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+    *SEMANTIC_CONTROLLED_ALTERNATIVE_TOOL_NAMES,
+})
 
 CONTROLLED_ALTERNATIVE_IDS: tuple[str, ...] = (
     "filesystem.stage_delete.v1",
@@ -1109,6 +1145,82 @@ def _branch_schema_for_alternative(alternative_id: str) -> dict[str, Any]:
     }
 
 
+def is_semantic_controlled_alternative_tool(tool_name: Any) -> bool:
+    if not isinstance(tool_name, str):
+        return False
+    return tool_name in SEMANTIC_ALTERNATIVE_ID_BY_TOOL
+
+
+def is_controlled_alternative_tool_name(tool_name: str) -> bool:
+    return (
+        tool_name == GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME
+        or is_semantic_controlled_alternative_tool(tool_name)
+    )
+
+
+def semantic_alternative_id_for_tool(tool_name: Any) -> str | None:
+    if not isinstance(tool_name, str):
+        return None
+    return SEMANTIC_ALTERNATIVE_ID_BY_TOOL.get(tool_name)
+
+
+def semantic_tool_name_for_alternative_id(alternative_id: Any) -> str | None:
+    if not isinstance(alternative_id, str):
+        return None
+    return SEMANTIC_TOOL_BY_ALTERNATIVE_ID.get(alternative_id)
+
+
+@_total(ERROR_REQUEST_MALFORMED)
+def normalize_semantic_tool_call(
+    tool_name: str,
+    arguments: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Map one semantic MCP tool call onto the generic controlled-alternative shape."""
+
+    alternative_id = semantic_alternative_id_for_tool(tool_name)
+    if alternative_id is None:
+        raise ControlledAlternativeValidationError(ERROR_REQUEST_MALFORMED)
+    payload = _require_mapping(arguments, error_code=ERROR_REQUEST_MALFORMED)
+    local = validate_controlled_alternative_local_input(alternative_id, payload)
+    if alternative_id == "filesystem.stage_delete.v1":
+        nested = {"path": local.path}
+    elif alternative_id in {"filesystem.restore_staged.v1", "filesystem.cleanup_staged.v1"}:
+        nested = {"quarantine_entry_id": local.quarantine_entry_id}
+    else:
+        raise ControlledAlternativeValidationError(ERROR_REQUEST_MALFORMED)
+    return {"alternative_id": alternative_id, "input": nested}
+
+
+def build_semantic_controlled_alternative_tool_schema(alternative_id: Any) -> dict[str, Any]:
+    if not isinstance(alternative_id, str):
+        raise ControlledAlternativeValidationError(ERROR_DESCRIPTOR_INVALID)
+    tool_name = semantic_tool_name_for_alternative_id(alternative_id)
+    if tool_name is None:
+        raise ControlledAlternativeValidationError(ERROR_DESCRIPTOR_INVALID)
+    description = _SEMANTIC_ALTERNATIVE_DESCRIPTIONS.get(alternative_id)
+    if description is None:
+        raise ControlledAlternativeValidationError(ERROR_DESCRIPTOR_INVALID)
+    return {
+        "name": tool_name,
+        "description": description,
+        "inputSchema": _input_schema_for_alternative(alternative_id),
+    }
+
+
+@_total(ERROR_DESCRIPTOR_INVALID)
+def build_semantic_controlled_alternative_tool_schemas(
+    descriptor: ControlledAlternativeProviderDescriptor,
+) -> tuple[dict[str, Any], ...]:
+    """Return descriptor-driven semantic filesystem tool schemas."""
+
+    validated = validate_provider_descriptor(descriptor)
+    return tuple(
+        build_semantic_controlled_alternative_tool_schema(alternative_id)
+        for alternative_id in validated.alternative_ids
+        if alternative_id in FILESYSTEM_SEMANTIC_ALTERNATIVE_IDS
+    )
+
+
 @_total(ERROR_DESCRIPTOR_INVALID)
 def build_controlled_alternative_tool_schema(
     descriptor: ControlledAlternativeProviderDescriptor,
@@ -1150,9 +1262,24 @@ __all__ = [
     "ERROR_DISCOVERY_INELIGIBLE",
     "ERROR_REQUEST_MALFORMED",
     "ERROR_RESULT_UNSAFE",
+    "FILESYSTEM_SEMANTIC_ALTERNATIVE_IDS",
     "GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME",
+    "RESERVED_CONTROLLED_ALTERNATIVE_TOOL_NAMES",
+    "SEMANTIC_ALTERNATIVE_ID_BY_TOOL",
+    "SEMANTIC_CLEANUP_STAGED_TOOL_NAME",
+    "SEMANTIC_CONTROLLED_ALTERNATIVE_TOOL_NAMES",
+    "SEMANTIC_RESTORE_STAGED_TOOL_NAME",
+    "SEMANTIC_STAGE_DELETE_TOOL_NAME",
+    "SEMANTIC_TOOL_BY_ALTERNATIVE_ID",
     "build_controlled_alternative_tool_schema",
+    "build_semantic_controlled_alternative_tool_schema",
+    "build_semantic_controlled_alternative_tool_schemas",
     "discover_controlled_alternative_provider",
+    "is_controlled_alternative_tool_name",
+    "is_semantic_controlled_alternative_tool",
+    "normalize_semantic_tool_call",
+    "semantic_alternative_id_for_tool",
+    "semantic_tool_name_for_alternative_id",
     "set_controlled_alternative_provider_loader",
     "validate_controlled_alternative_local_input",
     "validate_provider_descriptor",

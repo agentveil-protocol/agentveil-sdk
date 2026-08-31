@@ -55,6 +55,7 @@ _REDIRECT_CREATE_IMPLEMENTER_TASK = "create_implementer_task"
 _REDIRECT_SWITCH_TO_BUILD_AGENT = "switch_to_build_agent"
 _REDIRECT_USE_READ_ONLY_TOOL = "use_read_only_tool"
 _REDIRECT_REQUEST_APPROVAL = "request_approval"
+_REDIRECT_CONTROLLED_STAGE_DELETE = "controlled_stage_delete"
 _REDIRECT_STOP_AND_CLASSIFY = "stop_and_classify_unknown_action"
 
 REDIRECT_CONTEXT_ARG = "redirect_context"
@@ -117,6 +118,12 @@ REDIRECT_PLAYBOOKS: dict[str, RedirectPlaybookSpec] = {
         redirect_playbook_id=_REDIRECT_REQUEST_APPROVAL,
         supports_follow_up=True,
         allowed_follow_up_tools=("write_file", "apply_patch"),
+        target_bound=True,
+    ),
+    _REDIRECT_CONTROLLED_STAGE_DELETE: RedirectPlaybookSpec(
+        redirect_playbook_id=_REDIRECT_CONTROLLED_STAGE_DELETE,
+        supports_follow_up=True,
+        allowed_follow_up_tools=("agentveil_stage_delete",),
         target_bound=True,
     ),
     _REDIRECT_STOP_AND_CLASSIFY: RedirectPlaybookSpec(

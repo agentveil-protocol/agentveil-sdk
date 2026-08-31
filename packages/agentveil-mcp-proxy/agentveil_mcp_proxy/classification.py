@@ -41,7 +41,10 @@ from agentveil_mcp_proxy.policy import (
     ToolCallContext,
 )
 from agentveil_mcp_proxy.content_risk_signals import derive_content_risk_signals
-from agentveil_mcp_proxy.controlled_alternatives import GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME
+from agentveil_mcp_proxy.controlled_alternatives import (
+    GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+    is_semantic_controlled_alternative_tool,
+)
 
 
 
@@ -397,11 +400,24 @@ class ToolCallClassifier:
                 nested_resource_exact,
                 nested_resource_label,
             )
+
             nested_label = nested_resource_label(args)
             if nested_label is not None:
                 resource_plain = nested_label
             alternative_id = alternative_id_from_arguments(args)
             exact_resource = nested_resource_exact(args)
+        elif is_semantic_controlled_alternative_tool(tool):
+            from agentveil_mcp_proxy.controlled_alternatives_runtime import (
+                semantic_alternative_id_for_tool,
+                semantic_resource_exact,
+                semantic_resource_label,
+            )
+
+            nested_label = semantic_resource_label(tool, args)
+            if nested_label is not None:
+                resource_plain = nested_label
+            alternative_id = semantic_alternative_id_for_tool(tool)
+            exact_resource = semantic_resource_exact(tool, args)
         else:
             exact_resource = None
         heuristic_risk = infer_risk_class(action_plain, tool=tool, resource=resource_plain, arguments=args)
@@ -423,7 +439,7 @@ class ToolCallClassifier:
             action_family=action_family,
         )
         evaluation = self.engine.evaluate(context)
-        if tool == GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME:
+        if tool == GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME or is_semantic_controlled_alternative_tool(tool):
             from agentveil_mcp_proxy.controlled_alternatives_runtime import apply_controlled_alternative_policy
             evaluation, heuristic_applied, action_family = apply_controlled_alternative_policy(
                 alternative_id=alternative_id,
