@@ -1402,9 +1402,6 @@ _BROAD_GIT_EXCLUDE_FORBIDDEN: frozenset[str] = frozenset({
     ".claude/",
     ".cursor/",
     ".gemini/",
-    "AGENTS.md",
-    "CLAUDE.md",
-    "GEMINI.md",
 })
 
 

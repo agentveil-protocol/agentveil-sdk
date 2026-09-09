@@ -1034,6 +1034,8 @@ def test_owned_git_exclude_hides_exact_agentveil_control_files_only(tmp_path: Pa
     user_file = project / ".codex" / "agentveil" / "user-notes.md"
     user_file.write_text("user-owned\n", encoding="utf-8")
     (project / "AGENTS.md").write_text("user instructions\n", encoding="utf-8")
+    (project / "CLAUDE.md").write_text("user instructions\n", encoding="utf-8")
+    (project / "GEMINI.md").write_text("user instructions\n", encoding="utf-8")
 
     added = add_agentveil_owned_git_excludes(
         project,
@@ -1046,6 +1048,8 @@ def test_owned_git_exclude_hides_exact_agentveil_control_files_only(tmp_path: Pa
             ".gemini/settings.json",
             ".codex/agentveil/user-notes.md",
             "AGENTS.md",
+            "CLAUDE.md",
+            "GEMINI.md",
             ".codex/",
             "*",
         ],
@@ -1064,10 +1068,14 @@ def test_owned_git_exclude_hides_exact_agentveil_control_files_only(tmp_path: Pa
     assert ".cursor/mcp.json" not in porcelain
     assert ".codex/agentveil/user-notes.md" in porcelain
     assert "AGENTS.md" in porcelain
+    assert "CLAUDE.md" in porcelain
+    assert "GEMINI.md" in porcelain
     text = _exclude_text(project)
     lines = text.splitlines()
     assert ".codex/" not in lines
     assert "AGENTS.md" not in lines
+    assert "CLAUDE.md" not in lines
+    assert "GEMINI.md" not in lines
     assert "*" not in lines
 
 
