@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ from agentveil_mcp_proxy.client_guidance import (
     ControlledAlternativeSuggestion,
     NativeActionIntent,
     NativeControlledGuidanceEnvelope,
+    add_agentveil_owned_git_excludes,
     build_native_controlled_guidance_envelope,
     format_native_controlled_guidance_text,
     is_agentveil_owned_controlled_mcp_tool,
@@ -31,6 +33,8 @@ from agentveil_mcp_proxy.client_guidance import (
     native_hook_deny_instruction,
     native_write_redirect_supported,
     normalize_native_action,
+    remove_agentveil_owned_git_exclude_if_target_missing,
+    remove_agentveil_owned_git_excludes,
     select_controlled_alternative_suggestion,
     trusted_static_controlled_route_ready,
 )
@@ -987,3 +991,127 @@ def test_helper_rejects_non_string_and_does_not_search_payload_text() -> None:
         {"tool": "agentveil_stage_delete"},
     ):
         assert is_agentveil_owned_controlled_mcp_tool(value) is False
+
+
+def _init_git_project(path: Path) -> None:
+    subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True, text=True)
+
+
+def _git_porcelain(path: Path) -> str:
+    completed = subprocess.run(
+        # claim-check: allow exact git option used to expose untracked fixture files in disposable repos.
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout
+
+
+def _exclude_text(project: Path) -> str:
+    exclude = project / ".git" / "info" / "exclude"
+    if not exclude.exists():
+        return ""
+    return exclude.read_text(encoding="utf-8")
+
+
+def test_owned_git_exclude_hides_exact_agentveil_control_files_only(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    _init_git_project(project)
+    for relpath in (
+        ".codex/hooks.json",
+        ".codex/agentveil/evidence.jsonl",
+        ".claude/settings.json",
+        ".cursor/hooks.json",
+        ".cursor/mcp.json",
+        ".gemini/settings.json",
+    ):
+        path = project / relpath
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("agentveil-owned\n", encoding="utf-8")
+    user_file = project / ".codex" / "agentveil" / "user-notes.md"
+    user_file.write_text("user-owned\n", encoding="utf-8")
+    (project / "AGENTS.md").write_text("user instructions\n", encoding="utf-8")
+
+    added = add_agentveil_owned_git_excludes(
+        project,
+        [
+            ".codex/hooks.json",
+            ".codex/agentveil/evidence.jsonl",
+            ".claude/settings.json",
+            ".cursor/hooks.json",
+            ".cursor/mcp.json",
+            ".gemini/settings.json",
+            ".codex/agentveil/user-notes.md",
+            "AGENTS.md",
+            ".codex/",
+            "*",
+        ],
+    )
+
+    assert added == (
+        ".claude/settings.json",
+        ".codex/agentveil/evidence.jsonl",
+        ".codex/hooks.json",
+        ".cursor/hooks.json",
+        ".cursor/mcp.json",
+        ".gemini/settings.json",
+    )
+    porcelain = _git_porcelain(project)
+    assert ".codex/hooks.json" not in porcelain
+    assert ".cursor/mcp.json" not in porcelain
+    assert ".codex/agentveil/user-notes.md" in porcelain
+    assert "AGENTS.md" in porcelain
+    text = _exclude_text(project)
+    lines = text.splitlines()
+    assert ".codex/" not in lines
+    assert "AGENTS.md" not in lines
+    assert "*" not in lines
+
+
+def test_owned_git_exclude_uninstall_preserves_user_lines(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    _init_git_project(project)
+    exclude = project / ".git" / "info" / "exclude"
+    exclude.write_text("user-cache/\n", encoding="utf-8")
+
+    add_agentveil_owned_git_excludes(project, (".codex/hooks.json", ".codex/agentveil/evidence.jsonl"))
+    removed = remove_agentveil_owned_git_excludes(project, (".codex/hooks.json",))
+    assert removed == (".codex/hooks.json",)
+    text = _exclude_text(project)
+    assert "user-cache/" in text
+    assert ".codex/hooks.json" not in text
+    assert ".codex/agentveil/evidence.jsonl" in text
+
+    evidence = project / ".codex" / "agentveil" / "evidence.jsonl"
+    assert remove_agentveil_owned_git_exclude_if_target_missing(
+        project,
+        ".codex/agentveil/evidence.jsonl",
+        evidence,
+    ) == (".codex/agentveil/evidence.jsonl",)
+    assert "user-cache/" in _exclude_text(project)
+
+
+def test_owned_git_exclude_fail_closed_on_unsafe_exclude_file(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    _init_git_project(project)
+    outside = tmp_path / "outside-exclude"
+    outside.write_text("outside\n", encoding="utf-8")
+    exclude = project / ".git" / "info" / "exclude"
+    exclude.unlink()
+    exclude.symlink_to(outside)
+
+    assert add_agentveil_owned_git_excludes(project, (".codex/hooks.json",)) == ()
+    assert outside.read_text(encoding="utf-8") == "outside\n"
+
+
+def test_owned_git_exclude_non_git_project_is_noop(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+
+    assert add_agentveil_owned_git_excludes(project, (".codex/hooks.json",)) == ()
+    assert not (project / ".git").exists()

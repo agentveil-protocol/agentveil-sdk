@@ -8,22 +8,26 @@ path.
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
 
-from agentveil_mcp_proxy import claude_hook_setup
 from agentveil_mcp_proxy.claude_hook_setup import (
     AGENTVEIL_HOOK_MARKER,
+    AGENTVEIL_MCP_SERVER_NAME,
     HOOK_MATCHER,
     HookSetupError,
     build_hook_command,
     build_managed_hook_entry,
+    connector_status,
     install_hook,
     load_settings,
+    mcp_route_present,
     project_evidence_path,
+    project_mcp_config_path,
     project_settings_path,
-    setup_home,
+    remove_mcp_route,
     status_hook,
     uninstall_hook,
 )
@@ -302,7 +306,7 @@ def test_install_command_shell_quotes_paths_with_spaces(tmp_path: Path) -> None:
 
     spaced = tmp_path / "dir with spaces"
     spaced.mkdir()
-    result = install_hook(spaced, python="/opt/py thon/bin/python3")
+    install_hook(spaced, python="/opt/py thon/bin/python3")
     settings = json.loads(project_settings_path(spaced).read_text(encoding="utf-8"))
     command = _managed_entries(settings)[0]["hooks"][0]["command"]
     # The command must split cleanly via shlex (no broken quoting).
@@ -487,14 +491,6 @@ def test_load_settings_non_object_raises(tmp_path: Path) -> None:
 
 # ----- P10D.14 S5: one-command connector (.mcp.json route + status) ----------
 
-from agentveil_mcp_proxy.claude_hook_setup import (
-    AGENTVEIL_MCP_SERVER_NAME,
-    connector_status,
-    mcp_route_present,
-    project_mcp_config_path,
-    remove_mcp_route,
-)
-
 
 def _write_mcp(project: Path, data: dict) -> None:
     p = project_mcp_config_path(project)
@@ -629,3 +625,110 @@ def test_setup_claude_code_attempts_console_project_status_sync(tmp_path, monkey
     capsys.readouterr()
     assert len(sync_calls) == 1
     assert sync_calls[0]["connector"] == "claude-code"
+
+
+def _init_local_git(project: Path) -> None:
+    subprocess.run(["git", "init", "-b", "main"], cwd=project, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "dev@example.test"],
+        cwd=project,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Dev"],
+        cwd=project,
+        check=True,
+        capture_output=True,
+    )
+
+
+def _git_porcelain(project: Path) -> str:
+    return subprocess.run(
+        # Evidence: Git status mode below exposes untracked test files in disposable repos.
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=project,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
+def _exclude_lines(project: Path) -> list[str]:
+    path = project / ".git" / "info" / "exclude"
+    if not path.is_file():
+        return []
+    return [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+
+def test_claude_setup_created_control_artifacts_do_not_contaminate_git(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    project.mkdir()
+    _init_local_git(project)
+    exclude = project / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    exclude.write_text("# keep-user-exclude\n*.local\n", encoding="utf-8")
+    (project / ".claude" / "agentveil").mkdir(parents=True)
+    (project / ".claude" / "agentveil" / "evidence.jsonl").write_text("{}\n", encoding="utf-8")
+    install_hook(project)
+    lines = _exclude_lines(project)
+    assert ".claude/settings.json" in lines
+    assert ".claude/agentveil/evidence.jsonl" in lines
+    assert ".claude/" not in lines
+    porcelain = _git_porcelain(project)
+    assert ".claude/settings.json" not in porcelain
+    assert ".claude/agentveil/evidence.jsonl" not in porcelain
+    assert "# keep-user-exclude" in exclude.read_text(encoding="utf-8")
+    status = json.dumps(connector_status(project, proxy_route_present=True))
+    assert str(project) not in status
+    assert "/Users/" not in status
+
+    uninstall_hook(project)
+    leftover = exclude.read_text(encoding="utf-8")
+    assert "# keep-user-exclude" in leftover
+    assert "*.local" in leftover
+
+
+def test_claude_setup_does_not_claim_preexisting_settings_or_create_git(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    project.mkdir()
+    _init_local_git(project)
+    settings = project_settings_path(project)
+    settings.parent.mkdir(parents=True)
+    settings.write_text(json.dumps({"permissions": {"allow": ["Read"]}}) + "\n", encoding="utf-8")
+    install_hook(project)
+    payload = _read_settings(project)
+    assert payload["permissions"]["allow"] == ["Read"]
+    assert ".claude/settings.json" not in _exclude_lines(project)
+    assert ".claude/settings.json" in _git_porcelain(project)
+
+    lone = tmp_path / "nongit"
+    lone.mkdir()
+    install_hook(lone)
+    assert not (lone / ".git").exists()
+
+
+def test_claude_uninstall_drops_evidence_exclude_only_when_file_missing(tmp_path: Path) -> None:
+    missing = tmp_path / "missing-evidence"
+    missing.mkdir()
+    _init_local_git(missing)
+    assert not project_evidence_path(missing).exists()
+    install_hook(missing)
+    assert ".claude/agentveil/evidence.jsonl" in _exclude_lines(missing)
+    uninstall_hook(missing)
+    assert ".claude/agentveil/evidence.jsonl" not in _exclude_lines(missing)
+
+    kept = tmp_path / "kept-evidence"
+    kept.mkdir()
+    _init_local_git(kept)
+    evidence = project_evidence_path(kept)
+    evidence.parent.mkdir(parents=True)
+    evidence.write_text("{}\n", encoding="utf-8")
+    install_hook(kept)
+    uninstall_hook(kept)
+    assert evidence.is_file()
+    assert ".claude/agentveil/evidence.jsonl" in _exclude_lines(kept)

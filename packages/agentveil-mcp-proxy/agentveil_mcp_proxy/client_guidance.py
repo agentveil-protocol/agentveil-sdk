@@ -1383,6 +1383,267 @@ def format_native_controlled_guidance_text(envelope: NativeControlledGuidanceEnv
     )
 
 
+_OWNED_GIT_EXCLUDE_START = "# agentveil:owned-exclude:v1:start"
+_OWNED_GIT_EXCLUDE_END = "# agentveil:owned-exclude:v1:end"
+_OWNED_GIT_EXCLUDE_EXACT: frozenset[str] = frozenset({
+    ".codex/hooks.json",
+    ".codex/agentveil/evidence.jsonl",
+    ".claude/settings.json",
+    ".claude/agentveil/evidence.jsonl",
+    ".cursor/hooks.json",
+    ".cursor/mcp.json",
+    ".cursor/agentveil/evidence.jsonl",
+    ".gemini/settings.json",
+    ".gemini/agentveil/evidence.jsonl",
+})
+_BROAD_GIT_EXCLUDE_FORBIDDEN: frozenset[str] = frozenset({
+    "*",
+    ".codex/",
+    ".claude/",
+    ".cursor/",
+    ".gemini/",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "GEMINI.md",
+})
+
+
+def _validate_owned_git_exclude_relpath(relpath: Any) -> str | None:
+    if not isinstance(relpath, str) or not relpath:
+        return None
+    if relpath != relpath.strip():
+        return None
+    if relpath in _BROAD_GIT_EXCLUDE_FORBIDDEN:
+        return None
+    if any(ord(ch) < 32 for ch in relpath):
+        return None
+    if relpath.startswith("/") or relpath.startswith("\\") or "\\" in relpath:
+        return None
+    if any(marker in relpath for marker in ("*", "?", "[", "]")):
+        return None
+    parts = relpath.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        return None
+    if relpath not in _OWNED_GIT_EXCLUDE_EXACT:
+        return None
+    return relpath
+
+
+def _lstat_or_none(path: Path) -> os.stat_result | None:
+    try:
+        return os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+
+
+def _is_safe_regular_file(info: os.stat_result) -> bool:
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        return False
+    if getattr(info, "st_nlink", 1) > 1:
+        return False
+    return True
+
+
+def _is_safe_directory(info: os.stat_result) -> bool:
+    return not stat.S_ISLNK(info.st_mode) and stat.S_ISDIR(info.st_mode)
+
+
+def _exclude_path_for_project(project_root: Path) -> Path | None:
+    root = Path(project_root)
+    git_dir = root / ".git"
+    git_info = _lstat_or_none(git_dir)
+    if git_info is None or not _is_safe_directory(git_info):
+        return None
+    info_dir = git_dir / "info"
+    info_stat = _lstat_or_none(info_dir)
+    if info_stat is not None and not _is_safe_directory(info_stat):
+        return None
+    return info_dir / "exclude"
+
+
+def _parse_owned_git_exclude(text: str) -> tuple[list[str], frozenset[str]] | None:
+    start = text.find(_OWNED_GIT_EXCLUDE_START)
+    end = text.find(_OWNED_GIT_EXCLUDE_END)
+    if start < 0 and end < 0:
+        return text.splitlines(), frozenset()
+    if start < 0 or end < 0 or end < start:
+        return None
+    prefix = text[:start]
+    suffix = text[end + len(_OWNED_GIT_EXCLUDE_END):]
+    if _OWNED_GIT_EXCLUDE_START in prefix or _OWNED_GIT_EXCLUDE_END in prefix:
+        return None
+    if _OWNED_GIT_EXCLUDE_START in suffix or _OWNED_GIT_EXCLUDE_END in suffix:
+        return None
+    owned: list[str] = []
+    block = text[start + len(_OWNED_GIT_EXCLUDE_START):end]
+    for raw in block.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        validated = _validate_owned_git_exclude_relpath(line)
+        if validated is None:
+            return None
+        owned.append(validated)
+    user_lines = prefix.splitlines() + [line for line in suffix.splitlines() if line != ""]
+    return user_lines, frozenset(owned)
+
+
+def _render_owned_git_exclude(user_lines: list[str], owned: frozenset[str]) -> str:
+    kept_user = [line for line in user_lines if line.strip()]
+    parts: list[str] = []
+    if kept_user:
+        parts.append("\n".join(kept_user))
+    if owned:
+        block = "\n".join(
+            (
+                _OWNED_GIT_EXCLUDE_START,
+                *sorted(owned),
+                _OWNED_GIT_EXCLUDE_END,
+            )
+        )
+        parts.append(block)
+    if not parts:
+        return ""
+    return "\n".join(parts) + "\n"
+
+
+def _write_local_git_exclude_atomically(path: Path, text: str) -> bool:
+    parent = path.parent
+    try:
+        parent_stat = _lstat_or_none(parent)
+        if parent_stat is None:
+            parent.mkdir(parents=True, exist_ok=True)
+            parent_stat = _lstat_or_none(parent)
+        if parent_stat is None or not _is_safe_directory(parent_stat):
+            return False
+        existing_stat = _lstat_or_none(path)
+        if existing_stat is not None and not _is_safe_regular_file(existing_stat):
+            return False
+        tmp_path = parent / f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd: int | None = None
+        published = False
+        try:
+            fd = os.open(str(tmp_path), flags, 0o600)
+            os.write(fd, text.encode("utf-8"))
+            os.fsync(fd)
+            os.close(fd)
+            fd = None
+            existing_stat = _lstat_or_none(path)
+            if existing_stat is not None and not _is_safe_regular_file(existing_stat):
+                return False
+            os.replace(str(tmp_path), str(path))
+            published = True
+            written_stat = _lstat_or_none(path)
+            if written_stat is None or not _is_safe_regular_file(written_stat):
+                return False
+            return True
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if not published:
+                try:
+                    os.unlink(str(tmp_path))
+                except OSError:
+                    pass
+    except OSError:
+        return False
+
+
+def add_agentveil_owned_git_excludes(
+    project_root: Path,
+    relpaths: tuple[str, ...] | list[str],
+) -> tuple[str, ...]:
+    """Add exact AgentVeil-owned control files to local `.git/info/exclude`."""
+
+    validated = [
+        relpath
+        for item in relpaths
+        if (relpath := _validate_owned_git_exclude_relpath(item)) is not None
+    ]
+    if not validated:
+        return ()
+    exclude_path = _exclude_path_for_project(project_root)
+    if exclude_path is None:
+        return ()
+    existing_stat = _lstat_or_none(exclude_path)
+    if existing_stat is not None and not _is_safe_regular_file(existing_stat):
+        return ()
+    current = ""
+    try:
+        if existing_stat is not None:
+            current = exclude_path.read_text(encoding="utf-8")
+    except OSError:
+        return ()
+    parsed = _parse_owned_git_exclude(current)
+    if parsed is None:
+        return ()
+    user_lines, owned = parsed
+    updated = frozenset(owned | set(validated))
+    rendered = _render_owned_git_exclude(user_lines, updated)
+    if rendered == current:
+        return tuple(sorted(validated))
+    if not _write_local_git_exclude_atomically(exclude_path, rendered):
+        return ()
+    return tuple(sorted(validated))
+
+
+def remove_agentveil_owned_git_excludes(
+    project_root: Path,
+    relpaths: tuple[str, ...] | list[str],
+) -> tuple[str, ...]:
+    """Remove only AgentVeil-owned local exclude entries; preserve user lines."""
+
+    validated = [
+        relpath
+        for item in relpaths
+        if (relpath := _validate_owned_git_exclude_relpath(item)) is not None
+    ]
+    if not validated:
+        return ()
+    exclude_path = _exclude_path_for_project(project_root)
+    if exclude_path is None:
+        return ()
+    existing_stat = _lstat_or_none(exclude_path)
+    if existing_stat is None or not _is_safe_regular_file(existing_stat):
+        return ()
+    try:
+        current = exclude_path.read_text(encoding="utf-8")
+    except OSError:
+        return ()
+    parsed = _parse_owned_git_exclude(current)
+    if parsed is None:
+        return ()
+    user_lines, owned = parsed
+    removing = frozenset(validated)
+    updated = frozenset(item for item in owned if item not in removing)
+    rendered = _render_owned_git_exclude(user_lines, updated)
+    if rendered == current:
+        return tuple(sorted(removing & owned))
+    if not _write_local_git_exclude_atomically(exclude_path, rendered):
+        return ()
+    return tuple(sorted(removing & owned))
+
+
+def remove_agentveil_owned_git_exclude_if_target_missing(
+    project_root: Path,
+    relpath: str,
+    target: Path,
+) -> tuple[str, ...]:
+    """Remove one owned exclude entry only after its AgentVeil-owned target is gone."""
+
+    if Path(target).is_file():
+        return ()
+    return remove_agentveil_owned_git_excludes(project_root, (relpath,))
+
+
 def native_hook_deny_instruction(
     *,
     native_tool: str,
@@ -1774,6 +2035,7 @@ __all__ = [
     "NativeActionIntent",
     "NativeControlledGuidanceEnvelope",
     "NativeRedirectOrigin",
+    "add_agentveil_owned_git_excludes",
     "assert_client_guidance_payload_is_privacy_safe",
     "build_native_controlled_guidance_envelope",
     "build_client_guidance_payload",
@@ -1803,6 +2065,8 @@ __all__ = [
     "parse_redirect_context_from_gemini_hook_output",
     "register_exact_delete_redirect_origin",
     "register_native_redirect_origin",
+    "remove_agentveil_owned_git_exclude_if_target_missing",
+    "remove_agentveil_owned_git_excludes",
     "resolve_live_hook_runtime_binding",
     "resolve_proxy_home",
     "supported_client_pack_ids",

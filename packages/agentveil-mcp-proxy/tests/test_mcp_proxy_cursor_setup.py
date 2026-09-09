@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -959,3 +960,139 @@ def test_setup_cursor_attempts_console_project_status_sync(tmp_path, monkeypatch
     capsys.readouterr()
     assert len(sync_calls) == 1
     assert sync_calls[0]["connector"] == "cursor"
+
+
+def _init_local_git(project: Path) -> None:
+    subprocess.run(["git", "init", "-b", "main"], cwd=project, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "dev@example.test"],
+        cwd=project,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Dev"],
+        cwd=project,
+        check=True,
+        capture_output=True,
+    )
+
+
+def _git_porcelain(project: Path) -> str:
+    return subprocess.run(
+        # Evidence: Git status mode below exposes untracked test files in disposable repos.
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=project,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
+def _exclude_lines(project: Path) -> list[str]:
+    path = project / ".git" / "info" / "exclude"
+    if not path.is_file():
+        return []
+    return [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+
+def test_cursor_setup_created_control_artifacts_do_not_contaminate_git(tmp_path: Path) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    _init_local_git(workspace)
+    exclude = workspace / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    exclude.write_text("# keep-user-exclude\n*.local\n", encoding="utf-8")
+    (workspace / ".cursor" / "agentveil").mkdir(parents=True)
+    (workspace / ".cursor" / "agentveil" / "evidence.jsonl").write_text("{}\n", encoding="utf-8")
+    proxy = tmp_path / "bin" / "agentveil-mcp-proxy"
+    proxy.parent.mkdir(parents=True)
+    proxy.write_text("#!/bin/sh\n", encoding="utf-8")
+    install_hooks(workspace)
+    install_mcp_route(workspace, proxy_command=str(proxy))
+    lines = _exclude_lines(workspace)
+    assert ".cursor/hooks.json" in lines
+    assert ".cursor/mcp.json" in lines
+    assert ".cursor/agentveil/evidence.jsonl" in lines
+    assert ".cursor/" not in lines
+    porcelain = _git_porcelain(workspace)
+    assert ".cursor/hooks.json" not in porcelain
+    assert ".cursor/mcp.json" not in porcelain
+    assert ".cursor/agentveil/evidence.jsonl" not in porcelain
+    assert "# keep-user-exclude" in exclude.read_text(encoding="utf-8")
+    status = json.dumps(connector_status(workspace))
+    assert str(workspace) not in status
+    assert "/Users/" not in status
+
+    remove_hooks(workspace)
+    remove_mcp_route(workspace)
+    leftover = exclude.read_text(encoding="utf-8")
+    assert "# keep-user-exclude" in leftover
+    assert "*.local" in leftover
+    leftover_lines = _exclude_lines(workspace)
+    assert ".cursor/mcp.json" not in leftover_lines
+    if not hooks_config_path(workspace).exists():
+        assert ".cursor/hooks.json" not in leftover_lines
+
+
+def test_cursor_setup_does_not_claim_preexisting_control_files_or_create_git(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    _init_local_git(workspace)
+    hooks = hooks_config_path(workspace)
+    hooks.parent.mkdir(parents=True)
+    hooks.write_text(json.dumps({
+        "version": 1,
+        "hooks": {"preToolUse": [{"command": "echo user-hook"}]},
+    }) + "\n", encoding="utf-8")
+    mcp = mcp_config_path(workspace)
+    mcp.write_text(json.dumps({"mcpServers": {"other": {"command": "other"}}}) + "\n", encoding="utf-8")
+    proxy = tmp_path / "bin" / "agentveil-mcp-proxy"
+    proxy.parent.mkdir(parents=True)
+    proxy.write_text("#!/bin/sh\n", encoding="utf-8")
+    install_hooks(workspace)
+    install_mcp_route(workspace, proxy_command=str(proxy))
+    payload = json.loads(hooks.read_text(encoding="utf-8"))
+    assert any(
+        item.get("command") == "echo user-hook"
+        for item in payload["hooks"]["preToolUse"]
+    )
+    assert "other" in json.loads(mcp.read_text(encoding="utf-8"))["mcpServers"]
+    assert ".cursor/hooks.json" not in _exclude_lines(workspace)
+    assert ".cursor/mcp.json" not in _exclude_lines(workspace)
+    porcelain = _git_porcelain(workspace)
+    assert ".cursor/hooks.json" in porcelain
+    assert ".cursor/mcp.json" in porcelain
+
+    lone = tmp_path / "nongit"
+    lone.mkdir()
+    install_hooks(lone)
+    assert not (lone / ".git").exists()
+
+
+def test_cursor_uninstall_drops_evidence_exclude_only_when_file_missing(tmp_path: Path) -> None:
+    missing = tmp_path / "missing-evidence"
+    missing.mkdir()
+    _init_local_git(missing)
+    assert not cursor_setup.project_evidence_path(missing).exists()
+    install_hooks(missing)
+    assert ".cursor/agentveil/evidence.jsonl" in _exclude_lines(missing)
+    remove_hooks(missing)
+    assert ".cursor/agentveil/evidence.jsonl" not in _exclude_lines(missing)
+
+    kept = tmp_path / "kept-evidence"
+    kept.mkdir()
+    _init_local_git(kept)
+    evidence = cursor_setup.project_evidence_path(kept)
+    evidence.parent.mkdir(parents=True)
+    evidence.write_text("{}\n", encoding="utf-8")
+    install_hooks(kept)
+    remove_hooks(kept)
+    assert evidence.is_file()
+    assert ".cursor/agentveil/evidence.jsonl" in _exclude_lines(kept)

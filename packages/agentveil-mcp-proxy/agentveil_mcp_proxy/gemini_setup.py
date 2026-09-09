@@ -20,6 +20,11 @@ from agentveil_mcp_proxy.client_connect import (
     build_connect_status_payload,
     build_disconnect_payload,
 )
+from agentveil_mcp_proxy.client_guidance import (
+    add_agentveil_owned_git_excludes,
+    remove_agentveil_owned_git_exclude_if_target_missing,
+    remove_agentveil_owned_git_excludes,
+)
 
 
 GEMINI_CONNECTOR_ID = "gemini_cli"
@@ -173,6 +178,7 @@ def _strip_managed_groups(groups: Any) -> tuple[list[Any], int]:
 def install_hook(*, project_dir: Path, python: str) -> dict[str, Any]:
     target = Path(project_dir).resolve()
     path = settings_path(target)
+    created_settings = not path.exists()
     payload = _load_settings_json(path)
     hooks = payload.get("hooks")
     if hooks is None:
@@ -191,6 +197,10 @@ def install_hook(*, project_dir: Path, python: str) -> dict[str, Any]:
     updated_payload = dict(payload)
     updated_payload["hooks"] = updated_hooks
     _write_settings_json(path, updated_payload)
+    owned = [".gemini/agentveil/evidence.jsonl"]
+    if created_settings:
+        owned.append(".gemini/settings.json")
+    add_agentveil_owned_git_excludes(target, owned)
     return {
         "settings_path": path,
         "evidence_path": evidence_path(target),
@@ -215,6 +225,11 @@ def validate_hook_config(*, project_dir: Path) -> None:
 
 def remove_hook(*, project_dir: Path) -> dict[str, Any]:
     target = Path(project_dir).resolve()
+    remove_agentveil_owned_git_exclude_if_target_missing(
+        target,
+        ".gemini/agentveil/evidence.jsonl",
+        evidence_path(target),
+    )
     path = settings_path(target)
     if not path.exists():
         return {"settings_path": path, "removed_entries": 0, "reload_required": False}
@@ -237,6 +252,7 @@ def remove_hook(*, project_dir: Path) -> dict[str, Any]:
         _write_settings_json(path, updated_payload)
     else:
         path.unlink()
+        remove_agentveil_owned_git_excludes(target, (".gemini/settings.json",))
     return {"settings_path": path, "removed_entries": removed, "reload_required": removed > 0}
 
 
