@@ -2200,6 +2200,7 @@ def test_semantic_schemas_project_filesystem_and_prepare_when_advertised() -> No
             git_operation["inputSchema"],
         )
     op_dumped = json.dumps(git_operation)
+    assert "bounded denial is the controlled completion signal" in op_dumped
     assert "workspace_root" not in op_dumped
     assert "state_root" not in op_dumped
     assert "route_id" not in op_dumped
@@ -2282,6 +2283,7 @@ def test_semantic_mapping_is_immutable_and_total() -> None:
     assert "prepare_for_review" in git_tool["description"]
     assert "intent=commit" in git_tool["description"]
     assert "those intents are denied" in git_tool["description"]
+    assert "bounded denial is the controlled completion signal" in git_tool["description"]
     assert SECRET_PATH not in git_tool["description"]
     assert WORKSPACE_ROOT not in git_tool["description"]
     assert "agentveil_private_policy" not in git_tool["description"]

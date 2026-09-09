@@ -25,6 +25,7 @@ from agentveil_mcp_proxy.client_guidance import (
     NativeActionIntent,
     NativeControlledGuidanceEnvelope,
     add_agentveil_owned_git_excludes,
+    build_client_guidance_payload,
     build_native_controlled_guidance_envelope,
     format_native_controlled_guidance_text,
     is_agentveil_owned_controlled_mcp_tool,
@@ -39,6 +40,17 @@ from agentveil_mcp_proxy.client_guidance import (
     trusted_static_controlled_route_ready,
 )
 from redirect_hook_contract_fixtures import init_redirect_contract_home
+
+
+def test_client_guidance_routes_explicit_git_intents_to_agentveil_tool() -> None:
+    payload = build_client_guidance_payload(client_id="codex")
+    guidance = "\n".join(payload["routing_guidance"])
+    assert "agentveil_git_operation" in guidance
+    assert "operation=commit" in guidance
+    assert "operation=push" in guidance
+    assert "bounded denial is the controlled completion signal" in guidance
+    assert "commit is authorized" not in guidance
+    assert "push is authorized" not in guidance
 
 
 @pytest.mark.parametrize(

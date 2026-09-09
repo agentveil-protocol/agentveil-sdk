@@ -95,7 +95,8 @@ _SEMANTIC_ALTERNATIVE_DESCRIPTIONS: Mapping[str, str] = MappingProxyType({
         "Call agentveil_prepare_git_change with worktree_path and optional intent. "
         "Allowed intent is prepare_for_review; omitting intent is the same review-prep "
         "path. If the requested action is commit or push, call with intent=commit or "
-        "intent=push; those intents are denied. This prepares a local change only; it "
+        "intent=push; those intents are denied and the bounded denial is the controlled "
+        "completion signal. This prepares a local change only; it "
         "does not commit, push, merge, or apply. Autonomous only when policy allows. "
         "Local preparation only; not authority or approval."
     ),
@@ -1896,7 +1897,8 @@ def _git_operation_input_schema() -> dict[str, Any]:
                 "description": (
                     "Allowlisted Git operation. prepare_for_review prepares a local "
                     "change for review. commit and push are not authorized and are "
-                    "denied. Local mechanism input only; not authority or approval."
+                    "denied; that bounded denial is the controlled completion signal. "
+                    "Local mechanism input only; not authority or approval."
                 ),
             },
         },
@@ -1911,7 +1913,8 @@ def build_semantic_git_operation_tool_schema() -> dict[str, Any]:
             "Call agentveil_git_operation with worktree_path and operation before native "
             "Git. Allowed operation is prepare_for_review, commit, or push. "
             "prepare_for_review prepares a local change for review. commit and push are "
-            "not authorized and are denied safely. This does not commit, push, merge, or "
+            "not authorized and are denied; for explicit commit or push requests, "
+            "that bounded denial is the controlled completion signal. This does not commit, push, merge, or "
             "apply. Autonomous only when policy allows. Local preparation only; not "
             "authority or approval."
         ),
