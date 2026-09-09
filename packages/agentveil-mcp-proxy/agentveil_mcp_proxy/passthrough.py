@@ -52,11 +52,17 @@ from agentveil_mcp_proxy.classification import (
     sha256_jcs,
 )
 from agentveil_mcp_proxy.controlled_alternatives import (
+    AGENTVEIL_WRITE_FILE_DOWNSTREAM_TOOL_NAME,
     ControlledAlternativeValidationError,
     GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+    SEMANTIC_WRITE_FILE_TOOL_NAME,
+    agentveil_write_file_catalog_collision,
+    inject_agentveil_write_file_tool,
     is_controlled_alternative_tool_name,
     is_semantic_controlled_alternative_tool,
+    normalize_agentveil_write_file_call,
     normalize_semantic_tool_call,
+    projected_controlled_alternative_validation_payload,
 )
 from agentveil_mcp_proxy.controlled_alternatives_runtime import (
     ControlledAlternativeExecutionAbort,
@@ -78,7 +84,6 @@ from agentveil_mcp_proxy.evidence import (
 from agentveil_mcp_proxy.evidence.events_show import (
     DEFAULT_SHOW_LAST,
     LOCAL_PROOF_AGENT_INSPECTION_HINT,
-    LOCAL_PROOF_INSPECTION_HINT,
     LOCAL_PROOF_MCP_TOOL_NAME,
     render_local_proof_mcp_content,
 )
@@ -113,7 +118,6 @@ from agentveil_mcp_proxy.role_doctor import (
     REDIRECT_LINEAGE_STATUS_VERIFIED,
     REDIRECT_ROLE_FOLLOW_UP,
     REDIRECT_ROLE_ORIGINAL,
-    UNSUPPORTED_REDIRECT_PLAYBOOK,
     RedirectContext,
     blocked_error_message,
     build_approval_guidance,
@@ -165,7 +169,6 @@ from agentveil_mcp_proxy.policy import (
     build_session_bound_facts,
     build_session_integrity_metadata,
     detect_session_integrity_mismatch,
-    derive_target_reached,
     SESSION_INTEGRITY_EVENT_TYPE,
 )
 from agentveil_mcp_proxy.tool_schema_validation import (
@@ -1211,6 +1214,7 @@ class McpPassthrough:
         self._schema_request_counter = 0
         self._request_local = threading.local()
         self._downstream_tool_calls_forwarded = 0
+        self._agentveil_write_file_catalog_collision = False
         self._windows_job: _WindowsJobObject | None = None
         self._stdio_worker_count = STDIO_REQUEST_WORKERS
         self._stdio_queue_maxsize = STDIO_REQUEST_QUEUE_MAXSIZE
@@ -1614,6 +1618,13 @@ class McpPassthrough:
             semantic_precheck = self._semantic_controlled_precheck_response(message, request_id)
             if semantic_precheck is not None:
                 return [semantic_precheck] if has_id else []
+            direct_write_precheck = self._agentveil_write_file_precheck_response(
+                message,
+                request_id,
+            )
+            if direct_write_precheck is not None:
+                return [direct_write_precheck] if has_id else []
+            message = self._downstream_agentveil_write_file_message(message)
             invalid_error = self._invalid_arguments_error(message, request_id)
             if invalid_error is not None:
                 return [invalid_error] if has_id else []
@@ -1768,9 +1779,10 @@ class McpPassthrough:
                     and has_id
                     and not _message_is_concurrent_tools_call(message)
                 ):
+                    downstream_message = self._downstream_agentveil_write_file_message(message)
                     with self._mutation_execution_lock:
                         stale_generation = self._send_tools_call_if_current_generation(
-                            message,
+                            downstream_message,
                             request_id,
                             approval_outcome,
                         )
@@ -2728,6 +2740,8 @@ class McpPassthrough:
             return None
         tool = params.get("name")
         if not isinstance(tool, str) or not tool:
+            return None
+        if tool == SEMANTIC_WRITE_FILE_TOOL_NAME:
             return None
         if is_controlled_alternative_tool_name(tool):
             return None
@@ -3861,20 +3875,83 @@ class McpPassthrough:
             )
         try:
             normalize_semantic_tool_call(tool_name, arguments)
-        except ControlledAlternativeValidationError:
+        except ControlledAlternativeValidationError as exc:
             return local_mcp_result(
                 request_id,
-                {
-                    "mechanism_status": "error",
-                    "error_code": "request_malformed",
-                    "target_reached": False,
-                    "rollback_available": False,
-                    "verification_level": "not_verified",
-                },
+                projected_controlled_alternative_validation_payload(exc),
             )
         return None
 
+    def _agentveil_write_file_precheck_response(
+        self,
+        message: Mapping[str, Any],
+        request_id: Any,
+    ) -> dict[str, Any] | None:
+        if message.get("method") != "tools/call":
+            return None
+        params = message.get("params")
+        if not isinstance(params, Mapping):
+            return None
+        tool_name = params.get("name")
+        if tool_name != SEMANTIC_WRITE_FILE_TOOL_NAME:
+            return None
+        if not self._tool_schemas.is_advertised(SEMANTIC_WRITE_FILE_TOOL_NAME):
+            self._ensure_tool_schema(SEMANTIC_WRITE_FILE_TOOL_NAME)
+        if (
+            self._agentveil_write_file_catalog_collision
+            or not self._tool_schemas.is_advertised(SEMANTIC_WRITE_FILE_TOOL_NAME)
+            or not self._tool_schemas.is_advertised(AGENTVEIL_WRITE_FILE_DOWNSTREAM_TOOL_NAME)
+        ):
+            self._record_security_event({
+                "type": "unknown_tool_call",
+                "action": "blocked_pre_approval",
+                "reason": "unknown_tool",
+                "risk_class": "tool_identity_violation",
+                "tool": tool_name,
+            })
+            return _blocked_error(
+                request_id,
+                "blocked by MCP proxy: tool not advertised by downstream",  # claim-check: allow bounded local unknown-tool error.
+                reason="unknown_tool",
+            )
+        arguments = params.get("arguments", {})
+        if not isinstance(arguments, Mapping):
+            arguments = {}
+        try:
+            normalize_agentveil_write_file_call(arguments)
+        except ControlledAlternativeValidationError as exc:
+            return local_mcp_result(
+                request_id,
+                projected_controlled_alternative_validation_payload(exc),
+            )
+        return None
+
+    def _downstream_agentveil_write_file_message(
+        self,
+        message: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if message.get("method") != "tools/call":
+            return message
+        params = message.get("params")
+        if not isinstance(params, Mapping):
+            return message
+        if params.get("name") != SEMANTIC_WRITE_FILE_TOOL_NAME:
+            return message
+        arguments = params.get("arguments", {})
+        if not isinstance(arguments, Mapping):
+            return message
+        normalized = normalize_agentveil_write_file_call(arguments)
+        rewritten = dict(message)
+        rewritten_params = dict(params)
+        rewritten_params["name"] = AGENTVEIL_WRITE_FILE_DOWNSTREAM_TOOL_NAME
+        rewritten_params["arguments"] = normalized
+        rewritten["params"] = rewritten_params
+        return rewritten
+
     def _inject_controlled_alternative_list(self, response: Any) -> Any:
+        self._agentveil_write_file_catalog_collision = agentveil_write_file_catalog_collision(response)
+        if not self._agentveil_write_file_catalog_collision:
+            response = inject_agentveil_write_file_tool(response)
         if self.controlled_runtime is None:
             self._controlled_catalog_collision = False
             return response
@@ -3917,16 +3994,10 @@ class McpPassthrough:
             arguments = {}
         try:
             normalized_arguments = normalize_controlled_alternative_arguments(tool_name, arguments)
-        except ControlledAlternativeValidationError:
+        except ControlledAlternativeValidationError as exc:
             return local_mcp_result(
                 request_id,
-                {
-                    "mechanism_status": "error",
-                    "error_code": "request_malformed",
-                    "target_reached": False,
-                    "rollback_available": False,
-                    "verification_level": "not_verified",
-                },
+                projected_controlled_alternative_validation_payload(exc),
             )
         if alternative_id_from_arguments(normalized_arguments) == "filesystem.cleanup_staged.v1":
             if not self._cleanup_authority_is_bound(classification, approval_outcome):
@@ -5276,7 +5347,7 @@ class McpPassthrough:
         while True:
             try:
                 chunk = read_chunk(4096)
-            except OSError as exc:
+            except OSError:
                 if not self._stopping:
                     self._set_downstream_error(PassthroughError("downstream read failed"))
                 return

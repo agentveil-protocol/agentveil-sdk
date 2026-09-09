@@ -15,6 +15,8 @@ import pytest
 
 import agentveil_mcp_proxy.controlled_alternatives as ca_mod
 from agentveil_mcp_proxy.controlled_alternatives import (
+    AUTHORITY_FORBIDDEN_RESULT_KEYS,
+    APPLY_PREPARED_PATCH_ALTERNATIVE_ID,
     CONTROLLED_ALTERNATIVE_IDS,
     CONTROLLED_ALTERNATIVE_PROVIDER_CONTRACT_VERSION,
     CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP,
@@ -26,24 +28,38 @@ from agentveil_mcp_proxy.controlled_alternatives import (
     ERROR_DISCOVERY_ENTRYPOINT_LOAD_FAILED,
     ERROR_DISCOVERY_ENTRYPOINT_MISSING,
     ERROR_DISCOVERY_INELIGIBLE,
+    ERROR_GIT_INTENT_DENIED,
     ERROR_REQUEST_MALFORMED,
     ERROR_RESULT_UNSAFE,
     GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+    KNOWN_CONTROLLED_ALTERNATIVE_IDS,
+    OPTIONAL_CONTROLLED_ALTERNATIVE_IDS,
+    RESTORE_QUARANTINE_ENTRY_ID_INSTRUCTION,
+    SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME,
     SEMANTIC_CLEANUP_STAGED_TOOL_NAME,
+    SEMANTIC_GIT_OPERATION_TOOL_NAME,
+    SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME,
+    SEMANTIC_PREPARE_PATCH_TOOL_NAME,
     SEMANTIC_RESTORE_STAGED_TOOL_NAME,
     SEMANTIC_STAGE_DELETE_TOOL_NAME,
+    SEMANTIC_WRITE_FILE_TOOL_NAME,
     SEMANTIC_TOOL_BY_ALTERNATIVE_ID,
     ControlledAlternativeBoundedLocalInput,
     ControlledAlternativeProviderDescriptor,
     ControlledAlternativeProviderResult,
     ControlledAlternativeValidationError,
     build_controlled_alternative_tool_schema,
+    build_agentveil_write_file_tool_schema,
     build_semantic_controlled_alternative_tool_schema,
     build_semantic_controlled_alternative_tool_schemas,
     discover_controlled_alternative_provider,
+    git_intent_denied_local_payload,
+    inject_agentveil_write_file_tool,
     is_controlled_alternative_tool_name,
     is_semantic_controlled_alternative_tool,
+    normalize_agentveil_write_file_call,
     normalize_semantic_tool_call,
+    projected_controlled_alternative_validation_payload,
     semantic_alternative_id_for_tool,
     semantic_tool_name_for_alternative_id,
     set_controlled_alternative_provider_loader,
@@ -97,6 +113,8 @@ else:
 
 SECRET_PATCH = "password=super-secret-value"
 QUARANTINE_ENTRY_ID_CANARY = "cafebabedeadbeef0123456789abcdef"
+PREPARED_ARTIFACT_REF_CANARY = "d00df00ddeadbeef0123456789abcdef"
+PREPARED_ARTIFACT_HASH_CANARY = "ab" * 32
 ROUTE_CANARY = "route-secret-9f3a"
 SUMMARY_CANARY = "customer-summary-should-not-leak"
 STDEV_CANARY = 424242
@@ -229,6 +247,8 @@ def _assert_bounded_error(
         RELATIVE_ROOT,
         NON_NORMALIZED_ROOT,
         QUARANTINE_ENTRY_ID_CANARY,
+        PREPARED_ARTIFACT_REF_CANARY,
+        PREPARED_ARTIFACT_HASH_CANARY,
         *extra_canaries,
     ):
         assert canary not in rendered
@@ -250,8 +270,17 @@ def test_constants_match_ca0_contract() -> None:
         "git.prepare_local_change.v1",
     )
     assert ca_mod.MAX_RESOURCE_LOCATOR_FIELDS == 8
-    assert ca_mod.MAX_RESULT_TOP_LEVEL_KEYS == 12
+    assert ca_mod.MAX_RESULT_TOP_LEVEL_KEYS == 14
     assert ca_mod.MAX_QUARANTINE_ENTRY_ID_BYTES == 64
+    assert ca_mod.MAX_PREPARED_ARTIFACT_REF_BYTES == 64
+    assert ca_mod.MAX_PREPARED_ARTIFACT_REF_CHARS == 32
+    assert ca_mod.MAX_PREPARED_ARTIFACT_HASH_CHARS == 64
+    assert APPLY_PREPARED_PATCH_ALTERNATIVE_ID == "protected_write.apply_prepared_patch.v1"
+    assert OPTIONAL_CONTROLLED_ALTERNATIVE_IDS == frozenset({APPLY_PREPARED_PATCH_ALTERNATIVE_ID})
+    assert KNOWN_CONTROLLED_ALTERNATIVE_IDS == (
+        frozenset(CONTROLLED_ALTERNATIVE_IDS) | OPTIONAL_CONTROLLED_ALTERNATIVE_IDS
+    )
+    assert APPLY_PREPARED_PATCH_ALTERNATIVE_ID not in CONTROLLED_ALTERNATIVE_IDS
 
 
 @pytest.mark.parametrize("alternative_id, raw_input", list(FAMILY_INPUTS.items()))
@@ -343,7 +372,20 @@ def test_sensitive_repr_surfaces_are_redacted() -> None:
             "quarantine_entry_id": QUARANTINE_ENTRY_ID_CANARY,
         }
     )
-    for value in (local_input, locator, request, bounded, result, staged):
+    prepared = validate_provider_result(
+        {
+            "contract_version": "1",
+            "alternative_id": "protected_write.prepare_patch.v1",
+            "operation_ref": "op-1",
+            "result_status": "success",
+            "outcome_class_candidate": "PREPARED_FOR_APPROVAL",
+            "target_reached": False,
+            "rollback_available": False,
+            "prepared_artifact_ref": PREPARED_ARTIFACT_REF_CANARY,
+            "prepared_artifact_hash": PREPARED_ARTIFACT_HASH_CANARY,
+        }
+    )
+    for value in (local_input, locator, request, bounded, result, staged, prepared):
         rendered = f"{value!r}{value}"
         assert SECRET_PATH not in rendered
         assert SECRET_PATCH not in rendered
@@ -352,6 +394,8 @@ def test_sensitive_repr_surfaces_are_redacted() -> None:
         assert ROUTE_CANARY not in rendered
         assert SUMMARY_CANARY not in rendered
         assert QUARANTINE_ENTRY_ID_CANARY not in rendered
+        assert PREPARED_ARTIFACT_REF_CANARY not in rendered
+        assert PREPARED_ARTIFACT_HASH_CANARY not in rendered
         assert str(STDEV_CANARY) not in rendered
         assert not hasattr(value, "to_dict")
 
@@ -952,6 +996,310 @@ def test_result_dataclass_cannot_bypass_quarantine_id_validation() -> None:
             )
         )
     _assert_bounded_error(invalid_tuple, ERROR_REQUEST_MALFORMED)
+
+
+def _prepared_write_result_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "contract_version": "1",
+        "alternative_id": "protected_write.prepare_patch.v1",
+        "operation_ref": "op-1",
+        "result_status": "success",
+        "outcome_class_candidate": "PREPARED_FOR_APPROVAL",
+        "target_reached": False,
+        "rollback_available": False,
+        "prepared_artifact_ref": PREPARED_ARTIFACT_REF_CANARY,
+        "prepared_artifact_hash": PREPARED_ARTIFACT_HASH_CANARY,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _prepared_write_result_dataclass(**overrides: object) -> ControlledAlternativeProviderResult:
+    payload: dict[str, object] = {
+        "contract_version": "1",
+        "alternative_id": "protected_write.prepare_patch.v1",
+        "operation_ref": "op-1",
+        "result_status": "success",
+        "outcome_class_candidate": "PREPARED_FOR_APPROVAL",
+        "target_reached": False,
+        "rollback_available": False,
+        "error_code": None,
+        "bounded_summary": None,
+        "quarantine_entry_id": None,
+        "prepared_artifact_ref": PREPARED_ARTIFACT_REF_CANARY,
+        "prepared_artifact_hash": PREPARED_ARTIFACT_HASH_CANARY,
+    }
+    payload.update(overrides)
+    return ControlledAlternativeProviderResult(**payload)  # type: ignore[arg-type]
+
+
+def test_protected_write_prepared_result_accepts_mapping_and_dataclass() -> None:
+    mapping = _prepared_write_result_payload()
+    parsed = validate_provider_result(mapping)
+    assert parsed.alternative_id == "protected_write.prepare_patch.v1"
+    assert parsed.result_status == "success"
+    assert parsed.outcome_class_candidate == "PREPARED_FOR_APPROVAL"
+    assert parsed.target_reached is False
+    assert parsed.rollback_available is False
+    assert parsed.prepared_artifact_ref == PREPARED_ARTIFACT_REF_CANARY
+    assert parsed.prepared_artifact_hash == PREPARED_ARTIFACT_HASH_CANARY
+    assert parsed.quarantine_entry_id is None
+    rendered = f"{parsed!r}{parsed}"
+    assert PREPARED_ARTIFACT_REF_CANARY not in rendered
+    assert PREPARED_ARTIFACT_HASH_CANARY not in rendered
+    again = validate_provider_result(parsed)
+    assert again.prepared_artifact_ref == PREPARED_ARTIFACT_REF_CANARY
+    assert again.prepared_artifact_hash == PREPARED_ARTIFACT_HASH_CANARY
+
+    accepted = validate_provider_result(_prepared_write_result_dataclass())
+    assert accepted.prepared_artifact_ref == PREPARED_ARTIFACT_REF_CANARY
+    assert accepted.prepared_artifact_hash == PREPARED_ARTIFACT_HASH_CANARY
+    round_trip = validate_provider_result(accepted)
+    assert round_trip.prepared_artifact_ref == parsed.prepared_artifact_ref
+    assert round_trip.prepared_artifact_hash == parsed.prepared_artifact_hash
+    assert PREPARED_ARTIFACT_REF_CANARY not in f"{accepted!r}{accepted}{round_trip!r}{round_trip}"
+
+
+@pytest.mark.parametrize("missing_key", ["prepared_artifact_ref", "prepared_artifact_hash"])
+def test_protected_write_prepared_result_requires_both_fields(missing_key: str) -> None:
+    payload = _prepared_write_result_payload()
+    del payload[missing_key]
+    with pytest.raises(ControlledAlternativeValidationError) as missing:
+        validate_provider_result(payload)
+    _assert_bounded_error(missing, ERROR_REQUEST_MALFORMED)
+    dataclass_kwargs = {missing_key: None}
+    with pytest.raises(ControlledAlternativeValidationError) as missing_dc:
+        validate_provider_result(_prepared_write_result_dataclass(**dataclass_kwargs))
+    _assert_bounded_error(missing_dc, ERROR_REQUEST_MALFORMED)
+
+
+def test_protected_write_prepared_result_rejects_both_fields_absent() -> None:
+    payload = _prepared_write_result_payload()
+    del payload["prepared_artifact_ref"]
+    del payload["prepared_artifact_hash"]
+    with pytest.raises(ControlledAlternativeValidationError) as missing:
+        validate_provider_result(payload)
+    _assert_bounded_error(missing, ERROR_REQUEST_MALFORMED)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"result_status": "error", "error_code": "internal_error"},
+        {"result_status": "unavailable", "error_code": "atomic_relocation_unavailable"},
+        {"outcome_class_candidate": "COMPLETED_WITH_ALTERNATIVE"},
+        {"outcome_class_candidate": "COMPLETED_DIRECTLY"},
+        {"target_reached": True},
+        {"rollback_available": True},
+        {"target_reached": True, "rollback_available": True},
+    ],
+)
+def test_protected_write_wrong_tuple_forbids_prepared_fields(overrides: dict[str, object]) -> None:
+    payload = _prepared_write_result_payload(**overrides)
+    with pytest.raises(ControlledAlternativeValidationError) as forbidden:
+        validate_provider_result(payload)
+    _assert_bounded_error(forbidden, ERROR_REQUEST_MALFORMED)
+    del payload["prepared_artifact_ref"]
+    del payload["prepared_artifact_hash"]
+    if payload.get("result_status") == "success":
+        parsed = validate_provider_result(payload)
+        assert parsed.prepared_artifact_ref is None
+        assert parsed.prepared_artifact_hash is None
+    else:
+        parsed = validate_provider_result(payload)
+        assert parsed.result_status == payload["result_status"]
+        assert parsed.prepared_artifact_ref is None
+        assert parsed.prepared_artifact_hash is None
+
+
+@pytest.mark.parametrize(
+    "result_status, outcome",
+    [
+        ("error", "ALTERNATIVE_UNAVAILABLE"),
+        ("unavailable", "ALTERNATIVE_UNAVAILABLE"),
+        ("error", "DENIED"),
+    ],
+)
+def test_protected_write_failure_forbids_prepared_fields(
+    result_status: str,
+    outcome: str,
+) -> None:
+    payload = _prepared_write_result_payload(
+        result_status=result_status,
+        outcome_class_candidate=outcome,
+        error_code="internal_error",
+    )
+    with pytest.raises(ControlledAlternativeValidationError) as forbidden:
+        validate_provider_result(payload)
+    _assert_bounded_error(forbidden, ERROR_REQUEST_MALFORMED)
+    del payload["prepared_artifact_ref"]
+    del payload["prepared_artifact_hash"]
+    parsed = validate_provider_result(payload)
+    assert parsed.result_status == result_status
+    assert parsed.prepared_artifact_ref is None
+    assert parsed.prepared_artifact_hash is None
+
+
+@pytest.mark.parametrize(
+    "alternative_id",
+    [item for item in CONTROLLED_ALTERNATIVE_IDS if item != "protected_write.prepare_patch.v1"],
+)
+def test_other_alternative_results_forbid_prepared_artifact_fields(alternative_id: str) -> None:
+    payload = _prepared_write_result_payload(alternative_id=alternative_id)
+    if alternative_id == "filesystem.stage_delete.v1":
+        payload["outcome_class_candidate"] = "COMPLETED_WITH_ALTERNATIVE"
+        payload["target_reached"] = True
+        payload["rollback_available"] = True
+        payload["quarantine_entry_id"] = QUARANTINE_ENTRY_ID_CANARY
+    with pytest.raises(ControlledAlternativeValidationError) as forbidden:
+        validate_provider_result(payload)
+    _assert_bounded_error(forbidden, ERROR_REQUEST_MALFORMED)
+    del payload["prepared_artifact_ref"]
+    del payload["prepared_artifact_hash"]
+    parsed = validate_provider_result(payload)
+    assert parsed.alternative_id == alternative_id
+    assert parsed.prepared_artifact_ref is None
+    assert parsed.prepared_artifact_hash is None
+    if alternative_id == "filesystem.stage_delete.v1":
+        assert parsed.quarantine_entry_id == QUARANTINE_ENTRY_ID_CANARY
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        None,
+        True,
+        1,
+        "",
+        "a" * 31,
+        "a" * 33,
+        "A" * 32,
+        "g" * 32,
+        "a" * 31 + " ",
+        " " + "a" * 31,
+    ],
+)
+def test_protected_write_rejects_malformed_prepared_artifact_ref(bad_value: object) -> None:
+    payload = _prepared_write_result_payload(prepared_artifact_ref=bad_value)
+    with pytest.raises(ControlledAlternativeValidationError) as malformed:
+        validate_provider_result(payload)
+    extra = (bad_value,) if isinstance(bad_value, str) and bad_value else ()
+    _assert_bounded_error(malformed, ERROR_REQUEST_MALFORMED, *extra)
+
+
+def test_protected_write_rejects_oversized_path_like_and_authority_like_ref() -> None:
+    oversized = "a" * (ca_mod.MAX_PREPARED_ARTIFACT_REF_BYTES + 1)
+    with pytest.raises(ControlledAlternativeValidationError) as too_big:
+        validate_provider_result(_prepared_write_result_payload(prepared_artifact_ref=oversized))
+    _assert_bounded_error(too_big, ERROR_REQUEST_MALFORMED, oversized)
+
+    for path_like in (SECRET_PATH, "../artifact", r"C:\artifact", "~artifact", "/tmp/artifact"):
+        with pytest.raises(ControlledAlternativeValidationError) as path_exc:
+            validate_provider_result(_prepared_write_result_payload(prepared_artifact_ref=path_like))
+        _assert_bounded_error(path_exc, ERROR_REQUEST_MALFORMED, path_like)
+
+    for authority_like in (
+        "allow",
+        "decision",
+        "authority_grant",
+        "approval_granted",
+        "approval_id",
+        "evidence_id",
+        "bounded_summary",
+        "operation_ref",
+    ):
+        with pytest.raises(ControlledAlternativeValidationError) as authority_exc:
+            validate_provider_result(
+                _prepared_write_result_payload(prepared_artifact_ref=authority_like)
+            )
+        _assert_bounded_error(authority_exc, ERROR_REQUEST_MALFORMED, authority_like)
+
+    with pytest.raises(ControlledAlternativeValidationError) as same_as_op:
+        validate_provider_result(_prepared_write_result_payload(prepared_artifact_ref="op-1"))
+    _assert_bounded_error(same_as_op, ERROR_REQUEST_MALFORMED, "op-1")
+    with pytest.raises(ControlledAlternativeValidationError) as same_as_summary:
+        validate_provider_result(
+            _prepared_write_result_payload(
+                bounded_summary=SUMMARY_CANARY,
+                prepared_artifact_ref=SUMMARY_CANARY,
+            )
+        )
+    _assert_bounded_error(same_as_summary, ERROR_REQUEST_MALFORMED, SUMMARY_CANARY)
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        None,
+        True,
+        1,
+        "",
+        "a" * 63,
+        "a" * 65,
+        "A" * 64,
+        "g" * 64,
+        "ab" * 31 + "GG",
+        PREPARED_ARTIFACT_HASH_CANARY.upper(),
+    ],
+)
+def test_protected_write_rejects_malformed_prepared_artifact_hash(bad_value: object) -> None:
+    payload = _prepared_write_result_payload(prepared_artifact_hash=bad_value)
+    with pytest.raises(ControlledAlternativeValidationError) as malformed:
+        validate_provider_result(payload)
+    extra = (bad_value,) if isinstance(bad_value, str) and bad_value else ()
+    _assert_bounded_error(malformed, ERROR_REQUEST_MALFORMED, *extra)
+
+
+def test_protected_write_rejects_extra_and_authority_result_keys() -> None:
+    payload = _prepared_write_result_payload(apply=True)
+    with pytest.raises(ControlledAlternativeValidationError) as extra:
+        validate_provider_result(payload)
+    _assert_bounded_error(extra, ERROR_REQUEST_MALFORMED)
+    with pytest.raises(ControlledAlternativeValidationError) as allow_key:
+        validate_provider_result(_prepared_write_result_payload(ALLOW=True))
+    _assert_bounded_error(allow_key, ERROR_RESULT_UNSAFE)
+    overflowing = _prepared_write_result_payload()
+    while len(overflowing) <= ca_mod.MAX_RESULT_TOP_LEVEL_KEYS:
+        overflowing[f"extra_{len(overflowing)}"] = "x"
+    with pytest.raises(ControlledAlternativeValidationError) as too_many:
+        validate_provider_result(overflowing)
+    _assert_bounded_error(too_many, ERROR_REQUEST_MALFORMED)
+
+
+def test_result_dataclass_cannot_bypass_prepared_artifact_validation() -> None:
+    with pytest.raises(ControlledAlternativeValidationError) as uppercase_hash:
+        validate_provider_result(
+            _prepared_write_result_dataclass(prepared_artifact_hash="AB" * 32)
+        )
+    _assert_bounded_error(uppercase_hash, ERROR_REQUEST_MALFORMED, "AB" * 32)
+    with pytest.raises(ControlledAlternativeValidationError) as path_ref:
+        validate_provider_result(
+            _prepared_write_result_dataclass(prepared_artifact_ref=SECRET_PATH)
+        )
+    _assert_bounded_error(path_ref, ERROR_REQUEST_MALFORMED, SECRET_PATH)
+    with pytest.raises(ControlledAlternativeValidationError) as wrong_family:
+        validate_provider_result(
+            _prepared_write_result_dataclass(
+                alternative_id="filesystem.restore_staged.v1",
+            )
+        )
+    _assert_bounded_error(wrong_family, ERROR_REQUEST_MALFORMED)
+    with pytest.raises(ControlledAlternativeValidationError) as wrong_tuple:
+        validate_provider_result(
+            _prepared_write_result_dataclass(
+                target_reached=True,
+                rollback_available=False,
+            )
+        )
+    _assert_bounded_error(wrong_tuple, ERROR_REQUEST_MALFORMED)
+    with pytest.raises(ControlledAlternativeValidationError) as missing:
+        validate_provider_result(
+            _prepared_write_result_dataclass(
+                prepared_artifact_ref=None,
+                prepared_artifact_hash=None,
+            )
+        )
+    _assert_bounded_error(missing, ERROR_REQUEST_MALFORMED)
 
 
 def test_validate_provider_descriptor_rejects_bypass_and_missing_fields() -> None:
@@ -1747,16 +2095,36 @@ def test_semantic_tool_constants_and_mapping() -> None:
     assert SEMANTIC_STAGE_DELETE_TOOL_NAME == "agentveil_stage_delete"
     assert SEMANTIC_RESTORE_STAGED_TOOL_NAME == "agentveil_restore_staged"
     assert SEMANTIC_CLEANUP_STAGED_TOOL_NAME == "agentveil_cleanup_staged"
+    assert SEMANTIC_PREPARE_PATCH_TOOL_NAME == "agentveil_prepare_patch"
+    assert SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME == "agentveil_prepare_git_change"
     assert semantic_alternative_id_for_tool(SEMANTIC_STAGE_DELETE_TOOL_NAME) == (
         "filesystem.stage_delete.v1"
     )
+    assert semantic_alternative_id_for_tool(SEMANTIC_PREPARE_PATCH_TOOL_NAME) == (
+        "protected_write.prepare_patch.v1"
+    )
+    assert semantic_alternative_id_for_tool(SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME) == (
+        "git.prepare_local_change.v1"
+    )
+    assert semantic_alternative_id_for_tool(SEMANTIC_GIT_OPERATION_TOOL_NAME) == (
+        "git.prepare_local_change.v1"
+    )
+    assert semantic_tool_name_for_alternative_id("git.prepare_local_change.v1") == (
+        SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME
+    )
     assert is_semantic_controlled_alternative_tool(SEMANTIC_STAGE_DELETE_TOOL_NAME)
+    assert is_semantic_controlled_alternative_tool(SEMANTIC_PREPARE_PATCH_TOOL_NAME)
+    assert is_semantic_controlled_alternative_tool(SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME)
+    assert is_semantic_controlled_alternative_tool(SEMANTIC_GIT_OPERATION_TOOL_NAME)
     assert is_controlled_alternative_tool_name(GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME)
     assert is_controlled_alternative_tool_name(SEMANTIC_STAGE_DELETE_TOOL_NAME)
+    assert is_controlled_alternative_tool_name(SEMANTIC_PREPARE_PATCH_TOOL_NAME)
+    assert is_controlled_alternative_tool_name(SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME)
+    assert is_controlled_alternative_tool_name(SEMANTIC_GIT_OPERATION_TOOL_NAME)
     assert not is_semantic_controlled_alternative_tool(GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME)
 
 
-def test_semantic_schemas_project_exact_three_filesystem_tools() -> None:
+def test_semantic_schemas_project_filesystem_and_prepare_when_advertised() -> None:
     jsonschema = pytest.importorskip("jsonschema")
     descriptor = validate_provider_descriptor(_valid_descriptor_payload())
     schemas = build_semantic_controlled_alternative_tool_schemas(descriptor)
@@ -1764,6 +2132,9 @@ def test_semantic_schemas_project_exact_three_filesystem_tools() -> None:
         SEMANTIC_STAGE_DELETE_TOOL_NAME,
         SEMANTIC_RESTORE_STAGED_TOOL_NAME,
         SEMANTIC_CLEANUP_STAGED_TOOL_NAME,
+        SEMANTIC_PREPARE_PATCH_TOOL_NAME,
+        SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME,
+        SEMANTIC_GIT_OPERATION_TOOL_NAME,
     ]
     stage = schemas[0]
     assert stage["inputSchema"]["additionalProperties"] is False
@@ -1771,6 +2142,70 @@ def test_semantic_schemas_project_exact_three_filesystem_tools() -> None:
     jsonschema.validate({"path": "notes.txt"}, stage["inputSchema"])
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate({"path": "notes.txt", "alternative_id": "x"}, stage["inputSchema"])
+    prepare = schemas[3]
+    jsonschema.validate({"path": "notes.txt", "patch": "diff"}, prepare["inputSchema"])
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({"path": "notes.txt"}, prepare["inputSchema"])
+    dumped = json.dumps(prepare)
+    assert "workspace_root" not in dumped
+    assert "state_root" not in dumped
+    assert "route_id" not in dumped
+    assert "st_dev" not in dumped
+    assert "prepared_artifact_ref" not in prepare["inputSchema"]["properties"]
+    git_schema = schemas[4]
+    assert git_schema["name"] == SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME
+    assert git_schema["inputSchema"]["additionalProperties"] is False
+    assert set(git_schema["inputSchema"]["required"]) == {"worktree_path"}
+    assert set(git_schema["inputSchema"]["properties"]) == {"worktree_path", "intent"}
+    jsonschema.validate({"worktree_path": "."}, git_schema["inputSchema"])
+    jsonschema.validate(
+        {"worktree_path": ".", "intent": "prepare_for_review"},
+        git_schema["inputSchema"],
+    )
+    jsonschema.validate(
+        {"worktree_path": ".", "intent": "commit"},
+        git_schema["inputSchema"],
+    )
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({"worktree_path": ".", "alternative_id": "x"}, git_schema["inputSchema"])
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({"path": "repo"}, git_schema["inputSchema"])
+    git_dumped = json.dumps(git_schema)
+    assert "workspace_root" not in git_dumped
+    assert "state_root" not in git_dumped
+    assert "route_id" not in git_dumped
+    assert "st_dev" not in git_dumped
+    assert "diff" not in git_dumped.lower()
+    assert "remote" not in git_dumped.lower()
+    assert "branch" not in git_dumped.lower()
+    assert "agentveil_private_policy" not in git_dumped
+    git_operation = schemas[5]
+    assert git_operation["name"] == SEMANTIC_GIT_OPERATION_TOOL_NAME
+    assert git_operation["inputSchema"]["additionalProperties"] is False
+    assert set(git_operation["inputSchema"]["required"]) == {"worktree_path", "operation"}
+    assert set(git_operation["inputSchema"]["properties"]) == {"worktree_path", "operation"}
+    jsonschema.validate(
+        {"worktree_path": ".", "operation": "prepare_for_review"},
+        git_operation["inputSchema"],
+    )
+    jsonschema.validate(
+        {"worktree_path": ".", "operation": "commit"},
+        git_operation["inputSchema"],
+    )
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({"worktree_path": "."}, git_operation["inputSchema"])
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(
+            {"worktree_path": ".", "operation": "prepare_for_review", "intent": "commit"},
+            git_operation["inputSchema"],
+        )
+    op_dumped = json.dumps(git_operation)
+    assert "workspace_root" not in op_dumped
+    assert "state_root" not in op_dumped
+    assert "route_id" not in op_dumped
+    assert "remote" not in op_dumped.lower()
+    assert "branch" not in op_dumped.lower()
+    assert "agentveil_private_policy" not in op_dumped
 
 
 def test_normalize_semantic_tool_call_maps_to_generic_shape() -> None:
@@ -1781,6 +2216,22 @@ def test_normalize_semantic_tool_call_maps_to_generic_shape() -> None:
     assert mapped == {
         "alternative_id": "filesystem.stage_delete.v1",
         "input": {"path": "notes.txt"},
+    }
+    prepared = normalize_semantic_tool_call(
+        SEMANTIC_PREPARE_PATCH_TOOL_NAME,
+        {"path": "notes.txt", "patch": "diff"},
+    )
+    assert prepared == {
+        "alternative_id": "protected_write.prepare_patch.v1",
+        "input": {"path": "notes.txt", "patch": "diff"},
+    }
+    git_prepared = normalize_semantic_tool_call(
+        SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME,
+        {"worktree_path": "."},
+    )
+    assert git_prepared == {
+        "alternative_id": "git.prepare_local_change.v1",
+        "input": {"worktree_path": "."},
     }
 
 
@@ -1808,4 +2259,883 @@ def test_semantic_mapping_is_immutable_and_total() -> None:
         build_semantic_controlled_alternative_tool_schema("unknown")
     _assert_bounded_error(unknown_alt, ERROR_DESCRIPTOR_INVALID)
     stage = build_semantic_controlled_alternative_tool_schema("filesystem.stage_delete.v1")
-    assert "file or directory" in stage["description"]
+    assert "agentveil_stage_delete" in stage["description"]
+    assert "native destructive delete may be denied" in stage["description"]
+    restore = build_semantic_controlled_alternative_tool_schema("filesystem.restore_staged.v1")
+    assert "agentveil_restore_staged(quarantine_entry_id)" in restore["description"]
+    cleanup = build_semantic_controlled_alternative_tool_schema("filesystem.cleanup_staged.v1")
+    assert "agentveil_cleanup_staged(quarantine_entry_id)" in cleanup["description"]
+    assert "approval" in cleanup["description"]
+    prepare = build_semantic_controlled_alternative_tool_schema("protected_write.prepare_patch.v1")
+    assert "agentveil_prepare_patch" in prepare["description"]
+    assert "does not apply the patch" in prepare["description"]
+    assert "not authority" in prepare["description"]
+    assert "existing workspace file" in prepare["description"]
+    assert "ordinary file creation" in prepare["description"]
+    assert "Prefer this AgentVeil tool" not in prepare["description"]
+    assert "create a new file" in prepare["inputSchema"]["properties"]["path"]["description"]
+    git_tool = build_semantic_controlled_alternative_tool_schema("git.prepare_local_change.v1")
+    assert "agentveil_prepare_git_change" in git_tool["description"]
+    assert "does not commit" in git_tool["description"]
+    assert "not authority" in git_tool["description"]
+    assert "push" in git_tool["description"]
+    assert "prepare_for_review" in git_tool["description"]
+    assert "intent=commit" in git_tool["description"]
+    assert "those intents are denied" in git_tool["description"]
+    assert SECRET_PATH not in git_tool["description"]
+    assert WORKSPACE_ROOT not in git_tool["description"]
+    assert "agentveil_private_policy" not in git_tool["description"]
+
+
+_RESTORE_HANDOFF_PRIVACY_CANARIES = (
+    "/Users/",
+    "/private/",
+    "/var/folders/",
+    "agentveil_private_policy",
+    "Codex",
+    "Claude",
+    "Cursor",
+    "Gemini",
+)
+
+
+def _assert_restore_handoff_surface_is_bounded(text: str) -> None:
+    lowered = text.lower()
+    for canary in _RESTORE_HANDOFF_PRIVACY_CANARIES:
+        assert canary not in text
+    assert "authority_grant" not in lowered
+    assert "approval_granted" not in lowered
+    assert "approval_binding_ref" not in lowered
+
+
+def test_semantic_restore_handoff_schema_pair_is_self_describing() -> None:
+    jsonschema = pytest.importorskip("jsonschema")
+    stage = build_semantic_controlled_alternative_tool_schema("filesystem.stage_delete.v1")
+    restore = build_semantic_controlled_alternative_tool_schema("filesystem.restore_staged.v1")
+    cleanup = build_semantic_controlled_alternative_tool_schema("filesystem.cleanup_staged.v1")
+    generic = build_controlled_alternative_tool_schema(validate_provider_descriptor(_valid_descriptor_payload()))
+
+    assert RESTORE_QUARANTINE_ENTRY_ID_INSTRUCTION in stage["description"]
+    assert "quarantine_entry_id" in stage["description"]
+    assert RESTORE_QUARANTINE_ENTRY_ID_INSTRUCTION in restore["description"]
+    restore_id = restore["inputSchema"]["properties"]["quarantine_entry_id"]["description"]
+    assert restore_id.startswith(RESTORE_QUARANTINE_ENTRY_ID_INSTRUCTION)
+    assert "not authority" in restore_id
+    jsonschema.validate({"quarantine_entry_id": "a" * 32}, restore["inputSchema"])
+
+    assert "Requires explicit approval" in cleanup["description"]
+    assert "not the autonomous next step" in cleanup["description"].lower()
+    cleanup_id = cleanup["inputSchema"]["properties"]["quarantine_entry_id"]["description"]
+    assert "approval" in cleanup_id.lower()
+    assert "autonomous next step" in cleanup_id.lower()
+
+    assert generic["name"] == GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME
+    dumped = json.dumps([stage, restore, cleanup, generic])
+    _assert_restore_handoff_surface_is_bounded(dumped)
+    for schema in (stage, restore, cleanup, generic):
+        assert AUTHORITY_FORBIDDEN_RESULT_KEYS.isdisjoint(schema)
+        props = schema.get("inputSchema", {}).get("properties", {})
+        assert AUTHORITY_FORBIDDEN_RESULT_KEYS.isdisjoint(props)
+    assert '"allow"' not in dumped
+    assert '"authority_grant"' not in dumped
+
+
+def test_malformed_restore_id_fails_closed_without_handoff_fields() -> None:
+    with pytest.raises(ControlledAlternativeValidationError) as missing:
+        normalize_semantic_tool_call(SEMANTIC_RESTORE_STAGED_TOOL_NAME, {})
+    _assert_bounded_error(missing, ERROR_REQUEST_MALFORMED)
+    with pytest.raises(ControlledAlternativeValidationError) as wrong_type:
+        normalize_semantic_tool_call(SEMANTIC_RESTORE_STAGED_TOOL_NAME, {"quarantine_entry_id": 123})
+    _assert_bounded_error(wrong_type, ERROR_REQUEST_MALFORMED)
+    with pytest.raises(ControlledAlternativeValidationError) as extra:
+        normalize_semantic_tool_call(
+            SEMANTIC_RESTORE_STAGED_TOOL_NAME,
+            {"quarantine_entry_id": "a" * 32, "path": "notes.txt"},
+        )
+    _assert_bounded_error(extra, ERROR_REQUEST_MALFORMED)
+
+
+def test_normalize_semantic_prepare_rejects_malformed_and_untrusted_input() -> None:
+    valid = {"path": "notes.txt", "patch": "diff"}
+    cases = (
+        {"path": "notes.txt"},
+        {"patch": "diff"},
+        {"path": "notes.txt", "patch": "diff", "extra": 1},
+        {"path": "notes.txt", "patch": "diff", "workspace_root": "/tmp"},
+        {"path": "notes.txt", "patch": "diff", "route_id": "r1"},
+        {"path": "notes.txt", "patch": "diff", "st_dev": 1},
+        {"path": 123, "patch": "diff"},
+        {"path": "notes.txt", "patch": 123},
+        {"path": "/tmp/notes.txt", "patch": "diff"},
+        {"path": "../notes.txt", "patch": "diff"},
+        {"path": "notes.txt/../secret.txt", "patch": "diff"},
+        {"path": r"C:\secret.txt", "patch": "diff"},
+        {"path": "C:/secret.txt", "patch": "diff"},
+        {"path": "notes.txt\n", "patch": "diff"},
+        {"path": "notes\x00.txt", "patch": "diff"},
+        {"path": "notes.txt", "patch": "diff\0more"},
+        {"path": "notes.txt", "patch": "x" * (ca_mod.MAX_PATCH_BYTES + 1)},
+        {"path": SECRET_PATH, "patch": SECRET_PATCH},
+    )
+    for payload in cases:
+        with pytest.raises(ControlledAlternativeValidationError) as exc:
+            normalize_semantic_tool_call(SEMANTIC_PREPARE_PATCH_TOOL_NAME, payload)
+        _assert_bounded_error(exc, ERROR_REQUEST_MALFORMED, "diff", "diff\0more")
+    accepted = normalize_semantic_tool_call(SEMANTIC_PREPARE_PATCH_TOOL_NAME, valid)
+    assert accepted["input"]["path"] == "notes.txt"
+    dumped = f"{accepted!r}{accepted}"
+    assert SECRET_PATH not in dumped
+    assert WORKSPACE_ROOT not in dumped
+    assert STATE_ROOT not in dumped
+    assert "agentveil_private_policy" not in dumped
+
+
+@pytest.mark.parametrize(
+    "drive_path",
+    [
+        r"C:\secret.txt",
+        "C:/secret.txt",
+    ],
+)
+def test_normalize_semantic_prepare_rejects_windows_drive_paths_on_any_host(
+    drive_path: str,
+) -> None:
+    with pytest.raises(ControlledAlternativeValidationError) as exc:
+        normalize_semantic_tool_call(
+            SEMANTIC_PREPARE_PATCH_TOOL_NAME,
+            {"path": drive_path, "patch": "diff"},
+        )
+    _assert_bounded_error(exc, ERROR_REQUEST_MALFORMED, drive_path, r"C:\secret.txt", "C:/secret.txt")
+    accepted = normalize_semantic_tool_call(
+        SEMANTIC_PREPARE_PATCH_TOOL_NAME,
+        {"path": "notes.txt", "patch": "diff"},
+    )
+    assert accepted == {
+        "alternative_id": "protected_write.prepare_patch.v1",
+        "input": {"path": "notes.txt", "patch": "diff"},
+    }
+
+
+def test_normalize_semantic_git_rejects_malformed_and_untrusted_input() -> None:
+    valid = {"worktree_path": "."}
+    cases = (
+        {},
+        {"worktree_path": "." , "extra": 1},
+        {"path": "repo"},
+        {"worktree_path": ".", "alternative_id": "git.prepare_local_change.v1"},
+        {"worktree_path": ".", "workspace_root": "/tmp"},
+        {"worktree_path": ".", "state_root": "/tmp"},
+        {"worktree_path": ".", "route_id": "r1"},
+        {"worktree_path": ".", "st_dev": 1},
+        {"worktree_path": 123},
+        {"worktree_path": None},
+        {"worktree_path": ["."]},
+        {"worktree_path": "/tmp/repo"},
+        {"worktree_path": "../repo"},
+        {"worktree_path": "repo/../secret"},
+        {"worktree_path": r"C:\secret"},
+        {"worktree_path": "C:/secret"},
+        {"worktree_path": "repo\n"},
+        {"worktree_path": "repo\x00"},
+        {"worktree_path": "~repo"},
+        {"worktree_path": SECRET_PATH},
+        {"worktree_path": " . "},
+        {"worktree_path": " repo"},
+        {"worktree_path": "repo "},
+        {"worktree_path": "\t."},
+        {"worktree_path": ".\t"},
+        {"worktree_path": ".", "approval_granted": True},
+        {"worktree_path": ".", "allow": True},
+    )
+    for payload in cases:
+        with pytest.raises(ControlledAlternativeValidationError) as exc:
+            normalize_semantic_tool_call(SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME, payload)
+        code = str(exc.value)
+        assert code in {ERROR_REQUEST_MALFORMED, ERROR_RESULT_UNSAFE}
+        _assert_bounded_error(exc, code, "diff", "origin", "main")
+    accepted = normalize_semantic_tool_call(SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME, valid)
+    assert accepted == {
+        "alternative_id": "git.prepare_local_change.v1",
+        "input": {"worktree_path": "."},
+    }
+    rel = normalize_semantic_tool_call(
+        SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME,
+        {"worktree_path": "repo"},
+    )
+    assert rel["input"]["worktree_path"] == "repo"
+    dumped = f"{accepted!r}{accepted}{rel!r}{rel}"
+    assert SECRET_PATH not in dumped
+    assert WORKSPACE_ROOT not in dumped
+    assert STATE_ROOT not in dumped
+    assert "agentveil_private_policy" not in dumped
+    assert ROUTE_CANARY not in dumped
+
+
+def test_git_intent_prepare_for_review_normalizes_to_existing_path() -> None:
+    omitted = normalize_semantic_tool_call(
+        SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME,
+        {"worktree_path": "."},
+    )
+    explicit = normalize_semantic_tool_call(
+        SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME,
+        {"worktree_path": ".", "intent": "prepare_for_review"},
+    )
+    parsed = validate_controlled_alternative_local_input(
+        "git.prepare_local_change.v1",
+        {"worktree_path": ".", "intent": "prepare_for_review"},
+    )
+    assert omitted == {
+        "alternative_id": "git.prepare_local_change.v1",
+        "input": {"worktree_path": "."},
+    }
+    assert explicit == {
+        "alternative_id": "git.prepare_local_change.v1",
+        "input": {"worktree_path": ".", "intent": "prepare_for_review"},
+    }
+    assert parsed.alternative_id == "git.prepare_local_change.v1"
+    assert parsed.worktree_path == "."
+    assert "intent" not in parsed.__dict__ or parsed.__dict__.get("intent") is None
+    rendered = f"{parsed!r}{parsed}{explicit!r}{explicit}"
+    assert SECRET_PATH not in rendered
+    assert WORKSPACE_ROOT not in rendered
+    assert "/Users/" not in rendered
+    assert "agentveil_private_policy" not in rendered
+
+
+@pytest.mark.parametrize("forbidden_intent", ["commit", "push"])
+def test_git_intent_commit_and_push_are_denied(forbidden_intent: str) -> None:
+    payload = {"worktree_path": ".", "intent": forbidden_intent}
+    with pytest.raises(ControlledAlternativeValidationError) as local_denied:
+        validate_controlled_alternative_local_input("git.prepare_local_change.v1", payload)
+    _assert_bounded_error(
+        local_denied,
+        ERROR_GIT_INTENT_DENIED,
+        forbidden_intent,
+        "/Users/",
+        "origin",
+        "origin/main",
+    )
+    with pytest.raises(ControlledAlternativeValidationError) as semantic_denied:
+        normalize_semantic_tool_call(SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME, payload)
+    _assert_bounded_error(
+        semantic_denied,
+        ERROR_GIT_INTENT_DENIED,
+        forbidden_intent,
+        "/Users/",
+        "origin",
+        "origin/main",
+    )
+    payload = git_intent_denied_local_payload()
+    assert payload == {
+        "mechanism_status": "error",
+        "error_code": ERROR_GIT_INTENT_DENIED,
+        "result_status": "denied",
+        "decision": "denied",
+        "target_reached": False,
+        "rollback_available": False,
+        "verification_level": "not_verified",
+    }
+    projected = projected_controlled_alternative_validation_payload(semantic_denied.value)
+    assert projected == payload
+    malformed = projected_controlled_alternative_validation_payload(
+        ControlledAlternativeValidationError(ERROR_REQUEST_MALFORMED)
+    )
+    assert malformed["error_code"] == ERROR_REQUEST_MALFORMED
+    assert malformed.get("result_status") != "denied"
+    assert "decision" not in malformed
+
+
+def test_git_operation_prepare_for_review_maps_to_existing_path() -> None:
+    mapped = normalize_semantic_tool_call(
+        SEMANTIC_GIT_OPERATION_TOOL_NAME,
+        {"worktree_path": ".", "operation": "prepare_for_review"},
+    )
+    assert mapped == {
+        "alternative_id": "git.prepare_local_change.v1",
+        "input": {"worktree_path": ".", "intent": "prepare_for_review"},
+    }
+    compat = normalize_semantic_tool_call(
+        SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME,
+        {"worktree_path": "."},
+    )
+    assert compat == {
+        "alternative_id": "git.prepare_local_change.v1",
+        "input": {"worktree_path": "."},
+    }
+    dumped = f"{mapped!r}{mapped}{compat!r}{compat}"
+    assert SECRET_PATH not in dumped
+    assert "/Users/" not in dumped
+    assert "agentveil_private_policy" not in dumped
+
+
+@pytest.mark.parametrize("forbidden_operation", ["commit", "push"])
+def test_git_operation_commit_and_push_are_denied(forbidden_operation: str) -> None:
+    payload = {"worktree_path": ".", "operation": forbidden_operation}
+    with pytest.raises(ControlledAlternativeValidationError) as denied:
+        normalize_semantic_tool_call(SEMANTIC_GIT_OPERATION_TOOL_NAME, payload)
+    _assert_bounded_error(
+        denied,
+        ERROR_GIT_INTENT_DENIED,
+        forbidden_operation,
+        "/Users/",
+        "origin",
+        "origin/main",
+    )
+    assert projected_controlled_alternative_validation_payload(denied.value) == (
+        git_intent_denied_local_payload()
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"worktree_path": "."},
+        {"operation": "prepare_for_review"},
+        {"worktree_path": ".", "operation": "rebase"},
+        {"worktree_path": ".", "operation": "COMMIT"},
+        {"worktree_path": ".", "operation": " commit"},
+        {"worktree_path": ".", "operation": "commit\n"},
+        {"worktree_path": ".", "operation": 123},
+        {"worktree_path": ".", "operation": None},
+        {"worktree_path": ".", "operation": "prepare_for_review", "intent": "commit"},
+        {"worktree_path": ".", "operation": "prepare_for_review", "extra": 1},
+        {"worktree_path": ".", "operation": "prepare_for_review", "allow": True},
+        {"worktree_path": "/tmp/repo", "operation": "prepare_for_review"},
+        {"worktree_path": "../repo", "operation": "prepare_for_review"},
+    ],
+)
+def test_git_operation_malformed_fields_fail_closed(payload: dict[str, object]) -> None:
+    with pytest.raises(ControlledAlternativeValidationError) as denied:
+        normalize_semantic_tool_call(SEMANTIC_GIT_OPERATION_TOOL_NAME, payload)
+    code = str(denied.value)
+    assert code in {ERROR_REQUEST_MALFORMED, ERROR_RESULT_UNSAFE}
+    assert code != ERROR_GIT_INTENT_DENIED
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"worktree_path": ".", "intent": "rebase"},
+        {"worktree_path": ".", "intent": "COMMIT"},
+        {"worktree_path": ".", "intent": "Push"},
+        {"worktree_path": ".", "intent": " commit"},
+        {"worktree_path": ".", "intent": "commit "},
+        {"worktree_path": ".", "intent": "\tcommit"},
+        {"worktree_path": ".", "intent": "commit\n"},
+        {"worktree_path": ".", "intent": "commit\x00"},
+        {"worktree_path": ".", "intent": ""},
+        {"worktree_path": ".", "intent": " "},
+        {"worktree_path": ".", "intent": 123},
+        {"worktree_path": ".", "intent": None},
+        {"worktree_path": ".", "intent": ["commit"]},
+        {"worktree_path": ".", "intent": {"commit": True}},
+        {"worktree_path": ".", "intent": "prepare_for_review", "extra": 1},
+        {"worktree_path": ".", "intent": "allow"},
+        {"worktree_path": ".", "approval_granted": True},
+        {"worktree_path": ".", "intent": "prepare_for_review", "allow": True},
+    ],
+)
+def test_git_intent_malformed_and_authority_fields_fail_closed(payload: dict[str, object]) -> None:
+    with pytest.raises(ControlledAlternativeValidationError) as denied:
+        validate_controlled_alternative_local_input("git.prepare_local_change.v1", payload)
+    code = str(denied.value)
+    assert code in {ERROR_REQUEST_MALFORMED, ERROR_RESULT_UNSAFE}
+    extra = tuple(
+        value for value in payload.values() if isinstance(value, str) and value
+    )
+    _assert_bounded_error(denied, code, *extra, "/Users/", "origin/main")
+    with pytest.raises(ControlledAlternativeValidationError) as semantic:
+        normalize_semantic_tool_call(SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME, payload)
+    assert str(semantic.value) in {ERROR_REQUEST_MALFORMED, ERROR_RESULT_UNSAFE}
+
+
+@pytest.mark.parametrize(
+    "drive_path",
+    [
+        r"C:\secret",
+        "C:/secret",
+    ],
+)
+def test_normalize_semantic_git_rejects_windows_drive_paths_on_any_host(
+    drive_path: str,
+) -> None:
+    with pytest.raises(ControlledAlternativeValidationError) as exc:
+        normalize_semantic_tool_call(
+            SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME,
+            {"worktree_path": drive_path},
+        )
+    _assert_bounded_error(exc, ERROR_REQUEST_MALFORMED, drive_path, r"C:\secret", "C:/secret")
+    accepted = normalize_semantic_tool_call(
+        SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME,
+        {"worktree_path": "."},
+    )
+    assert accepted == {
+        "alternative_id": "git.prepare_local_change.v1",
+        "input": {"worktree_path": "."},
+    }
+
+
+def _apply_descriptor_payload() -> dict[str, object]:
+    payload = _valid_descriptor_payload()
+    payload["alternative_ids"] = list(CONTROLLED_ALTERNATIVE_IDS) + [
+        APPLY_PREPARED_PATCH_ALTERNATIVE_ID
+    ]
+    return payload
+
+
+def _apply_locator(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "locator_kind": "prepared_write_artifact",
+        "route_id": ROUTE_CANARY,
+        "st_dev": STDEV_CANARY,
+        **_trusted_roots(),
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _apply_local_input(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "prepared_artifact_ref": PREPARED_ARTIFACT_REF_CANARY,
+        "prepared_artifact_hash": PREPARED_ARTIFACT_HASH_CANARY,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _apply_request_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "contract_version": "1",
+        "profile_id": CONTROLLED_ALTERNATIVES_PROFILE_ID,
+        "alternative_id": APPLY_PREPARED_PATCH_ALTERNATIVE_ID,
+        "operation_ref": "op-1",
+        "action_family": "write",
+        "semantic_category": "filesystem",
+        "invocation_phase": "propose",
+        "resource_locator": _apply_locator(),
+        "bounded_local_input": {
+            "prepared_artifact_ref": PREPARED_ARTIFACT_REF_CANARY,
+            "prepared_artifact_hash": PREPARED_ARTIFACT_HASH_CANARY,
+        },
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_optional_apply_descriptor_is_backward_compatible() -> None:
+    required = validate_provider_descriptor(_valid_descriptor_payload())
+    assert required.alternative_ids == CONTROLLED_ALTERNATIVE_IDS
+    advertised = validate_provider_descriptor(_apply_descriptor_payload())
+    assert advertised.alternative_ids == (
+        *CONTROLLED_ALTERNATIVE_IDS,
+        APPLY_PREPARED_PATCH_ALTERNATIVE_ID,
+    )
+    missing_required = _valid_descriptor_payload()
+    missing_required["alternative_ids"] = list(CONTROLLED_ALTERNATIVE_IDS[:-1]) + [
+        APPLY_PREPARED_PATCH_ALTERNATIVE_ID
+    ]
+    with pytest.raises(ControlledAlternativeValidationError) as missing:
+        validate_provider_descriptor(missing_required)
+    _assert_bounded_error(missing, ERROR_DESCRIPTOR_INVALID)
+    unknown_extra = _valid_descriptor_payload()
+    unknown_extra["alternative_ids"] = list(CONTROLLED_ALTERNATIVE_IDS) + ["unknown.apply.v1"]
+    with pytest.raises(ControlledAlternativeValidationError) as unknown:
+        validate_provider_descriptor(unknown_extra)
+    _assert_bounded_error(unknown, ERROR_DESCRIPTOR_INVALID)
+    apply_in_middle = list(CONTROLLED_ALTERNATIVE_IDS)
+    apply_in_middle.insert(2, APPLY_PREPARED_PATCH_ALTERNATIVE_ID)
+    middle = _valid_descriptor_payload()
+    middle["alternative_ids"] = apply_in_middle
+    with pytest.raises(ControlledAlternativeValidationError) as misplaced:
+        validate_provider_descriptor(middle)
+    _assert_bounded_error(misplaced, ERROR_DESCRIPTOR_INVALID)
+
+
+def test_semantic_apply_tool_appears_only_when_advertised() -> None:
+    jsonschema = pytest.importorskip("jsonschema")
+    old_schemas = build_semantic_controlled_alternative_tool_schemas(
+        validate_provider_descriptor(_valid_descriptor_payload())
+    )
+    old_names = [schema["name"] for schema in old_schemas]
+    assert SEMANTIC_STAGE_DELETE_TOOL_NAME in old_names
+    assert SEMANTIC_RESTORE_STAGED_TOOL_NAME in old_names
+    assert SEMANTIC_CLEANUP_STAGED_TOOL_NAME in old_names
+    assert SEMANTIC_PREPARE_PATCH_TOOL_NAME in old_names
+    assert SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME in old_names
+    assert SEMANTIC_GIT_OPERATION_TOOL_NAME in old_names
+    assert SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME not in old_names
+    advertised = build_semantic_controlled_alternative_tool_schemas(
+        validate_provider_descriptor(_apply_descriptor_payload())
+    )
+    names = [schema["name"] for schema in advertised]
+    assert names[-1] == SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME
+    apply_schema = advertised[-1]
+    assert apply_schema["name"] == SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME
+    assert set(apply_schema["inputSchema"]["required"]) == {
+        "prepared_artifact_ref",
+        "prepared_artifact_hash",
+    }
+    assert set(apply_schema["inputSchema"]["properties"]) == {
+        "prepared_artifact_ref",
+        "prepared_artifact_hash",
+    }
+    assert apply_schema["inputSchema"]["additionalProperties"] is False
+    jsonschema.validate(_apply_local_input(), apply_schema["inputSchema"])
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({"prepared_artifact_ref": PREPARED_ARTIFACT_REF_CANARY}, apply_schema["inputSchema"])
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(
+            {**_apply_local_input(), "path": "notes.txt"},
+            apply_schema["inputSchema"],
+        )
+    dumped = json.dumps(apply_schema)
+    assert "patch" not in dumped.lower() or "prepared" in dumped.lower()
+    assert "workspace_root" not in dumped
+    assert "state_root" not in dumped
+    assert "route_id" not in dumped
+    assert "st_dev" not in dumped
+    assert SECRET_PATH not in dumped
+    assert "not authority" in apply_schema["description"]
+    generic = build_controlled_alternative_tool_schema(
+        validate_provider_descriptor(_apply_descriptor_payload())
+    )
+    assert generic["name"] == GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME
+    assert APPLY_PREPARED_PATCH_ALTERNATIVE_ID in json.dumps(generic["inputSchema"])
+
+
+def test_semantic_apply_constants_and_mapping() -> None:
+    assert SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME == "agentveil_apply_prepared_patch"
+    assert semantic_alternative_id_for_tool(SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME) == (
+        APPLY_PREPARED_PATCH_ALTERNATIVE_ID
+    )
+    assert semantic_tool_name_for_alternative_id(APPLY_PREPARED_PATCH_ALTERNATIVE_ID) == (
+        SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME
+    )
+    assert is_semantic_controlled_alternative_tool(SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME)
+    assert is_controlled_alternative_tool_name(SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME)
+
+
+def test_normalize_semantic_apply_maps_ref_and_hash_only() -> None:
+    mapped = normalize_semantic_tool_call(
+        SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME,
+        _apply_local_input(),
+    )
+    assert mapped == {
+        "alternative_id": APPLY_PREPARED_PATCH_ALTERNATIVE_ID,
+        "input": {
+            "prepared_artifact_ref": PREPARED_ARTIFACT_REF_CANARY,
+            "prepared_artifact_hash": PREPARED_ARTIFACT_HASH_CANARY,
+        },
+    }
+    dumped = f"{mapped!r}{mapped}"
+    assert SECRET_PATH not in dumped
+    assert WORKSPACE_ROOT not in dumped
+    assert STATE_ROOT not in dumped
+    assert SECRET_PATCH not in dumped
+
+
+def test_normalize_semantic_apply_rejects_malformed_path_like_and_authority_input() -> None:
+    valid = _apply_local_input()
+    malformed = (
+        {},
+        {"prepared_artifact_ref": PREPARED_ARTIFACT_REF_CANARY},
+        {"prepared_artifact_hash": PREPARED_ARTIFACT_HASH_CANARY},
+        {**valid, "extra": 1},
+        {**valid, "path": "notes.txt"},
+        {**valid, "patch": SECRET_PATCH},
+        {**valid, "workspace_root": WORKSPACE_ROOT},
+        {**valid, "state_root": STATE_ROOT},
+        {**valid, "route_id": ROUTE_CANARY},
+        {**valid, "st_dev": STDEV_CANARY},
+        {"prepared_artifact_ref": 123, "prepared_artifact_hash": PREPARED_ARTIFACT_HASH_CANARY},
+        {"prepared_artifact_ref": PREPARED_ARTIFACT_REF_CANARY, "prepared_artifact_hash": 123},
+        {"prepared_artifact_ref": "/tmp/artifact", "prepared_artifact_hash": PREPARED_ARTIFACT_HASH_CANARY},
+        {"prepared_artifact_ref": "../artifact", "prepared_artifact_hash": PREPARED_ARTIFACT_HASH_CANARY},
+        {"prepared_artifact_ref": r"C:\artifact", "prepared_artifact_hash": PREPARED_ARTIFACT_HASH_CANARY},
+        {"prepared_artifact_ref": SECRET_PATH, "prepared_artifact_hash": PREPARED_ARTIFACT_HASH_CANARY},
+        {"prepared_artifact_ref": "allow", "prepared_artifact_hash": PREPARED_ARTIFACT_HASH_CANARY},
+        {"prepared_artifact_ref": "approval_granted", "prepared_artifact_hash": PREPARED_ARTIFACT_HASH_CANARY},
+        {"prepared_artifact_ref": "a" * 31, "prepared_artifact_hash": PREPARED_ARTIFACT_HASH_CANARY},
+        {"prepared_artifact_ref": PREPARED_ARTIFACT_REF_CANARY, "prepared_artifact_hash": "ab" * 31},
+        {"prepared_artifact_ref": PREPARED_ARTIFACT_REF_CANARY, "prepared_artifact_hash": "AB" * 32},
+        {"prepared_artifact_ref": "A" * 32, "prepared_artifact_hash": PREPARED_ARTIFACT_HASH_CANARY},
+    )
+    for payload in malformed:
+        with pytest.raises(ControlledAlternativeValidationError) as exc:
+            normalize_semantic_tool_call(SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME, payload)
+        _assert_bounded_error(exc, ERROR_REQUEST_MALFORMED, SECRET_PATCH)
+    for payload in (
+        {**valid, "approval_granted": True},
+        {**valid, "allow": True},
+    ):
+        with pytest.raises(ControlledAlternativeValidationError) as authority:
+            normalize_semantic_tool_call(SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME, payload)
+        _assert_bounded_error(authority, ERROR_RESULT_UNSAFE)
+    accepted = normalize_semantic_tool_call(SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME, valid)
+    assert accepted["input"]["prepared_artifact_ref"] == PREPARED_ARTIFACT_REF_CANARY
+
+
+def test_apply_local_input_and_locator_accept_bounded_ref_hash() -> None:
+    parsed = validate_controlled_alternative_local_input(
+        APPLY_PREPARED_PATCH_ALTERNATIVE_ID,
+        _apply_local_input(),
+    )
+    assert parsed.alternative_id == APPLY_PREPARED_PATCH_ALTERNATIVE_ID
+    assert parsed.prepared_artifact_ref == PREPARED_ARTIFACT_REF_CANARY
+    assert parsed.prepared_artifact_hash == PREPARED_ARTIFACT_HASH_CANARY
+    assert parsed.path is None
+    assert parsed.patch is None
+    locator = validate_resource_locator(
+        _apply_locator(),
+        alternative_id=APPLY_PREPARED_PATCH_ALTERNATIVE_ID,
+    )
+    assert locator.locator_kind == "prepared_write_artifact"
+    assert locator.normalized_path is None
+    assert locator.workspace_root == WORKSPACE_ROOT
+    assert locator.state_root == STATE_ROOT
+    with pytest.raises(ControlledAlternativeValidationError) as with_path:
+        validate_resource_locator(
+            _apply_locator(normalized_path=SECRET_PATH),
+            alternative_id=APPLY_PREPARED_PATCH_ALTERNATIVE_ID,
+        )
+    _assert_bounded_error(with_path, ERROR_REQUEST_MALFORMED)
+
+
+def test_apply_provider_request_is_ref_hash_only() -> None:
+    accepted = validate_provider_request(_apply_request_payload())
+    assert accepted.alternative_id == APPLY_PREPARED_PATCH_ALTERNATIVE_ID
+    assert accepted.bounded_local_input is not None
+    assert accepted.bounded_local_input.prepared_artifact_ref == PREPARED_ARTIFACT_REF_CANARY
+    assert accepted.bounded_local_input.prepared_artifact_hash == PREPARED_ARTIFACT_HASH_CANARY
+    assert accepted.bounded_local_input.patch is None
+    assert accepted.resource_locator.normalized_path is None
+    assert PREPARED_ARTIFACT_REF_CANARY not in repr(accepted)
+    assert PREPARED_ARTIFACT_HASH_CANARY not in repr(accepted)
+    assert WORKSPACE_ROOT not in repr(accepted)
+    omitted = _apply_request_payload()
+    del omitted["bounded_local_input"]
+    with pytest.raises(ControlledAlternativeValidationError) as missing:
+        validate_provider_request(omitted)
+    _assert_bounded_error(missing, ERROR_REQUEST_MALFORMED)
+    with pytest.raises(ControlledAlternativeValidationError) as patch_only:
+        validate_provider_request(
+            _apply_request_payload(bounded_local_input={"patch": SECRET_PATCH})
+        )
+    _assert_bounded_error(patch_only, ERROR_REQUEST_MALFORMED)
+    with pytest.raises(ControlledAlternativeValidationError) as with_path:
+        validate_provider_request(
+            _apply_request_payload(resource_locator=_apply_locator(normalized_path=SECRET_PATH))
+        )
+    _assert_bounded_error(with_path, ERROR_REQUEST_MALFORMED)
+
+
+def test_apply_result_forbids_prepared_artifact_fields() -> None:
+    payload = {
+        "contract_version": "1",
+        "alternative_id": APPLY_PREPARED_PATCH_ALTERNATIVE_ID,
+        "operation_ref": "op-1",
+        "result_status": "success",
+        "outcome_class_candidate": "COMPLETED_WITH_ALTERNATIVE",
+        "target_reached": False,
+        "rollback_available": False,
+        "prepared_artifact_ref": PREPARED_ARTIFACT_REF_CANARY,
+        "prepared_artifact_hash": PREPARED_ARTIFACT_HASH_CANARY,
+    }
+    with pytest.raises(ControlledAlternativeValidationError) as forbidden:
+        validate_provider_result(payload)
+    _assert_bounded_error(forbidden, ERROR_REQUEST_MALFORMED)
+    del payload["prepared_artifact_ref"]
+    del payload["prepared_artifact_hash"]
+    parsed = validate_provider_result(payload)
+    assert parsed.alternative_id == APPLY_PREPARED_PATCH_ALTERNATIVE_ID
+    assert parsed.prepared_artifact_ref is None
+    assert parsed.prepared_artifact_hash is None
+    assert parsed.target_reached is False
+
+
+@pytest.mark.parametrize(
+    ("alternative_id", "raw_input"),
+    [
+        ("filesystem.stage_delete.v1", {"path": "secrets.env"}),
+        ("filesystem.stage_delete.v1", {"path": ".env"}),
+        ("filesystem.stage_delete.v1", {"path": ".env.local"}),
+        ("filesystem.stage_delete.v1", {"path": "dir/secrets.env"}),
+        ("filesystem.stage_delete.v1", {"path": "SECRETS.ENV"}),
+        ("filesystem.stage_delete.v1", {"path": "credentials.json"}),
+        ("filesystem.stage_delete.v1", {"path": "id_rsa"}),
+        ("filesystem.stage_delete.v1", {"path": "cert.pem"}),
+        ("filesystem.stage_delete.v1", {"path": " secrets.env"}),
+        ("filesystem.stage_delete.v1", {"path": "secrets.env\n"}),
+        ("filesystem.stage_delete.v1", {"path": "../secrets.env"}),
+        ("protected_write.prepare_patch.v1", {"path": "locked_config.yaml", "patch": "diff"}),
+        ("protected_write.prepare_patch.v1", {"path": "config/locked_config.yaml", "patch": "diff"}),
+        ("protected_write.prepare_patch.v1", {"path": "LOCKED_CONFIG.YAML", "patch": "diff"}),
+        ("protected_write.prepare_patch.v1", {"path": "locked_config.yaml\n", "patch": "diff"}),
+    ],
+)
+def test_validate_local_input_rejects_unsafe_redirect_targets(
+    alternative_id: str,
+    raw_input: dict[str, str],
+) -> None:
+    with pytest.raises(ControlledAlternativeValidationError) as denied:
+        validate_controlled_alternative_local_input(alternative_id, raw_input)
+    canaries = tuple(value for value in raw_input.values() if isinstance(value, str))
+    _assert_bounded_error(denied, ERROR_REQUEST_MALFORMED, *canaries)
+
+
+@pytest.mark.parametrize(
+    ("alternative_id", "raw_input"),
+    [
+        ("filesystem.stage_delete.v1", {"path": "notes.txt"}),
+        ("filesystem.stage_delete.v1", {"path": "secret.txt"}),
+        ("filesystem.stage_delete.v1", {"path": "generated.log"}),
+        ("protected_write.prepare_patch.v1", {"path": "notes.txt", "patch": "diff"}),
+        ("protected_write.prepare_patch.v1", {"path": "config.yaml", "patch": "diff"}),
+    ],
+)
+def test_validate_local_input_keeps_safe_redirect_targets(
+    alternative_id: str,
+    raw_input: dict[str, str],
+) -> None:
+    parsed = validate_controlled_alternative_local_input(alternative_id, raw_input)
+    assert parsed.alternative_id == alternative_id
+    assert parsed.path == raw_input["path"]
+
+
+def test_normalize_semantic_stage_delete_rejects_unsafe_and_untrusted_paths() -> None:
+    cases = (
+        {"path": "secrets.env"},
+        {"path": ".env.local"},
+        {"path": "/tmp/notes.txt"},
+        {"path": "../notes.txt"},
+        {"path": "notes.txt\n"},
+        {"path": r"C:\secret.txt"},
+    )
+    for payload in cases:
+        with pytest.raises(ControlledAlternativeValidationError) as denied:
+            normalize_semantic_tool_call(SEMANTIC_STAGE_DELETE_TOOL_NAME, payload)
+        _assert_bounded_error(denied, ERROR_REQUEST_MALFORMED, *payload.values())
+    mapped = normalize_semantic_tool_call(SEMANTIC_STAGE_DELETE_TOOL_NAME, {"path": "notes.txt"})
+    assert mapped == {
+        "alternative_id": "filesystem.stage_delete.v1",
+        "input": {"path": "notes.txt"},
+    }
+
+
+def test_agentveil_write_file_schema_and_injection_are_owned_channel_only() -> None:
+    schema = build_agentveil_write_file_tool_schema()
+    assert schema["name"] == SEMANTIC_WRITE_FILE_TOOL_NAME
+    assert schema["inputSchema"]["additionalProperties"] is False
+    assert set(schema["inputSchema"]["required"]) == {"path", "content"}
+    assert set(schema["inputSchema"]["properties"]) == {"path", "content"}
+    dumped = json.dumps(schema)
+    assert "write_file" in dumped
+    assert "AgentVeil MCP proxy route" in dumped
+    assert "not a controlled alternative" in dumped
+    assert "approval_granted" not in dumped
+    assert "workspace_root" not in dumped
+    assert "state_root" not in dumped
+    assert "route_id" not in dumped
+    assert "agentveil_private_policy" not in dumped
+
+    listed = {"result": {"tools": [{"name": "write_file", "inputSchema": {"type": "object"}}]}}
+    injected = inject_agentveil_write_file_tool(listed)
+    assert [tool["name"] for tool in injected["result"]["tools"]] == [
+        "write_file",
+        SEMANTIC_WRITE_FILE_TOOL_NAME,
+    ]
+    no_downstream = {"result": {"tools": [{"name": "read_file", "inputSchema": {"type": "object"}}]}}
+    assert inject_agentveil_write_file_tool(no_downstream) == no_downstream
+    collision = {"result": {"tools": [{"name": SEMANTIC_WRITE_FILE_TOOL_NAME}]}}
+    assert inject_agentveil_write_file_tool(collision) == collision
+
+
+def test_normalize_agentveil_write_file_call_preserves_exact_content() -> None:
+    mapped = normalize_agentveil_write_file_call(
+        {"path": "todo.txt", "content": "first line\nsecond line\n"}
+    )
+    assert mapped == {"path": "todo.txt", "content": "first line\nsecond line\n"}
+    empty = normalize_agentveil_write_file_call({"path": "empty.txt", "content": ""})
+    assert empty == {"path": "empty.txt", "content": ""}
+
+
+@pytest.mark.parametrize(
+    ("payload", "error_code"),
+    [
+        ({}, ERROR_REQUEST_MALFORMED),
+        ({"path": "todo.txt"}, ERROR_REQUEST_MALFORMED),
+        ({"content": "x"}, ERROR_REQUEST_MALFORMED),
+        ({"path": "todo.txt", "content": "x", "extra": "y"}, ERROR_REQUEST_MALFORMED),
+        ({"path": " todo.txt", "content": "x"}, ERROR_REQUEST_MALFORMED),
+        ({"path": "todo.txt ", "content": "x"}, ERROR_REQUEST_MALFORMED),
+        ({"path": "../todo.txt", "content": "x"}, ERROR_REQUEST_MALFORMED),
+        ({"path": "/tmp/todo.txt", "content": "x"}, ERROR_REQUEST_MALFORMED),
+        ({"path": r"C:\todo.txt", "content": "x"}, ERROR_REQUEST_MALFORMED),
+        ({"path": "todo.txt\n", "content": "x"}, ERROR_REQUEST_MALFORMED),
+        ({"path": "todo.txt", "content": "x\0"}, ERROR_REQUEST_MALFORMED),
+        ({"path": 123, "content": "x"}, ERROR_REQUEST_MALFORMED),
+        ({"path": "todo.txt", "content": 123}, ERROR_REQUEST_MALFORMED),
+        ({"path": "todo.txt", "content": "x", "approval_granted": True}, ERROR_RESULT_UNSAFE),
+    ],
+)
+def test_normalize_agentveil_write_file_call_rejects_untrusted_input(
+    payload: dict[str, object],
+    error_code: str,
+) -> None:
+    with pytest.raises(ControlledAlternativeValidationError) as denied:
+        normalize_agentveil_write_file_call(payload)
+    _assert_bounded_error(denied, error_code, "todo.txt", "/tmp", r"C:\todo")
+
+
+_ADD_FILE_PATCH = "*** Begin Patch\n*** Add File: created.txt\n+hello\n*** End Patch"
+_UPDATE_FILE_PATCH = "*** Begin Patch\n*** Update File: notes.txt\n*** End Patch"
+
+
+def test_prepare_patch_rejects_clear_create_file_payloads() -> None:
+    cases = (
+        {"path": "created.txt", "patch": _ADD_FILE_PATCH},
+        {"path": "notes.txt", "patch": "*** Add File: notes.txt\n+x"},
+        {
+            "path": "notes.txt",
+            "patch": "*** Begin Patch\n*** Add File: notes.txt\n+x\n*** Update File: notes.txt\n*** End Patch",
+        },
+        {"path": "notes.txt", "patch": "  *** Add File: notes.txt\n+x"},
+    )
+    for payload in cases:
+        with pytest.raises(ControlledAlternativeValidationError) as denied:
+            validate_controlled_alternative_local_input(
+                "protected_write.prepare_patch.v1",
+                payload,
+            )
+        _assert_bounded_error(denied, ERROR_REQUEST_MALFORMED, *payload.values())
+        with pytest.raises(ControlledAlternativeValidationError) as semantic:
+            normalize_semantic_tool_call(SEMANTIC_PREPARE_PATCH_TOOL_NAME, payload)
+        _assert_bounded_error(semantic, ERROR_REQUEST_MALFORMED, *payload.values())
+
+
+def test_prepare_patch_keeps_existing_file_update_payloads() -> None:
+    update = validate_controlled_alternative_local_input(
+        "protected_write.prepare_patch.v1",
+        {"path": "notes.txt", "patch": _UPDATE_FILE_PATCH},
+    )
+    assert update.path == "notes.txt"
+    assert update.patch == _UPDATE_FILE_PATCH
+    mapped = normalize_semantic_tool_call(
+        SEMANTIC_PREPARE_PATCH_TOOL_NAME,
+        {"path": "notes.txt", "patch": _UPDATE_FILE_PATCH},
+    )
+    assert mapped == {
+        "alternative_id": "protected_write.prepare_patch.v1",
+        "input": {"path": "notes.txt", "patch": _UPDATE_FILE_PATCH},
+    }
+    plain = normalize_semantic_tool_call(
+        SEMANTIC_PREPARE_PATCH_TOOL_NAME,
+        {"path": "notes.txt", "patch": "diff"},
+    )
+    assert plain["input"]["patch"] == "diff"
+    literal = "*** Begin Patch\n*** Update File: notes.txt\n@@\n *** Add File: literal content\n*** End Patch"
+    literal_update = validate_controlled_alternative_local_input(
+        "protected_write.prepare_patch.v1",
+        {"path": "notes.txt", "patch": literal},
+    )
+    assert literal_update.patch == literal

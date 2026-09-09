@@ -1176,3 +1176,102 @@ def test_claude_allow_does_not_read_static_config(tmp_path: Path, monkeypatch: p
     assert decision.hook_action == "allow"
     assert calls == []
     assert out.getvalue() == ""
+
+
+_SEMANTIC_TOOL_INPUTS = {
+    "agentveil_stage_delete": {"path": "notes.txt"},
+    "agentveil_restore_staged": {"quarantine_entry_id": "a" * 32},
+    "agentveil_cleanup_staged": {"quarantine_entry_id": "a" * 32},
+    "agentveil_prepare_patch": {"path": "notes.txt", "patch": "diff"},
+    "agentveil_apply_prepared_patch": {
+        "prepared_artifact_ref": "a" * 32,
+        "prepared_artifact_hash": "ab" * 32,
+    },
+    "agentveil_prepare_git_change": {"worktree_path": "."},
+    "agentveil_git_operation": {"worktree_path": ".", "operation": "prepare_for_review"},
+    "agentveil_write_file": {"path": "todo.txt", "content": "done\n"},
+}
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "mcp__agentveil__agentveil_stage_delete",
+        "mcp__agentveil__agentveil_restore_staged",
+        "mcp__agentveil__agentveil_cleanup_staged",
+        "mcp__agentveil__agentveil_prepare_patch",
+        "mcp__agentveil__agentveil_apply_prepared_patch",
+        "mcp__agentveil__agentveil_prepare_git_change",
+        "mcp__agentveil__agentveil_git_operation",
+        "mcp__agentveil__agentveil_write_file",
+    ],
+)
+def test_claude_hook_does_not_deny_agentveil_owned_semantic_mcp_tools(tool_name: str) -> None:
+    leaf = tool_name.rsplit("__", 1)[-1]
+    out = io.StringIO()
+    decision = process_hook(
+        _payload(tool_name, _SEMANTIC_TOOL_INPUTS[leaf]),
+        out=out,
+    )
+    assert decision.hook_action == "allow"
+    assert decision.reason_code == "controlled_route_passthrough"
+    assert out.getvalue() == ""
+
+
+def test_claude_hook_cleanup_passes_to_proxy_and_is_not_approved() -> None:
+    out = io.StringIO()
+    decision = process_hook(
+        _payload(
+            "mcp__agentveil__agentveil_cleanup_staged",
+            _SEMANTIC_TOOL_INPUTS["agentveil_cleanup_staged"],
+        ),
+        out=out,
+    )
+    assert decision.hook_action == "allow"
+    assert decision.reason_code == "controlled_route_passthrough"
+    assert out.getvalue() == ""
+
+
+def test_claude_hook_still_denies_native_destructive_actions() -> None:
+    engine = PolicyEngine(default_proxy_config_for_hook())
+    assert decide(_payload("Write", {"file_path": "/x", "content": "y"}), engine).hook_action == "deny"
+    assert decide(_payload("Bash", {"command": "rm notes.txt"}), engine).hook_action == "deny"
+
+
+def test_claude_hook_rejects_lookalike_and_shell_text_as_controlled_tool() -> None:
+    engine = PolicyEngine(default_proxy_config_for_hook())
+    lookalike = decide(
+        _payload("mcp__agentveil__agentveil_stage_delete_now", {"path": "notes.txt"}),
+        engine,
+    )
+    assert lookalike.hook_action == "deny"
+    shell_text = decide(
+        _payload("Bash", {"command": "agentveil_stage_delete notes.txt"}),
+        engine,
+    )
+    assert shell_text.hook_action == "deny"
+
+
+def test_claude_hook_does_not_passthrough_whitespace_or_non_string_tool_name() -> None:
+    engine = PolicyEngine(default_proxy_config_for_hook())
+    for tool_name in (
+        " agentveil_stage_delete",
+        "agentveil_stage_delete ",
+        "\tagentveil_stage_delete",
+        "mcp__agentveil__agentveil_stage_delete ",
+        "MCP:agentveil_stage_delete ",
+    ):
+        decision = decide(_payload(tool_name, {"path": "notes.txt"}), engine)
+        assert decision.reason_code != "controlled_route_passthrough", repr(tool_name)
+    for tool_name in (None, 123, True, ["agentveil_stage_delete"], {"tool": "agentveil_stage_delete"}):
+        decision = decide(
+            {
+                "session_id": "test-session",
+                "cwd": "/tmp/probe",
+                "hook_event_name": "PreToolUse",
+                "tool_name": tool_name,
+                "tool_input": {"path": "notes.txt"},
+            },
+            engine,
+        )
+        assert decision.reason_code != "controlled_route_passthrough", repr(tool_name)

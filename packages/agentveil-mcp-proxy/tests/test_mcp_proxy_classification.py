@@ -1017,3 +1017,105 @@ def test_controlled_alternative_tool_classifies_by_nested_id() -> None:
     assert "wt-a" not in json.dumps(worktree.backend_metadata())
     assert "cafebabedeadbeef0123456789abcdef" not in f"{cleanup!r}"
     assert "cafebabedeadbeef0123456789abcdef" not in json.dumps(cleanup.backend_metadata())
+
+
+def test_semantic_prepare_patch_classifies_as_write_without_leaking_patch() -> None:
+    from agentveil_mcp_proxy.controlled_alternatives import SEMANTIC_PREPARE_PATCH_TOOL_NAME
+
+    patch = "*** Begin Patch\nsecret-bytes\n*** End Patch"
+    classifier = ToolCallClassifier(_config(), server_name="downstream")
+    prepared = classifier.classify(
+        tool=SEMANTIC_PREPARE_PATCH_TOOL_NAME,
+        arguments={"path": "notes.txt", "patch": patch},
+    )
+    assert prepared.risk_class is RiskClass.WRITE
+    assert prepared.action_family == "write"
+    assert prepared.resource_hash == sha256_text("path:notes.txt")
+    other = classifier.classify(
+        tool=SEMANTIC_PREPARE_PATCH_TOOL_NAME,
+        arguments={"path": "other.txt", "patch": patch},
+    )
+    assert prepared.resource_hash != other.resource_hash
+    same_path = classifier.classify(
+        tool=SEMANTIC_PREPARE_PATCH_TOOL_NAME,
+        arguments={"path": "notes.txt", "patch": "other-patch"},
+    )
+    assert same_path.resource_hash == prepared.resource_hash
+    dumped = json.dumps(prepared.backend_metadata()) + json.dumps(prepared.local_evidence_metadata())
+    assert "notes.txt" not in dumped
+    assert patch not in dumped
+    assert "*** Begin Patch" not in dumped
+    assert patch not in f"{prepared!r}{prepared.resource}"
+    assert "agentveil_private_policy" not in dumped
+
+
+def test_semantic_apply_prepared_patch_classifies_as_write_without_leaking_ref() -> None:
+    from agentveil_mcp_proxy.controlled_alternatives import SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME
+
+    artifact_ref = "d00df00ddeadbeef0123456789abcdef"
+    artifact_hash = "ab" * 32
+    classifier = ToolCallClassifier(_config(), server_name="downstream")
+    applied = classifier.classify(
+        tool=SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME,
+        arguments={
+            "prepared_artifact_ref": artifact_ref,
+            "prepared_artifact_hash": artifact_hash,
+        },
+    )
+    assert applied.risk_class is RiskClass.WRITE
+    assert applied.action_family == "write"
+    assert applied.resource_hash == sha256_text("prepared_artifact_ref:" + artifact_ref)
+    other = classifier.classify(
+        tool=SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME,
+        arguments={
+            "prepared_artifact_ref": "cafebabedeadbeef0123456789abcdef",
+            "prepared_artifact_hash": artifact_hash,
+        },
+    )
+    assert applied.resource_hash != other.resource_hash
+    same_ref = classifier.classify(
+        tool=SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME,
+        arguments={
+            "prepared_artifact_ref": artifact_ref,
+            "prepared_artifact_hash": "cd" * 32,
+        },
+    )
+    assert same_ref.resource_hash == applied.resource_hash
+    dumped = json.dumps(applied.backend_metadata()) + json.dumps(applied.local_evidence_metadata())
+    assert artifact_ref not in dumped
+    assert artifact_hash not in dumped
+    assert artifact_ref not in f"{applied!r}{applied.resource}"
+    assert artifact_hash not in f"{applied!r}{applied.resource}"
+    assert "agentveil_private_policy" not in dumped
+    assert "/Users/" not in dumped
+
+
+def test_semantic_prepare_git_change_classifies_as_write_without_leaking_path() -> None:
+    from agentveil_mcp_proxy.controlled_alternatives import SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME
+
+    classifier = ToolCallClassifier(_config(), server_name="downstream")
+    prepared = classifier.classify(
+        tool=SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME,
+        arguments={"worktree_path": "."},
+    )
+    assert prepared.risk_class is RiskClass.WRITE
+    assert prepared.action_family == "write"
+    assert prepared.resource_hash == sha256_text("worktree_path:.")
+    other = classifier.classify(
+        tool=SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME,
+        arguments={"worktree_path": "repo"},
+    )
+    assert prepared.resource_hash != other.resource_hash
+    same = classifier.classify(
+        tool=SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME,
+        arguments={"worktree_path": "."},
+    )
+    assert same.resource_hash == prepared.resource_hash
+    dumped = json.dumps(prepared.backend_metadata()) + json.dumps(prepared.local_evidence_metadata())
+    assert "worktree_path:." not in dumped
+    assert "repo" not in dumped
+    assert "/Users/" not in dumped
+    assert "origin" not in dumped
+    assert "agentveil_private_policy" not in dumped
+    assert "approval_granted" not in dumped
+    assert "worktree_path:." not in f"{prepared!r}{prepared.resource}"

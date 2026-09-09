@@ -51,6 +51,7 @@ from agentveil_mcp_proxy.console_project_status_client import (
 from agentveil_mcp_proxy.client_guidance import (
     NativeRedirectOrigin,
     format_native_redirect_agent_surface,
+    is_agentveil_owned_controlled_mcp_tool,
     maybe_register_native_redirect_for_hook_deny,
     native_hook_deny_instruction,
     trusted_static_controlled_route_ready,
@@ -346,6 +347,14 @@ def decide(payload: Mapping[str, Any], engine: PolicyEngine) -> HookDecision:
     # through (instead of denying write-shaped MCP tools on this controlled route) so the redirect
     # to "use the controlled MCP tool" is reachable. The proxy, not the hook,
     # then applies approval/redirect/evidence to these calls.
+    if is_agentveil_owned_controlled_mcp_tool(payload.get("tool_name")):
+        return HookDecision(
+            hook_action="allow",
+            reason_code="controlled_route_passthrough",
+            context=context,
+            evaluation=evaluation,
+            disposition=HookDisposition.ALLOW,
+        )
     if is_agentveil_controlled_mcp_server(context.server):
         return HookDecision(
             hook_action="allow",

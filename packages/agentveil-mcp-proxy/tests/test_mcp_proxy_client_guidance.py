@@ -25,6 +25,7 @@ from agentveil_mcp_proxy.client_guidance import (
     NativeControlledGuidanceEnvelope,
     build_native_controlled_guidance_envelope,
     format_native_controlled_guidance_text,
+    is_agentveil_owned_controlled_mcp_tool,
     native_action_intent_from_mapping,
     native_controlled_guidance_envelope_from_mapping,
     native_hook_deny_instruction,
@@ -200,6 +201,34 @@ def test_exact_literal_shell_delete_selects_stage_delete() -> None:
     _assert_available_envelope(
         select_controlled_alternative_suggestion(intent, redirect_route_ready=True)
     )
+
+
+@pytest.mark.parametrize(
+    ("native_tool", "tool_input"),
+    [
+        ("Delete", {"path": "secrets.env"}),
+        ("Bash", {"command": "rm .env"}),
+        ("Bash", {"command": "rm .env.local"}),
+        ("Delete", {"path": "credentials.json"}),
+        ("apply_patch", {"patch": "*** Begin Patch\n*** Delete File: secrets.env\n*** End Patch"}),
+    ],
+)
+def test_unsafe_secret_delete_does_not_select_stage_delete(
+    native_tool: str,
+    tool_input: dict[str, str],
+) -> None:
+    intent = normalize_native_action(native_tool=native_tool, tool_input=tool_input)
+    envelope = select_controlled_alternative_suggestion(intent, redirect_route_ready=True)
+    _assert_unavailable(
+        envelope,
+        reason="insufficient_target",
+        leaks=("secrets.env", ".env", ".env.local", "credentials.json", "filesystem.stage_delete.v1"),
+    )
+    still_safe = select_controlled_alternative_suggestion(
+        normalize_native_action(native_tool="Delete", tool_input={"path": "notes.txt"}),
+        redirect_route_ready=True,
+    )
+    _assert_available_envelope(still_safe)
 
 
 def test_exact_unlink_and_double_dash_shell_delete_are_exact() -> None:
@@ -866,3 +895,95 @@ def test_exact_delete_live_redirect_registers_controlled_stage_delete(tmp_path: 
         assert origin.redirect_context["redirect_playbook_id"] == "controlled_stage_delete"
     finally:
         fixture.lease.close()
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "agentveil_stage_delete",
+        "agentveil_restore_staged",
+        "agentveil_cleanup_staged",
+        "agentveil_prepare_patch",
+        "agentveil_apply_prepared_patch",
+        "agentveil_prepare_git_change",
+        "agentveil_git_operation",
+        "agentveil_write_file",
+        "mcp__agentveil__agentveil_stage_delete",
+        "mcp__agentveil__agentveil_restore_staged",
+        "mcp__agentveil__agentveil_cleanup_staged",
+        "mcp__agentveil__agentveil_prepare_patch",
+        "mcp__agentveil__agentveil_apply_prepared_patch",
+        "mcp__agentveil__agentveil_prepare_git_change",
+        "mcp__agentveil__agentveil_git_operation",
+        "mcp__agentveil__agentveil_write_file",
+        "mcp__agentveil-mcp-proxy__agentveil_restore_staged",
+        "mcp__agentveil_mcp_proxy__agentveil_cleanup_staged",
+        "mcp_agentveil_agentveil_stage_delete",
+        "mcp_agentveil-mcp-proxy_agentveil_restore_staged",
+        "mcp_agentveil_mcp_proxy_agentveil_cleanup_staged",
+        "mcp_agentveil_agentveil_prepare_patch",
+        "mcp_agentveil_agentveil_apply_prepared_patch",
+        "mcp_agentveil_agentveil_prepare_git_change",
+        "mcp_agentveil_agentveil_git_operation",
+        "mcp_agentveil_agentveil_write_file",
+        "MCP:agentveil_stage_delete",
+        "agentveil:agentveil_restore_staged",
+        "agentveil-mcp-proxy:agentveil_cleanup_staged",
+        "agentveil:agentveil_prepare_patch",
+        "agentveil:agentveil_apply_prepared_patch",
+        "agentveil:agentveil_prepare_git_change",
+        "agentveil:agentveil_git_operation",
+        "agentveil:agentveil_write_file",
+    ],
+)
+def test_helper_accepts_exact_agentveil_owned_controlled_mcp_tools(name: str) -> None:
+    assert is_agentveil_owned_controlled_mcp_tool(name) is True
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "agentveil_stage_delete_now",
+        "agentveil_prepare_git_change_now",
+        "agentveil_git_operation_now",
+        "agentveil_write_file_now",
+        "x_agentveil_stage_delete",
+        "agentveil-stage-delete",
+        "stage_delete",
+        "delete_file",
+        "apply_patch",
+        "Delete",
+        "rm",
+        "agentveil_controlled_alternative",
+        "mcp__filesystem__agentveil_stage_delete",
+        "mcp__agentveil__delete_file",
+        "mcp__agentveil__agentveil_stage_delete_x",
+        "mcp__agentveil__x_agentveil_stage_delete",
+        "mcp_filesystem_agentveil_stage_delete",
+        "mcp_evil_not_agentveil_stage_delete",
+        "mcp_agentveil_stage_delete",
+        "filesystem:agentveil_stage_delete",
+        "MCP:write_file",
+        " agentveil_stage_delete",
+        "agentveil_stage_delete ",
+        "	agentveil_stage_delete",
+        "mcp__agentveil__agentveil_stage_delete ",
+        "MCP:agentveil_stage_delete ",
+        "agentveil_stage_delete notes.txt",
+        "please call agentveil_stage_delete",
+        "rm -rf notes && agentveil_stage_delete",
+        "",
+    ],
+)
+def test_helper_rejects_lookalikes_native_and_shell_text(name: str) -> None:
+    assert is_agentveil_owned_controlled_mcp_tool(name) is False
+
+
+def test_helper_rejects_non_string_and_does_not_search_payload_text() -> None:
+    for value in (
+        None,
+        123,
+        True,
+        ["agentveil_stage_delete"],
+        {"tool": "agentveil_stage_delete"},
+    ):
+        assert is_agentveil_owned_controlled_mcp_tool(value) is False

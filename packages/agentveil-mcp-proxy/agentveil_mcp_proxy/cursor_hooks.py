@@ -34,6 +34,7 @@ from agentveil_mcp_proxy.client_guidance import (
     NATIVE_FILE_WRITE_REDIRECT_INSTRUCTION,
     NativeRedirectOrigin,
     format_native_redirect_agent_surface,
+    is_agentveil_owned_controlled_mcp_tool,
     maybe_register_native_redirect_for_hook_deny,
     native_hook_deny_instruction,
     trusted_static_controlled_route_ready,
@@ -387,7 +388,23 @@ def decide(payload: Mapping[str, Any], engine: PolicyEngine, *, workspace: Path)
     evaluation = engine.evaluate(context)
     hook_event = str(payload.get("hook_event") or "")
 
-    if hook_event == "beforeMCPExecution" or is_mcp_tool_name(str(payload.get("tool_name") or payload.get("tool_class") or "")):
+    if is_agentveil_owned_controlled_mcp_tool(payload.get("tool_name")) or is_agentveil_owned_controlled_mcp_tool(
+        payload.get("tool_class")
+    ):
+        return HookDecision(
+            "allow",
+            "controlled_route_passthrough",
+            context,
+            evaluation,
+            HookDisposition.ALLOW,
+        )
+
+    raw_tool = payload.get("tool_name")
+    if not isinstance(raw_tool, str):
+        raw_tool = payload.get("tool_class")
+    if not isinstance(raw_tool, str):
+        raw_tool = ""
+    if hook_event == "beforeMCPExecution" or is_mcp_tool_name(raw_tool):
         tool = normalize_mcp_tool_name(context.tool)
         if tool in _MCP_READ_TOOLS:
             return HookDecision("allow", "mcp_read_allow", context, evaluation, HookDisposition.ALLOW)

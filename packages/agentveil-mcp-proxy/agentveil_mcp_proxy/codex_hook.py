@@ -36,6 +36,7 @@ from agentveil_mcp_proxy.console_project_status_client import (
 from agentveil_mcp_proxy.client_guidance import (
     NativeRedirectOrigin,
     format_native_redirect_agent_surface,
+    is_agentveil_owned_controlled_mcp_tool,
     maybe_register_native_redirect_for_hook_deny,
     native_hook_deny_instruction,
     trusted_static_controlled_route_ready,
@@ -212,6 +213,17 @@ def _reason_code(evaluation: PolicyEvaluation, hook_action: str) -> str:
 def decide(payload: Mapping[str, Any], engine: PolicyEngine) -> HookDecision:
     context = build_tool_call_context(payload)
     evaluation = engine.evaluate(context)
+    if any(
+        is_agentveil_owned_controlled_mcp_tool(payload.get(key))
+        for key in ("tool_name", "toolName", "tool", "name")
+    ):
+        return HookDecision(
+            hook_action="allow",
+            reason_code="controlled_route_passthrough",
+            context=context,
+            evaluation=evaluation,
+            disposition=HookDisposition.ALLOW,
+        )
     if is_agentveil_controlled_mcp_server(context.server):
         return HookDecision(
             hook_action="allow",

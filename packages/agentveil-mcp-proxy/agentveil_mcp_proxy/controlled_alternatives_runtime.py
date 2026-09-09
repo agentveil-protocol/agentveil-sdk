@@ -20,17 +20,21 @@ from typing import Any, Callable, Mapping
 from agentveil_mcp_proxy.client_config import downstream_startup_fingerprint
 from agentveil_mcp_proxy.client_guidance import trusted_project_workspace_root_from_downstream
 from agentveil_mcp_proxy.controlled_alternatives import (
+    APPLY_PREPARED_PATCH_ALTERNATIVE_ID,
     CONTROLLED_ALTERNATIVE_PROVIDER_CONTRACT_VERSION,
     CONTROLLED_ALTERNATIVES_PROFILE_ID,
+    ERROR_GIT_INTENT_DENIED,
     ERROR_REQUEST_MALFORMED,
     GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
     RESERVED_CONTROLLED_ALTERNATIVE_TOOL_NAMES,
+    STAGE_DELETE_RESTORE_HANDOFF_NOTE,
     ControlledAlternativeProvider,
     ControlledAlternativeProviderResult,
     ControlledAlternativeValidationError,
     build_controlled_alternative_tool_schema,
     build_semantic_controlled_alternative_tool_schemas,
     discover_controlled_alternative_provider,
+    git_intent_denied_local_payload,
     is_semantic_controlled_alternative_tool,
     normalize_semantic_tool_call,
     semantic_alternative_id_for_tool,
@@ -49,6 +53,8 @@ _HEX32 = frozenset("0123456789abcdef")
 _STAGE_DELETE = "filesystem.stage_delete.v1"
 _RESTORE = "filesystem.restore_staged.v1"
 _CLEANUP = "filesystem.cleanup_staged.v1"
+_PREPARE_PATCH = "protected_write.prepare_patch.v1"
+_APPLY_PATCH = APPLY_PREPARED_PATCH_ALTERNATIVE_ID
 _WRITE_ALTERNATIVES = frozenset({_STAGE_DELETE, _RESTORE})
 _JSONRPC_VERSION = "2.0"
 
@@ -207,7 +213,12 @@ def normalize_controlled_alternative_arguments(
     if tool_name == GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME:
         if not isinstance(arguments, Mapping):
             raise ControlledAlternativeValidationError(ERROR_REQUEST_MALFORMED)
-        return dict(arguments)
+        copied = dict(arguments)
+        alternative_id = alternative_id_from_arguments(copied)
+        raw_input = copied.get("input")
+        if alternative_id is not None and isinstance(raw_input, Mapping):
+            validate_controlled_alternative_local_input(alternative_id, raw_input)
+        return copied
     if is_semantic_controlled_alternative_tool(tool_name):
         return normalize_semantic_tool_call(tool_name, arguments)
     raise ControlledAlternativeValidationError(ERROR_REQUEST_MALFORMED)
@@ -216,7 +227,7 @@ def normalize_controlled_alternative_arguments(
 def semantic_resource_label(tool_name: str, arguments: Mapping[str, Any]) -> str | None:
     if not is_semantic_controlled_alternative_tool(tool_name):
         return None
-    for key in ("path", "quarantine_entry_id", "worktree_path"):
+    for key in ("path", "quarantine_entry_id", "worktree_path", "prepared_artifact_ref"):
         value = arguments.get(key)
         if isinstance(value, str) and value:
             return f"{key}:redacted"
@@ -226,7 +237,7 @@ def semantic_resource_label(tool_name: str, arguments: Mapping[str, Any]) -> str
 def semantic_resource_exact(tool_name: str, arguments: Mapping[str, Any]) -> str | None:
     if not is_semantic_controlled_alternative_tool(tool_name):
         return None
-    for key in ("path", "quarantine_entry_id", "worktree_path"):
+    for key in ("path", "quarantine_entry_id", "worktree_path", "prepared_artifact_ref"):
         value = arguments.get(key)
         if isinstance(value, str) and value:
             return f"{key}:{value}"
@@ -251,7 +262,7 @@ def nested_resource_exact(arguments: Mapping[str, Any]) -> str | None:
     nested = arguments.get("input")
     if not isinstance(nested, Mapping):
         return None
-    for key in ("path", "quarantine_entry_id", "worktree_path"):
+    for key in ("path", "quarantine_entry_id", "worktree_path", "prepared_artifact_ref"):
         value = nested.get(key)
         if isinstance(value, str) and value:
             return f"{key}:{value}"
@@ -262,7 +273,7 @@ def nested_resource_label(arguments: Mapping[str, Any]) -> str | None:
     nested = arguments.get("input")
     if not isinstance(nested, Mapping):
         return None
-    for key in ("path", "quarantine_entry_id", "worktree_path"):
+    for key in ("path", "quarantine_entry_id", "worktree_path", "prepared_artifact_ref"):
         value = nested.get(key)
         if isinstance(value, str) and value:
             return f"{key}:redacted"
@@ -278,7 +289,8 @@ def apply_controlled_alternative_policy(
     """Map frozen alternatives onto ordinary write A-R or cleanup H."""
 
     if alternative_id in _WRITE_ALTERNATIVES or alternative_id in {
-        "protected_write.prepare_patch.v1",
+        _PREPARE_PATCH,
+        _APPLY_PATCH,
         "git.prepare_local_change.v1",
     }:
         return (
@@ -414,9 +426,12 @@ def execute_controlled_alternative(
     except ControlledAlternativeExecutionAbort:
         raise
     except ControlledAlternativeValidationError as exc:
+        code = str(exc.args[0]) if exc.args else ERROR_REQUEST_MALFORMED
+        if code == ERROR_GIT_INTENT_DENIED:
+            return git_intent_denied_local_payload()
         return {
             "mechanism_status": "error",
-            "error_code": str(exc.args[0]) if exc.args else ERROR_REQUEST_MALFORMED,
+            "error_code": code,
             "target_reached": False,
             "rollback_available": False,
             "verification_level": "not_verified",
@@ -523,11 +538,14 @@ def _build_locator(
         locator["locator_kind"] = "quarantine_entry"
         locator["quarantine_entry_id"] = _require_hex32(local.quarantine_entry_id)
         return locator
-    if alternative_id == "protected_write.prepare_patch.v1":
+    if alternative_id == _PREPARE_PATCH:
         if not isinstance(local.path, str):
             raise ControlledAlternativeValidationError(ERROR_REQUEST_MALFORMED)
         locator["locator_kind"] = "protected_write_target"
         locator["normalized_path"] = _normalize_workspace_path(binding.workspace_root, local.path)
+        return locator
+    if alternative_id == _APPLY_PATCH:
+        locator["locator_kind"] = "prepared_write_artifact"
         return locator
     if not isinstance(local.worktree_path, str):
         raise ControlledAlternativeValidationError(ERROR_REQUEST_MALFORMED)
@@ -596,15 +614,22 @@ def _invoke_phase(
         "alternative_id": alternative_id,
         "operation_ref": operation_ref,
         "action_family": "delete" if alternative_id.split(".", 1)[0] == "filesystem" else "write",
-        "semantic_category": "filesystem" if alternative_id.startswith("filesystem.") else "git",
+        "semantic_category": (
+            "git" if alternative_id.split(".", 1)[0] == "git" else "filesystem"
+        ),
         "invocation_phase": phase,
         "resource_locator": dict(locator),
     }
     if correlation_token is not None:
         payload["correlation_token"] = correlation_token
         payload["resource_locator"]["correlation_token"] = correlation_token
-    if alternative_id == "protected_write.prepare_patch.v1":
+    if alternative_id == _PREPARE_PATCH:
         payload["bounded_local_input"] = {"patch": local_input.get("patch")}
+    elif alternative_id == _APPLY_PATCH:
+        payload["bounded_local_input"] = {
+            "prepared_artifact_ref": local_input.get("prepared_artifact_ref"),
+            "prepared_artifact_hash": local_input.get("prepared_artifact_hash"),
+        }
     request = validate_provider_request(payload)
     method = getattr(binding.provider, phase)
     raw = method(request)
@@ -619,7 +644,17 @@ def _project_local_result(
     verified: bool = False,
     normalized_path: str | None = None,
 ) -> dict[str, Any]:
-    payload: dict[str, Any] = {
+    payload: dict[str, Any] = {}
+    stage_success = (
+        alternative_id == _STAGE_DELETE
+        and result.result_status == "success"
+        and isinstance(result.quarantine_entry_id, str)
+        and result.quarantine_entry_id
+    )
+    if stage_success:
+        payload["quarantine_entry_id"] = result.quarantine_entry_id
+        payload["restore_handoff"] = STAGE_DELETE_RESTORE_HANDOFF_NOTE
+    payload.update({
         "mechanism_status": result.result_status,
         "target_reached": result.target_reached,
         "rollback_available": result.rollback_available,
@@ -628,11 +663,21 @@ def _project_local_result(
             if verified and result.result_status == "success"
             else "not_verified"
         ),
-    }
+    })
     if result.result_status != "success" and result.error_code:
         payload["error_code"] = result.error_code
-    if result.quarantine_entry_id is not None:
+    if result.quarantine_entry_id is not None and "quarantine_entry_id" not in payload:
         payload["quarantine_entry_id"] = result.quarantine_entry_id
+    if (
+        alternative_id == _PREPARE_PATCH
+        and result.result_status == "success"
+        and isinstance(result.prepared_artifact_ref, str)
+        and isinstance(result.prepared_artifact_hash, str)
+    ):
+        payload["prepared_artifact_ref"] = result.prepared_artifact_ref
+        payload["prepared_artifact_hash"] = result.prepared_artifact_hash
+        if result.outcome_class_candidate == "PREPARED_FOR_APPROVAL":
+            payload["outcome_class_candidate"] = result.outcome_class_candidate
     if alternative_id == _STAGE_DELETE and result.result_status == "success" and result.target_reached:
         source = normalized_path if isinstance(normalized_path, str) else getattr(local, "path", None)
         if verified and isinstance(source, str) and _source_absent(source):

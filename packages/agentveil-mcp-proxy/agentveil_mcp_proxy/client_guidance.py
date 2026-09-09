@@ -32,7 +32,17 @@ from agentveil_mcp_proxy.client_packs import (
     normalize_client_pack_ids,
 )
 from agentveil_mcp_proxy.control_artifacts import write_atomic_control_file
-from agentveil_mcp_proxy.controlled_alternatives import SEMANTIC_STAGE_DELETE_TOOL_NAME
+from agentveil_mcp_proxy.controlled_alternatives import (
+    SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME,
+    SEMANTIC_CLEANUP_STAGED_TOOL_NAME,
+    SEMANTIC_GIT_OPERATION_TOOL_NAME,
+    SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME,
+    SEMANTIC_PREPARE_PATCH_TOOL_NAME,
+    SEMANTIC_RESTORE_STAGED_TOOL_NAME,
+    SEMANTIC_STAGE_DELETE_TOOL_NAME,
+    SEMANTIC_WRITE_FILE_TOOL_NAME,
+    controlled_alternative_target_is_ineligible,
+)
 from agentveil_mcp_proxy.policy import build_redirect_automation_metadata
 from agentveil_mcp_proxy.role_doctor import (
     REDIRECT_LINEAGE_MAX_AGE_SECONDS,
@@ -141,6 +151,72 @@ _CANONICAL_NATIVE_WRITE_TOOLS = frozenset({
 })
 
 _NATIVE_FILE_WRITE_DENY_TOOLS = _CANONICAL_NATIVE_WRITE_TOOLS
+
+_AGENTVEIL_OWNED_CONTROLLED_MCP_TOOL_NAMES: frozenset[str] = frozenset({
+    SEMANTIC_STAGE_DELETE_TOOL_NAME,
+    SEMANTIC_RESTORE_STAGED_TOOL_NAME,
+    SEMANTIC_CLEANUP_STAGED_TOOL_NAME,
+    SEMANTIC_PREPARE_PATCH_TOOL_NAME,
+    SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME,
+    SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME,
+    SEMANTIC_GIT_OPERATION_TOOL_NAME,
+    SEMANTIC_WRITE_FILE_TOOL_NAME,
+})
+_AGENTVEIL_OWNED_HOOK_MCP_SERVER_LABELS: frozenset[str] = frozenset({
+    "agentveil",
+    "agentveil-mcp-proxy",
+    "agentveil_mcp_proxy",
+})
+
+
+def is_agentveil_owned_controlled_mcp_tool(raw: object) -> bool:
+    """Return True when the hook event tool name is an AgentVeil-owned controlled tool.
+
+    Exact MCP tool names only. A True result means pass the call to the proxy;
+    it is not approval, execution, or a policy decision.
+    """
+
+    return _agentveil_owned_controlled_mcp_tool_name(raw) is not None
+
+
+def _agentveil_owned_controlled_mcp_tool_name(raw: object) -> str | None:
+    """Return the exact reserved tool name, or None for native/lookalike/shell text."""
+
+    if not isinstance(raw, str):
+        return None
+    # Exact match only: do not strip or otherwise normalize whitespace/control.
+    if not raw or any(ch.isspace() or ord(ch) < 32 for ch in raw):
+        return None
+    name = raw
+    tools = _AGENTVEIL_OWNED_CONTROLLED_MCP_TOOL_NAMES
+    servers = _AGENTVEIL_OWNED_HOOK_MCP_SERVER_LABELS
+    if name in tools:
+        return name
+    if name[:4].upper() == "MCP:":
+        leaf = name.split(":", 1)[1]
+        if leaf in tools:
+            return leaf
+        return None
+    if name.startswith("mcp__"):
+        parts = name.split("__")
+        if len(parts) == 3 and parts[1] in servers and parts[2] in tools:
+            return parts[2]
+        return None
+    if name.startswith("mcp_"):
+        rest = name[4:]
+        for server in sorted(servers, key=len, reverse=True):
+            prefix = f"{server}_"
+            if rest.startswith(prefix):
+                leaf = rest[len(prefix):]
+                if leaf in tools:
+                    return leaf
+                return None
+        return None
+    if ":" in name:
+        server, leaf = name.split(":", 1)
+        if server in servers and leaf in tools:
+            return leaf
+    return None
 
 
 @dataclass(frozen=True)
@@ -1224,6 +1300,17 @@ def select_controlled_alternative_suggestion(
     )
     suggestion_ready = redirect_route_ready is True or static_route_ready is True
     if exact and suggestion_ready:
+        if controlled_alternative_target_is_ineligible(
+            NATIVE_CONTROLLED_ALTERNATIVE_ID_STAGE_DELETE,
+            intent.relative_path,
+        ):
+            envelope = NativeControlledGuidanceEnvelope(
+                schema_version=NATIVE_CONTROLLED_GUIDANCE_SCHEMA_VERSION,
+                suggestion_status="unavailable",
+                reason="insufficient_target",
+                alternative=None,
+            )
+            return native_controlled_guidance_envelope_from_mapping(envelope.public_mapping())
         envelope = NativeControlledGuidanceEnvelope(
             schema_version=NATIVE_CONTROLLED_GUIDANCE_SCHEMA_VERSION,
             suggestion_status="available",
@@ -1699,6 +1786,7 @@ __all__ = [
     "hook_runtime_binding_is_fresh",
     "hook_runtime_binding_path",
     "hook_runtime_bindings_dir",
+    "is_agentveil_owned_controlled_mcp_tool",
     "maybe_register_native_redirect_for_hook_deny",
     "native_action_intent_from_mapping",
     "native_controlled_guidance_envelope_from_mapping",
