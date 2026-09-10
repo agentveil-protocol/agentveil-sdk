@@ -52,6 +52,7 @@ from agentveil_mcp_proxy.console_pairing_client import (
     PairingToken,
     RevokeOutcome,
 )
+from agentveil_mcp_proxy.controlled_alternatives import inject_agentveil_write_file_tool
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore, PendingApproval
 from agentveil_mcp_proxy.identity import encrypted_identity_payload, load_agent_from_identity
 from agentveil_mcp_proxy.policy import ProxyConfig
@@ -63,7 +64,9 @@ WRONG_PASSPHRASE = "wrong horse battery staple"
 
 
 def _quickstart_filesystem_tool_count() -> int:
-    return len(quickstart_filesystem_tools())
+    response = {"result": {"tools": quickstart_filesystem_tools()}}
+    injected = inject_agentveil_write_file_tool(response)
+    return len(injected["result"]["tools"])
 
 
 def _mode(path: Path) -> int:

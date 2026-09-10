@@ -12,6 +12,7 @@ import pytest
 
 import agentveil_mcp_proxy.cli as proxy_cli
 from agentveil_mcp_proxy.cli import init_proxy, load_proxy_config, main, proxy_paths, run_proxy
+from agentveil_mcp_proxy.controlled_alternatives import SEMANTIC_WRITE_FILE_TOOL_NAME
 from agentveil_mcp_proxy.policy import PolicyDecision
 from agentveil_mcp_proxy.product_route import (
     FILESYSTEM_PRODUCT_TOOLS,
@@ -23,7 +24,6 @@ from agentveil_mcp_proxy.product_route import (
     PRODUCT_ROUTE_POLICY_ID,
     PRODUCT_ROUTE_SETUP_PROFILE,
     PRODUCT_ROUTE_TOOL_CATALOG,
-    PRODUCT_ROUTE_TOOL_PACK,
     PRODUCT_ROUTE_WORKSPACE_DIRNAME,
     SANDBOX_READ_ONLY_MCP_TOOLS,
     _pack_policy_expectation,
@@ -335,7 +335,7 @@ def test_product_route_tools_list_includes_read_only_filesystem_tools(
 
     tools = _responses(out.getvalue())[0]["result"]["tools"]
     tool_names = [entry["name"] for entry in tools]
-    assert tool_names == list(PRODUCT_ROUTE_TOOL_CATALOG)
+    assert tool_names == [*PRODUCT_ROUTE_TOOL_CATALOG, SEMANTIC_WRITE_FILE_TOOL_NAME]
     assert "read_file" in tool_names
     assert "get_file_info" in tool_names
 
