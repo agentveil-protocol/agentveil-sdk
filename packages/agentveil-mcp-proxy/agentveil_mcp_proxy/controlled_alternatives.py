@@ -328,6 +328,16 @@ def controlled_alternative_target_is_ineligible(alternative_id: str, raw_path: A
     return any(_component_is_locked_config(part) for part in parts)
 
 
+def _agentveil_write_file_target_is_ineligible(raw_path: str) -> bool:
+    """Return True when the owned write alias must not rewrite to downstream write_file."""
+
+    parts = _path_components_for_eligibility(raw_path)
+    return any(
+        _component_is_locked_config(part) or _component_is_secret_or_credential(part)
+        for part in parts
+    )
+
+
 def _reject_ineligible_controlled_alternative_target(alternative_id: str, raw_path: Any) -> None:
     if controlled_alternative_target_is_ineligible(alternative_id, raw_path):
         raise ControlledAlternativeValidationError(ERROR_REQUEST_MALFORMED)
@@ -726,6 +736,8 @@ def normalize_agentveil_write_file_call(arguments: Mapping[str, Any]) -> dict[st
     if len(raw_path.encode("utf-8")) > MAX_NORMALIZED_PATH_BYTES:
         raise ControlledAlternativeValidationError(ERROR_REQUEST_MALFORMED)
     _reject_untrusted_workspace_relpath(raw_path)
+    if _agentveil_write_file_target_is_ineligible(raw_path):
+        raise ControlledAlternativeValidationError(ERROR_REQUEST_MALFORMED)
     if "\0" in content or len(content.encode("utf-8")) > MAX_AGENTVEIL_WRITE_FILE_CONTENT_BYTES:
         raise ControlledAlternativeValidationError(ERROR_REQUEST_MALFORMED)
     return {"path": raw_path, "content": content}
@@ -1928,10 +1940,12 @@ def build_agentveil_write_file_tool_schema() -> dict[str, Any]:
         "description": (
             "Write one bounded workspace-relative text file through the AgentVeil MCP "
             "proxy route. Use this for ordinary in-scope file creation or ordinary "
-            "direct writes instead of protected patch preparation. This is not a "
-            "controlled alternative, not authority, and not approval; AgentVeil still "
-            "classifies and enforces policy before forwarding to the downstream "
-            "write_file tool."
+            "direct writes instead of protected patch preparation. Locked-config, "
+            "secret, and other protected overwrite targets are rejected here; eligible "
+            "existing-file updates stay on the protected-write prepare/apply route. "
+            "This is not a controlled alternative, not authority, and not approval; "
+            "AgentVeil still classifies and enforces policy before forwarding to the "
+            "downstream write_file tool."
         ),
         "inputSchema": {
             "type": "object",

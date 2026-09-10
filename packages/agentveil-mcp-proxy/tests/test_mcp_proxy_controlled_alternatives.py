@@ -3059,6 +3059,10 @@ def test_normalize_agentveil_write_file_call_preserves_exact_content() -> None:
     assert mapped == {"path": "todo.txt", "content": "first line\nsecond line\n"}
     empty = normalize_agentveil_write_file_call({"path": "empty.txt", "content": ""})
     assert empty == {"path": "empty.txt", "content": ""}
+    ordinary = normalize_agentveil_write_file_call({"path": "notes.txt", "content": "ok\n"})
+    assert ordinary == {"path": "notes.txt", "content": "ok\n"}
+    config = normalize_agentveil_write_file_call({"path": "config.yaml", "content": "ok\n"})
+    assert config == {"path": "config.yaml", "content": "ok\n"}
 
 
 @pytest.mark.parametrize(
@@ -3078,6 +3082,12 @@ def test_normalize_agentveil_write_file_call_preserves_exact_content() -> None:
         ({"path": 123, "content": "x"}, ERROR_REQUEST_MALFORMED),
         ({"path": "todo.txt", "content": 123}, ERROR_REQUEST_MALFORMED),
         ({"path": "todo.txt", "content": "x", "approval_granted": True}, ERROR_RESULT_UNSAFE),
+        ({"path": "locked_config.yaml", "content": "overwrite-canary"}, ERROR_REQUEST_MALFORMED),
+        ({"path": "config/locked_config.yaml", "content": "overwrite-canary"}, ERROR_REQUEST_MALFORMED),
+        ({"path": "LOCKED_CONFIG.YAML", "content": "overwrite-canary"}, ERROR_REQUEST_MALFORMED),
+        ({"path": "secrets.env", "content": "token=do-not-copy"}, ERROR_REQUEST_MALFORMED),
+        ({"path": ".env", "content": "token=do-not-copy"}, ERROR_REQUEST_MALFORMED),
+        ({"path": "credentials.json", "content": "token=do-not-copy"}, ERROR_REQUEST_MALFORMED),
     ],
 )
 def test_normalize_agentveil_write_file_call_rejects_untrusted_input(
@@ -3086,7 +3096,8 @@ def test_normalize_agentveil_write_file_call_rejects_untrusted_input(
 ) -> None:
     with pytest.raises(ControlledAlternativeValidationError) as denied:
         normalize_agentveil_write_file_call(payload)
-    _assert_bounded_error(denied, error_code, "todo.txt", "/tmp", r"C:\todo")
+    extra = [value for value in payload.values() if isinstance(value, str)]
+    _assert_bounded_error(denied, error_code, "todo.txt", "/tmp", r"C:\todo", *extra)
 
 
 _ADD_FILE_PATCH = "*** Begin Patch\n*** Add File: created.txt\n+hello\n*** End Patch"

@@ -3360,6 +3360,95 @@ def test_agentveil_write_file_malformed_never_reaches_downstream(
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
 
 
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "locked_config.yaml",
+        "config/locked_config.yaml",
+        "secrets.env",
+        ".env",
+    ],
+)
+def test_agentveil_write_file_protected_overwrite_never_reaches_downstream(
+    tmp_path,
+    monkeypatch,
+    relative_path,
+):
+    home = tmp_path / "avp-home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    original = "lock: true\n"
+    target.write_text(original, encoding="utf-8")
+    overwrite = "OVERWRITE_CANARY\n"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    payload_log_path = tmp_path / "downstream_payloads.jsonl"
+    _set_recording_write_file_downstream(
+        init.config_path,
+        _recording_write_file_downstream(tmp_path),
+        log_path=log_path,
+        payload_log_path=payload_log_path,
+        write_root=workspace,
+    )
+    _set_allow_policy(init.config_path, server="fake-downstream", tool="write_file")
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("protected overwrite must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(
+            _json_line({"jsonrpc": "2.0", "id": "list-1", "method": "tools/list", "params": {}})
+            + _json_line({
+                "jsonrpc": "2.0",
+                "id": "call-1",
+                "method": "tools/call",
+                "params": {
+                    "name": SEMANTIC_WRITE_FILE_TOOL_NAME,
+                    "arguments": {"path": relative_path, "content": overwrite},
+                },
+            })
+        ),
+        out=client_out,
+        approval_ui_mode="none",
+    ) == 0
+
+    raw = client_out.getvalue()
+    response = _responses(raw)[1]
+    body = json.loads(response["result"]["content"][0]["text"])
+    assert body == {
+        "mechanism_status": "error",
+        "error_code": "request_malformed",
+        "target_reached": False,
+        "rollback_available": False,
+        "verification_level": "not_verified",
+    }
+    assert target.read_text(encoding="utf-8") == original
+    assert not payload_log_path.exists()
+    assert _pending_approval_count(home) == 0
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
+    leaked = raw + json.dumps(body)
+    for canary in (
+        overwrite,
+        original,
+        relative_path,
+        str(home),
+        str(workspace),
+        str(target),
+        "state_root",
+        "route_id",
+        "agentveil_private_policy",
+        "private_v1",
+    ):
+        assert canary not in leaked
+
+
 def test_agentveil_write_file_catalog_collision_never_reaches_downstream(tmp_path, monkeypatch):
     home = tmp_path / "avp-home"
     workspace = tmp_path / "workspace"
