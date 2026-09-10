@@ -41,6 +41,11 @@ from agentveil_mcp_proxy.policy import (
     ToolCallContext,
 )
 from agentveil_mcp_proxy.content_risk_signals import derive_content_risk_signals
+from agentveil_mcp_proxy.controlled_alternatives import (
+    GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+    is_semantic_controlled_alternative_tool,
+)
+
 
 
 HASH_PREFIX = "sha256:"
@@ -307,6 +312,7 @@ class ClassifiedToolCall:
     authority: str | None = None
     metadata_evidence: Mapping[str, Any] | None = None
     content_risk_signals: Mapping[str, bool] | None = None
+    controlled_alternative_id: str | None = None
 
     def backend_metadata(self) -> dict[str, Any]:
         """Return privacy-filtered metadata intended for later backend calls."""
@@ -387,8 +393,41 @@ class ToolCallClassifier:
         args = dict(arguments) if isinstance(arguments, Mapping) else {}
         action_plain = f"{self.server_name}.{tool}"
         resource_plain = extract_resource(args)
+        alternative_id = None
+        if tool == GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME:
+            from agentveil_mcp_proxy.controlled_alternatives_runtime import (
+                alternative_id_from_arguments,
+                nested_resource_exact,
+                nested_resource_label,
+            )
+
+            nested_label = nested_resource_label(args)
+            if nested_label is not None:
+                resource_plain = nested_label
+            alternative_id = alternative_id_from_arguments(args)
+            exact_resource = nested_resource_exact(args)
+        elif is_semantic_controlled_alternative_tool(tool):
+            from agentveil_mcp_proxy.controlled_alternatives_runtime import (
+                semantic_alternative_id_for_tool,
+                semantic_resource_exact,
+                semantic_resource_label,
+            )
+
+            nested_label = semantic_resource_label(tool, args)
+            if nested_label is not None:
+                resource_plain = nested_label
+            alternative_id = semantic_alternative_id_for_tool(tool)
+            exact_resource = semantic_resource_exact(tool, args)
+        else:
+            exact_resource = None
         heuristic_risk = infer_risk_class(action_plain, tool=tool, resource=resource_plain, arguments=args)
         action_family = infer_action_family(tool)
+        if alternative_id == "filesystem.cleanup_staged.v1":
+            action_family = "delete"
+            heuristic_risk = RiskClass.DESTRUCTIVE
+        elif alternative_id is not None:
+            action_family = "write"
+            heuristic_risk = RiskClass.WRITE
         role_authority = self.config.role_authority
         context = ToolCallContext(
             server=self.server_name,
@@ -400,8 +439,21 @@ class ToolCallClassifier:
             action_family=action_family,
         )
         evaluation = self.engine.evaluate(context)
+        if tool == GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME or is_semantic_controlled_alternative_tool(tool):
+            from agentveil_mcp_proxy.controlled_alternatives_runtime import apply_controlled_alternative_policy
+            evaluation, heuristic_applied, action_family = apply_controlled_alternative_policy(
+                alternative_id=alternative_id,
+                evaluation=evaluation,
+                action_family=action_family,
+            )
+            risk_override = heuristic_applied
+        else:
+            risk_override = None
         action_hash = sha256_text(action_plain)
-        resource_hash = None if resource_plain is None else sha256_text(resource_plain)
+        if exact_resource is not None:
+            resource_hash = sha256_text(exact_resource)
+        else:
+            resource_hash = None if resource_plain is None else sha256_text(resource_plain)
         metadata_evidence = None
         if tool in _PACKAGE_INSTALL_CLONE_CONTEXT_TOOLS:
             collected = collect_install_metadata_evidence(tool=tool, arguments=args)
@@ -417,13 +469,14 @@ class ToolCallClassifier:
             resource=_privacy_value(resource_plain, self.config.privacy.resource, value_hash=resource_hash),
             resource_hash=resource_hash,
             payload_hash=sha256_jcs(payload),
-            risk_class=evaluation.risk_class,
+            risk_class=risk_override if risk_override is not None else evaluation.risk_class,
             policy_evaluation=evaluation,
             action_family=action_family,
             role=context.role,
             authority=context.authority,
             metadata_evidence=metadata_evidence,
             content_risk_signals=content_risk_signals,
+            controlled_alternative_id=alternative_id,
         )
 
 

@@ -11,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import sys
 import threading
+import types
 import zipfile
 
 import pytest
@@ -43,9 +44,22 @@ from agentveil_mcp_proxy.paid_install import (
     sha256_hex,
     validate_bounded_package_name,
     validate_bounded_package_version,
+    ERROR_HANDOFF_HOOK_IMPORT_FAILED,
+    ERROR_HANDOFF_HOOK_MULTIPLE,
+    ERROR_VENDORED_PROVIDER_MALFORMED,
+    ERROR_VENDORED_PROVIDER_MISSING,
+    discover_exact_vendored_controlled_alternative_provider_entry,
+    install_state_path,
+    resolve_vendored_controlled_alternative_provider,
+    vendor_root,
     verify_free_builder_wheel_artifact,
     verify_wheel_artifact,
+    write_install_state,
 )
+from agentveil_mcp_proxy.controlled_alternatives import (
+    CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP,
+)
+
 
 PACKAGE_NAME = "agentveil-private-policy"
 PACKAGE_VERSION = "0.1.0"
@@ -784,3 +798,347 @@ def test_verify_free_builder_wheel_artifact_rejects_hash_mismatch(tmp_path):
                 package_version=PACKAGE_VERSION,
             ),
         )
+
+
+CA_MODULE_NAME = PACKAGE_NAME.replace("-", "_")
+CA_PROVIDER_SOURCE = """
+class _Provider:
+    calls = []
+
+    def descriptor(self):
+        self.calls.append("descriptor")
+        return {"provider_id": "private_v1"}
+
+    def propose(self, request):
+        self.calls.append("propose")
+        raise RuntimeError("CA1B_PHASE_CANARY")
+
+    def execute(self, request):
+        self.calls.append("execute")
+        raise RuntimeError("CA1B_PHASE_CANARY")
+
+    def verify(self, request):
+        self.calls.append("verify")
+        raise RuntimeError("CA1B_PHASE_CANARY")
+
+def build_provider():
+    return _Provider()
+"""
+
+
+def _build_controlled_alternative_test_wheel(
+    tmp_path: Path,
+    *,
+    source: str = CA_PROVIDER_SOURCE,
+    entry_points: str | None = None,
+) -> tuple[Path, str]:
+    extra = {
+        f"{CA_MODULE_NAME}/controlled_provider.py": source,
+        f"{CA_MODULE_NAME}-{PACKAGE_VERSION}.dist-info/entry_points.txt": (
+            entry_points
+            if entry_points is not None
+            else (
+                f"[{CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP}]\n"
+                f"private_v1 = {CA_MODULE_NAME}.controlled_provider:build_provider\n"
+            )
+        ),
+    }
+    return _build_test_wheel(tmp_path, extra_entries=extra)
+
+
+def _install_active_controlled_alternative(home: Path, *, wheel_path: Path) -> Path:
+    vendor_dir = vendor_root(home) / f"{PACKAGE_NAME}-{PACKAGE_VERSION}"
+    install_wheel_to_vendor(
+        home=home,
+        wheel_path=wheel_path,
+        target_dir=vendor_dir,
+        expected_package_name=PACKAGE_NAME,
+        expected_package_version=PACKAGE_VERSION,
+        require_empty_target=True,
+    )
+    write_install_state(
+        install_state_path(home),
+        {
+            "status": STATUS_ACTIVE,
+            "provider_id": "private_v1",
+            "package_name": PACKAGE_NAME,
+            "package_version": PACKAGE_VERSION,
+            "public_fallback_available": True,
+            "error_code": None,
+            "last_installed_at": "2026-08-08T12:00:00+00:00",
+            "install_safety_state": "verified",
+            "install_safety_reason": None,
+        },
+    )
+    return vendor_dir
+
+
+def test_vendored_controlled_alternative_provider_loads_without_phases(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    wheel_path, _digest = _build_controlled_alternative_test_wheel(tmp_path / "wheel")
+    vendor_dir = _install_active_controlled_alternative(home, wheel_path=wheel_path)
+    before_path = list(sys.path)
+    before_modules = {
+        key
+        for key in sys.modules
+        if key == CA_MODULE_NAME or key.startswith(f"{CA_MODULE_NAME}.")
+    }
+    provider, error = resolve_vendored_controlled_alternative_provider(home=home)
+    assert error is None
+    assert provider is not None
+    assert getattr(provider, "calls", None) == []
+    assert not hasattr(provider, "descriptor") or provider.calls == []
+    assert sys.path == before_path
+    after_modules = {
+        key
+        for key in sys.modules
+        if key == CA_MODULE_NAME or key.startswith(f"{CA_MODULE_NAME}.")
+    }
+    assert after_modules == before_modules
+    assert str(vendor_dir.resolve()) not in sys.path
+    assert error is None
+    assert str(home) not in str(error)
+
+
+def test_vendored_controlled_alternative_provider_missing_without_entry(tmp_path):
+    vendor_dir = tmp_path / "vendor"
+    vendor_dir.mkdir()
+    dist_info = vendor_dir / f"{CA_MODULE_NAME}-{PACKAGE_VERSION}.dist-info"
+    dist_info.mkdir()
+    (dist_info / "METADATA").write_text(
+        f"Name: {PACKAGE_NAME}\nVersion: {PACKAGE_VERSION}\n",
+        encoding="utf-8",
+    )
+    (dist_info / "entry_points.txt").write_text(
+        "[agentveil_mcp_proxy.paid_providers]\nprivate_v1 = agentveil_private_policy.p:build\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(PaidInstallError, match=ERROR_VENDORED_PROVIDER_MISSING):
+        discover_exact_vendored_controlled_alternative_provider_entry(
+            vendor_dir,
+            package_name=PACKAGE_NAME,
+            package_version=PACKAGE_VERSION,
+        )
+
+
+def test_vendored_controlled_alternative_provider_duplicate_entry(tmp_path):
+    vendor_dir = tmp_path / "vendor"
+    vendor_dir.mkdir()
+    dist_info = vendor_dir / f"{CA_MODULE_NAME}-{PACKAGE_VERSION}.dist-info"
+    dist_info.mkdir()
+    (dist_info / "METADATA").write_text(
+        f"Name: {PACKAGE_NAME}\nVersion: {PACKAGE_VERSION}\n",
+        encoding="utf-8",
+    )
+    (dist_info / "entry_points.txt").write_text(
+        f"[{CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP}]\n"
+        f"private_v1 = {CA_MODULE_NAME}.controlled_provider:build_provider\n"
+        f"private_v1 = {CA_MODULE_NAME}.other:build_provider\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(PaidInstallError, match=ERROR_HANDOFF_HOOK_MULTIPLE):
+        discover_exact_vendored_controlled_alternative_provider_entry(
+            vendor_dir,
+            package_name=PACKAGE_NAME,
+            package_version=PACKAGE_VERSION,
+        )
+
+
+def test_vendored_controlled_alternative_factory_and_malformed_are_bounded(tmp_path, monkeypatch):
+    canary = "CA1B_FACTORY_CANARY"
+    home = tmp_path / "factory-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    wheel_path, _digest = _build_controlled_alternative_test_wheel(
+        tmp_path / "factory",
+        source=f"def build_provider():\n    raise RuntimeError({canary!r})\n",
+    )
+    _install_active_controlled_alternative(home, wheel_path=wheel_path)
+    provider, error = resolve_vendored_controlled_alternative_provider(home=home)
+    assert provider is None
+    assert error == ERROR_HANDOFF_HOOK_IMPORT_FAILED
+    assert canary not in str(error)
+
+    malformed_home = tmp_path / "malformed-home"
+    monkeypatch.setenv("AVP_HOME", str(malformed_home))
+    malformed_wheel, _digest = _build_controlled_alternative_test_wheel(
+        tmp_path / "malformed",
+        entry_points=(
+            f"[{CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP}]\n"
+            "private_v1 = not a valid target\n"
+        ),
+    )
+    _install_active_controlled_alternative(malformed_home, wheel_path=malformed_wheel)
+    provider, error = resolve_vendored_controlled_alternative_provider(home=malformed_home)
+    assert provider is None
+    assert error == ERROR_VENDORED_PROVIDER_MALFORMED
+    assert "not a valid target" not in str(error)
+
+
+def _private_module_snapshot() -> dict[str, object]:
+    return {
+        key: sys.modules[key]
+        for key in list(sys.modules)
+        if key == CA_MODULE_NAME or key.startswith(f"{CA_MODULE_NAME}.")
+    }
+
+
+def _assert_bounded_controlled_resolver_failure(
+    provider,
+    error,
+    *,
+    before_path: list[str],
+    before_modules: dict[str, object],
+    canaries: tuple[str, ...] = (),
+) -> None:
+    assert provider is None
+    assert error in {
+        ERROR_VENDORED_PROVIDER_MISSING,
+        ERROR_VENDORED_PROVIDER_MALFORMED,
+        ERROR_HANDOFF_HOOK_IMPORT_FAILED,
+        ERROR_HANDOFF_HOOK_MULTIPLE,
+    }
+    assert sys.path == before_path
+    for key, module in before_modules.items():
+        assert sys.modules.get(key) is module
+    rendered = f"{error!r}{error}"
+    for canary in canaries:
+        assert canary not in rendered
+    assert "/" not in str(error)
+    assert "\\" not in str(error)
+
+
+def test_resolve_vendored_controlled_alternative_provider_hostile_custody(tmp_path, monkeypatch):
+    sentinel = types.ModuleType(CA_MODULE_NAME)
+    monkeypatch.setitem(sys.modules, CA_MODULE_NAME, sentinel)
+
+    def _run(home: Path):
+        before_path = list(sys.path)
+        before_modules = _private_module_snapshot()
+        provider, error = resolve_vendored_controlled_alternative_provider(home=home)
+        return provider, error, before_path, before_modules
+
+    home = tmp_path / "wrong-name"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    wheel_path, _digest = _build_controlled_alternative_test_wheel(tmp_path / "wheel-name")
+    _install_active_controlled_alternative(home, wheel_path=wheel_path)
+    write_install_state(
+        install_state_path(home),
+        {
+            "status": STATUS_ACTIVE,
+            "provider_id": "private_v1",
+            "package_name": "wrong-package-name",
+            "package_version": PACKAGE_VERSION,
+            "public_fallback_available": True,
+            "error_code": None,
+            "last_installed_at": "2026-08-08T12:00:00+00:00",
+            "install_safety_state": "verified",
+            "install_safety_reason": None,
+        },
+    )
+    provider, error, before_path, before_modules = _run(home)
+    _assert_bounded_controlled_resolver_failure(
+        provider,
+        error,
+        before_path=before_path,
+        before_modules=before_modules,
+        canaries=("wrong-package-name", str(home)),
+    )
+
+    version_home = tmp_path / "wrong-version"
+    monkeypatch.setenv("AVP_HOME", str(version_home))
+    version_wheel, _digest = _build_controlled_alternative_test_wheel(tmp_path / "wheel-version")
+    _install_active_controlled_alternative(version_home, wheel_path=version_wheel)
+    write_install_state(
+        install_state_path(version_home),
+        {
+            "status": STATUS_ACTIVE,
+            "provider_id": "private_v1",
+            "package_name": PACKAGE_NAME,
+            "package_version": "9.9.9",
+            "public_fallback_available": True,
+            "error_code": None,
+            "last_installed_at": "2026-08-08T12:00:00+00:00",
+            "install_safety_state": "verified",
+            "install_safety_reason": None,
+        },
+    )
+    provider, error, before_path, before_modules = _run(version_home)
+    _assert_bounded_controlled_resolver_failure(
+        provider,
+        error,
+        before_path=before_path,
+        before_modules=before_modules,
+        canaries=("9.9.9", str(version_home)),
+    )
+
+    symlink_home = tmp_path / "symlink-home"
+    monkeypatch.setenv("AVP_HOME", str(symlink_home))
+    symlink_wheel, _digest = _build_controlled_alternative_test_wheel(tmp_path / "wheel-symlink")
+    vendor_dir = _install_active_controlled_alternative(symlink_home, wheel_path=symlink_wheel)
+    outside = tmp_path / "outside-vendor"
+    vendor_dir.rename(outside)
+    vendor_dir.symlink_to(outside)
+    provider, error, before_path, before_modules = _run(symlink_home)
+    _assert_bounded_controlled_resolver_failure(
+        provider,
+        error,
+        before_path=before_path,
+        before_modules=before_modules,
+        canaries=(str(outside), str(symlink_home)),
+    )
+
+    origin_home = tmp_path / "origin-home"
+    monkeypatch.setenv("AVP_HOME", str(origin_home))
+    origin_wheel, _digest = _build_controlled_alternative_test_wheel(
+        tmp_path / "wheel-origin",
+        entry_points=(
+            f"[{CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP}]\n"
+            "private_v1 = json:dumps\n"
+        ),
+    )
+    _install_active_controlled_alternative(origin_home, wheel_path=origin_wheel)
+    provider, error, before_path, before_modules = _run(origin_home)
+    _assert_bounded_controlled_resolver_failure(
+        provider,
+        error,
+        before_path=before_path,
+        before_modules=before_modules,
+        canaries=("json", "dumps", str(origin_home)),
+    )
+
+    none_home = tmp_path / "none-home"
+    monkeypatch.setenv("AVP_HOME", str(none_home))
+    none_wheel, _digest = _build_controlled_alternative_test_wheel(
+        tmp_path / "wheel-none",
+        source="def build_provider():\n    return None\n",
+    )
+    _install_active_controlled_alternative(none_home, wheel_path=none_wheel)
+    provider, error, before_path, before_modules = _run(none_home)
+    _assert_bounded_controlled_resolver_failure(
+        provider,
+        error,
+        before_path=before_path,
+        before_modules=before_modules,
+        canaries=("None", str(none_home)),
+    )
+    assert sys.modules.get(CA_MODULE_NAME) is sentinel
+
+
+def test_vendored_controlled_alternative_provider_restores_module_identity(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    sentinel = types.ModuleType(CA_MODULE_NAME)
+    child = types.ModuleType(f"{CA_MODULE_NAME}.preexisting")
+    monkeypatch.setitem(sys.modules, CA_MODULE_NAME, sentinel)
+    monkeypatch.setitem(sys.modules, f"{CA_MODULE_NAME}.preexisting", child)
+    wheel_path, _digest = _build_controlled_alternative_test_wheel(tmp_path / "wheel")
+    _install_active_controlled_alternative(home, wheel_path=wheel_path)
+    before_path = list(sys.path)
+    provider, error = resolve_vendored_controlled_alternative_provider(home=home)
+    assert error is None
+    assert provider is not None
+    assert getattr(provider, "calls", None) == []
+    assert sys.path == before_path
+    assert sys.modules.get(CA_MODULE_NAME) is sentinel
+    assert sys.modules.get(f"{CA_MODULE_NAME}.preexisting") is child

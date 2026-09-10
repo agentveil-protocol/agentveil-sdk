@@ -21,6 +21,7 @@ import agentveil_mcp_proxy.passthrough as passthrough_module
 import agentveil_mcp_proxy.cli as proxy_cli
 from agentveil_mcp_proxy.cli import ProxyCliError, init_proxy, run_proxy
 from agentveil_mcp_proxy.classification import ToolCallClassifier
+from agentveil_mcp_proxy.controlled_alternatives import SEMANTIC_WRITE_FILE_TOOL_NAME
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore
 from agentveil_mcp_proxy.evidence.observability import (
     APPROVAL_REQUIRED_INSTRUCTIONS,
@@ -389,6 +390,104 @@ for line in sys.stdin:
     return script
 
 
+def _recording_write_file_downstream(tmp_path: Path) -> Path:
+    script = tmp_path / "recording_write_file_downstream.py"
+    script.write_text(
+        """
+import json
+import os
+from pathlib import Path
+import sys
+
+TOOLS = [
+    {
+        "name": "write_file",
+        "description": "Write a file",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            "required": ["path", "content"],
+            "additionalProperties": False,
+        },
+    }
+]
+if os.environ.get("INCLUDE_AGENTVEIL_WRITE_ALIAS") == "1":
+    TOOLS.append({
+        "name": "agentveil_write_file",
+        "description": "Downstream collision",
+        "inputSchema": {"type": "object"},
+    })
+log_path = os.environ.get("DOWNSTREAM_LOG")
+payload_log_path = os.environ["DOWNSTREAM_PAYLOAD_LOG"]
+write_root = Path(os.environ["WRITE_ROOT"])
+
+def log(method):
+    if log_path:
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(method + "\\n")
+
+def log_payload(payload):
+    with open(payload_log_path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload, sort_keys=True) + "\\n")
+
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method", "")
+    log(method)
+    if "id" not in msg:
+        continue
+    if method == "initialize":
+        result = {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "fake-downstream", "version": "1.0.0"},
+        }
+    elif method == "tools/list":
+        result = {"tools": TOOLS}
+    elif method == "tools/call":
+        params = msg.get("params") or {}
+        args = params.get("arguments") or {}
+        target = write_root / args["path"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(args["content"], encoding="utf-8")
+        log_payload({"name": params.get("name"), "arguments": args})
+        result = {"content": [{"type": "text", "text": "written"}]}
+    else:
+        result = {"ok": True, "method": method}
+    print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": result}), flush=True)
+""".lstrip(),
+        encoding="utf-8",
+    )
+    return script
+
+
+def _set_recording_write_file_downstream(
+    config_path: Path,
+    script: Path,
+    *,
+    log_path: Path,
+    payload_log_path: Path,
+    write_root: Path,
+    include_owned_alias: bool = False,
+) -> None:
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["downstream"] = {
+        "name": "fake-downstream",
+        "command": sys.executable,
+        "args": ["-u", str(script)],
+        "env": {
+            "DOWNSTREAM_LOG": str(log_path),
+            "DOWNSTREAM_PAYLOAD_LOG": str(payload_log_path),
+            "WRITE_ROOT": str(write_root),
+            "INCLUDE_AGENTVEIL_WRITE_ALIAS": "1" if include_owned_alias else "0",
+        },
+    }
+    _write_json(config_path, config)
+
+
 def _crashing_downstream(tmp_path: Path) -> Path:
     script = tmp_path / "crashing_downstream.py"
     script.write_text(
@@ -732,12 +831,12 @@ def test_run_mirrors_initialize_initialized_and_tools_list(tmp_path):
 
     assert [response["id"] for response in responses] == [1, 2]
     assert responses[0]["result"]["serverInfo"] == {"name": "fake-downstream", "version": "1.0.0"}
-    assert responses[1]["result"] == {
-        "tools": [
-            {"name": "read_file", "description": "Read a file", "inputSchema": {"type": "object"}},
-            {"name": "write_file", "description": "Write a file", "inputSchema": {"type": "object"}},
-        ]
-    }
+    tools = responses[1]["result"]["tools"]
+    assert tools[:2] == [
+        {"name": "read_file", "description": "Read a file", "inputSchema": {"type": "object"}},
+        {"name": "write_file", "description": "Write a file", "inputSchema": {"type": "object"}},
+    ]
+    assert tools[2]["name"] == SEMANTIC_WRITE_FILE_TOOL_NAME
     assert log_path.read_text(encoding="utf-8").splitlines() == [
         "initialize",
         "notifications/initialized",
@@ -1426,7 +1525,7 @@ def test_secret_read_file_path_fails_before_downstream_read(tmp_path, monkeypatc
 def test_agentveil_control_manifest_read_blocked_before_downstream(tmp_path, monkeypatch):
     home = tmp_path / "avp-home"
     sandbox = tmp_path / "sandbox"
-    init = init_proxy(
+    init_proxy(
         home=home,
         agent_name="proxy",
         plaintext=True,
@@ -3134,6 +3233,324 @@ def test_non_instruction_write_allowed_with_allow_policy(tmp_path):
     assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list", "tools/call"]
 
 
+def test_agentveil_write_file_reaches_downstream_write_file_without_approval(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    payload_log_path = tmp_path / "downstream_payloads.jsonl"
+    _set_recording_write_file_downstream(
+        init.config_path,
+        _recording_write_file_downstream(tmp_path),
+        log_path=log_path,
+        payload_log_path=payload_log_path,
+        write_root=workspace,
+    )
+    _set_allow_policy(init.config_path, server="fake-downstream", tool="write_file")
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("owned write alias must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(
+            _json_line({"jsonrpc": "2.0", "id": "list-1", "method": "tools/list", "params": {}})
+            + _json_line({
+                "jsonrpc": "2.0",
+                "id": "call-1",
+                "method": "tools/call",
+                "params": {
+                    "name": SEMANTIC_WRITE_FILE_TOOL_NAME,
+                    "arguments": {
+                        "path": "todo.txt",
+                        "content": "one\n",
+                    },
+                },
+            })
+        ),
+        out=client_out,
+        approval_ui_mode="none",
+    ) == 0
+
+    responses = _responses(client_out.getvalue())
+    tool_names = [tool["name"] for tool in responses[0]["result"]["tools"]]
+    assert SEMANTIC_WRITE_FILE_TOOL_NAME in tool_names
+    assert responses[1]["result"] == {"content": [{"type": "text", "text": "written"}]}
+    assert (workspace / "todo.txt").read_text(encoding="utf-8") == "one\n"
+    payloads = [
+        json.loads(line)
+        for line in payload_log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert payloads == [{
+        "name": "write_file",
+        "arguments": {"path": "todo.txt", "content": "one\n"},
+    }]
+    assert _pending_approval_count(home) == 0
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list", "tools/call"]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"path": " todo.txt", "content": "one\n"},
+        {"path": "todo.txt ", "content": "one\n"},
+        {"path": "../todo.txt", "content": "one\n"},
+        {"path": "todo.txt", "content": "one\n", "approval_granted": True},
+        {"path": "todo.txt", "content": "nul\x00byte"},
+    ],
+)
+def test_agentveil_write_file_malformed_never_reaches_downstream(
+    tmp_path,
+    monkeypatch,
+    arguments,
+):
+    home = tmp_path / "avp-home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    payload_log_path = tmp_path / "downstream_payloads.jsonl"
+    _set_recording_write_file_downstream(
+        init.config_path,
+        _recording_write_file_downstream(tmp_path),
+        log_path=log_path,
+        payload_log_path=payload_log_path,
+        write_root=workspace,
+    )
+    _set_allow_policy(init.config_path, server="fake-downstream", tool="write_file")
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("malformed owned write alias must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(
+            _json_line({"jsonrpc": "2.0", "id": "list-1", "method": "tools/list", "params": {}})
+            + _json_line({
+                "jsonrpc": "2.0",
+                "id": "call-1",
+                "method": "tools/call",
+                "params": {
+                    "name": SEMANTIC_WRITE_FILE_TOOL_NAME,
+                    "arguments": arguments,
+                },
+            })
+        ),
+        out=client_out,
+        approval_ui_mode="none",
+    ) == 0
+
+    response = _responses(client_out.getvalue())[1]
+    body = json.loads(response["result"]["content"][0]["text"])
+    assert body["mechanism_status"] == "error"
+    assert body["error_code"] == "request_malformed"
+    assert body["target_reached"] is False
+    assert not (workspace / "todo.txt").exists()
+    assert not payload_log_path.exists()
+    assert _pending_approval_count(home) == 0
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "locked_config.yaml",
+        "config/locked_config.yaml",
+        "secrets.env",
+        ".env",
+    ],
+)
+def test_agentveil_write_file_protected_overwrite_never_reaches_downstream(
+    tmp_path,
+    monkeypatch,
+    relative_path,
+):
+    home = tmp_path / "avp-home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    original = "lock: true\n"
+    target.write_text(original, encoding="utf-8")
+    overwrite = "OVERWRITE_CANARY\n"
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    payload_log_path = tmp_path / "downstream_payloads.jsonl"
+    _set_recording_write_file_downstream(
+        init.config_path,
+        _recording_write_file_downstream(tmp_path),
+        log_path=log_path,
+        payload_log_path=payload_log_path,
+        write_root=workspace,
+    )
+    _set_allow_policy(init.config_path, server="fake-downstream", tool="write_file")
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("protected overwrite must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(
+            _json_line({"jsonrpc": "2.0", "id": "list-1", "method": "tools/list", "params": {}})
+            + _json_line({
+                "jsonrpc": "2.0",
+                "id": "call-1",
+                "method": "tools/call",
+                "params": {
+                    "name": SEMANTIC_WRITE_FILE_TOOL_NAME,
+                    "arguments": {"path": relative_path, "content": overwrite},
+                },
+            })
+        ),
+        out=client_out,
+        approval_ui_mode="none",
+    ) == 0
+
+    raw = client_out.getvalue()
+    response = _responses(raw)[1]
+    body = json.loads(response["result"]["content"][0]["text"])
+    assert body == {
+        "mechanism_status": "error",
+        "error_code": "request_malformed",
+        "target_reached": False,
+        "rollback_available": False,
+        "verification_level": "not_verified",
+    }
+    assert target.read_text(encoding="utf-8") == original
+    assert not payload_log_path.exists()
+    assert _pending_approval_count(home) == 0
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
+    leaked = raw + json.dumps(body)
+    for canary in (
+        overwrite,
+        original,
+        relative_path,
+        str(home),
+        str(workspace),
+        str(target),
+        "state_root",
+        "route_id",
+        "agentveil_private_policy",
+        "private_v1",
+    ):
+        assert canary not in leaked
+
+
+def test_agentveil_write_file_catalog_collision_never_reaches_downstream(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    payload_log_path = tmp_path / "downstream_payloads.jsonl"
+    _set_recording_write_file_downstream(
+        init.config_path,
+        _recording_write_file_downstream(tmp_path),
+        log_path=log_path,
+        payload_log_path=payload_log_path,
+        write_root=workspace,
+        include_owned_alias=True,
+    )
+    _set_allow_policy(init.config_path, server="fake-downstream", tool="write_file")
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("colliding owned write alias must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(
+            _json_line({"jsonrpc": "2.0", "id": "list-1", "method": "tools/list", "params": {}})
+            + _json_line({
+                "jsonrpc": "2.0",
+                "id": "call-1",
+                "method": "tools/call",
+                "params": {
+                    "name": SEMANTIC_WRITE_FILE_TOOL_NAME,
+                    "arguments": {"path": "todo.txt", "content": "one\n"},
+                },
+            })
+        ),
+        out=client_out,
+        approval_ui_mode="none",
+    ) == 0
+
+    responses = _responses(client_out.getvalue())
+    tool_names = [tool["name"] for tool in responses[0]["result"]["tools"]]
+    assert tool_names.count(SEMANTIC_WRITE_FILE_TOOL_NAME) == 1
+    assert responses[1]["error"]["data"]["reason"] == "unknown_tool"
+    assert not (workspace / "todo.txt").exists()
+    assert not payload_log_path.exists()
+    assert _pending_approval_count(home) == 0
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
+
+
+def test_agentveil_write_file_instruction_path_still_requires_approval(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    init = init_proxy(home=home, agent_name="proxy", plaintext=True)
+    log_path = tmp_path / "downstream.log"
+    payload_log_path = tmp_path / "downstream_payloads.jsonl"
+    _set_recording_write_file_downstream(
+        init.config_path,
+        _recording_write_file_downstream(tmp_path),
+        log_path=log_path,
+        payload_log_path=payload_log_path,
+        write_root=workspace,
+    )
+    _set_allow_policy(init.config_path, server="fake-downstream", tool="write_file")
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("instruction write must be handled by local approval")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(
+            _json_line({"jsonrpc": "2.0", "id": "list-1", "method": "tools/list", "params": {}})
+            + _json_line({
+                "jsonrpc": "2.0",
+                "id": "call-1",
+                "method": "tools/call",
+                "params": {
+                    "name": SEMANTIC_WRITE_FILE_TOOL_NAME,
+                    "arguments": {"path": "AGENTS.md", "content": "instructions"},
+                },
+            })
+        ),
+        out=client_out,
+        approval_ui_mode="none",
+    ) == 0
+
+    response = _responses(client_out.getvalue())[1]
+    assert response["error"]["code"] == JSONRPC_APPROVAL_REQUIRED
+    assert response["error"]["data"]["reason"] == "instruction_file_write_requires_approval"
+    assert not (workspace / "AGENTS.md").exists()
+    assert not payload_log_path.exists()
+    assert _pending_approval_count(home) == 1
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["tools/list"]
+
+
 def test_non_github_copilot_instructions_path_allowed_with_allow_policy(tmp_path):
     home = tmp_path / "avp-home"
     init = init_proxy(home=home, agent_name="proxy", plaintext=True)
@@ -4148,6 +4565,56 @@ def test_redirect_follow_up_policy_block_does_not_reach_downstream(tmp_path, mon
     assert follow_meta is not None
     assert follow_meta["redirect_role"] == "follow_up"
     assert follow_meta["target_reached"] is False
+
+
+def test_filesystem_implementer_delete_file_policy_block_uses_inspection_guidance(
+    tmp_path,
+    monkeypatch,
+):
+    home = tmp_path / "home"
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir(parents=True, exist_ok=True)
+    target = sandbox / "keep.txt"
+    target.write_text("stay", encoding="utf-8")
+    init_proxy(
+        home=home,
+        agent_name="proxy",
+        plaintext=True,
+        role_preset="implementer",
+        policy_pack="filesystem",
+        downstream_config=proxy_cli.quickstart_filesystem_downstream(sandbox),
+    )
+
+    class ExplodingAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("policy block redirect must not construct AVPAgent")
+
+    monkeypatch.setattr(proxy_cli, "AVPAgent", ExplodingAgent)
+    client_out = io.StringIO()
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(_json_line(_tool_call_args(
+            "delete_file",
+            {"path": "keep.txt"},
+            # claim-check: allow negative regression identifier for expected policy denial.
+            call_id="delete-blocked",
+        ))),
+        out=client_out,
+        approval_ui_mode="none",
+    ) == 0
+
+    response = _responses(client_out.getvalue())[0]
+    data = response["error"]["data"]
+    assert data["reason"] == "local_policy_block"
+    assert data["redirect_playbook_id"] == "inspect_before_delete"
+    assert data["redirect_playbook_id"] != "switch_to_build_agent"
+    assert data.get("target_reached") is False
+    assert target.read_text(encoding="utf-8") == "stay"
+    # claim-check: allow negative regression lookup for expected policy denial evidence.
+    metadata = _redirect_metadata_for_request(home, "delete-blocked")
+    assert metadata is not None
+    assert metadata["target_reached"] is False
+    assert SECRET not in client_out.getvalue()
 
 
 def test_redirect_malformed_context_fails_closed_without_downstream(tmp_path, monkeypatch):

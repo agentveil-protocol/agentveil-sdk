@@ -45,6 +45,8 @@ class ProcessScenario:
     expect_allow: bool = False
     expect_redirect_context: bool = False
     expect_hard_block_copy: bool = False
+    expect_playbook_id: str | None = None
+    connector_ids: tuple[str, ...] | None = None
 
 
 def _publish_live_binding(home: Path, sandbox: Path) -> object:
@@ -218,11 +220,18 @@ MCP_PASSTHROUGH_PAYLOADS = {
     },
 }
 
-DESTRUCTIVE_PAYLOADS = {
+RECOVERABLE_DELETE_PAYLOADS = {
     "cursor": {
         "hook_event": "preToolUse",
         "tool_name": "Delete",
         "tool_input": {"path": "note.txt"},
+    },
+}
+
+DESTRUCTIVE_PAYLOADS = {
+    "cursor": {
+        "hook_event": "beforeShellExecution",
+        "command": "rm -rf /tmp/workspace",
     },
     "claude_code": {"tool_name": "Bash", "tool_input": {"command": "rm -rf /tmp/workspace"}},
     "codex": {
@@ -272,10 +281,21 @@ PROCESS_SCENARIOS = (
         expect_redirect_context=False,
     ),
     ProcessScenario(
+        "recoverable_exact_delete",
+        payload=None,
+        publish_binding=True,
+        install_cursor_mcp=False,
+        expect_allow=False,
+        expect_redirect_context=True,
+        expect_playbook_id="controlled_stage_delete",
+        connector_ids=("cursor",),
+    ),
+    ProcessScenario(
         "destructive_hard_block",
         payload=None,
         publish_binding=True,
         install_cursor_mcp=False,
+        cursor_hook_event="beforeShellExecution",
         expect_allow=False,
         expect_redirect_context=False,
         expect_hard_block_copy=True,
@@ -288,6 +308,8 @@ def _scenario_payload(case: InstalledHookCase, scenario: ProcessScenario) -> dic
         return SAFE_ALLOW_PAYLOADS[case.connector_id]
     if scenario.scenario_id == "controlled_mcp_passthrough":
         return MCP_PASSTHROUGH_PAYLOADS[case.connector_id]
+    if scenario.scenario_id == "recoverable_exact_delete":
+        return RECOVERABLE_DELETE_PAYLOADS[case.connector_id]
     if scenario.scenario_id == "destructive_hard_block":
         return DESTRUCTIVE_PAYLOADS[case.connector_id]
     return case.hook_payload
@@ -401,6 +423,8 @@ def test_installed_hook_process_truth_table(
     case: InstalledHookCase,
     scenario: ProcessScenario,
 ) -> None:
+    if scenario.connector_ids is not None and case.connector_id not in scenario.connector_ids:
+        pytest.skip(f"{scenario.scenario_id} applies to {scenario.connector_ids}")
     project = tmp_path / "project"
     project.mkdir()
     sandbox = project / "sandbox"
@@ -428,7 +452,8 @@ def test_installed_hook_process_truth_table(
         redirect_context = case.parse_context(hook_output or {}) if hook_output else None
         if scenario.expect_redirect_context:
             assert redirect_context is not None
-            assert redirect_context["redirect_playbook_id"] == "request_approval"
+            expected_playbook = scenario.expect_playbook_id or "request_approval"
+            assert redirect_context["redirect_playbook_id"] == expected_playbook
             meta = durable_original_metadata(home, redirect_context["original_request_id"])
             assert meta is not None
             assert meta["redirect_role"] == "original"

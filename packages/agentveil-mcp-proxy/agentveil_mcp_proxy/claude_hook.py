@@ -51,8 +51,10 @@ from agentveil_mcp_proxy.console_project_status_client import (
 from agentveil_mcp_proxy.client_guidance import (
     NativeRedirectOrigin,
     format_native_redirect_agent_surface,
+    is_agentveil_owned_controlled_mcp_tool,
     maybe_register_native_redirect_for_hook_deny,
     native_hook_deny_instruction,
+    trusted_static_controlled_route_ready,
 )
 from agentveil_mcp_proxy.hook_policy import (
     HookDisposition,
@@ -345,6 +347,14 @@ def decide(payload: Mapping[str, Any], engine: PolicyEngine) -> HookDecision:
     # through (instead of denying write-shaped MCP tools on this controlled route) so the redirect
     # to "use the controlled MCP tool" is reachable. The proxy, not the hook,
     # then applies approval/redirect/evidence to these calls.
+    if is_agentveil_owned_controlled_mcp_tool(payload.get("tool_name")):
+        return HookDecision(
+            hook_action="allow",
+            reason_code="controlled_route_passthrough",
+            context=context,
+            evaluation=evaluation,
+            disposition=HookDisposition.ALLOW,
+        )
     if is_agentveil_controlled_mcp_server(context.server):
         return HookDecision(
             hook_action="allow",
@@ -374,6 +384,8 @@ def format_hook_output(
     decision: HookDecision,
     *,
     redirect_origin: NativeRedirectOrigin | None = None,
+    tool_input: Mapping[str, Any] | None = None,
+    static_route_ready: bool = False,
 ) -> str | None:
     """Format Claude-compatible PreToolUse JSON, or ``None`` to allow silently.
 
@@ -395,6 +407,8 @@ def format_hook_output(
             native_tool=decision.context.tool,
             risk_class=decision.evaluation.risk_class.value,
             redirect_route_ready=decision.disposition is HookDisposition.REDIRECT,
+            static_route_ready=static_route_ready,
+            tool_input=tool_input if isinstance(tool_input, Mapping) else {},
         )
         reason = f"{reason}. {instruction}"
     reason = format_native_redirect_agent_surface(reason, redirect_origin)
@@ -543,7 +557,19 @@ def process_hook(
             project_dir=home.parent if home is not None else Path.cwd(),
             runtime_home=home,
         )
-    output = format_hook_output(decision, redirect_origin=redirect_origin)
+    output = format_hook_output(
+        decision,
+        redirect_origin=redirect_origin,
+        tool_input=tool_input if isinstance(tool_input, Mapping) else {},
+        static_route_ready=(
+            trusted_static_controlled_route_ready(
+                home=home,
+                project_root=home.parent if home is not None else None,
+            )
+            if decision.hook_action == "deny"
+            else False
+        ),
+    )
     if output is not None:
         if out is None:
             out = sys.stdout

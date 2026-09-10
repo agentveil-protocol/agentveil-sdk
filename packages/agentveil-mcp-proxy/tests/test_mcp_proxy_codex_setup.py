@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -359,3 +360,127 @@ def test_setup_codex_attempts_console_project_status_sync(tmp_path, monkeypatch,
     capsys.readouterr()
     assert len(sync_calls) == 1
     assert sync_calls[0]["connector"] == "codex"
+
+
+def _init_local_git(project: Path) -> None:
+    subprocess.run(["git", "init", "-b", "main"], cwd=project, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "dev@example.test"],
+        cwd=project,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Dev"],
+        cwd=project,
+        check=True,
+        capture_output=True,
+    )
+
+
+def _git_porcelain(project: Path) -> str:
+    return subprocess.run(
+        # Evidence: Git status mode below exposes untracked test files in disposable repos.
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=project,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
+def _exclude_lines(project: Path) -> list[str]:
+    path = project / ".git" / "info" / "exclude"
+    if not path.is_file():
+        return []
+    return [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+
+def test_codex_setup_created_control_artifacts_do_not_contaminate_git(tmp_path: Path) -> None:
+    from agentveil_mcp_proxy import codex_setup
+
+    project = tmp_path / "repo"
+    project.mkdir()
+    _init_local_git(project)
+    exclude = project / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    exclude.write_text("# keep-user-exclude\n*.local\n", encoding="utf-8")
+    (project / "user.txt").write_text("keep\n", encoding="utf-8")
+    (project / ".codex" / "agentveil").mkdir(parents=True)
+    (project / ".codex" / "agentveil" / "evidence.jsonl").write_text("{}\n", encoding="utf-8")
+    codex_setup.install_hook(project_dir=project, python="python3")
+    lines = _exclude_lines(project)
+    assert ".codex/hooks.json" in lines
+    assert ".codex/agentveil/evidence.jsonl" in lines
+    assert ".codex/" not in lines
+    assert "*" not in lines
+    assert "AGENTS.md" not in lines
+    porcelain = _git_porcelain(project)
+    assert ".codex/hooks.json" not in porcelain
+    assert ".codex/agentveil/evidence.jsonl" not in porcelain
+    assert "user.txt" in porcelain
+    text = exclude.read_text(encoding="utf-8")
+    assert "# keep-user-exclude" in text
+    assert "*.local" in text
+    assert str(project) not in text
+    status = json.dumps(codex_setup.connector_status(project_dir=project, center_state="running"))
+    assert str(project) not in status
+    assert "/Users/" not in status
+    assert "secret" not in status.lower()
+
+    codex_setup.remove_hook(project_dir=project)
+    leftover = _exclude_lines(project)
+    assert ".codex/hooks.json" not in leftover
+    assert "# keep-user-exclude" in exclude.read_text(encoding="utf-8")
+    assert "*.local" in exclude.read_text(encoding="utf-8")
+
+
+def test_codex_setup_does_not_claim_preexisting_hooks_or_create_git(tmp_path: Path) -> None:
+    from agentveil_mcp_proxy import codex_setup
+
+    project = tmp_path / "repo"
+    project.mkdir()
+    _init_local_git(project)
+    hooks = project / ".codex" / "hooks.json"
+    hooks.parent.mkdir(parents=True)
+    hooks.write_text(json.dumps({"hooks": {"PreToolUse": []}}) + "\n", encoding="utf-8")
+    user_before = hooks.read_text(encoding="utf-8")
+    codex_setup.install_hook(project_dir=project, python="python3")
+    assert hooks.read_text(encoding="utf-8") != user_before
+    assert ".codex/hooks.json" not in _exclude_lines(project)
+    assert ".codex/hooks.json" in _git_porcelain(project)
+
+    lone = tmp_path / "nongit"
+    lone.mkdir()
+    codex_setup.install_hook(project_dir=lone, python="python3")
+    assert not (lone / ".git").exists()
+    status = json.dumps(codex_setup.connector_status(project_dir=lone, center_state="running"))
+    assert str(lone) not in status
+
+
+def test_codex_uninstall_drops_evidence_exclude_only_when_file_missing(tmp_path: Path) -> None:
+    from agentveil_mcp_proxy import codex_setup
+
+    missing = tmp_path / "missing-evidence"
+    missing.mkdir()
+    _init_local_git(missing)
+    assert not codex_setup.evidence_path(missing).exists()
+    codex_setup.install_hook(project_dir=missing, python="python3")
+    assert ".codex/agentveil/evidence.jsonl" in _exclude_lines(missing)
+    codex_setup.remove_hook(project_dir=missing)
+    assert ".codex/agentveil/evidence.jsonl" not in _exclude_lines(missing)
+
+    kept = tmp_path / "kept-evidence"
+    kept.mkdir()
+    _init_local_git(kept)
+    evidence = codex_setup.evidence_path(kept)
+    evidence.parent.mkdir(parents=True)
+    evidence.write_text("{}\n", encoding="utf-8")
+    codex_setup.install_hook(project_dir=kept, python="python3")
+    codex_setup.remove_hook(project_dir=kept)
+    assert evidence.is_file()
+    assert ".codex/agentveil/evidence.jsonl" in _exclude_lines(kept)

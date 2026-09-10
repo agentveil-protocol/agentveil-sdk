@@ -19,6 +19,7 @@ from agentveil_mcp_proxy.redirect_playbooks import (
     redirect_fields_from_guidance,
     uses_risk_family_redirects,
 )
+from agentveil_mcp_proxy.role_doctor import build_deny_guidance
 
 PAYLOAD_HASH = "sha256:" + "a" * 64
 RESOURCE_HASH = "sha256:" + "b" * 64
@@ -47,15 +48,21 @@ def _product_route_classification(
     )
 
 
-def _non_product_classification(tool: str = "write_file") -> ClassifiedToolCall:
+def _non_product_classification(
+    tool: str = "write_file",
+    *,
+    role: str = "implementer",
+    risk_class: RiskClass = RiskClass.WRITE,
+) -> ClassifiedToolCall:
     from agentveil_mcp_proxy.policy import PolicyEvaluation
 
+    rule_id = "filesystem-delete" if risk_class is RiskClass.DESTRUCTIVE else "filesystem-write"
     evaluation = PolicyEvaluation(
-        decision=PolicyDecision.APPROVAL,
-        risk_class=RiskClass.WRITE,
+        decision=PolicyDecision.APPROVAL if risk_class is not RiskClass.DESTRUCTIVE else PolicyDecision.BLOCK,
+        risk_class=risk_class,
         policy_id="filesystem-pack",
-        policy_rule_id="filesystem-write",
-        matched_rule_ids=("filesystem-write",),
+        policy_rule_id=rule_id,
+        matched_rule_ids=(rule_id,),
         policy_context_hash="c" * 64,
     )
     return ClassifiedToolCall(
@@ -68,9 +75,10 @@ def _non_product_classification(tool: str = "write_file") -> ClassifiedToolCall:
         resource=RESOURCE_HASH,
         resource_hash=RESOURCE_HASH,
         payload_hash=PAYLOAD_HASH,
-        risk_class=RiskClass.WRITE,
+        risk_class=risk_class,
         policy_evaluation=evaluation,
         action_family=infer_action_family(tool),
+        role=role,
     )
 
 
@@ -235,3 +243,17 @@ def test_original_request_fingerprint_is_bounded() -> None:
     assert fingerprint["target_ref"] == f"resource:{classification.resource_hash}"
     assert fingerprint["payload_hash"] == PAYLOAD_HASH
     assert fingerprint["request_id"] == "req-1"
+
+
+def test_common_policy_block_matches_risk_family_playbook() -> None:
+    classification = _non_product_classification(
+        "delete_file",
+        role="implementer",
+        risk_class=RiskClass.DESTRUCTIVE,
+    )
+    common = build_deny_guidance(classification, reason="local_policy_block")
+    routed = build_risk_family_guidance(classification, outcome="block")
+
+    assert common.redirect.redirect_playbook_id == routed.redirect_playbook_id
+    assert common.redirect.redirect_playbook_id == "inspect_before_delete"
+    assert common.redirect.redirect_playbook_id != "switch_to_build_agent"

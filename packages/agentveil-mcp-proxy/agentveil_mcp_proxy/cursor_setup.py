@@ -13,7 +13,6 @@ Approval Center lifecycle, and reports bounded ``Protected`` / ``Advisory`` /
 from __future__ import annotations
 
 import json
-import os
 import secrets
 import shlex
 import stat
@@ -23,6 +22,11 @@ from pathlib import Path
 from typing import Any
 
 from agentveil_mcp_proxy.client_connect import resolve_cursor_global_mcp_json_path
+from agentveil_mcp_proxy.client_guidance import (
+    add_agentveil_owned_git_excludes,
+    remove_agentveil_owned_git_exclude_if_target_missing,
+    remove_agentveil_owned_git_excludes,
+)
 from agentveil_mcp_proxy.cursor_hooks import AGENTVEIL_MCP_SERVER_KEY
 from agentveil_mcp_proxy.cursor_user_mcp import (
     detect_unmanaged_user_mcp_route,
@@ -33,8 +37,6 @@ from agentveil_mcp_proxy.cursor_user_mcp import (
 )
 from agentveil_mcp_proxy.product_route import (
     PRODUCT_ROUTE_DOWNSTREAM_NAME,
-    build_product_route_downstream_config,
-    initialize_product_route_profile,
 )
 
 AGENTVEIL_HOOK_MARKER = "agentveil_mcp_proxy.cursor_hooks"
@@ -529,6 +531,10 @@ def install_hooks(
         home=resolved_home,
         evidence_path=resolved_evidence,
     )
+    owned = [".cursor/agentveil/evidence.jsonl"]
+    if created:
+        owned.append(".cursor/hooks.json")
+    add_agentveil_owned_git_excludes(workspace, owned)
     return InstallHooksResult(
         hooks_path=hooks_config_path(workspace),
         evidence_path=resolved_evidence,
@@ -565,6 +571,8 @@ def install_mcp_route(
     servers[AGENTVEIL_MCP_SERVER_KEY] = entry
     payload["mcpServers"] = servers
     _write_json(path, payload)
+    if created:
+        add_agentveil_owned_git_excludes(workspace, (".cursor/mcp.json",))
     install_user_mcp_route(workspace, python=sys.executable, proxy_command=proxy_command)
     return InstallMcpResult(
         config_path=path,
@@ -574,6 +582,12 @@ def install_mcp_route(
 
 
 def remove_hooks(workspace: Path) -> int:
+    workspace = workspace.resolve()
+    remove_agentveil_owned_git_exclude_if_target_missing(
+        workspace,
+        ".cursor/agentveil/evidence.jsonl",
+        project_evidence_path(workspace),
+    )
     path = hooks_config_path(workspace)
     if not path.is_file():
         return 0
@@ -599,6 +613,7 @@ def remove_hooks(workspace: Path) -> int:
     other = {key: value for key, value in payload.items() if key != "hooks"}
     if not merged_hooks and not other:
         path.unlink()
+        remove_agentveil_owned_git_excludes(workspace, (".cursor/hooks.json",))
         return removed
     payload = dict(other)
     payload["hooks"] = merged_hooks
@@ -618,6 +633,7 @@ def remove_mcp_route(workspace: Path) -> bool:
             other = {key: value for key, value in payload.items() if key != "mcpServers"}
             if not servers and not other:
                 path.unlink()
+                remove_agentveil_owned_git_excludes(workspace, (".cursor/mcp.json",))
             else:
                 payload = dict(other)
                 payload["mcpServers"] = servers

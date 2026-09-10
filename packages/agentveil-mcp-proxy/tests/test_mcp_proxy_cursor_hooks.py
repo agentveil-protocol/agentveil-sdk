@@ -652,3 +652,271 @@ def test_cursor_shell_classifier_matches_shared_matrix(command: str, expected: R
         )
         is expected
     )
+
+
+def test_cursor_exact_delete_tool_hard_block_has_null_alternative(tmp_path: Path) -> None:
+    out = StringIO()
+    decision = cursor_hooks.process_hook(
+        {"hook_event": "preToolUse", "tool_name": "Delete", "tool_input": {"path": "notes.txt"}},
+        workspace=tmp_path,
+        out=out,
+    )
+    response = json.loads(out.getvalue())
+    assert decision.hook_action == "deny"
+    assert decision.disposition.value == "hard_block"
+    assert response["permission"] == "deny"
+    assert "alternative=null" in response["agent_message"]
+    assert "filesystem.stage_delete.v1" not in response["agent_message"]
+
+
+def test_cursor_apply_patch_delete_with_binding_is_redirect_and_available(tmp_path: Path) -> None:
+    home, _sandbox, downstream = init_redirect_contract_home(tmp_path)
+    fixture = publish_live_hook_binding(home, downstream=downstream)
+    try:
+        out = StringIO()
+        decision = cursor_hooks.process_hook(
+            {
+                "hook_event": "preToolUse",
+                "tool_name": "ApplyPatch",
+                "tool_input": {"patch": "*** Begin Patch\n*** Delete File: notes.txt\n*** End Patch"},
+            },
+            workspace=tmp_path,
+            home=home,
+            out=out,
+        )
+        response = json.loads(out.getvalue())
+        assert decision.hook_action == "deny"
+        assert decision.disposition.value == "redirect"
+        assert decision.reason_code == "managed_route_redirect"
+        assert "suggestion_status=available" in response["agent_message"]
+        assert "alternative.tool_contract=agentveil_stage_delete" in response["agent_message"]
+        assert "alternative.input.path=notes.txt" in response["agent_message"]
+        assert "alternative.id=" not in response["agent_message"]
+        assert "alternative.input.path=notes.txt" in response["agent_message"]
+    finally:
+        fixture.lease.close()
+
+
+def test_cursor_exact_shell_delete_uses_shell_canonicalize_but_stays_unavailable(tmp_path: Path) -> None:
+    out = StringIO()
+    decision = cursor_hooks.process_hook(
+        {"hook_event": "beforeShellExecution", "command": "rm notes.txt"},
+        workspace=tmp_path,
+        out=out,
+    )
+    response = json.loads(out.getvalue())
+    assert decision.hook_action == "deny"
+    assert decision.disposition.value == "hard_block"
+    assert "alternative=null" in response["agent_message"]
+    assert "filesystem.stage_delete.v1" not in response["agent_message"]
+
+
+def test_cursor_ambiguous_shell_stays_deny_without_alternative(tmp_path: Path) -> None:
+    out = StringIO()
+    decision = cursor_hooks.process_hook(
+        {"hook_event": "beforeShellExecution", "command": "rm -rf /tmp/workspace"},
+        workspace=tmp_path,
+        evidence_path=tmp_path / "evidence.jsonl",
+        out=out,
+    )
+    response = json.loads(out.getvalue())
+    dumped = (tmp_path / "evidence.jsonl").read_text(encoding="utf-8")
+    assert decision.hook_action == "deny"
+    assert "alternative=null" in response["agent_message"]
+    assert "filesystem.stage_delete.v1" not in response["agent_message"]
+    assert "/tmp/workspace" not in response["agent_message"]
+    assert "/tmp/workspace" not in dumped
+
+
+def test_cursor_trusted_static_exact_delete_is_hard_block_with_available_suggestion(tmp_path: Path) -> None:
+    home, sandbox, _downstream = init_redirect_contract_home(tmp_path)
+    out = StringIO()
+    decision = cursor_hooks.process_hook(
+        {
+            "hook_event": "preToolUse",
+            "tool_name": "ApplyPatch",
+            "tool_input": {"patch": "*** Begin Patch\n*** Delete File: notes.txt\n*** End Patch"},
+        },
+        workspace=tmp_path,
+        home=home,
+        out=out,
+    )
+    response = json.loads(out.getvalue())
+    message = response["agent_message"]
+    assert decision.hook_action == "deny"
+    assert decision.disposition.value == "hard_block"
+    assert parse_redirect_context_from_cursor_hook_output(response) is None
+    assert "suggestion_status=available" in message
+    assert "alternative.tool_contract=agentveil_stage_delete" in message
+    assert "alternative.input.path=notes.txt" in message
+    assert "alternative.id=" not in message
+    assert "alternative.input.path=notes.txt" in message
+    assert "not currently available" not in message
+    assert str(home) not in message
+    assert str(sandbox) not in message
+
+
+def test_cursor_allow_does_not_read_static_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home, _sandbox, _downstream = init_redirect_contract_home(tmp_path)
+    calls: list[object] = []
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.cursor_hooks.trusted_static_controlled_route_ready",
+        lambda **kwargs: calls.append(kwargs) or True,
+    )
+    out = StringIO()
+    decision = cursor_hooks.process_hook(
+        {"hook_event": "preToolUse", "tool_name": "Read", "tool_input": {"path": "notes.txt"}},
+        workspace=tmp_path,
+        home=home,
+        out=out,
+    )
+    assert decision.hook_action == "allow"
+    assert calls == []
+    assert json.loads(out.getvalue()) == {"permission": "allow"}
+
+
+def test_cursor_hook_does_not_deny_agentveil_owned_semantic_mcp_tools(tmp_path: Path) -> None:
+    for tool_name, arguments in (
+        ("agentveil_stage_delete", {"path": "notes.txt"}),
+        ("agentveil_restore_staged", {"quarantine_entry_id": "a" * 32}),
+        ("agentveil_cleanup_staged", {"quarantine_entry_id": "a" * 32}),
+        ("agentveil_prepare_patch", {"path": "notes.txt", "patch": "diff"}),
+        (
+            "agentveil_apply_prepared_patch",
+            {"prepared_artifact_ref": "a" * 32, "prepared_artifact_hash": "ab" * 32},
+        ),
+        ("agentveil_prepare_git_change", {"worktree_path": "."}),
+        ("agentveil_git_operation", {"worktree_path": ".", "operation": "prepare_for_review"}),
+        ("agentveil_write_file", {"path": "todo.txt", "content": "done\n"}),
+        ("MCP:agentveil_stage_delete", {"path": "notes.txt"}),
+        ("agentveil:agentveil_restore_staged", {"quarantine_entry_id": "a" * 32}),
+        ("agentveil:agentveil_prepare_patch", {"path": "notes.txt", "patch": "diff"}),
+        (
+            "agentveil:agentveil_apply_prepared_patch",
+            {"prepared_artifact_ref": "a" * 32, "prepared_artifact_hash": "ab" * 32},
+        ),
+        ("agentveil:agentveil_prepare_git_change", {"worktree_path": "."}),
+        ("agentveil:agentveil_git_operation", {"worktree_path": ".", "operation": "prepare_for_review"}),
+        ("agentveil:agentveil_write_file", {"path": "todo.txt", "content": "done\n"}),
+    ):
+        out = StringIO()
+        decision = cursor_hooks.process_hook(
+            {
+                "hook_event": "beforeMCPExecution",
+                "tool_name": tool_name,
+                "arguments": arguments,
+            },
+            workspace=tmp_path,
+            out=out,
+        )
+        assert decision.hook_action == "allow", tool_name
+        assert decision.reason_code == "controlled_route_passthrough", tool_name
+        assert json.loads(out.getvalue()) == {"permission": "allow"}
+
+
+def test_cursor_hook_cleanup_passes_to_proxy_and_is_not_approved(tmp_path: Path) -> None:
+    out = StringIO()
+    decision = cursor_hooks.process_hook(
+        {
+            "hook_event": "beforeMCPExecution",
+            "tool_name": "agentveil_cleanup_staged",
+            "arguments": {"quarantine_entry_id": "a" * 32},
+        },
+        workspace=tmp_path,
+        out=out,
+    )
+    response = json.loads(out.getvalue())
+    assert decision.hook_action == "allow"
+    assert decision.reason_code == "controlled_route_passthrough"
+    assert response == {"permission": "allow"}
+    assert "approved" not in json.dumps(response)
+
+
+def test_cursor_hook_still_denies_native_destructive_actions(tmp_path: Path) -> None:
+    out = StringIO()
+    decision = cursor_hooks.process_hook(
+        {
+            "hook_event": "preToolUse",
+            "tool_name": "Delete",
+            "tool_input": {"path": "notes.txt"},
+        },
+        workspace=tmp_path,
+        out=out,
+    )
+    assert decision.hook_action == "deny"
+    assert json.loads(out.getvalue())["permission"] == "deny"
+    out = StringIO()
+    decision = cursor_hooks.process_hook(
+        {"hook_event": "beforeShellExecution", "command": "rm notes.txt"},
+        workspace=tmp_path,
+        out=out,
+    )
+    assert decision.hook_action == "deny"
+    out = StringIO()
+    decision = cursor_hooks.process_hook(
+        {
+            "hook_event": "preToolUse",
+            "tool_name": "ApplyPatch",
+            "tool_input": {"patch": "*** Begin Patch\n*** Delete File: notes.txt\n*** End Patch"},
+        },
+        workspace=tmp_path,
+        out=out,
+    )
+    assert decision.hook_action == "deny"
+
+
+def test_cursor_hook_rejects_lookalike_and_shell_text_as_controlled_tool(tmp_path: Path) -> None:
+    out = StringIO()
+    decision = cursor_hooks.process_hook(
+        {
+            "hook_event": "beforeMCPExecution",
+            "tool_name": "filesystem:agentveil_stage_delete",
+            "arguments": {"path": "notes.txt"},
+        },
+        workspace=tmp_path,
+        out=out,
+    )
+    assert decision.hook_action == "deny"
+    out = StringIO()
+    decision = cursor_hooks.process_hook(
+        {
+            "hook_event": "beforeShellExecution",
+            "command": "agentveil_stage_delete notes.txt",
+        },
+        workspace=tmp_path,
+        out=out,
+    )
+    assert decision.hook_action == "deny"
+
+
+def test_cursor_hook_does_not_passthrough_whitespace_or_non_string_tool_name(tmp_path: Path) -> None:
+    for tool_name in (
+        " agentveil_stage_delete",
+        "agentveil_stage_delete ",
+        "\tagentveil_stage_delete",
+        "mcp__agentveil__agentveil_stage_delete ",
+        "MCP:agentveil_stage_delete ",
+    ):
+        out = StringIO()
+        decision = cursor_hooks.process_hook(
+            {
+                "hook_event": "beforeMCPExecution",
+                "tool_name": tool_name,
+                "arguments": {"path": "notes.txt"},
+            },
+            workspace=tmp_path,
+            out=out,
+        )
+        assert decision.reason_code != "controlled_route_passthrough", repr(tool_name)
+    for tool_name in (None, 123, True, ["agentveil_stage_delete"], {"tool": "agentveil_stage_delete"}):
+        out = StringIO()
+        decision = cursor_hooks.process_hook(
+            {
+                "hook_event": "beforeMCPExecution",
+                "tool_name": tool_name,
+                "arguments": {"path": "notes.txt"},
+            },
+            workspace=tmp_path,
+            out=out,
+        )
+        assert decision.reason_code != "controlled_route_passthrough", repr(tool_name)

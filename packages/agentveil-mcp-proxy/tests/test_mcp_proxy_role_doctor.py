@@ -16,9 +16,12 @@ from agentveil_mcp_proxy.cli import explain_role_proxy, init_proxy, main, run_pr
 from agentveil_mcp_proxy.role_doctor import (
     MUTATION_ACTION_FAMILIES,
     READ_ACTION_FAMILIES,
+    build_deny_guidance,
     build_role_doctor_report,
     build_role_preset_guide,
 )
+from agentveil_mcp_proxy.classification import ClassifiedToolCall, infer_action_family, sha256_text
+from agentveil_mcp_proxy.policy import PolicyDecision, PolicyEvaluation, RiskClass
 from agentveil_mcp_proxy.role_presets import ROLE_PRESET_NAMES
 
 from mcp_fake_downstream import fake_target_reached, tool_entry, write_downstream
@@ -333,3 +336,84 @@ def test_unknown_high_risk_block_maps_to_stop_and_classify(tmp_path, monkeypatch
 def test_build_role_doctor_report_all_presets():
     report = build_role_doctor_report()
     assert len(report["presets"]) == len(ROLE_PRESET_NAMES)
+
+
+def _filesystem_classification(
+    tool: str,
+    *,
+    role: str,
+    risk_class: RiskClass = RiskClass.DESTRUCTIVE,
+) -> ClassifiedToolCall:
+    resource_hash = sha256_text("notes.txt")
+    evaluation = PolicyEvaluation(
+        decision=PolicyDecision.BLOCK,
+        risk_class=risk_class,
+        policy_id="filesystem",
+        policy_rule_id="filesystem-delete",
+        matched_rule_ids=("filesystem-delete",),
+        policy_context_hash="c" * 64,
+    )
+    return ClassifiedToolCall(
+        server="filesystem",
+        tool=tool,
+        action_plain=tool,
+        action=tool,
+        action_hash=sha256_text(tool),
+        resource_plain="notes.txt",
+        resource=resource_hash,
+        resource_hash=resource_hash,
+        payload_hash=sha256_text("payload"),
+        risk_class=risk_class,
+        policy_evaluation=evaluation,
+        action_family=infer_action_family(tool),
+        role=role,
+    )
+
+
+def test_local_policy_block_delete_file_uses_inspect_before_delete_guidance():
+    guidance = build_deny_guidance(
+        _filesystem_classification("delete_file", role="implementer"),
+        reason="local_policy_block",
+    )
+
+    assert guidance.redirect.redirect_playbook_id == "inspect_before_delete"
+    assert guidance.redirect.suggested_next_step_id == "inspect_before_delete"
+    assert guidance.redirect.redirect_playbook_id != "switch_to_build_agent"
+    assert "delete" in guidance.redirect.next_step.lower()
+
+
+def test_role_authority_reviewer_mutation_keeps_create_implementer_task():
+    guidance = build_deny_guidance(
+        _filesystem_classification("write_file", role="reviewer", risk_class=RiskClass.WRITE),
+        reason="role_authority_denied",
+    )
+
+    assert guidance.redirect.redirect_playbook_id == "create_implementer_task"
+
+
+def test_role_authority_readonly_mutation_keeps_use_read_only_tool():
+    guidance = build_deny_guidance(
+        _filesystem_classification("write_file", role="readonly", risk_class=RiskClass.WRITE),
+        reason="role_authority_denied",
+    )
+
+    assert guidance.redirect.redirect_playbook_id == "use_read_only_tool"
+
+
+def test_unknown_action_local_policy_block_keeps_stop_and_classify():
+    guidance = build_deny_guidance(
+        _filesystem_classification("mystery_action", role="implementer", risk_class=RiskClass.UNKNOWN),
+        reason="local_policy_block",
+    )
+
+    assert guidance.redirect.redirect_playbook_id == "stop_and_classify_unknown_action"
+
+
+def test_runtime_gate_block_keeps_switch_to_build_agent_fallback():
+    guidance = build_deny_guidance(
+        _filesystem_classification("delete_file", role="implementer"),
+        reason="runtime_gate_block",
+    )
+
+    assert guidance.redirect.redirect_playbook_id == "switch_to_build_agent"
+    assert guidance.redirect.suggested_next_step_id == "switch_to_build_agent"

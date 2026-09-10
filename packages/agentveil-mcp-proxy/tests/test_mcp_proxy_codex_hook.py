@@ -427,3 +427,264 @@ def test_codex_hook_denied_remains_denied_when_upload_fails(monkeypatch):
 @pytest.mark.parametrize("command,expected", NATIVE_SHELL_COMMAND_MATRIX)
 def test_codex_shell_classifier_matches_shared_matrix(command: str, expected: RiskClass) -> None:
     assert classify_codex_tool("Bash", {"command": command}) is expected
+
+
+def test_codex_exact_delete_patch_renders_common_stage_delete_and_stays_deny(tmp_path) -> None:
+    home, _sandbox, downstream = init_redirect_contract_home(tmp_path)
+    fixture = publish_live_hook_binding(home, downstream=downstream)
+    try:
+        out = io.StringIO()
+        decision = codex_hook.process_hook(
+            _payload(
+                "apply_patch",
+                {"patch": "*** Begin Patch\n*** Delete File: notes.txt\n*** End Patch"},
+            ),
+            home=home,
+            out=out,
+        )
+        reason = _deny_reason(out.getvalue())
+        assert decision.hook_action == "deny"
+        assert decision.disposition.value == "redirect"
+        assert decision.reason_code == "managed_route_redirect"
+        assert "suggestion_status=available" in reason
+        assert "alternative.tool_contract=agentveil_stage_delete" in reason
+        assert "alternative.input.path=notes.txt" in reason
+        assert "alternative.id=" not in reason
+        assert "redirect_context=" in reason
+        assert "controlled_stage_delete" in reason
+        assert "agentveil_stage_delete" in reason
+        assert "target_reached=false" in reason
+    finally:
+        fixture.lease.close()
+
+
+def test_codex_exact_delete_patch_without_binding_is_hard_block_unavailable() -> None:
+    out = io.StringIO()
+    decision = codex_hook.process_hook(
+        _payload(
+            "apply_patch",
+            {"patch": "*** Begin Patch\n*** Delete File: notes.txt\n*** End Patch"},
+        ),
+        out=out,
+    )
+    reason = _deny_reason(out.getvalue())
+    assert decision.hook_action == "deny"
+    assert decision.disposition.value == "hard_block"
+    assert "alternative=null" in reason
+    assert "filesystem.stage_delete.v1" not in reason
+    assert "managed AgentVeil write route is not currently available" in reason
+    out = io.StringIO()
+    decision = codex_hook.process_hook(_payload("Bash", {"command": "rm notes.txt"}), out=out)
+    reason = _deny_reason(out.getvalue())
+    assert decision.hook_action == "deny"
+    assert decision.disposition.value == "hard_block"
+    assert "alternative=null" in reason
+    assert "filesystem.stage_delete.v1" not in reason
+
+
+def test_codex_ambiguous_delete_is_unavailable_and_does_not_leak(tmp_path: Path) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    out = io.StringIO()
+    decision = codex_hook.process_hook(
+        _payload("Bash", {"command": "rm -rf /tmp/workspace"}),
+        evidence_path=evidence,
+        out=out,
+    )
+    reason = _deny_reason(out.getvalue())
+    dumped = evidence.read_text(encoding="utf-8")
+    assert decision.hook_action == "deny"
+    assert "alternative=null" in reason
+    assert "filesystem.stage_delete.v1" not in reason
+    assert "/tmp/workspace" not in reason
+    assert "/tmp/workspace" not in dumped
+    assert "rm -rf" not in dumped
+
+
+def test_codex_controlled_mcp_route_still_allows_without_guidance() -> None:
+    out = io.StringIO()
+    decision = codex_hook.process_hook(
+        _payload(
+            "mcp__agentveil-mcp-proxy__agentveil_controlled_alternative",
+            {"alternative_id": "filesystem.stage_delete.v1", "input": {"path": "notes.txt"}},
+        ),
+        out=out,
+    )
+    assert decision.hook_action == "allow"
+    assert out.getvalue() == ""
+
+
+def test_codex_trusted_static_exact_delete_is_hard_block_with_available_suggestion(tmp_path: Path) -> None:
+    home, sandbox, _downstream = init_redirect_contract_home(tmp_path)
+    out = io.StringIO()
+    decision = codex_hook.process_hook(
+        _payload(
+            "apply_patch",
+            {"patch": "*** Begin Patch\n*** Delete File: notes.txt\n*** End Patch"},
+        ),
+        home=home,
+        out=out,
+    )
+    payload = json.loads(out.getvalue())
+    reason = _deny_reason(out.getvalue())
+    assert decision.hook_action == "deny"
+    assert decision.disposition.value == "hard_block"
+    assert decision.reason_code == "risky_blocked"
+    assert parse_redirect_context_from_codex_hook_output(payload) is None
+    assert "suggestion_status=available" in reason
+    assert "alternative.tool_contract=agentveil_stage_delete" in reason
+    assert "alternative.input.path=notes.txt" in reason
+    assert "alternative.id=" not in reason
+    assert "alternative.input.path=notes.txt" in reason
+    assert "not currently available" not in reason
+    assert "redirect_context=" not in reason
+    assert str(home) not in reason
+    assert str(sandbox) not in reason
+
+
+def test_codex_trusted_static_ambiguous_stays_unavailable_without_broken_route_copy(tmp_path: Path) -> None:
+    home, _sandbox, _downstream = init_redirect_contract_home(tmp_path)
+    out = io.StringIO()
+    decision = codex_hook.process_hook(
+        _payload("Bash", {"command": "rm notes.txt extra.txt"}),
+        home=home,
+        out=out,
+    )
+    reason = _deny_reason(out.getvalue())
+    assert decision.hook_action == "deny"
+    assert decision.disposition.value == "hard_block"
+    assert "alternative=null" in reason
+    assert "filesystem.stage_delete.v1" not in reason
+    assert "not currently available" not in reason
+
+
+def test_codex_allow_does_not_read_static_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home, _sandbox, _downstream = init_redirect_contract_home(tmp_path)
+    calls: list[object] = []
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.codex_hook.trusted_static_controlled_route_ready",
+        lambda **kwargs: calls.append(kwargs) or True,
+    )
+    out = io.StringIO()
+    decision = codex_hook.process_hook(
+        _payload("Bash", {"command": "git status --short"}),
+        home=home,
+        out=out,
+    )
+    assert decision.hook_action == "allow"
+    assert calls == []
+    assert out.getvalue() == ""
+
+
+_SEMANTIC_TOOL_INPUTS = {
+    "agentveil_stage_delete": {"path": "notes.txt"},
+    "agentveil_restore_staged": {"quarantine_entry_id": "a" * 32},
+    "agentveil_cleanup_staged": {"quarantine_entry_id": "a" * 32},
+    "agentveil_prepare_patch": {"path": "notes.txt", "patch": "diff"},
+    "agentveil_apply_prepared_patch": {
+        "prepared_artifact_ref": "a" * 32,
+        "prepared_artifact_hash": "ab" * 32,
+    },
+    "agentveil_prepare_git_change": {"worktree_path": "."},
+    "agentveil_git_operation": {"worktree_path": ".", "operation": "prepare_for_review"},
+    "agentveil_write_file": {"path": "todo.txt", "content": "done\n"},
+}
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "mcp__agentveil__agentveil_stage_delete",
+        "mcp__agentveil__agentveil_restore_staged",
+        "mcp__agentveil__agentveil_cleanup_staged",
+        "mcp__agentveil__agentveil_prepare_patch",
+        "mcp__agentveil__agentveil_apply_prepared_patch",
+        "mcp__agentveil__agentveil_prepare_git_change",
+        "mcp__agentveil__agentveil_git_operation",
+        "mcp__agentveil__agentveil_write_file",
+    ],
+)
+def test_codex_hook_does_not_deny_agentveil_owned_semantic_mcp_tools(tool_name: str) -> None:
+    leaf = tool_name.rsplit("__", 1)[-1]
+    out = io.StringIO()
+    decision = codex_hook.process_hook(
+        _payload(tool_name, _SEMANTIC_TOOL_INPUTS[leaf]),
+        out=out,
+    )
+    assert decision.hook_action == "allow"
+    assert decision.reason_code == "controlled_route_passthrough"
+    assert out.getvalue() == ""
+
+
+def test_codex_hook_cleanup_passes_to_proxy_and_is_not_approved() -> None:
+    out = io.StringIO()
+    decision = codex_hook.process_hook(
+        _payload(
+            "mcp__agentveil__agentveil_cleanup_staged",
+            _SEMANTIC_TOOL_INPUTS["agentveil_cleanup_staged"],
+        ),
+        out=out,
+    )
+    assert decision.hook_action == "allow"
+    assert decision.reason_code == "controlled_route_passthrough"
+    assert out.getvalue() == ""
+    dumped = json.dumps(decision.__dict__, default=str)
+    assert "approv" not in dumped.lower()
+
+
+def test_codex_hook_still_denies_native_destructive_actions() -> None:
+    out = io.StringIO()
+    decision = codex_hook.process_hook(
+        _payload(
+            "apply_patch",
+            {"patch": "*** Begin Patch\n*** Delete File: notes.txt\n*** End Patch"},
+        ),
+        out=out,
+    )
+    assert decision.hook_action == "deny"
+    assert "denied apply_patch" in _deny_reason(out.getvalue())
+    out = io.StringIO()
+    decision = codex_hook.process_hook(_payload("Bash", {"command": "rm notes.txt"}), out=out)
+    assert decision.hook_action == "deny"
+    assert "denied Bash" in _deny_reason(out.getvalue())
+
+
+def test_codex_hook_rejects_lookalike_and_shell_text_as_controlled_tool() -> None:
+    out = io.StringIO()
+    decision = codex_hook.process_hook(
+        _payload("mcp__agentveil__agentveil_stage_delete_now", {"path": "notes.txt"}),
+        out=out,
+    )
+    assert decision.hook_action == "deny"
+    out = io.StringIO()
+    decision = codex_hook.process_hook(
+        _payload("Bash", {"command": "agentveil_stage_delete notes.txt"}),
+        out=out,
+    )
+    assert decision.hook_action == "deny"
+    assert out.getvalue() != ""
+
+
+def test_codex_hook_does_not_passthrough_whitespace_or_non_string_tool_name() -> None:
+    for tool_name in (
+        " agentveil_stage_delete",
+        "agentveil_stage_delete ",
+        "\tagentveil_stage_delete",
+        "mcp__agentveil__agentveil_stage_delete ",
+        "MCP:agentveil_stage_delete ",
+    ):
+        out = io.StringIO()
+        decision = codex_hook.process_hook(_payload(tool_name, {"path": "notes.txt"}), out=out)
+        assert decision.reason_code != "controlled_route_passthrough", repr(tool_name)
+    for tool_name in (None, 123, True, ["agentveil_stage_delete"], {"tool": "agentveil_stage_delete"}):
+        out = io.StringIO()
+        decision = codex_hook.process_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": "sess-test",
+                "cwd": "/private/customer/workspace",
+                "tool_name": tool_name,
+                "tool_input": {"path": "notes.txt"},
+            },
+            out=out,
+        )
+        assert decision.reason_code != "controlled_route_passthrough", repr(tool_name)

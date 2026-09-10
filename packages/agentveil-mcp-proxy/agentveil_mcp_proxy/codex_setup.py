@@ -16,6 +16,11 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from agentveil_mcp_proxy.client_config import DEFAULT_SERVER_NAME
+from agentveil_mcp_proxy.client_guidance import (
+    add_agentveil_owned_git_excludes,
+    remove_agentveil_owned_git_exclude_if_target_missing,
+    remove_agentveil_owned_git_excludes,
+)
 from agentveil_mcp_proxy.client_connect import (
     build_connect_status_payload,
     build_disconnect_payload,
@@ -167,6 +172,7 @@ def _strip_managed_groups(groups: Any) -> tuple[list[Any], int]:
 def install_hook(*, project_dir: Path, python: str) -> dict[str, Any]:
     target = Path(project_dir).resolve()
     path = hooks_path(target)
+    created_hooks = not path.exists()
     payload = _load_hooks_json(path)
     hooks = payload.get("hooks")
     if hooks is None:
@@ -185,6 +191,10 @@ def install_hook(*, project_dir: Path, python: str) -> dict[str, Any]:
     updated_payload = dict(payload)
     updated_payload["hooks"] = updated_hooks
     _write_hooks_json(path, updated_payload)
+    owned = [".codex/agentveil/evidence.jsonl"]
+    if created_hooks:
+        owned.append(".codex/hooks.json")
+    add_agentveil_owned_git_excludes(target, owned)
     return {
         "hooks_path": path,
         "evidence_path": evidence_path(target),
@@ -210,6 +220,17 @@ def validate_hook_config(*, project_dir: Path) -> None:
 def remove_hook(*, project_dir: Path) -> dict[str, Any]:
     target = Path(project_dir).resolve()
     path = hooks_path(target)
+    try:
+        return _remove_hook(target=target, path=path)
+    finally:
+        remove_agentveil_owned_git_exclude_if_target_missing(
+            target,
+            ".codex/agentveil/evidence.jsonl",
+            evidence_path(target),
+        )
+
+
+def _remove_hook(*, target: Path, path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"hooks_path": path, "removed_entries": 0, "reload_required": False}
     payload = _load_hooks_json(path)
@@ -231,6 +252,7 @@ def remove_hook(*, project_dir: Path) -> dict[str, Any]:
         _write_hooks_json(path, updated_payload)
     else:
         path.unlink()
+        remove_agentveil_owned_git_excludes(target, (".codex/hooks.json",))
     return {"hooks_path": path, "removed_entries": removed, "reload_required": removed > 0}
 
 

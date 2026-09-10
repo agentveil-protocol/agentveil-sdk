@@ -15,6 +15,7 @@ from agentveil_mcp_proxy.classification import (
     extract_resource,
     infer_risk_class,
     sha256_jcs,
+    sha256_text,
 )
 from agentveil_mcp_proxy.passthrough import DownstreamConfig, McpPassthrough
 from agentveil_mcp_proxy.policy import PolicyDecision, ProxyConfig, RiskClass, builtin_policy_pack
@@ -955,3 +956,166 @@ def test_native_shell_matrix_privacy_deny_cases_do_not_echo_secret_operands() ->
     assert risk is RiskClass.DESTRUCTIVE
     assert secret not in repr(risk)
     assert secret not in risk.value
+
+
+def test_controlled_alternative_tool_classifies_by_nested_id() -> None:
+    from agentveil_mcp_proxy.controlled_alternatives import GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME
+
+    classifier = ToolCallClassifier(_config(), server_name="downstream")
+    staged = classifier.classify(
+        tool=GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+        arguments={"alternative_id": "filesystem.stage_delete.v1", "input": {"path": "notes.txt"}},
+    )
+    assert staged.risk_class is RiskClass.WRITE
+    assert staged.action_family == "write"
+    assert "notes.txt" not in f"{staged.resource}"
+    cleanup = classifier.classify(
+        tool=GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+        arguments={
+            "alternative_id": "filesystem.cleanup_staged.v1",
+            "input": {"quarantine_entry_id": "cafebabedeadbeef0123456789abcdef"},
+        },
+    )
+    assert cleanup.risk_class is RiskClass.DESTRUCTIVE
+    assert cleanup.action_family == "delete"
+    protect = ToolCallClassifier(_config(), server_name="downstream")
+    asked = protect.classify(
+        tool=GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+        arguments={"alternative_id": "filesystem.stage_delete.v1", "input": {"path": "notes.txt"}},
+    )
+    assert asked.policy_evaluation.decision is PolicyDecision.ASK_BACKEND
+    assert asked.risk_class is RiskClass.WRITE
+    other = classifier.classify(
+        tool=GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+        arguments={"alternative_id": "filesystem.stage_delete.v1", "input": {"path": "other.txt"}},
+    )
+    assert staged.resource_hash != other.resource_hash
+    assert staged.resource_hash == sha256_text("path:notes.txt")
+    assert other.resource_hash == sha256_text("path:other.txt")
+    assert "notes.txt" not in json.dumps(staged.backend_metadata())
+    assert "notes.txt" not in json.dumps(staged.local_evidence_metadata())
+    first_cleanup = cleanup.resource_hash
+    second_cleanup = classifier.classify(
+        tool=GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+        arguments={
+            "alternative_id": "filesystem.cleanup_staged.v1",
+            "input": {"quarantine_entry_id": "aa" * 16},
+        },
+    )
+    assert first_cleanup != second_cleanup.resource_hash
+    assert second_cleanup.resource_hash == sha256_text("quarantine_entry_id:" + ("aa" * 16))
+    worktree = classifier.classify(
+        tool=GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+        arguments={"alternative_id": "filesystem.stage_delete.v1", "input": {"worktree_path": "wt-a"}},
+    )
+    other_worktree = classifier.classify(
+        tool=GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+        arguments={"alternative_id": "filesystem.stage_delete.v1", "input": {"worktree_path": "wt-b"}},
+    )
+    assert worktree.resource_hash == sha256_text("worktree_path:wt-a")
+    assert worktree.resource_hash != other_worktree.resource_hash
+    assert "wt-a" not in json.dumps(worktree.backend_metadata())
+    assert "cafebabedeadbeef0123456789abcdef" not in f"{cleanup!r}"
+    assert "cafebabedeadbeef0123456789abcdef" not in json.dumps(cleanup.backend_metadata())
+
+
+def test_semantic_prepare_patch_classifies_as_write_without_leaking_patch() -> None:
+    from agentveil_mcp_proxy.controlled_alternatives import SEMANTIC_PREPARE_PATCH_TOOL_NAME
+
+    patch = "*** Begin Patch\nsecret-bytes\n*** End Patch"
+    classifier = ToolCallClassifier(_config(), server_name="downstream")
+    prepared = classifier.classify(
+        tool=SEMANTIC_PREPARE_PATCH_TOOL_NAME,
+        arguments={"path": "notes.txt", "patch": patch},
+    )
+    assert prepared.risk_class is RiskClass.WRITE
+    assert prepared.action_family == "write"
+    assert prepared.resource_hash == sha256_text("path:notes.txt")
+    other = classifier.classify(
+        tool=SEMANTIC_PREPARE_PATCH_TOOL_NAME,
+        arguments={"path": "other.txt", "patch": patch},
+    )
+    assert prepared.resource_hash != other.resource_hash
+    same_path = classifier.classify(
+        tool=SEMANTIC_PREPARE_PATCH_TOOL_NAME,
+        arguments={"path": "notes.txt", "patch": "other-patch"},
+    )
+    assert same_path.resource_hash == prepared.resource_hash
+    dumped = json.dumps(prepared.backend_metadata()) + json.dumps(prepared.local_evidence_metadata())
+    assert "notes.txt" not in dumped
+    assert patch not in dumped
+    assert "*** Begin Patch" not in dumped
+    assert patch not in f"{prepared!r}{prepared.resource}"
+    assert "agentveil_private_policy" not in dumped
+
+
+def test_semantic_apply_prepared_patch_classifies_as_write_without_leaking_ref() -> None:
+    from agentveil_mcp_proxy.controlled_alternatives import SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME
+
+    artifact_ref = "d00df00ddeadbeef0123456789abcdef"
+    artifact_hash = "ab" * 32
+    classifier = ToolCallClassifier(_config(), server_name="downstream")
+    applied = classifier.classify(
+        tool=SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME,
+        arguments={
+            "prepared_artifact_ref": artifact_ref,
+            "prepared_artifact_hash": artifact_hash,
+        },
+    )
+    assert applied.risk_class is RiskClass.WRITE
+    assert applied.action_family == "write"
+    assert applied.resource_hash == sha256_text("prepared_artifact_ref:" + artifact_ref)
+    other = classifier.classify(
+        tool=SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME,
+        arguments={
+            "prepared_artifact_ref": "cafebabedeadbeef0123456789abcdef",
+            "prepared_artifact_hash": artifact_hash,
+        },
+    )
+    assert applied.resource_hash != other.resource_hash
+    same_ref = classifier.classify(
+        tool=SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME,
+        arguments={
+            "prepared_artifact_ref": artifact_ref,
+            "prepared_artifact_hash": "cd" * 32,
+        },
+    )
+    assert same_ref.resource_hash == applied.resource_hash
+    dumped = json.dumps(applied.backend_metadata()) + json.dumps(applied.local_evidence_metadata())
+    assert artifact_ref not in dumped
+    assert artifact_hash not in dumped
+    assert artifact_ref not in f"{applied!r}{applied.resource}"
+    assert artifact_hash not in f"{applied!r}{applied.resource}"
+    assert "agentveil_private_policy" not in dumped
+    assert "/Users/" not in dumped
+
+
+def test_semantic_prepare_git_change_classifies_as_write_without_leaking_path() -> None:
+    from agentveil_mcp_proxy.controlled_alternatives import SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME
+
+    classifier = ToolCallClassifier(_config(), server_name="downstream")
+    prepared = classifier.classify(
+        tool=SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME,
+        arguments={"worktree_path": "."},
+    )
+    assert prepared.risk_class is RiskClass.WRITE
+    assert prepared.action_family == "write"
+    assert prepared.resource_hash == sha256_text("worktree_path:.")
+    other = classifier.classify(
+        tool=SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME,
+        arguments={"worktree_path": "repo"},
+    )
+    assert prepared.resource_hash != other.resource_hash
+    same = classifier.classify(
+        tool=SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME,
+        arguments={"worktree_path": "."},
+    )
+    assert same.resource_hash == prepared.resource_hash
+    dumped = json.dumps(prepared.backend_metadata()) + json.dumps(prepared.local_evidence_metadata())
+    assert "worktree_path:." not in dumped
+    assert "repo" not in dumped
+    assert "/Users/" not in dumped
+    assert "origin" not in dumped
+    assert "agentveil_private_policy" not in dumped
+    assert "approval_granted" not in dumped
+    assert "worktree_path:." not in f"{prepared!r}{prepared.resource}"

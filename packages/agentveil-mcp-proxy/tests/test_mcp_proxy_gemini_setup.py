@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -339,3 +340,117 @@ def test_setup_gemini_cli_attempts_console_project_status_sync(tmp_path, monkeyp
     capsys.readouterr()
     assert len(sync_calls) == 1
     assert sync_calls[0]["connector"] == "gemini-cli"
+
+
+def _init_local_git(project: Path) -> None:
+    subprocess.run(["git", "init", "-b", "main"], cwd=project, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "dev@example.test"],
+        cwd=project,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Dev"],
+        cwd=project,
+        check=True,
+        capture_output=True,
+    )
+
+
+def _git_porcelain(project: Path) -> str:
+    return subprocess.run(
+        # Evidence: Git status mode below exposes untracked test files in disposable repos.
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=project,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
+def _exclude_lines(project: Path) -> list[str]:
+    path = project / ".git" / "info" / "exclude"
+    if not path.is_file():
+        return []
+    return [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+
+def test_gemini_setup_created_control_artifacts_do_not_contaminate_git(tmp_path: Path) -> None:
+    from agentveil_mcp_proxy import gemini_setup
+
+    project = tmp_path / "repo"
+    project.mkdir()
+    _init_local_git(project)
+    exclude = project / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    exclude.write_text("# keep-user-exclude\n*.local\n", encoding="utf-8")
+    (project / ".gemini" / "agentveil").mkdir(parents=True)
+    (project / ".gemini" / "agentveil" / "evidence.jsonl").write_text("{}\n", encoding="utf-8")
+    gemini_setup.install_hook(project_dir=project, python="python3")
+    lines = _exclude_lines(project)
+    assert ".gemini/settings.json" in lines
+    assert ".gemini/agentveil/evidence.jsonl" in lines
+    assert ".gemini/" not in lines
+    porcelain = _git_porcelain(project)
+    assert ".gemini/settings.json" not in porcelain
+    assert ".gemini/agentveil/evidence.jsonl" not in porcelain
+    assert "# keep-user-exclude" in exclude.read_text(encoding="utf-8")
+    status = json.dumps(gemini_setup.connector_status(project_dir=project, center_state="running"))
+    assert str(project) not in status
+    assert "/Users/" not in status
+
+    gemini_setup.remove_hook(project_dir=project)
+    leftover = exclude.read_text(encoding="utf-8")
+    assert "# keep-user-exclude" in leftover
+    assert "*.local" in leftover
+    assert ".gemini/settings.json" not in _exclude_lines(project)
+
+
+def test_gemini_setup_does_not_claim_preexisting_settings_or_create_git(tmp_path: Path) -> None:
+    from agentveil_mcp_proxy import gemini_setup
+
+    project = tmp_path / "repo"
+    project.mkdir()
+    _init_local_git(project)
+    settings = _gemini_settings(project)
+    settings.parent.mkdir(parents=True)
+    settings.write_text(json.dumps({"model": "gemini-pro"}) + "\n", encoding="utf-8")
+    gemini_setup.install_hook(project_dir=project, python="python3")
+    payload = json.loads(settings.read_text(encoding="utf-8"))
+    assert payload["model"] == "gemini-pro"
+    assert ".gemini/settings.json" not in _exclude_lines(project)
+    assert ".gemini/settings.json" in _git_porcelain(project)
+
+    lone = tmp_path / "nongit"
+    lone.mkdir()
+    gemini_setup.install_hook(project_dir=lone, python="python3")
+    assert not (lone / ".git").exists()
+
+
+def test_gemini_uninstall_drops_evidence_exclude_only_when_file_missing(tmp_path: Path) -> None:
+    from agentveil_mcp_proxy import gemini_setup
+
+    missing = tmp_path / "missing-evidence"
+    missing.mkdir()
+    _init_local_git(missing)
+    assert not gemini_setup.evidence_path(missing).exists()
+    gemini_setup.install_hook(project_dir=missing, python="python3")
+    assert ".gemini/agentveil/evidence.jsonl" in _exclude_lines(missing)
+    gemini_setup.remove_hook(project_dir=missing)
+    assert ".gemini/agentveil/evidence.jsonl" not in _exclude_lines(missing)
+
+    kept = tmp_path / "kept-evidence"
+    kept.mkdir()
+    _init_local_git(kept)
+    evidence = gemini_setup.evidence_path(kept)
+    evidence.parent.mkdir(parents=True)
+    evidence.write_text("{}\n", encoding="utf-8")
+    gemini_setup.install_hook(project_dir=kept, python="python3")
+    gemini_setup.remove_hook(project_dir=kept)
+    assert evidence.is_file()
+    assert ".gemini/agentveil/evidence.jsonl" in _exclude_lines(kept)

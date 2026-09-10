@@ -364,3 +364,204 @@ def test_gemini_hook_redirect_does_not_upload_decision_summary(monkeypatch, tmp_
 @pytest.mark.parametrize("command,expected", NATIVE_SHELL_COMMAND_MATRIX)
 def test_gemini_shell_classifier_matches_shared_matrix(command: str, expected: RiskClass) -> None:
     assert classify_gemini_tool("run_shell_command", {"command": command}) is expected
+
+
+def test_gemini_exact_shell_delete_hard_block_has_null_alternative() -> None:
+    out = io.StringIO()
+    decision = gemini_hook.process_hook(
+        _payload("run_shell_command", {"command": "rm notes.txt"}),
+        out=out,
+    )
+    reason = _deny_reason(out.getvalue())
+    assert decision.hook_action == "deny"
+    assert decision.disposition.value == "hard_block"
+    assert "alternative=null" in reason
+    assert "filesystem.stage_delete.v1" not in reason
+
+
+def test_gemini_write_file_does_not_select_stage_delete() -> None:
+    out = io.StringIO()
+    decision = gemini_hook.process_hook(
+        _payload("write_file", {"path": "notes.txt", "content": "x"}),
+        out=out,
+    )
+    reason = _deny_reason(out.getvalue())
+    assert decision.hook_action == "deny"
+    assert "alternative=null" in reason
+    assert "filesystem.stage_delete.v1" not in reason
+
+
+def test_gemini_renderer_matches_shared_unavailable_envelope_for_hard_block() -> None:
+    from agentveil_mcp_proxy.client_guidance import (
+        build_native_controlled_guidance_envelope,
+        format_native_controlled_guidance_text,
+    )
+
+    envelope = build_native_controlled_guidance_envelope(
+        native_tool="run_shell_command",
+        tool_input={"command": "rm notes.txt"},
+        redirect_route_ready=False,
+    )
+    shared = format_native_controlled_guidance_text(envelope)
+    out = io.StringIO()
+    gemini_hook.process_hook(_payload("run_shell_command", {"command": "rm notes.txt"}), out=out)
+    assert shared in _deny_reason(out.getvalue())
+    assert "alternative=null" in shared
+
+
+def test_gemini_trusted_static_exact_delete_is_hard_block_with_available_suggestion(tmp_path: Path) -> None:
+    home, sandbox, _downstream = init_redirect_contract_home(tmp_path)
+    out = io.StringIO()
+    decision = gemini_hook.process_hook(
+        _payload("run_shell_command", {"command": "rm notes.txt"}),
+        home=home,
+        out=out,
+    )
+    payload = json.loads(out.getvalue())
+    reason = _deny_reason(out.getvalue())
+    assert decision.hook_action == "deny"
+    assert decision.disposition.value == "hard_block"
+    assert parse_redirect_context_from_gemini_hook_output(payload) is None
+    assert "suggestion_status=available" in reason
+    assert "alternative.tool_contract=agentveil_stage_delete" in reason
+    assert "alternative.input.path=notes.txt" in reason
+    assert "alternative.id=" not in reason
+    assert "alternative.input.path=notes.txt" in reason
+    assert "not currently available" not in reason
+    assert str(home) not in reason
+    assert str(sandbox) not in reason
+
+
+def test_gemini_allow_does_not_read_static_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home, _sandbox, _downstream = init_redirect_contract_home(tmp_path)
+    calls: list[object] = []
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.gemini_hook.trusted_static_controlled_route_ready",
+        lambda **kwargs: calls.append(kwargs) or True,
+    )
+    out = io.StringIO()
+    decision = gemini_hook.process_hook(
+        _payload("read_file", {"path": "notes.txt"}),
+        home=home,
+        out=out,
+    )
+    assert decision.hook_action == "allow"
+    assert calls == []
+
+
+_SEMANTIC_TOOL_INPUTS = {
+    "agentveil_stage_delete": {"path": "notes.txt"},
+    "agentveil_restore_staged": {"quarantine_entry_id": "a" * 32},
+    "agentveil_cleanup_staged": {"quarantine_entry_id": "a" * 32},
+    "agentveil_prepare_patch": {"path": "notes.txt", "patch": "diff"},
+    "agentveil_apply_prepared_patch": {
+        "prepared_artifact_ref": "a" * 32,
+        "prepared_artifact_hash": "ab" * 32,
+    },
+    "agentveil_prepare_git_change": {"worktree_path": "."},
+    "agentveil_git_operation": {"worktree_path": ".", "operation": "prepare_for_review"},
+    "agentveil_write_file": {"path": "todo.txt", "content": "done\n"},
+}
+
+
+@pytest.mark.parametrize(
+    "tool_name,arguments",
+    [
+        ("mcp_agentveil_agentveil_stage_delete", {"path": "notes.txt"}),
+        ("mcp_agentveil_agentveil_restore_staged", {"quarantine_entry_id": "a" * 32}),
+        ("mcp_agentveil_agentveil_cleanup_staged", {"quarantine_entry_id": "a" * 32}),
+        ("mcp_agentveil_agentveil_prepare_patch", {"path": "notes.txt", "patch": "diff"}),
+        (
+            "mcp_agentveil_agentveil_apply_prepared_patch",
+            {"prepared_artifact_ref": "a" * 32, "prepared_artifact_hash": "ab" * 32},
+        ),
+        ("mcp_agentveil_agentveil_prepare_git_change", {"worktree_path": "."}),
+        (
+            "mcp_agentveil_agentveil_git_operation",
+            {"worktree_path": ".", "operation": "prepare_for_review"},
+        ),
+        ("mcp_agentveil_agentveil_write_file", {"path": "todo.txt", "content": "done\n"}),
+    ],
+)
+def test_gemini_hook_does_not_deny_agentveil_owned_semantic_mcp_tools(
+    tool_name: str,
+    arguments: dict,
+) -> None:
+    out = io.StringIO()
+    decision = gemini_hook.process_hook(_payload(tool_name, arguments), out=out)
+    assert decision.hook_action == "allow"
+    assert decision.reason_code == "controlled_route_passthrough"
+    assert json.loads(out.getvalue())["decision"] == "allow"
+
+
+def test_gemini_hook_cleanup_passes_to_proxy_and_is_not_approved() -> None:
+    out = io.StringIO()
+    decision = gemini_hook.process_hook(
+        _payload(
+            "mcp_agentveil_agentveil_cleanup_staged",
+            _SEMANTIC_TOOL_INPUTS["agentveil_cleanup_staged"],
+        ),
+        out=out,
+    )
+    response = json.loads(out.getvalue())
+    assert decision.hook_action == "allow"
+    assert decision.reason_code == "controlled_route_passthrough"
+    assert response == {"decision": "allow"}
+    assert "approved" not in json.dumps(response)
+
+
+def test_gemini_hook_still_denies_native_destructive_actions() -> None:
+    out = io.StringIO()
+    decision = gemini_hook.process_hook(
+        _payload("run_shell_command", {"command": "rm notes.txt"}),
+        out=out,
+    )
+    assert decision.hook_action == "deny"
+    assert json.loads(out.getvalue())["decision"] == "deny"
+    out = io.StringIO()
+    decision = gemini_hook.process_hook(
+        _payload("write_file", {"path": "notes.txt", "content": "x"}),
+        out=out,
+    )
+    assert decision.hook_action == "deny"
+
+
+def test_gemini_hook_rejects_lookalike_and_shell_text_as_controlled_tool() -> None:
+    out = io.StringIO()
+    decision = gemini_hook.process_hook(
+        _payload("mcp_filesystem_agentveil_stage_delete", {"path": "notes.txt"}),
+        out=out,
+    )
+    assert decision.hook_action == "deny"
+    out = io.StringIO()
+    decision = gemini_hook.process_hook(
+        _payload("run_shell_command", {"command": "agentveil_stage_delete notes.txt"}),
+        out=out,
+    )
+    assert decision.hook_action == "deny"
+
+
+def test_gemini_hook_does_not_passthrough_whitespace_or_non_string_tool_name() -> None:
+    for tool_name in (
+        " agentveil_stage_delete",
+        "agentveil_stage_delete ",
+        "\tagentveil_stage_delete",
+        "mcp__agentveil__agentveil_stage_delete ",
+        "MCP:agentveil_stage_delete ",
+    ):
+        out = io.StringIO()
+        decision = gemini_hook.process_hook(_payload(tool_name, {"path": "notes.txt"}), out=out)
+        assert decision.reason_code != "controlled_route_passthrough", repr(tool_name)
+    for tool_name in (None, 123, True, ["agentveil_stage_delete"], {"tool": "agentveil_stage_delete"}):
+        out = io.StringIO()
+        decision = gemini_hook.process_hook(
+            {
+                "hook_event_name": "BeforeTool",
+                "session_id": "sess-test",
+                "cwd": "/private/customer/workspace",
+                "tool_name": tool_name,
+                "tool_input": {"path": "notes.txt"},
+            },
+            out=out,
+        )
+        assert decision.reason_code != "controlled_route_passthrough", repr(tool_name)
