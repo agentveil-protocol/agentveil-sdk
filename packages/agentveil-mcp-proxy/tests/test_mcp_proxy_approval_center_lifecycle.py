@@ -277,6 +277,23 @@ def test_managed_center_child_env_excludes_provider_and_generic_secrets():
     )
 
 
+def test_managed_center_child_env_includes_windows_home_metadata():
+    from agentveil_mcp_proxy.approval import server
+
+    parent_env = {
+        "HOME": "/tmp/isolated-home",
+        "USERPROFILE": "C:\\Users\\runneradmin",
+        "HOMEDRIVE": "C:",
+        "HOMEPATH": "\\Users\\runneradmin",
+    }
+    env = server._proxy_cli_child_env(parent_env=parent_env)
+
+    assert env["HOME"] == "/tmp/isolated-home"
+    assert env["USERPROFILE"] == "C:\\Users\\runneradmin"
+    assert env["HOMEDRIVE"] == "C:"
+    assert env["HOMEPATH"] == "\\Users\\runneradmin"
+
+
 def test_managed_center_child_env_omits_passphrase_when_passphrase_file_used():
     from agentveil_mcp_proxy.approval import server
     from agentveil_mcp_proxy.identity import PASSPHRASE_ENV

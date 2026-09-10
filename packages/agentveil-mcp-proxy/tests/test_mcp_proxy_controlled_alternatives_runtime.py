@@ -1220,6 +1220,8 @@ def test_isolated_vendored_853adf5_wheel_stage_restore(
     private_root = Path(
         "/Users/olegboiko/Desktop/AVP/.worktrees/controlled-alternatives-ca3-private-filesystem-v1"
     )
+    if not private_root.is_dir():
+        pytest.skip("requires local private CA3 filesystem provider worktree")
     head = subprocess.check_output(
         ["git", "-C", str(private_root), "rev-parse", "HEAD"],
         text=True,
@@ -1325,6 +1327,8 @@ def test_direct_allow_classes_do_not_call_provider_and_stay_within_baseline(
         "/Users/olegboiko/Desktop/AVP/.worktrees/controlled-alternatives-ca3-performance-baseline-v1"
         "/workspace/memory/controlled_alternatives_performance_baseline_2026-08-26.json"
     )
+    if not runner_path.is_file() or not canonical_path.is_file():
+        pytest.skip("requires local private CA3 performance baseline fixture")
     assert hashlib.sha256(canonical_path.read_bytes()).hexdigest() == (
         "0c0d62f9bf1eefcce8dc78da7b66be938396400fcd4162dda5d83d7eb8e82ca9"
     )
