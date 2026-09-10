@@ -26,6 +26,8 @@ def test_publish_jobs_have_bounded_timeouts_and_manual_tag_publish() -> None:
     assert text.count("timeout-minutes: 15") == 1
     assert "startsWith(inputs.release_tag, 'v')" in text
     assert text.count("ref: ${{ inputs.release_tag }}") == 4
+    assert '--commit "$(git rev-parse HEAD)"' in text
+    assert '--commit "${{ github.sha }}"' not in text
     assert '--ref "refs/tags/${{ inputs.release_tag }}"' in text
 
 

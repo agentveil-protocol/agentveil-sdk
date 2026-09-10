@@ -170,7 +170,7 @@ jobs:
           --project-file packages/agentveil-mcp-proxy/pyproject.toml
           --output-dir dist/evidence
           --repository "${{ github.server_url }}/${{ github.repository }}"
-          --commit "${{ github.sha }}"
+          --commit "$(git rev-parse HEAD)"
           --ref "refs/tags/${{ inputs.release_tag }}"
 
       - name: Attest built distributions
