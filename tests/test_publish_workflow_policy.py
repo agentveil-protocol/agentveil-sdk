@@ -14,14 +14,19 @@ def _workflow_text() -> str:
     return PUBLISH_WORKFLOW.read_text(encoding="utf-8")
 
 
-def test_publish_jobs_have_bounded_timeouts_and_tag_only_publish() -> None:
+def test_publish_jobs_have_bounded_timeouts_and_manual_tag_publish() -> None:
     text = _workflow_text()
     assert "workflow_dispatch:" in text
+    assert "release_tag:" in text
+    assert "push:" not in text
+    assert 'tags:' not in text
     assert text.count("timeout-minutes: 30") == 1
     assert text.count("timeout-minutes: 12") == 1
     assert text.count("timeout-minutes: 10") == 1
     assert text.count("timeout-minutes: 15") == 1
-    assert "if: startsWith(github.ref, 'refs/tags/')" in text
+    assert "startsWith(inputs.release_tag, 'v')" in text
+    assert text.count("ref: ${{ inputs.release_tag }}") == 4
+    assert '--ref "refs/tags/${{ inputs.release_tag }}"' in text
 
 
 def test_release_runs_each_full_suite_once_with_actionable_hang_diagnostics() -> None:
