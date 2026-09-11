@@ -16,12 +16,27 @@ import pytest
 import agentveil_mcp_proxy.controlled_alternatives as ca_mod
 from agentveil_mcp_proxy.controlled_alternatives import (
     AUTHORITY_FORBIDDEN_RESULT_KEYS,
+    AUTHORITY_STATUS_ACTIVE,
+    AUTHORITY_STATUS_DISABLED,
+    AUTHORITY_STATUS_EXPIRED,
+    AUTHORITY_STATUS_INVALID,
+    AUTHORITY_STATUS_MISSING,
     APPLY_PREPARED_PATCH_ALTERNATIVE_ID,
+    CONSOLE_BOUNDED_SUMMARY_UPLOAD_SCOPE,
+    CONTROLLED_ALTERNATIVE_AUTHORITY_CONTRACT_VERSION,
+    CONTROLLED_ALTERNATIVE_AUTHORITY_ENTRYPOINT_GROUP,
+    CONTROLLED_ALTERNATIVE_AUTHORITY_ID,
+    CONTROLLED_ALTERNATIVE_AUTHORITY_SCOPE,
     CONTROLLED_ALTERNATIVE_IDS,
     CONTROLLED_ALTERNATIVE_PROVIDER_CONTRACT_VERSION,
     CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP,
     CONTROLLED_ALTERNATIVE_PROVIDER_ID,
     CONTROLLED_ALTERNATIVES_PROFILE_ID,
+    ERROR_AUTHORITY_DUPLICATE,
+    ERROR_AUTHORITY_EXPIRED,
+    ERROR_AUTHORITY_INVALID,
+    ERROR_AUTHORITY_MISSING,
+    ERROR_AUTHORITY_SCOPE_REJECTED,
     ERROR_CONTRACT_INCOMPATIBLE,
     ERROR_DESCRIPTOR_INVALID,
     ERROR_DISCOVERY_DUPLICATE_ENTRYPOINT,
@@ -44,6 +59,7 @@ from agentveil_mcp_proxy.controlled_alternatives import (
     SEMANTIC_STAGE_DELETE_TOOL_NAME,
     SEMANTIC_WRITE_FILE_TOOL_NAME,
     SEMANTIC_TOOL_BY_ALTERNATIVE_ID,
+    ControlledAlternativeAuthoritySnapshot,
     ControlledAlternativeBoundedLocalInput,
     ControlledAlternativeProviderDescriptor,
     ControlledAlternativeProviderResult,
@@ -52,6 +68,7 @@ from agentveil_mcp_proxy.controlled_alternatives import (
     build_agentveil_write_file_tool_schema,
     build_semantic_controlled_alternative_tool_schema,
     build_semantic_controlled_alternative_tool_schemas,
+    discover_controlled_alternative_authority,
     discover_controlled_alternative_provider,
     git_intent_denied_local_payload,
     inject_agentveil_write_file_tool,
@@ -62,7 +79,9 @@ from agentveil_mcp_proxy.controlled_alternatives import (
     projected_controlled_alternative_validation_payload,
     semantic_alternative_id_for_tool,
     semantic_tool_name_for_alternative_id,
+    set_controlled_alternative_authority_loader,
     set_controlled_alternative_provider_loader,
+    validate_controlled_alternative_authority,
     validate_controlled_alternative_local_input,
     validate_provider_descriptor,
     validate_provider_request,
@@ -116,6 +135,8 @@ QUARANTINE_ENTRY_ID_CANARY = "cafebabedeadbeef0123456789abcdef"
 PREPARED_ARTIFACT_REF_CANARY = "d00df00ddeadbeef0123456789abcdef"
 PREPARED_ARTIFACT_HASH_CANARY = "ab" * 32
 ROUTE_CANARY = "route-secret-9f3a"
+AUTHORITY_TOKEN_CANARY = "ca-upload-token-should-not-leak"
+AUTHORITY_LICENSE_CANARY = "license-key-should-not-leak"
 SUMMARY_CANARY = "customer-summary-should-not-leak"
 STDEV_CANARY = 424242
 PRIVATE_MARKER_PATH = "agentveil_private_policy/demo"
@@ -190,6 +211,37 @@ def _active_paid_snapshot(*, private_enabled: bool = True) -> PaidProviderSnapsh
     )
 
 
+def _active_ca_authority_payload() -> dict[str, object]:
+    return {
+        "authority_present": True,
+        "authority_id": CONTROLLED_ALTERNATIVE_AUTHORITY_ID,
+        "contract_version": CONTROLLED_ALTERNATIVE_AUTHORITY_CONTRACT_VERSION,
+        "status": AUTHORITY_STATUS_ACTIVE,
+        "scope": CONTROLLED_ALTERNATIVE_AUTHORITY_SCOPE,
+    }
+
+
+def _active_ca_authority() -> ControlledAlternativeAuthoritySnapshot:
+    return validate_controlled_alternative_authority(_active_ca_authority_payload())
+
+
+def _assert_no_authority_canaries(*values: object) -> None:
+    blob = "".join(str(value) for value in values)
+    for canary in (
+        AUTHORITY_TOKEN_CANARY,
+        AUTHORITY_LICENSE_CANARY,
+        SECRET_PATH,
+        WORKSPACE_ROOT,
+        STATE_ROOT,
+        ROUTE_CANARY,
+        SUMMARY_CANARY,
+        PRIVATE_MARKER_PATH,
+        "bearer ",
+        "/Users/",
+    ):
+        assert canary not in blob
+
+
 def _valid_descriptor_payload() -> dict[str, object]:
     return {
         "provider_id": CONTROLLED_ALTERNATIVE_PROVIDER_ID,
@@ -224,8 +276,10 @@ class _FakeProvider:
 @pytest.fixture(autouse=True)
 def _reset_provider_loader() -> None:
     set_controlled_alternative_provider_loader(None)
+    set_controlled_alternative_authority_loader(None)
     yield
     set_controlled_alternative_provider_loader(None)
+    set_controlled_alternative_authority_loader(None)
 
 
 def _assert_bounded_error(
@@ -1334,26 +1388,332 @@ def test_validate_provider_descriptor_rejects_bypass_and_missing_fields() -> Non
     _assert_bounded_error(contract, ERROR_CONTRACT_INCOMPATIBLE)
 
 
-def test_discovery_requires_active_private_paid_snapshot() -> None:
-    inactive = PaidProviderSnapshot(
-        provider_present=True,
-        provider_id=CONTROLLED_ALTERNATIVE_PROVIDER_ID,
-        provider_contract_version=PUBLIC_PAID_PROVIDER_CONTRACT_VERSION,
-        status=STATUS_ACTIVE,
-        private_provider_enabled=False,
-        public_fallback_available=True,
-    )
-    result = discover_controlled_alternative_provider(inactive)
+def test_discovery_paid_snapshot_alone_is_not_ca_authority() -> None:
+    calls = {"provider": 0}
+
+    def _count_provider() -> _FakeProvider:
+        calls["provider"] += 1
+        return _FakeProvider()
+
+    set_controlled_alternative_provider_loader(_count_provider)
+    active = _active_paid_snapshot()
+    assert active.status == STATUS_ACTIVE
+    assert active.private_provider_enabled is True
+    result = discover_controlled_alternative_provider(active)
     assert result.available is False
     assert result.error_code == ERROR_DISCOVERY_INELIGIBLE
+    assert result.provider is None
+    assert calls["provider"] == 0
+
+    disabled_private = _active_paid_snapshot(private_enabled=False)
+    disabled = discover_controlled_alternative_provider(disabled_private)
+    assert disabled.available is False
+    assert disabled.error_code == ERROR_DISCOVERY_INELIGIBLE
+    assert calls["provider"] == 0
 
     missing = PaidProviderSnapshot(provider_present=False, status=STATUS_MISSING)
     assert discover_controlled_alternative_provider(missing).error_code == ERROR_DISCOVERY_INELIGIBLE
+    assert calls["provider"] == 0
+
+
+def test_hybrid_auth_contract_constants() -> None:
+    assert CONTROLLED_ALTERNATIVE_AUTHORITY_ENTRYPOINT_GROUP == (
+        "agentveil_mcp_proxy.controlled_alternative_authorities"
+    )
+    assert CONTROLLED_ALTERNATIVE_AUTHORITY_ID == "ca_route_v1"
+    assert CONTROLLED_ALTERNATIVE_AUTHORITY_CONTRACT_VERSION == "1"
+    assert CONTROLLED_ALTERNATIVE_AUTHORITY_SCOPE == "controlled_alternatives_route_v1"
+    assert CONSOLE_BOUNDED_SUMMARY_UPLOAD_SCOPE == "bounded_summary_upload"
+    assert AUTHORITY_STATUS_ACTIVE == "active"
+    assert AUTHORITY_STATUS_MISSING == "missing"
+    assert AUTHORITY_STATUS_EXPIRED == "expired"
+    assert AUTHORITY_STATUS_INVALID == "invalid"
+    assert AUTHORITY_STATUS_DISABLED == "disabled"
+    assert ca_mod.MAX_AUTHORITY_TOP_LEVEL_KEYS == 7
+    assert "route_ready" in ca_mod.BOUNDED_AUTHORITY_INPUT_KEYS
+
+
+def _provider_call_counter() -> tuple[dict[str, int], object]:
+    calls = {"provider": 0}
+
+    def _count_provider() -> _FakeProvider:
+        calls["provider"] += 1
+        return _FakeProvider()
+
+    set_controlled_alternative_provider_loader(_count_provider)
+    return calls, _count_provider
+
+
+def test_discovery_active_authority_exposes_compatible_provider() -> None:
+    calls, _loader = _provider_call_counter()
+    result = discover_controlled_alternative_provider(
+        _active_paid_snapshot(),
+        authority=_active_ca_authority(),
+    )
+    assert result.available is True
+    assert result.error_code is None
+    assert result.descriptor is not None
+    assert result.descriptor.provider_id == CONTROLLED_ALTERNATIVE_PROVIDER_ID
+    assert result.provider is not None
+    assert calls["provider"] == 1
+    assert result.descriptor.alternative_ids == CONTROLLED_ALTERNATIVE_IDS
+
+
+def test_discovery_rejects_console_bounded_summary_upload_scope() -> None:
+    calls, _loader = _provider_call_counter()
+    payload = _active_ca_authority_payload()
+    payload["scope"] = CONSOLE_BOUNDED_SUMMARY_UPLOAD_SCOPE
+    with pytest.raises(ControlledAlternativeValidationError) as exc_info:
+        validate_controlled_alternative_authority(payload)
+    _assert_bounded_error(exc_info, ERROR_AUTHORITY_SCOPE_REJECTED, AUTHORITY_TOKEN_CANARY)
+    result = discover_controlled_alternative_provider(
+        _active_paid_snapshot(),
+        authority=payload,
+    )
+    assert result.available is False
+    assert result.error_code == ERROR_AUTHORITY_SCOPE_REJECTED
+    assert result.provider is None
+    assert calls["provider"] == 0
+    _assert_no_authority_canaries(result, repr(result), str(result))
+
+    credential_shaped = {
+        "schema_version": 1,
+        "scope": CONSOLE_BOUNDED_SUMMARY_UPLOAD_SCOPE,
+        "token": AUTHORITY_TOKEN_CANARY,
+    }
+    rejected = discover_controlled_alternative_provider(
+        _active_paid_snapshot(),
+        authority=credential_shaped,
+    )
+    assert rejected.available is False
+    assert rejected.error_code == ERROR_AUTHORITY_INVALID
+    assert calls["provider"] == 0
+    _assert_no_authority_canaries(rejected, repr(rejected), str(rejected))
+
+
+def test_discovery_missing_invalid_expired_duplicate_authority_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls, _loader = _provider_call_counter()
+    missing = discover_controlled_alternative_provider(
+        _active_paid_snapshot(),
+        authority=None,
+    )
+    assert missing.available is False
+    assert missing.error_code == ERROR_DISCOVERY_INELIGIBLE
+    assert missing.provider is None
+
+    set_controlled_alternative_authority_loader(lambda: None)
+    absent_authority = discover_controlled_alternative_authority()
+    assert absent_authority.route_ready is False
+    assert absent_authority.error_code == ERROR_AUTHORITY_MISSING
+    set_controlled_alternative_authority_loader(None)
+
+    malformed = discover_controlled_alternative_provider(
+        _active_paid_snapshot(),
+        authority={"authority_present": "yes"},
+    )
+    assert malformed.available is False
+    assert malformed.error_code == ERROR_AUTHORITY_INVALID
+    assert malformed.provider is None
+
+    expired_payload = _active_ca_authority_payload()
+    expired_payload["status"] = AUTHORITY_STATUS_EXPIRED
+    expired = validate_controlled_alternative_authority(expired_payload)
+    assert expired.route_ready is False
+    assert expired.error_code == ERROR_AUTHORITY_EXPIRED
+    expired_result = discover_controlled_alternative_provider(
+        _active_paid_snapshot(),
+        authority=expired,
+    )
+    assert expired_result.available is False
+    assert expired_result.error_code == ERROR_AUTHORITY_EXPIRED
+    assert expired_result.provider is None
+
+    invalid_payload = _active_ca_authority_payload()
+    invalid_payload["status"] = AUTHORITY_STATUS_INVALID
+    invalid_result = discover_controlled_alternative_provider(
+        _active_paid_snapshot(),
+        authority=invalid_payload,
+    )
+    assert invalid_result.available is False
+    assert invalid_result.error_code == ERROR_AUTHORITY_INVALID
+    assert invalid_result.provider is None
+
+    disabled_payload = _active_ca_authority_payload()
+    disabled_payload["status"] = AUTHORITY_STATUS_DISABLED
+    disabled_result = discover_controlled_alternative_provider(
+        _active_paid_snapshot(),
+        authority=disabled_payload,
+    )
+    assert disabled_result.available is False
+    assert disabled_result.provider is None
+
+    class _NamedEntry:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def load(self) -> None:
+            raise RuntimeError(AUTHORITY_TOKEN_CANARY)
+
+    def _duplicate(*, group: str | None = None, **_kwargs):
+        assert group == CONTROLLED_ALTERNATIVE_AUTHORITY_ENTRYPOINT_GROUP
+        return [_NamedEntry(CONTROLLED_ALTERNATIVE_AUTHORITY_ID), _NamedEntry(CONTROLLED_ALTERNATIVE_AUTHORITY_ID)]
+
+    monkeypatch.setattr(ca_mod, "entry_points", _duplicate)
+    duplicate_authority = discover_controlled_alternative_authority()
+    assert duplicate_authority.route_ready is False
+    assert duplicate_authority.error_code == ERROR_AUTHORITY_DUPLICATE
+    duplicate_result = discover_controlled_alternative_provider(
+        _active_paid_snapshot(),
+        authority=duplicate_authority,
+    )
+    assert duplicate_result.available is False
+    assert duplicate_result.error_code == ERROR_AUTHORITY_DUPLICATE
+    assert calls["provider"] == 0
+    _assert_no_authority_canaries(duplicate_authority, duplicate_result)
+
+
+def test_validate_authority_rejects_unbounded_markers_and_unexpected_keys() -> None:
+    payload = _active_ca_authority_payload()
+    payload["authority_id"] = "x" * (ca_mod.MAX_AUTHORITY_ID_BYTES + 1)
+    with pytest.raises(ControlledAlternativeValidationError) as oversized:
+        validate_controlled_alternative_authority(payload)
+    _assert_bounded_error(oversized, ERROR_AUTHORITY_INVALID)
+
+    marked = _active_ca_authority_payload()
+    marked["authority_id"] = PRIVATE_MARKER_PATH
+    with pytest.raises(ControlledAlternativeValidationError) as marked_exc:
+        validate_controlled_alternative_authority(marked)
+    _assert_bounded_error(marked_exc, ERROR_AUTHORITY_INVALID, PRIVATE_MARKER_PATH)
+
+    path_like = _active_ca_authority_payload()
+    path_like["scope"] = WORKSPACE_ROOT
+    with pytest.raises(ControlledAlternativeValidationError) as path_exc:
+        validate_controlled_alternative_authority(path_like)
+    _assert_bounded_error(path_exc, ERROR_AUTHORITY_INVALID, WORKSPACE_ROOT)
+
+    extra = _active_ca_authority_payload()
+    extra["token"] = AUTHORITY_TOKEN_CANARY
+    extra["license"] = AUTHORITY_LICENSE_CANARY
+    with pytest.raises(ControlledAlternativeValidationError) as extra_exc:
+        validate_controlled_alternative_authority(extra)
+    _assert_bounded_error(
+        extra_exc,
+        ERROR_AUTHORITY_INVALID,
+        AUTHORITY_TOKEN_CANARY,
+        AUTHORITY_LICENSE_CANARY,
+    )
+
+    self_asserted = ControlledAlternativeAuthoritySnapshot(
+        authority_present=True,
+        authority_id=CONTROLLED_ALTERNATIVE_AUTHORITY_ID,
+        contract_version=CONTROLLED_ALTERNATIVE_AUTHORITY_CONTRACT_VERSION,
+        status=AUTHORITY_STATUS_ACTIVE,
+        scope=CONSOLE_BOUNDED_SUMMARY_UPLOAD_SCOPE,
+        route_ready=True,
+        error_code=None,
+    )
+    forged = discover_controlled_alternative_provider(
+        _active_paid_snapshot(),
+        authority=self_asserted,
+    )
+    assert forged.available is False
+    assert forged.error_code == ERROR_AUTHORITY_SCOPE_REJECTED
+
+
+def test_authority_to_dict_is_valid_mapping_input() -> None:
+    snapshot = _active_ca_authority()
+    exported = snapshot.to_dict()
+    assert "route_ready" in exported
+    assert exported["route_ready"] is True
+    calls, _loader = _provider_call_counter()
+    round_trip = validate_controlled_alternative_authority(exported)
+    assert round_trip.route_ready is True
+    assert round_trip.scope == CONTROLLED_ALTERNATIVE_AUTHORITY_SCOPE
+    result = discover_controlled_alternative_provider(
+        _active_paid_snapshot(),
+        authority=exported,
+    )
+    assert result.available is True
+    assert result.error_code is None
+    assert result.provider is not None
+    assert calls["provider"] == 1
+
+
+def test_forged_route_ready_does_not_grant_ca_authority() -> None:
+    calls, _loader = _provider_call_counter()
+    upload = _active_ca_authority_payload()
+    upload["scope"] = CONSOLE_BOUNDED_SUMMARY_UPLOAD_SCOPE
+    upload["route_ready"] = True
+    with pytest.raises(ControlledAlternativeValidationError) as upload_exc:
+        validate_controlled_alternative_authority(upload)
+    _assert_bounded_error(upload_exc, ERROR_AUTHORITY_SCOPE_REJECTED)
+    upload_result = discover_controlled_alternative_provider(
+        _active_paid_snapshot(),
+        authority=upload,
+    )
+    assert upload_result.available is False
+    assert upload_result.error_code == ERROR_AUTHORITY_SCOPE_REJECTED
+    assert upload_result.provider is None
+
+    expired = _active_ca_authority_payload()
+    expired["status"] = AUTHORITY_STATUS_EXPIRED
+    expired["route_ready"] = True
+    expired_snapshot = validate_controlled_alternative_authority(expired)
+    assert expired_snapshot.route_ready is False
+    assert expired_snapshot.error_code == ERROR_AUTHORITY_EXPIRED
+    expired_result = discover_controlled_alternative_provider(
+        _active_paid_snapshot(),
+        authority=expired,
+    )
+    assert expired_result.available is False
+    assert expired_result.error_code == ERROR_AUTHORITY_EXPIRED
+    assert expired_result.provider is None
+    assert calls["provider"] == 0
+
+    not_bool = _active_ca_authority_payload()
+    not_bool["route_ready"] = AUTHORITY_TOKEN_CANARY
+    with pytest.raises(ControlledAlternativeValidationError) as type_exc:
+        validate_controlled_alternative_authority(not_bool)
+    _assert_bounded_error(type_exc, ERROR_AUTHORITY_INVALID, AUTHORITY_TOKEN_CANARY)
+
+
+def test_authority_status_error_repr_hide_privacy_canaries() -> None:
+    snapshot = _active_ca_authority()
+    assert snapshot.route_ready is True
+    rendered = f"{snapshot!r}{snapshot}{snapshot.to_dict()}"
+    _assert_no_authority_canaries(rendered)
+
+    set_controlled_alternative_authority_loader(
+        lambda: {
+            "authority_present": True,
+            "authority_id": CONTROLLED_ALTERNATIVE_AUTHORITY_ID,
+            "contract_version": CONTROLLED_ALTERNATIVE_AUTHORITY_CONTRACT_VERSION,
+            "status": AUTHORITY_STATUS_ACTIVE,
+            "scope": CONSOLE_BOUNDED_SUMMARY_UPLOAD_SCOPE,
+            "token": AUTHORITY_TOKEN_CANARY,
+            "error_code": AUTHORITY_LICENSE_CANARY,
+        }
+    )
+    discovered = discover_controlled_alternative_authority()
+    assert discovered.route_ready is False
+    assert discovered.error_code == ERROR_AUTHORITY_INVALID
+    _assert_no_authority_canaries(discovered, repr(discovered), discovered.to_dict())
+
+    def _boom() -> None:
+        raise RuntimeError(f"secret {AUTHORITY_TOKEN_CANARY} {WORKSPACE_ROOT}")
+
+    set_controlled_alternative_authority_loader(_boom)
+    failed = discover_controlled_alternative_authority()
+    assert failed.route_ready is False
+    assert failed.error_code == ERROR_AUTHORITY_INVALID
+    _assert_no_authority_canaries(failed, repr(failed), str(failed))
 
 
 def test_discovery_returns_compatible_descriptor_from_loader() -> None:
     set_controlled_alternative_provider_loader(lambda: _FakeProvider())
-    result = discover_controlled_alternative_provider(_active_paid_snapshot())
+    result = discover_controlled_alternative_provider(_active_paid_snapshot(), authority=_active_ca_authority())
     assert result.available is True
     assert result.descriptor is not None
     assert result.descriptor.alternative_ids == CONTROLLED_ALTERNATIVE_IDS
@@ -1368,7 +1728,7 @@ def test_discovery_rejects_incompatible_descriptor_from_loader() -> None:
             return payload
 
     set_controlled_alternative_provider_loader(lambda: _BadProvider())
-    result = discover_controlled_alternative_provider(_active_paid_snapshot())
+    result = discover_controlled_alternative_provider(_active_paid_snapshot(), authority=_active_ca_authority())
     assert result.available is False
     assert result.error_code == ERROR_CONTRACT_INCOMPATIBLE
 
@@ -1393,7 +1753,7 @@ def test_discovery_malformed_snapshot_and_entry_point_errors_are_bounded(
         raise RuntimeError(canary)
 
     monkeypatch.setattr(ca_mod, "entry_points", _boom)
-    enumerated = discover_controlled_alternative_provider(_active_paid_snapshot())
+    enumerated = discover_controlled_alternative_provider(_active_paid_snapshot(), authority=_active_ca_authority())
     assert enumerated.available is False
     assert enumerated.error_code == ERROR_DISCOVERY_ENTRYPOINT_LOAD_FAILED
     assert canary not in repr(enumerated)
@@ -1402,7 +1762,7 @@ def test_discovery_malformed_snapshot_and_entry_point_errors_are_bounded(
 
 def test_discovery_loader_none_and_exception_are_load_failed() -> None:
     set_controlled_alternative_provider_loader(lambda: None)
-    none_result = discover_controlled_alternative_provider(_active_paid_snapshot())
+    none_result = discover_controlled_alternative_provider(_active_paid_snapshot(), authority=_active_ca_authority())
     assert none_result.available is False
     assert none_result.error_code == ERROR_DISCOVERY_ENTRYPOINT_LOAD_FAILED
 
@@ -1410,7 +1770,7 @@ def test_discovery_loader_none_and_exception_are_load_failed() -> None:
         raise RuntimeError("loader exploded")
 
     set_controlled_alternative_provider_loader(_boom)
-    boom_result = discover_controlled_alternative_provider(_active_paid_snapshot())
+    boom_result = discover_controlled_alternative_provider(_active_paid_snapshot(), authority=_active_ca_authority())
     assert boom_result.available is False
     assert boom_result.error_code == ERROR_DISCOVERY_ENTRYPOINT_LOAD_FAILED
     assert "exploded" not in str(boom_result)
@@ -1554,8 +1914,12 @@ pkg.__file__ = str(Path(proxy_src) / "agentveil_mcp_proxy" / "__init__.py")
 sys.modules["agentveil_mcp_proxy"] = pkg
 
 from agentveil_mcp_proxy.controlled_alternatives import (
+    CONTROLLED_ALTERNATIVE_AUTHORITY_CONTRACT_VERSION,
+    CONTROLLED_ALTERNATIVE_AUTHORITY_ID,
+    CONTROLLED_ALTERNATIVE_AUTHORITY_SCOPE,
     CONTROLLED_ALTERNATIVE_IDS,
     discover_controlled_alternative_provider,
+    validate_controlled_alternative_authority,
 )
 from agentveil_mcp_proxy.paid_provider import (
     PUBLIC_PAID_PROVIDER_CONTRACT_VERSION,
@@ -1563,6 +1927,13 @@ from agentveil_mcp_proxy.paid_provider import (
     PaidProviderSnapshot,
 )
 
+authority = validate_controlled_alternative_authority({
+    "authority_present": True,
+    "authority_id": CONTROLLED_ALTERNATIVE_AUTHORITY_ID,
+    "contract_version": CONTROLLED_ALTERNATIVE_AUTHORITY_CONTRACT_VERSION,
+    "status": "active",
+    "scope": CONTROLLED_ALTERNATIVE_AUTHORITY_SCOPE,
+})
 result = discover_controlled_alternative_provider(
     PaidProviderSnapshot(
         provider_present=True,
@@ -1571,7 +1942,8 @@ result = discover_controlled_alternative_provider(
         status=STATUS_ACTIVE,
         private_provider_enabled=True,
         public_fallback_available=True,
-    )
+    ),
+    authority=authority,
 )
 print(json.dumps({
     "available": result.available,
@@ -1605,7 +1977,7 @@ def test_importlib_metadata_discovery_reports_missing_duplicate_and_load_failed(
 
     monkeypatch.setattr(ca_mod, "entry_points", _missing)
     monkeypatch.setenv("AVP_HOME", str(tmp_path / "empty-home"))
-    missing = discover_controlled_alternative_provider(_active_paid_snapshot())
+    missing = discover_controlled_alternative_provider(_active_paid_snapshot(), authority=_active_ca_authority())
     assert missing.available is False
     assert missing.error_code == ERROR_DISCOVERY_ENTRYPOINT_MISSING
 
@@ -1630,7 +2002,7 @@ def test_importlib_metadata_discovery_reports_missing_duplicate_and_load_failed(
         return duplicates
 
     monkeypatch.setattr(ca_mod, "entry_points", _duplicate)
-    duplicate = discover_controlled_alternative_provider(_active_paid_snapshot())
+    duplicate = discover_controlled_alternative_provider(_active_paid_snapshot(), authority=_active_ca_authority())
     assert duplicate.available is False
     assert duplicate.error_code == ERROR_DISCOVERY_DUPLICATE_ENTRYPOINT
 
@@ -1647,7 +2019,7 @@ def test_importlib_metadata_discovery_reports_missing_duplicate_and_load_failed(
         return _entry_points_from_dist(broken)
 
     monkeypatch.setattr(ca_mod, "entry_points", _broken)
-    load_failed = discover_controlled_alternative_provider(_active_paid_snapshot())
+    load_failed = discover_controlled_alternative_provider(_active_paid_snapshot(), authority=_active_ca_authority())
     assert load_failed.available is False
     assert load_failed.error_code == ERROR_DISCOVERY_ENTRYPOINT_LOAD_FAILED
     assert "cannot load" not in str(load_failed)
@@ -1783,7 +2155,7 @@ def test_discover_controlled_alternative_from_active_vendored_free_builder_insta
     wheel_bytes = _build_controlled_alternative_wheel(tmp_path / "wheel")
     _install_active_controlled_alternative_vendor(home, wheel_bytes=wheel_bytes)
 
-    result = discover_controlled_alternative_provider(_active_paid_snapshot())
+    result = discover_controlled_alternative_provider(_active_paid_snapshot(), authority=_active_ca_authority())
     assert result.available is True
     assert result.error_code is None
     assert result.descriptor is not None
@@ -1826,7 +2198,7 @@ def test_global_duplicate_and_load_failure_do_not_use_vendored_controlled_altern
         return duplicates
 
     monkeypatch.setattr(ca_mod, "entry_points", _duplicate)
-    duplicate = discover_controlled_alternative_provider(_active_paid_snapshot())
+    duplicate = discover_controlled_alternative_provider(_active_paid_snapshot(), authority=_active_ca_authority())
     assert duplicate.available is False
     assert duplicate.error_code == ERROR_DISCOVERY_DUPLICATE_ENTRYPOINT
 
@@ -1842,7 +2214,7 @@ def test_global_duplicate_and_load_failure_do_not_use_vendored_controlled_altern
         return _entry_points_from_dist(broken)
 
     monkeypatch.setattr(ca_mod, "entry_points", _broken)
-    load_failed = discover_controlled_alternative_provider(_active_paid_snapshot())
+    load_failed = discover_controlled_alternative_provider(_active_paid_snapshot(), authority=_active_ca_authority())
     assert load_failed.available is False
     assert load_failed.error_code == ERROR_DISCOVERY_ENTRYPOINT_LOAD_FAILED
     assert "CA1B_GLOBAL_LOAD_CANARY" not in str(load_failed)
@@ -1862,7 +2234,7 @@ def test_vendored_controlled_alternative_failures_map_to_bounded_ca1_errors(
         entry_points="[agentveil_mcp_proxy.paid_providers]\nprivate_v1 = agentveil_private_policy.controlled_provider:build_provider\n",
     )
     _install_active_controlled_alternative_vendor(home, wheel_bytes=missing_wheel)
-    missing = discover_controlled_alternative_provider(_active_paid_snapshot())
+    missing = discover_controlled_alternative_provider(_active_paid_snapshot(), authority=_active_ca_authority())
     assert missing.available is False
     assert missing.error_code == ERROR_DISCOVERY_ENTRYPOINT_MISSING
 
@@ -1874,7 +2246,7 @@ def test_vendored_controlled_alternative_failures_map_to_bounded_ca1_errors(
         source=f"def build_provider():\n    raise RuntimeError({canary!r})\n",
     )
     _install_active_controlled_alternative_vendor(factory_home, wheel_bytes=factory_wheel)
-    factory_failed = discover_controlled_alternative_provider(_active_paid_snapshot())
+    factory_failed = discover_controlled_alternative_provider(_active_paid_snapshot(), authority=_active_ca_authority())
     assert factory_failed.available is False
     assert factory_failed.error_code == ERROR_DISCOVERY_ENTRYPOINT_LOAD_FAILED
     assert canary not in str(factory_failed)
@@ -1890,7 +2262,7 @@ def test_vendored_controlled_alternative_failures_map_to_bounded_ca1_errors(
         ),
     )
     _install_active_controlled_alternative_vendor(malformed_home, wheel_bytes=malformed_wheel)
-    malformed = discover_controlled_alternative_provider(_active_paid_snapshot())
+    malformed = discover_controlled_alternative_provider(_active_paid_snapshot(), authority=_active_ca_authority())
     assert malformed.available is False
     assert malformed.error_code == ERROR_DISCOVERY_ENTRYPOINT_LOAD_FAILED
     assert "not-a-valid-target" not in str(malformed)
@@ -2043,7 +2415,16 @@ def test_run_free_builder_install_flow_discovers_controlled_alternative(
     assert provider is not None
     assert getattr(provider, "calls", None) == []
 
-    controlled = discover_controlled_alternative_provider(paid_snapshot)
+    paid_only = discover_controlled_alternative_provider(paid_snapshot)
+    assert paid_only.available is False
+    assert paid_only.error_code == ERROR_DISCOVERY_INELIGIBLE
+    assert paid_only.provider is None
+    assert getattr(provider, "calls", None) == []
+
+    controlled = discover_controlled_alternative_provider(
+        paid_snapshot,
+        authority=_active_ca_authority(),
+    )
     assert controlled.available is True
     assert controlled.error_code is None
     assert controlled.descriptor is not None

@@ -20,8 +20,6 @@ from typing import Any, Callable, Mapping, Protocol
 
 from agentveil_mcp_proxy.paid_provider import (
     FORBIDDEN_PRIVATE_MARKERS,
-    PUBLIC_PAID_PROVIDER_CONTRACT_VERSION,
-    STATUS_ACTIVE,
     PaidProviderSnapshot,
     contains_private_provider_marker,
 )
@@ -210,7 +208,64 @@ ERROR_DISCOVERY_INELIGIBLE = "discovery_ineligible"
 ERROR_DISCOVERY_ENTRYPOINT_MISSING = "discovery_entrypoint_missing"
 ERROR_DISCOVERY_DUPLICATE_ENTRYPOINT = "discovery_entrypoint_duplicate"
 ERROR_DISCOVERY_ENTRYPOINT_LOAD_FAILED = "discovery_entrypoint_load_failed"
+ERROR_AUTHORITY_MISSING = "authority_missing"
+ERROR_AUTHORITY_INVALID = "authority_invalid"
+ERROR_AUTHORITY_EXPIRED = "authority_expired"
+ERROR_AUTHORITY_DUPLICATE = "authority_duplicate"
+ERROR_AUTHORITY_SCOPE_REJECTED = "authority_scope_rejected"
 ERROR_REQUEST_MALFORMED = "request_malformed"
+CONTROLLED_ALTERNATIVE_AUTHORITY_ENTRYPOINT_GROUP = (
+    "agentveil_mcp_proxy.controlled_alternative_authorities"
+)
+CONTROLLED_ALTERNATIVE_AUTHORITY_ID = "ca_route_v1"
+CONTROLLED_ALTERNATIVE_AUTHORITY_CONTRACT_VERSION = "1"
+CONTROLLED_ALTERNATIVE_AUTHORITY_SCOPE = "controlled_alternatives_route_v1"
+CONSOLE_BOUNDED_SUMMARY_UPLOAD_SCOPE = "bounded_summary_upload"
+AUTHORITY_STATUS_ACTIVE = "active"
+AUTHORITY_STATUS_MISSING = "missing"
+AUTHORITY_STATUS_EXPIRED = "expired"
+AUTHORITY_STATUS_INVALID = "invalid"
+AUTHORITY_STATUS_DISABLED = "disabled"
+ALLOWED_AUTHORITY_STATUSES = frozenset({
+    AUTHORITY_STATUS_ACTIVE,
+    AUTHORITY_STATUS_MISSING,
+    AUTHORITY_STATUS_EXPIRED,
+    AUTHORITY_STATUS_INVALID,
+    AUTHORITY_STATUS_DISABLED,
+})
+ALLOWED_AUTHORITY_ERROR_CODES = frozenset({
+    ERROR_AUTHORITY_MISSING,
+    ERROR_AUTHORITY_INVALID,
+    ERROR_AUTHORITY_EXPIRED,
+    ERROR_AUTHORITY_DUPLICATE,
+    ERROR_AUTHORITY_SCOPE_REJECTED,
+    ERROR_DISCOVERY_INELIGIBLE,
+})
+BOUNDED_AUTHORITY_INPUT_KEYS = frozenset({
+    "authority_present",
+    "authority_id",
+    "contract_version",
+    "status",
+    "scope",
+    "error_code",
+    "route_ready",
+})
+MAX_AUTHORITY_ID_BYTES = 64
+MAX_AUTHORITY_SCOPE_BYTES = 64
+MAX_AUTHORITY_STATUS_BYTES = 32
+MAX_AUTHORITY_ERROR_BYTES = 64
+MAX_AUTHORITY_TOP_LEVEL_KEYS = 7
+_AUTHORITY_UNSAFE_MARKERS = (
+    "/users/",
+    "/home/",
+    "/private/",
+    "/var/",
+    "/tmp/",
+    "c:\\",
+    "://",
+    "bearer ",
+    "token=",
+)
 ERROR_RESULT_UNSAFE = "result_unsafe"
 ERROR_GIT_INTENT_DENIED = "git_intent_denied"
 GIT_INTENT_PREPARE_FOR_REVIEW = "prepare_for_review"
@@ -618,6 +673,57 @@ class ControlledAlternativeDiscoveryResult:
     provider: Any = field(default=None, repr=False, compare=False)
 
 
+@dataclass(frozen=True)
+class ControlledAlternativeAuthoritySnapshot:
+    """Bounded public CA route-authority/readiness snapshot.
+
+    Paid provider status, package presence, and Console upload credentials are
+    not fields of this contract and are not CA authority for this public
+    discovery contract.
+    """
+
+    authority_present: bool
+    authority_id: str | None = None
+    contract_version: str | None = None
+    status: str = AUTHORITY_STATUS_MISSING
+    scope: str | None = None
+    route_ready: bool = False
+    error_code: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "authority_present": self.authority_present,
+            "authority_id": self.authority_id,
+            "contract_version": self.contract_version,
+            "status": self.status,
+            "scope": self.scope,
+            "route_ready": self.route_ready,
+            "error_code": self.error_code,
+        }
+
+    def __repr__(self) -> str:
+        return (
+            "ControlledAlternativeAuthoritySnapshot("
+            f"authority_present={self.authority_present!r}, "
+            f"authority_id={self.authority_id!r}, "
+            f"contract_version={self.contract_version!r}, "
+            f"status={self.status!r}, "
+            f"scope={self.scope!r}, "
+            f"route_ready={self.route_ready!r}, "
+            f"error_code={self.error_code!r})"
+        )
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+class ControlledAlternativeAuthorityProvider(Protocol):
+    """Optional installed authority provider for hybrid CA route readiness."""
+
+    def authority(self) -> Mapping[str, Any] | ControlledAlternativeAuthoritySnapshot:
+        ...
+
+
 class ControlledAlternativeProvider(Protocol):
     """Bounded in-process provider surface for future private wheel integration."""
 
@@ -644,6 +750,7 @@ class ControlledAlternativeProvider(Protocol):
 
 
 _provider_loader: Callable[[], ControlledAlternativeProvider | None] | None = None
+_authority_loader: Callable[[], Any] | None = None
 
 
 def set_controlled_alternative_provider_loader(
@@ -653,6 +760,15 @@ def set_controlled_alternative_provider_loader(
 
     global _provider_loader
     _provider_loader = loader
+
+
+def set_controlled_alternative_authority_loader(
+    loader: Callable[[], Any] | None,
+) -> None:
+    """Install or clear a test-only CA route-authority loader."""
+
+    global _authority_loader
+    _authority_loader = loader
 
 
 def _bounded_local_text(value: Any, *, max_bytes: int) -> str:
@@ -1504,19 +1620,248 @@ def validate_provider_result(
     )
 
 
-def _paid_snapshot_eligible(snapshot: Any) -> bool:
-    if not isinstance(snapshot, PaidProviderSnapshot):
-        return False
+def _authority_mapping(
+    raw: Mapping[str, Any] | ControlledAlternativeAuthoritySnapshot,
+) -> Mapping[str, Any]:
+    if isinstance(raw, ControlledAlternativeAuthoritySnapshot):
+        mapping: dict[str, Any] = {
+            "authority_present": raw.authority_present,
+            "authority_id": raw.authority_id,
+            "contract_version": raw.contract_version,
+            "status": raw.status,
+            "scope": raw.scope,
+            "route_ready": raw.route_ready,
+        }
+        if raw.error_code is not None:
+            mapping["error_code"] = raw.error_code
+        return mapping
+    return _require_mapping(raw, error_code=ERROR_AUTHORITY_INVALID)
+
+
+def _authority_text_is_unsafe(value: str) -> bool:
+    if contains_private_provider_marker(value):
+        return True
+    lowered = value.lower()
+    if any(marker in lowered for marker in FORBIDDEN_PRIVATE_MARKERS):
+        return True
+    if any(marker in lowered for marker in _AUTHORITY_UNSAFE_MARKERS):
+        return True
+    if any(ord(ch) < 32 for ch in value):
+        return True
+    return "/" in value or "\\" in value or ":" in value
+
+
+def _bounded_authority_text(value: Any, *, max_bytes: int) -> str:
     try:
-        return (
-            snapshot.provider_present is True
-            and snapshot.provider_id == CONTROLLED_ALTERNATIVE_PROVIDER_ID
-            and snapshot.provider_contract_version == PUBLIC_PAID_PROVIDER_CONTRACT_VERSION
-            and snapshot.status == STATUS_ACTIVE
-            and snapshot.private_provider_enabled is True
+        text = _bounded_exported_text(
+            value,
+            max_bytes=max_bytes,
+            error_code=ERROR_AUTHORITY_INVALID,
         )
+    except ControlledAlternativeValidationError as exc:
+        code = str(exc.args[0]) if exc.args else ERROR_AUTHORITY_INVALID
+        if code == ERROR_RESULT_UNSAFE:
+            raise ControlledAlternativeValidationError(ERROR_AUTHORITY_INVALID) from None
+        raise
+    if _authority_text_is_unsafe(text):
+        raise ControlledAlternativeValidationError(ERROR_AUTHORITY_INVALID)
+    return text
+
+
+def _fail_closed_authority_snapshot(
+    error_code: str,
+    *,
+    status: str = AUTHORITY_STATUS_INVALID,
+) -> ControlledAlternativeAuthoritySnapshot:
+    if error_code == ERROR_AUTHORITY_MISSING:
+        status = AUTHORITY_STATUS_MISSING
+    elif error_code == ERROR_AUTHORITY_EXPIRED:
+        status = AUTHORITY_STATUS_EXPIRED
+    return ControlledAlternativeAuthoritySnapshot(
+        authority_present=False,
+        authority_id=None,
+        contract_version=None,
+        status=status,
+        scope=None,
+        route_ready=False,
+        error_code=error_code,
+    )
+
+
+@_total(ERROR_AUTHORITY_INVALID)
+def validate_controlled_alternative_authority(
+    raw: Mapping[str, Any] | ControlledAlternativeAuthoritySnapshot,
+) -> ControlledAlternativeAuthoritySnapshot:
+    """Validate one caller-controlled CA route-authority payload.
+
+    ``route_ready`` may appear because public snapshots echo the computed flag
+    via ``to_dict()``. The caller-provided value is treated as informational;
+    readiness is recomputed from validated fields.
+    """
+
+    payload = _authority_mapping(raw)
+    if len(payload) > MAX_AUTHORITY_TOP_LEVEL_KEYS:
+        raise ControlledAlternativeValidationError(ERROR_AUTHORITY_INVALID)
+    _assert_no_authority_keys(payload)
+    _assert_no_extra_keys(payload, BOUNDED_AUTHORITY_INPUT_KEYS, error_code=ERROR_AUTHORITY_INVALID)
+    required = frozenset({
+        "authority_present",
+        "authority_id",
+        "contract_version",
+        "status",
+        "scope",
+    })
+    if not required <= set(payload):
+        raise ControlledAlternativeValidationError(ERROR_AUTHORITY_INVALID)
+    present = _require_key(payload, "authority_present", error_code=ERROR_AUTHORITY_INVALID)
+    if type(present) is not bool:
+        raise ControlledAlternativeValidationError(ERROR_AUTHORITY_INVALID)
+    if "route_ready" in payload and type(payload["route_ready"]) is not bool:
+        raise ControlledAlternativeValidationError(ERROR_AUTHORITY_INVALID)
+    authority_id = _bounded_authority_text(
+        _require_key(payload, "authority_id", error_code=ERROR_AUTHORITY_INVALID),
+        max_bytes=MAX_AUTHORITY_ID_BYTES,
+    )
+    contract_version = _bounded_authority_text(
+        _require_key(payload, "contract_version", error_code=ERROR_AUTHORITY_INVALID),
+        max_bytes=8,
+    )
+    status = _bounded_authority_text(
+        _require_key(payload, "status", error_code=ERROR_AUTHORITY_INVALID),
+        max_bytes=MAX_AUTHORITY_STATUS_BYTES,
+    )
+    scope = _bounded_authority_text(
+        _require_key(payload, "scope", error_code=ERROR_AUTHORITY_INVALID),
+        max_bytes=MAX_AUTHORITY_SCOPE_BYTES,
+    )
+    error_code = None
+    if "error_code" in payload and payload["error_code"] is not None:
+        error_code = _bounded_authority_text(
+            payload["error_code"],
+            max_bytes=MAX_AUTHORITY_ERROR_BYTES,
+        )
+        if error_code not in ALLOWED_AUTHORITY_ERROR_CODES:
+            raise ControlledAlternativeValidationError(ERROR_AUTHORITY_INVALID)
+    if scope == CONSOLE_BOUNDED_SUMMARY_UPLOAD_SCOPE or scope != CONTROLLED_ALTERNATIVE_AUTHORITY_SCOPE:
+        raise ControlledAlternativeValidationError(ERROR_AUTHORITY_SCOPE_REJECTED)
+    if contract_version != CONTROLLED_ALTERNATIVE_AUTHORITY_CONTRACT_VERSION:
+        raise ControlledAlternativeValidationError(ERROR_CONTRACT_INCOMPATIBLE)
+    if authority_id != CONTROLLED_ALTERNATIVE_AUTHORITY_ID:
+        raise ControlledAlternativeValidationError(ERROR_AUTHORITY_INVALID)
+    if status not in ALLOWED_AUTHORITY_STATUSES:
+        raise ControlledAlternativeValidationError(ERROR_AUTHORITY_INVALID)
+    if status == AUTHORITY_STATUS_EXPIRED:
+        return ControlledAlternativeAuthoritySnapshot(
+            authority_present=present,
+            authority_id=authority_id,
+            contract_version=contract_version,
+            status=AUTHORITY_STATUS_EXPIRED,
+            scope=scope,
+            route_ready=False,
+            error_code=ERROR_AUTHORITY_EXPIRED,
+        )
+    if status == AUTHORITY_STATUS_MISSING or present is False:
+        return ControlledAlternativeAuthoritySnapshot(
+            authority_present=False,
+            authority_id=authority_id,
+            contract_version=contract_version,
+            status=AUTHORITY_STATUS_MISSING,
+            scope=scope,
+            route_ready=False,
+            error_code=ERROR_AUTHORITY_MISSING,
+        )
+    if status in {AUTHORITY_STATUS_INVALID, AUTHORITY_STATUS_DISABLED}:
+        return ControlledAlternativeAuthoritySnapshot(
+            authority_present=present,
+            authority_id=authority_id,
+            contract_version=contract_version,
+            status=status,
+            scope=scope,
+            route_ready=False,
+            error_code=ERROR_AUTHORITY_INVALID,
+        )
+    if error_code is not None:
+        raise ControlledAlternativeValidationError(ERROR_AUTHORITY_INVALID)
+    return ControlledAlternativeAuthoritySnapshot(
+        authority_present=True,
+        authority_id=authority_id,
+        contract_version=contract_version,
+        status=AUTHORITY_STATUS_ACTIVE,
+        scope=scope,
+        route_ready=True,
+        error_code=None,
+    )
+
+
+def _iter_controlled_alternative_authority_entry_points() -> Any:
+    try:
+        return entry_points(group=CONTROLLED_ALTERNATIVE_AUTHORITY_ENTRYPOINT_GROUP)
+    except TypeError:
+        return entry_points().get(CONTROLLED_ALTERNATIVE_AUTHORITY_ENTRYPOINT_GROUP, ())
+
+
+def _load_authority_object(loaded: Any) -> ControlledAlternativeAuthoritySnapshot:
+    current = loaded
+    if callable(current):
+        current = current()
+    if isinstance(current, (ControlledAlternativeAuthoritySnapshot, Mapping)):
+        return validate_controlled_alternative_authority(current)
+    method = getattr(current, "authority", None)
+    if callable(method):
+        return validate_controlled_alternative_authority(method())
+    raise ControlledAlternativeValidationError(ERROR_AUTHORITY_INVALID)
+
+
+def discover_controlled_alternative_authority() -> ControlledAlternativeAuthoritySnapshot:
+    """Discover one bounded CA route-authority snapshot."""
+
+    if _authority_loader is not None:
+        try:
+            loaded = _authority_loader()
+        except Exception:
+            return _fail_closed_authority_snapshot(ERROR_AUTHORITY_INVALID)
+        if loaded is None:
+            return _fail_closed_authority_snapshot(ERROR_AUTHORITY_MISSING)
+        try:
+            return _load_authority_object(loaded)
+        except ControlledAlternativeValidationError as exc:
+            code = str(exc.args[0]) if exc.args else ERROR_AUTHORITY_INVALID
+            return _fail_closed_authority_snapshot(code)
+        except Exception:
+            return _fail_closed_authority_snapshot(ERROR_AUTHORITY_INVALID)
+
+    try:
+        discovered = _iter_controlled_alternative_authority_entry_points()
+        matches = [
+            entry
+            for entry in discovered
+            if getattr(entry, "name", None) == CONTROLLED_ALTERNATIVE_AUTHORITY_ID
+        ]
     except Exception:
-        return False
+        return _fail_closed_authority_snapshot(ERROR_AUTHORITY_INVALID)
+    if len(matches) > 1:
+        return _fail_closed_authority_snapshot(ERROR_AUTHORITY_DUPLICATE)
+    if not matches:
+        return _fail_closed_authority_snapshot(ERROR_AUTHORITY_MISSING)
+    try:
+        loaded = matches[0].load()
+    except Exception:
+        return _fail_closed_authority_snapshot(ERROR_AUTHORITY_INVALID)
+    try:
+        return _load_authority_object(loaded)
+    except ControlledAlternativeValidationError as exc:
+        code = str(exc.args[0]) if exc.args else ERROR_AUTHORITY_INVALID
+        return _fail_closed_authority_snapshot(code)
+    except Exception:
+        return _fail_closed_authority_snapshot(ERROR_AUTHORITY_INVALID)
+
+
+def _validated_authority(
+    authority: Any,
+) -> ControlledAlternativeAuthoritySnapshot:
+    if authority is None:
+        raise ControlledAlternativeValidationError(ERROR_DISCOVERY_INELIGIBLE)
+    return validate_controlled_alternative_authority(authority)
 
 
 def _iter_controlled_alternative_entry_points() -> Any:
@@ -1596,14 +1941,40 @@ def _resolve_vendored_controlled_alternative_provider() -> tuple[
 
 
 def discover_controlled_alternative_provider(
-    paid_snapshot: PaidProviderSnapshot | None,
+    paid_snapshot: PaidProviderSnapshot | None = None,
+    *,
+    authority: Mapping[str, Any] | ControlledAlternativeAuthoritySnapshot | None = None,
 ) -> ControlledAlternativeDiscoveryResult:
-    """Discover one compatible installed provider when paid activation is eligible."""
+    """Discover one compatible installed provider when CA route authority is ready.
 
-    if not _paid_snapshot_eligible(paid_snapshot):
+    ``paid_snapshot`` is legacy transport/status only and is not CA authority
+    for this public discovery path. Package presence and Console
+    ``bounded_summary_upload`` credentials are also not CA authority.
+    """
+
+    _ = paid_snapshot
+    if (
+        isinstance(authority, ControlledAlternativeAuthoritySnapshot)
+        and authority.route_ready is False
+    ):
         return ControlledAlternativeDiscoveryResult(
             available=False,
-            error_code=ERROR_DISCOVERY_INELIGIBLE,
+            error_code=authority.error_code or ERROR_DISCOVERY_INELIGIBLE,
+        )
+    try:
+        resolved = _validated_authority(authority)
+    except ControlledAlternativeValidationError as exc:
+        code = str(exc.args[0]) if exc.args else ERROR_AUTHORITY_INVALID
+        return ControlledAlternativeDiscoveryResult(available=False, error_code=code)
+    except Exception:
+        return ControlledAlternativeDiscoveryResult(
+            available=False,
+            error_code=ERROR_AUTHORITY_INVALID,
+        )
+    if not resolved.route_ready:
+        return ControlledAlternativeDiscoveryResult(
+            available=False,
+            error_code=resolved.error_code or ERROR_DISCOVERY_INELIGIBLE,
         )
     provider, resolve_error = _resolve_provider()
     if resolve_error is not None:
@@ -2068,11 +2439,23 @@ def build_controlled_alternative_tool_schema(
 
 
 __all__ = [
+    "AUTHORITY_STATUS_ACTIVE",
+    "AUTHORITY_STATUS_DISABLED",
+    "AUTHORITY_STATUS_EXPIRED",
+    "AUTHORITY_STATUS_INVALID",
+    "AUTHORITY_STATUS_MISSING",
+    "CONSOLE_BOUNDED_SUMMARY_UPLOAD_SCOPE",
+    "CONTROLLED_ALTERNATIVE_AUTHORITY_CONTRACT_VERSION",
+    "CONTROLLED_ALTERNATIVE_AUTHORITY_ENTRYPOINT_GROUP",
+    "CONTROLLED_ALTERNATIVE_AUTHORITY_ID",
+    "CONTROLLED_ALTERNATIVE_AUTHORITY_SCOPE",
     "CONTROLLED_ALTERNATIVE_IDS",
     "CONTROLLED_ALTERNATIVE_PROVIDER_CONTRACT_VERSION",
     "CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP",
     "CONTROLLED_ALTERNATIVE_PROVIDER_ID",
     "CONTROLLED_ALTERNATIVES_PROFILE_ID",
+    "ControlledAlternativeAuthorityProvider",
+    "ControlledAlternativeAuthoritySnapshot",
     "ControlledAlternativeDiscoveryResult",
     "ControlledAlternativeLocalInput",
     "ControlledAlternativeProvider",
@@ -2081,6 +2464,11 @@ __all__ = [
     "ControlledAlternativeProviderResult",
     "ControlledAlternativeResourceLocator",
     "ControlledAlternativeValidationError",
+    "ERROR_AUTHORITY_DUPLICATE",
+    "ERROR_AUTHORITY_EXPIRED",
+    "ERROR_AUTHORITY_INVALID",
+    "ERROR_AUTHORITY_MISSING",
+    "ERROR_AUTHORITY_SCOPE_REJECTED",
     "ERROR_CONTRACT_INCOMPATIBLE",
     "ERROR_DESCRIPTOR_INVALID",
     "ERROR_DISCOVERY_DUPLICATE_ENTRYPOINT",
@@ -2116,6 +2504,7 @@ __all__ = [
     "build_semantic_controlled_alternative_tool_schemas",
     "agentveil_write_file_catalog_collision",
     "controlled_alternative_target_is_ineligible",
+    "discover_controlled_alternative_authority",
     "discover_controlled_alternative_provider",
     "inject_agentveil_write_file_tool",
     "is_controlled_alternative_tool_name",
@@ -2124,7 +2513,9 @@ __all__ = [
     "normalize_semantic_tool_call",
     "semantic_alternative_id_for_tool",
     "semantic_tool_name_for_alternative_id",
+    "set_controlled_alternative_authority_loader",
     "set_controlled_alternative_provider_loader",
+    "validate_controlled_alternative_authority",
     "validate_controlled_alternative_local_input",
     "validate_provider_descriptor",
     "validate_provider_request",
