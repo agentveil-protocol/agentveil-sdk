@@ -13,6 +13,10 @@ from agentveil_mcp_proxy.classification import ToolCallClassifier
 from agentveil_mcp_proxy.controlled_alternatives import (
     AUTHORITY_FORBIDDEN_RESULT_KEYS,
     APPLY_PREPARED_PATCH_ALTERNATIVE_ID,
+    CONSOLE_BOUNDED_SUMMARY_UPLOAD_SCOPE,
+    CONTROLLED_ALTERNATIVE_AUTHORITY_CONTRACT_VERSION,
+    CONTROLLED_ALTERNATIVE_AUTHORITY_ID,
+    CONTROLLED_ALTERNATIVE_AUTHORITY_SCOPE,
     CONTROLLED_ALTERNATIVE_IDS,
     CONTROLLED_ALTERNATIVE_PROVIDER_CONTRACT_VERSION,
     CONTROLLED_ALTERNATIVE_PROVIDER_ID,
@@ -28,6 +32,9 @@ from agentveil_mcp_proxy.controlled_alternatives import (
     STAGE_DELETE_RESTORE_HANDOFF_NOTE,
     build_controlled_alternative_tool_schema,
     build_semantic_controlled_alternative_tool_schemas,
+    set_controlled_alternative_authority_loader,
+    set_controlled_alternative_provider_loader,
+    validate_controlled_alternative_authority,
     validate_provider_descriptor,
 )
 from agentveil_mcp_proxy.controlled_alternatives_runtime import (
@@ -369,6 +376,177 @@ def test_bind_rejects_global_state_root(tmp_path: Path) -> None:
         downstream={"name": "fs", "command": "python", "args": [], "cwd": str(workspace)},
     )
     assert bound is None
+
+
+def _active_runtime_authority():
+    return validate_controlled_alternative_authority({
+        "authority_present": True,
+        "authority_id": CONTROLLED_ALTERNATIVE_AUTHORITY_ID,
+        "contract_version": CONTROLLED_ALTERNATIVE_AUTHORITY_CONTRACT_VERSION,
+        "status": "active",
+        "scope": CONTROLLED_ALTERNATIVE_AUTHORITY_SCOPE,
+    })
+
+
+def test_bind_paid_snapshot_alone_does_not_expose_ca_tools(tmp_path: Path) -> None:
+    from test_mcp_proxy_controlled_alternatives import _active_paid_snapshot
+
+    workspace = tmp_path / "workspace"
+    home = workspace / ".avp"
+    workspace.mkdir()
+    home.mkdir()
+    calls = {"provider": 0}
+
+    def _count_provider() -> _FakeProvider:
+        calls["provider"] += 1
+        return _FakeProvider(workspace)
+
+    set_controlled_alternative_provider_loader(_count_provider)
+    set_controlled_alternative_authority_loader(None)
+    try:
+        bound = bind_controlled_alternative_runtime(
+            home=home,
+            downstream={"name": "fs", "command": "python", "args": [], "cwd": str(workspace)},
+            paid_snapshot=_active_paid_snapshot(),
+        )
+        assert bound is None
+        assert calls["provider"] == 0
+        hidden = inject_controlled_alternative_tool(
+            {"result": {"tools": [{"name": "read_file"}]}},
+            bound,
+        )
+        assert [tool["name"] for tool in hidden["result"]["tools"]] == ["read_file"]
+    finally:
+        set_controlled_alternative_provider_loader(None)
+        set_controlled_alternative_authority_loader(None)
+
+
+def test_bind_active_authority_exposes_ca_tools(tmp_path: Path) -> None:
+    from test_mcp_proxy_controlled_alternatives import _active_paid_snapshot
+
+    workspace = tmp_path / "workspace"
+    home = workspace / ".avp"
+    workspace.mkdir()
+    home.mkdir()
+    set_controlled_alternative_provider_loader(lambda: _FakeProvider(workspace))
+    try:
+        bound = bind_controlled_alternative_runtime(
+            home=home,
+            downstream={"name": "fs", "command": "python", "args": [], "cwd": str(workspace)},
+            paid_snapshot=_active_paid_snapshot(),
+            authority=_active_runtime_authority(),
+        )
+        assert bound is not None
+        listed = inject_controlled_alternative_tool(
+            {"result": {"tools": [{"name": "read_file"}]}},
+            bound,
+        )
+        assert [tool["name"] for tool in listed["result"]["tools"]] == [
+            "read_file",
+            *_expected_controlled_tool_names(_descriptor()),
+        ]
+        assert SECRET_PATH not in repr(bound)
+        assert str(bound.workspace_root) not in repr(bound)
+        assert bound.route_id not in repr(bound)
+    finally:
+        set_controlled_alternative_provider_loader(None)
+        set_controlled_alternative_authority_loader(None)
+
+
+def test_bind_accepts_authority_snapshot_to_dict(tmp_path: Path) -> None:
+    from test_mcp_proxy_controlled_alternatives import _active_paid_snapshot
+
+    workspace = tmp_path / "workspace"
+    home = workspace / ".avp"
+    workspace.mkdir()
+    home.mkdir()
+    set_controlled_alternative_provider_loader(lambda: _FakeProvider(workspace))
+    try:
+        bound = bind_controlled_alternative_runtime(
+            home=home,
+            downstream={"name": "fs", "command": "python", "args": [], "cwd": str(workspace)},
+            paid_snapshot=_active_paid_snapshot(),
+            authority=_active_runtime_authority().to_dict(),
+        )
+        assert bound is not None
+        listed = inject_controlled_alternative_tool(
+            {"result": {"tools": [{"name": "read_file"}]}},
+            bound,
+        )
+        assert [tool["name"] for tool in listed["result"]["tools"]] == [
+            "read_file",
+            *_expected_controlled_tool_names(_descriptor()),
+        ]
+    finally:
+        set_controlled_alternative_provider_loader(None)
+        set_controlled_alternative_authority_loader(None)
+
+
+def test_bind_rejects_forged_route_ready_and_upload_scope(tmp_path: Path) -> None:
+    from test_mcp_proxy_controlled_alternatives import _active_paid_snapshot
+
+    workspace = tmp_path / "workspace"
+    home = workspace / ".avp"
+    workspace.mkdir()
+    home.mkdir()
+    set_controlled_alternative_provider_loader(lambda: _FakeProvider(workspace))
+    try:
+        forged = {
+            "authority_present": True,
+            "authority_id": CONTROLLED_ALTERNATIVE_AUTHORITY_ID,
+            "contract_version": CONTROLLED_ALTERNATIVE_AUTHORITY_CONTRACT_VERSION,
+            "status": "expired",
+            "scope": CONSOLE_BOUNDED_SUMMARY_UPLOAD_SCOPE,
+            "route_ready": True,
+        }
+        bound = bind_controlled_alternative_runtime(
+            home=home,
+            downstream={"name": "fs", "command": "python", "args": [], "cwd": str(workspace)},
+            paid_snapshot=_active_paid_snapshot(),
+            authority=forged,
+        )
+        assert bound is None
+        hidden = inject_controlled_alternative_tool(
+            {"result": {"tools": [{"name": "read_file"}]}},
+            bound,
+        )
+        assert [tool["name"] for tool in hidden["result"]["tools"]] == ["read_file"]
+    finally:
+        set_controlled_alternative_provider_loader(None)
+        set_controlled_alternative_authority_loader(None)
+
+
+def test_bind_rejects_console_upload_scope_as_ca_authority(tmp_path: Path) -> None:
+    from test_mcp_proxy_controlled_alternatives import _active_paid_snapshot
+
+    workspace = tmp_path / "workspace"
+    home = workspace / ".avp"
+    workspace.mkdir()
+    home.mkdir()
+    set_controlled_alternative_provider_loader(lambda: _FakeProvider(workspace))
+    try:
+        rejected = {
+            "authority_present": True,
+            "authority_id": CONTROLLED_ALTERNATIVE_AUTHORITY_ID,
+            "contract_version": CONTROLLED_ALTERNATIVE_AUTHORITY_CONTRACT_VERSION,
+            "status": "active",
+            "scope": CONSOLE_BOUNDED_SUMMARY_UPLOAD_SCOPE,
+        }
+        bound = bind_controlled_alternative_runtime(
+            home=home,
+            downstream={"name": "fs", "command": "python", "args": [], "cwd": str(workspace)},
+            paid_snapshot=_active_paid_snapshot(),
+            authority=rejected,
+        )
+        assert bound is None
+        hidden = inject_controlled_alternative_tool(
+            {"result": {"tools": [{"name": "read_file"}]}},
+            bound,
+        )
+        assert [tool["name"] for tool in hidden["result"]["tools"]] == ["read_file"]
+    finally:
+        set_controlled_alternative_provider_loader(None)
+        set_controlled_alternative_authority_loader(None)
 
 
 def test_recheck_drift_blocks_execute(tmp_path: Path) -> None:
@@ -1261,6 +1439,7 @@ def test_isolated_vendored_853adf5_wheel_stage_restore(
         home=home,
         downstream={"name": "fs", "command": "python", "args": [], "cwd": str(workspace)},
         paid_snapshot=_active_paid_snapshot(),
+        authority=_active_runtime_authority(),
     )
     assert bound is not None
     classifier = ToolCallClassifier(_config(mode="observe"), server_name="fs")

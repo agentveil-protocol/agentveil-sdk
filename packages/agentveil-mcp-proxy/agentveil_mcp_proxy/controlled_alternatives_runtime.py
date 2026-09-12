@@ -28,11 +28,13 @@ from agentveil_mcp_proxy.controlled_alternatives import (
     GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
     RESERVED_CONTROLLED_ALTERNATIVE_TOOL_NAMES,
     STAGE_DELETE_RESTORE_HANDOFF_NOTE,
+    ControlledAlternativeAuthoritySnapshot,
     ControlledAlternativeProvider,
     ControlledAlternativeProviderResult,
     ControlledAlternativeValidationError,
     build_controlled_alternative_tool_schema,
     build_semantic_controlled_alternative_tool_schemas,
+    discover_controlled_alternative_authority,
     discover_controlled_alternative_provider,
     git_intent_denied_local_payload,
     is_semantic_controlled_alternative_tool,
@@ -42,7 +44,7 @@ from agentveil_mcp_proxy.controlled_alternatives import (
     validate_provider_request,
     validate_provider_result,
 )
-from agentveil_mcp_proxy.paid_provider import PaidProviderSnapshot, discover_paid_provider
+from agentveil_mcp_proxy.paid_provider import PaidProviderSnapshot
 from agentveil_mcp_proxy.policy import PolicyDecision, PolicyEvaluation, RiskClass
 from agentveil_mcp_proxy.role_doctor import (
     canonical_project_workspace_root_hash,
@@ -86,12 +88,29 @@ def bind_controlled_alternative_runtime(
     home: Path,
     downstream: Mapping[str, Any],
     paid_snapshot: PaidProviderSnapshot | None = None,
+    authority: Any = None,
 ) -> ControlledAlternativeRuntimeBinding | None:
-    """Return a cached runtime binding, or None when the tool must stay hidden."""
+    """Return a cached runtime binding, or None when the tool must stay hidden.
+
+    ``paid_snapshot`` is legacy transport/status only and is not CA authority.
+    Tool exposure requires an explicit or discovered CA route-authority snapshot.
+    """
 
     try:
-        snapshot = paid_snapshot if paid_snapshot is not None else discover_paid_provider()
-        discovered = discover_controlled_alternative_provider(snapshot)
+        resolved_authority = (
+            authority
+            if authority is not None
+            else discover_controlled_alternative_authority()
+        )
+        if (
+            isinstance(resolved_authority, ControlledAlternativeAuthoritySnapshot)
+            and resolved_authority.route_ready is False
+        ):
+            return None
+        discovered = discover_controlled_alternative_provider(
+            paid_snapshot,
+            authority=resolved_authority,
+        )
         if not discovered.available or discovered.descriptor is None or discovered.provider is None:
             return None
         workspace = trusted_project_workspace_root_from_downstream(dict(downstream))
