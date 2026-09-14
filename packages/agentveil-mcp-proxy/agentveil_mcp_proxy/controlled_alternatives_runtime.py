@@ -89,6 +89,7 @@ def bind_controlled_alternative_runtime(
     downstream: Mapping[str, Any],
     paid_snapshot: PaidProviderSnapshot | None = None,
     authority: Any = None,
+    runtime_context: Any = None,
 ) -> ControlledAlternativeRuntimeBinding | None:
     """Return a cached runtime binding, or None when the tool must stay hidden.
 
@@ -100,7 +101,7 @@ def bind_controlled_alternative_runtime(
         resolved_authority = (
             authority
             if authority is not None
-            else discover_controlled_alternative_authority()
+            else discover_controlled_alternative_authority(runtime_context=runtime_context)
         )
         if (
             isinstance(resolved_authority, ControlledAlternativeAuthoritySnapshot)
@@ -110,6 +111,7 @@ def bind_controlled_alternative_runtime(
         discovered = discover_controlled_alternative_provider(
             paid_snapshot,
             authority=resolved_authority,
+            runtime_context=runtime_context,
         )
         if not discovered.available or discovered.descriptor is None or discovered.provider is None:
             return None
