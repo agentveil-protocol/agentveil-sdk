@@ -1317,10 +1317,12 @@ def validate_provider_descriptor(
         )
     alt_tuple = tuple(alt_items)
     required = CONTROLLED_ALTERNATIVE_IDS
-    if alt_tuple[: len(required)] != required:
+    if not alt_tuple:
         raise ControlledAlternativeValidationError(ERROR_DESCRIPTOR_INVALID)
-    extra = alt_tuple[len(required) :]
-    if extra not in {(), (APPLY_PREPARED_PATCH_ALTERNATIVE_ID,)}:
+    if alt_tuple[-1] == APPLY_PREPARED_PATCH_ALTERNATIVE_ID:
+        if alt_tuple[:-1] != required:
+            raise ControlledAlternativeValidationError(ERROR_DESCRIPTOR_INVALID)
+    elif alt_tuple != required[: len(alt_tuple)]:
         raise ControlledAlternativeValidationError(ERROR_DESCRIPTOR_INVALID)
     return ControlledAlternativeProviderDescriptor(
         provider_id=provider_id,

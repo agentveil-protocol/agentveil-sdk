@@ -1358,7 +1358,7 @@ def test_result_dataclass_cannot_bypass_prepared_artifact_validation() -> None:
 
 def test_validate_provider_descriptor_rejects_bypass_and_missing_fields() -> None:
     payload = _valid_descriptor_payload()
-    payload["alternative_ids"] = list(CONTROLLED_ALTERNATIVE_IDS[:-1])
+    payload["alternative_ids"] = []
     with pytest.raises(ControlledAlternativeValidationError) as unknown:
         validate_provider_descriptor(payload)
     _assert_bounded_error(unknown, ERROR_DESCRIPTOR_INVALID)
@@ -1386,6 +1386,99 @@ def test_validate_provider_descriptor_rejects_bypass_and_missing_fields() -> Non
     with pytest.raises(ControlledAlternativeValidationError) as contract:
         validate_provider_descriptor(incompatible)
     _assert_bounded_error(contract, ERROR_CONTRACT_INCOMPATIBLE)
+
+
+def _descriptor_payload_with_ids(*alternative_ids: str) -> dict[str, object]:
+    payload = _valid_descriptor_payload()
+    payload["alternative_ids"] = list(alternative_ids)
+    return payload
+
+
+def test_stage_delete_only_descriptor_validates() -> None:
+    descriptor = validate_provider_descriptor(
+        _descriptor_payload_with_ids("filesystem.stage_delete.v1")
+    )
+    assert descriptor.alternative_ids == ("filesystem.stage_delete.v1",)
+
+
+def test_canonical_prefix_subsets_validate() -> None:
+    for end in range(1, len(CONTROLLED_ALTERNATIVE_IDS) + 1):
+        ids = CONTROLLED_ALTERNATIVE_IDS[:end]
+        validated = validate_provider_descriptor(_descriptor_payload_with_ids(*ids))
+        assert validated.alternative_ids == ids
+
+
+def test_validate_provider_descriptor_rejects_invalid_subset_catalogs() -> None:
+    invalid_catalogs = (
+        (),
+        ("filesystem.stage_delete.v1", "filesystem.stage_delete.v1"),
+        ("filesystem.stage_delete.v1", "unknown.alt.v1"),
+        ("filesystem.restore_staged.v1", "filesystem.stage_delete.v1"),
+        (
+            "filesystem.stage_delete.v1",
+            APPLY_PREPARED_PATCH_ALTERNATIVE_ID,
+            "filesystem.restore_staged.v1",
+        ),
+        (APPLY_PREPARED_PATCH_ALTERNATIVE_ID,),
+    )
+    for alternative_ids in invalid_catalogs:
+        payload = _descriptor_payload_with_ids(*alternative_ids)
+        with pytest.raises(ControlledAlternativeValidationError) as invalid:
+            validate_provider_descriptor(payload)
+        _assert_bounded_error(invalid, ERROR_DESCRIPTOR_INVALID)
+
+    wrong_profile = _valid_descriptor_payload()
+    wrong_profile["profile_id"] = "other_profile"
+    with pytest.raises(ControlledAlternativeValidationError) as profile:
+        validate_provider_descriptor(wrong_profile)
+    _assert_bounded_error(profile, ERROR_CONTRACT_INCOMPATIBLE)
+
+    authority = _valid_descriptor_payload()
+    authority["allow"] = True
+    with pytest.raises(ControlledAlternativeValidationError) as unsafe:
+        validate_provider_descriptor(authority)
+    _assert_bounded_error(unsafe, ERROR_RESULT_UNSAFE)
+
+
+def test_stage_delete_only_tool_schema_exposes_advertised_ids_only() -> None:
+    jsonschema = pytest.importorskip("jsonschema")
+    descriptor = validate_provider_descriptor(
+        _descriptor_payload_with_ids("filesystem.stage_delete.v1")
+    )
+    generic = build_controlled_alternative_tool_schema(descriptor)
+    branches = generic["inputSchema"]["oneOf"]
+    assert len(branches) == 1
+    assert branches[0]["properties"]["alternative_id"] == {
+        "const": "filesystem.stage_delete.v1"
+    }
+    jsonschema.validate(
+        {
+            "alternative_id": "filesystem.stage_delete.v1",
+            "input": FAMILY_INPUTS["filesystem.stage_delete.v1"],
+        },
+        generic["inputSchema"],
+    )
+    dumped = json.dumps(generic)
+    for hidden in (
+        "filesystem.restore_staged.v1",
+        "filesystem.cleanup_staged.v1",
+        "protected_write.prepare_patch.v1",
+        "git.prepare_local_change.v1",
+        APPLY_PREPARED_PATCH_ALTERNATIVE_ID,
+    ):
+        assert hidden not in dumped
+    semantic = build_semantic_controlled_alternative_tool_schemas(descriptor)
+    names = [schema["name"] for schema in semantic]
+    assert names == [SEMANTIC_STAGE_DELETE_TOOL_NAME]
+    for hidden_name in (
+        SEMANTIC_RESTORE_STAGED_TOOL_NAME,
+        SEMANTIC_CLEANUP_STAGED_TOOL_NAME,
+        SEMANTIC_PREPARE_PATCH_TOOL_NAME,
+        SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME,
+        SEMANTIC_GIT_OPERATION_TOOL_NAME,
+        SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME,
+    ):
+        assert hidden_name not in names
 
 
 def test_discovery_paid_snapshot_alone_is_not_ca_authority() -> None:

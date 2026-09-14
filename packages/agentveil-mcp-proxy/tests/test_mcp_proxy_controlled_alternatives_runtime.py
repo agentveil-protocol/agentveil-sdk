@@ -318,6 +318,62 @@ def test_inject_appends_only_when_bound() -> None:
     assert inject_controlled_alternative_tool(response, None) == response
 
 
+def _stage_delete_only_descriptor():
+    return validate_provider_descriptor({
+        "provider_id": CONTROLLED_ALTERNATIVE_PROVIDER_ID,
+        "contract_version": CONTROLLED_ALTERNATIVE_PROVIDER_CONTRACT_VERSION,
+        "profile_id": CONTROLLED_ALTERNATIVES_PROFILE_ID,
+        "alternative_ids": [STAGE],
+    })
+
+
+def _stage_delete_only_binding(tmp_path: Path) -> ControlledAlternativeRuntimeBinding:
+    workspace = tmp_path / "workspace"
+    home = workspace / ".avp"
+    workspace.mkdir(parents=True, exist_ok=True)
+    home.mkdir(parents=True, exist_ok=True)
+    descriptor = _stage_delete_only_descriptor()
+    provider = _FakeProvider(workspace, alternative_ids=descriptor.alternative_ids)
+    return ControlledAlternativeRuntimeBinding(
+        provider=provider,
+        descriptor=descriptor,
+        schema=build_controlled_alternative_tool_schema(descriptor),
+        workspace_root=str(workspace.resolve()),
+        state_root=str(home.resolve()),
+        route_id="sha256:" + ("ab" * 32),
+        st_dev=workspace.stat().st_dev,
+        semantic_schemas=build_semantic_controlled_alternative_tool_schemas(descriptor),
+    )
+
+
+def test_stage_delete_only_injection_exposes_advertised_tools_only(tmp_path: Path) -> None:
+    binding = _stage_delete_only_binding(tmp_path)
+    listed = inject_controlled_alternative_tool(
+        {"result": {"tools": [{"name": "read_file"}]}},
+        binding,
+    )
+    names = [tool["name"] for tool in listed["result"]["tools"]]
+    assert names == ["read_file", *_expected_controlled_tool_names(binding.descriptor)]
+    assert names == [
+        "read_file",
+        GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+        SEMANTIC_STAGE_DELETE_TOOL_NAME,
+    ]
+    hidden = (
+        SEMANTIC_RESTORE_STAGED_TOOL_NAME,
+        SEMANTIC_CLEANUP_STAGED_TOOL_NAME,
+        SEMANTIC_PREPARE_PATCH_TOOL_NAME,
+        SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME,
+        SEMANTIC_GIT_OPERATION_TOOL_NAME,
+        SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME,
+    )
+    for name in hidden:
+        assert name not in names
+    dumped = json.dumps(listed)
+    for alternative_id in (RESTORE, CLEANUP, PREPARE, APPLY, GIT):
+        assert alternative_id not in dumped
+
+
 def test_inject_and_stage_restore_cleanup(tmp_path: Path) -> None:
     binding = _binding(tmp_path)
     listed = inject_controlled_alternative_tool(
