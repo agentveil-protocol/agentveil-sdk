@@ -1317,10 +1317,12 @@ def validate_provider_descriptor(
         )
     alt_tuple = tuple(alt_items)
     required = CONTROLLED_ALTERNATIVE_IDS
-    if alt_tuple[: len(required)] != required:
+    if not alt_tuple:
         raise ControlledAlternativeValidationError(ERROR_DESCRIPTOR_INVALID)
-    extra = alt_tuple[len(required) :]
-    if extra not in {(), (APPLY_PREPARED_PATCH_ALTERNATIVE_ID,)}:
+    if alt_tuple[-1] == APPLY_PREPARED_PATCH_ALTERNATIVE_ID:
+        if alt_tuple[:-1] != required:
+            raise ControlledAlternativeValidationError(ERROR_DESCRIPTOR_INVALID)
+    elif alt_tuple != required[: len(alt_tuple)]:
         raise ControlledAlternativeValidationError(ERROR_DESCRIPTOR_INVALID)
     return ControlledAlternativeProviderDescriptor(
         provider_id=provider_id,
@@ -1800,10 +1802,13 @@ def _iter_controlled_alternative_authority_entry_points() -> Any:
         return entry_points().get(CONTROLLED_ALTERNATIVE_AUTHORITY_ENTRYPOINT_GROUP, ())
 
 
-def _load_authority_object(loaded: Any) -> ControlledAlternativeAuthoritySnapshot:
+def _load_authority_object(loaded: Any, runtime_context: Any = None) -> ControlledAlternativeAuthoritySnapshot:
+    from agentveil_mcp_proxy.controlled_alternatives_transport import bind_installed_runtime_context
+
     current = loaded
     if callable(current):
         current = current()
+    current = bind_installed_runtime_context(current, runtime_context)
     if isinstance(current, (ControlledAlternativeAuthoritySnapshot, Mapping)):
         return validate_controlled_alternative_authority(current)
     method = getattr(current, "authority", None)
@@ -1812,7 +1817,7 @@ def _load_authority_object(loaded: Any) -> ControlledAlternativeAuthoritySnapsho
     raise ControlledAlternativeValidationError(ERROR_AUTHORITY_INVALID)
 
 
-def discover_controlled_alternative_authority() -> ControlledAlternativeAuthoritySnapshot:
+def discover_controlled_alternative_authority(*, runtime_context: Any = None) -> ControlledAlternativeAuthoritySnapshot:
     """Discover one bounded CA route-authority snapshot."""
 
     if _authority_loader is not None:
@@ -1823,7 +1828,7 @@ def discover_controlled_alternative_authority() -> ControlledAlternativeAuthorit
         if loaded is None:
             return _fail_closed_authority_snapshot(ERROR_AUTHORITY_MISSING)
         try:
-            return _load_authority_object(loaded)
+            return _load_authority_object(loaded, runtime_context)
         except ControlledAlternativeValidationError as exc:
             code = str(exc.args[0]) if exc.args else ERROR_AUTHORITY_INVALID
             return _fail_closed_authority_snapshot(code)
@@ -1848,7 +1853,7 @@ def discover_controlled_alternative_authority() -> ControlledAlternativeAuthorit
     except Exception:
         return _fail_closed_authority_snapshot(ERROR_AUTHORITY_INVALID)
     try:
-        return _load_authority_object(loaded)
+        return _load_authority_object(loaded, runtime_context)
     except ControlledAlternativeValidationError as exc:
         code = str(exc.args[0]) if exc.args else ERROR_AUTHORITY_INVALID
         return _fail_closed_authority_snapshot(code)
@@ -1944,6 +1949,7 @@ def discover_controlled_alternative_provider(
     paid_snapshot: PaidProviderSnapshot | None = None,
     *,
     authority: Mapping[str, Any] | ControlledAlternativeAuthoritySnapshot | None = None,
+    runtime_context: Any = None,
 ) -> ControlledAlternativeDiscoveryResult:
     """Discover one compatible installed provider when CA route authority is ready.
 
@@ -1985,6 +1991,9 @@ def discover_controlled_alternative_provider(
             error_code=ERROR_DISCOVERY_ENTRYPOINT_LOAD_FAILED,
         )
     try:
+        from agentveil_mcp_proxy.controlled_alternatives_transport import bind_installed_runtime_context
+
+        provider = bind_installed_runtime_context(provider, runtime_context)
         descriptor = validate_provider_descriptor(provider.descriptor())
     except ControlledAlternativeValidationError as exc:
         code = str(exc.args[0]) if exc.args else ERROR_DESCRIPTOR_INVALID

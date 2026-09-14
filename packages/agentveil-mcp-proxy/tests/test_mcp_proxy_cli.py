@@ -4757,6 +4757,13 @@ def test_run_proxy_provider_absent_does_not_bind_controlled_runtime(tmp_path, mo
     }
     (home / "mcp-proxy" / "config.json").write_text(json.dumps(config), encoding="utf-8")
     captured = {}
+    real_bind = proxy_cli.bind_controlled_alternative_runtime
+
+    def capture_bind(**kwargs):
+        captured["runtime_context"] = kwargs.get("runtime_context")
+        return real_bind(**kwargs)
+
+    monkeypatch.setattr(proxy_cli, "bind_controlled_alternative_runtime", capture_bind)
     real = proxy_cli.McpPassthrough
 
     class CapturingPassthrough(real):
@@ -4772,3 +4779,5 @@ def test_run_proxy_provider_absent_does_not_bind_controlled_runtime(tmp_path, mo
         approval_ui_mode="none",
     ) == 0
     assert captured.get("controlled_runtime") is None
+    assert captured["runtime_context"] is not None
+    assert captured["runtime_context"].state_root == str(home)

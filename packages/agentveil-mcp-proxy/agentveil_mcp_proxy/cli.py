@@ -145,6 +145,7 @@ from agentveil_mcp_proxy.client_connect import (
 from agentveil_mcp_proxy.controlled_alternatives_runtime import (
     bind_controlled_alternative_runtime,
 )
+from agentveil_mcp_proxy.controlled_alternatives_transport import build_controlled_alternative_context
 from agentveil_mcp_proxy.paid_provider import discover_paid_provider
 from agentveil_mcp_proxy.passthrough import DownstreamConfig, McpPassthrough, PassthroughError
 from agentveil_mcp_proxy.paid_activation import (
@@ -3060,6 +3061,9 @@ def run_proxy(
             home=paths.home,
             downstream=dict(config.downstream),
             paid_snapshot=discover_paid_provider(),
+            runtime_context=build_controlled_alternative_context(
+                agent=proxy_agent, base_url=config.avp.base_url, state_root=paths.home,
+            ),
         )
         passthrough = McpPassthrough(
             downstream,
