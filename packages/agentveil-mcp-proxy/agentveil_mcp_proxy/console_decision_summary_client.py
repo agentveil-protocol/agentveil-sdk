@@ -25,6 +25,7 @@ from typing import Any, Callable, Mapping
 from urllib.parse import urlsplit
 
 from agentveil_mcp_proxy.classification import infer_action_family
+from agentveil_mcp_proxy.controlled_alternatives import KNOWN_CONTROLLED_ALTERNATIVE_IDS
 from agentveil_mcp_proxy.console_credentials import (
     CREDENTIAL_SCOPE,
     CredentialError,
@@ -42,6 +43,7 @@ _INGEST_PATH = "/console/decision-summaries/ingest"
 _REQUEST_TIMEOUT_SECONDS = 3.0
 _MAX_RESPONSE_BYTES = 16 * 1024
 _SCHEMA_VERSION = "1"
+_CONTROLLED_ALTERNATIVE_SCHEMA_VERSION = "2"
 _DEFAULT_QUEUE_CAPACITY = 256
 _MAX_DEDUP_KEYS = 4096
 _SHUTDOWN_JOIN_TIMEOUT_SECONDS = _REQUEST_TIMEOUT_SECONDS + 0.25
@@ -53,6 +55,28 @@ _DECISION_DENIED = "denied"
 _PROOF_INTACT = "intact"
 _PROOF_UNAVAILABLE = "unavailable"
 
+_CONTROLLED_ALTERNATIVE_OUTCOMES = frozenset({
+    "cleanup_completed",
+    "completed_safely",
+    "denied_safely",
+    "prepared_for_review",
+    "restored",
+})
+_CONTROLLED_ALTERNATIVE_VERIFICATION_LEVELS = frozenset({
+    "mechanism_verified",
+    "not_verified",
+    "public_source_absent",
+})
+_CONTROLLED_ALTERNATIVE_COMPLETED_OUTCOMES = {
+    "filesystem.stage_delete.v1": "completed_safely",
+    "filesystem.restore_staged.v1": "restored",
+    "filesystem.cleanup_staged.v1": "cleanup_completed",
+    "protected_write.apply_prepared_patch.v1": "completed_safely",
+}
+_CONTROLLED_ALTERNATIVE_PREPARED_IDS = frozenset({
+    "protected_write.prepare_patch.v1",
+    "git.prepare_local_change.v1",
+})
 _ACTION_FAMILIES = frozenset({
     "read",
     "write",
@@ -86,6 +110,11 @@ _REQUEST_KEYS = frozenset({
     "proof_status",
     "proof_hash",
     "idempotency_key",
+    "controlled_alternative_id",
+    "controlled_outcome",
+    "rollback_available",
+    "verification_level",
+    "result_hash",
 })
 _RESPONSE_KEYS = frozenset({
     "schema_version",
@@ -102,6 +131,7 @@ _HOOK_DENIED_UPLOAD_ACK_STATUSES = frozenset({"accepted", "duplicate"})
 _EVENT_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _PROOF_HASH_RE = re.compile(r"^[a-f0-9]{64}$")
+_RESULT_HASH_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
 _FORBIDDEN_EVENT_ID_FRAGMENTS = ("/Users/", "/home/", "../", "..\\", "C:\\")
 _FORBIDDEN_EVENT_ID_SUBSTRINGS = (
     "secret",
@@ -161,6 +191,11 @@ class DecisionSummaryPayload:
     proof_status: str
     proof_hash: str | None = None
     idempotency_key: str | None = None
+    controlled_alternative_id: str | None = None
+    controlled_outcome: str | None = None
+    rollback_available: bool | None = None
+    verification_level: str | None = None
+    result_hash: str | None = None
 
 
 Transport = Callable[..., RawResponse]
@@ -346,6 +381,84 @@ def _resolve_proof(record: PendingApproval) -> tuple[str, str | None]:
     return _PROOF_INTACT, record.decision_receipt_sha256
 
 
+def _controlled_outcome_for_record(
+    record: PendingApproval,
+    *,
+    alternative_id: str,
+    target_reached: bool,
+) -> str | None:
+    # claim-check: allow evidence status enum; target consistency is enforced below.
+    if record.status in {ApprovalStatus.DENIED.value, ApprovalStatus.BLOCKED.value}:
+        return "denied_safely" if target_reached is False else None
+    if record.status != ApprovalStatus.EXECUTED.value:
+        return None
+    if alternative_id in _CONTROLLED_ALTERNATIVE_PREPARED_IDS:
+        return "prepared_for_review" if target_reached is False else None
+    completed = _CONTROLLED_ALTERNATIVE_COMPLETED_OUTCOMES.get(alternative_id)
+    return completed if target_reached is True else None
+
+
+def _controlled_summary_consistent(
+    *,
+    alternative_id: object,
+    outcome: object,
+    decision: object,
+    target_reached: object,
+) -> bool:
+    if type(target_reached) is not bool:
+        return False
+    if outcome == "denied_safely":
+        return decision == _DECISION_DENIED and target_reached is False
+    if decision != _DECISION_ALLOWED:
+        return False
+    if alternative_id in _CONTROLLED_ALTERNATIVE_PREPARED_IDS:
+        return outcome == "prepared_for_review" and target_reached is False
+    return (
+        _CONTROLLED_ALTERNATIVE_COMPLETED_OUTCOMES.get(alternative_id) == outcome
+        and target_reached is True
+    )
+
+
+def _controlled_summary_fields(record: PendingApproval) -> dict[str, Any] | None:
+    metadata = parse_action_gate_metadata(record)
+    if not isinstance(metadata, Mapping):
+        return None
+    alternative_id = metadata.get("controlled_alternative_id")
+    if alternative_id not in KNOWN_CONTROLLED_ALTERNATIVE_IDS:
+        return None
+    target_reached = metadata.get("target_reached")
+    if type(target_reached) is not bool:
+        return None
+    outcome = _controlled_outcome_for_record(
+        record,
+        alternative_id=alternative_id,
+        target_reached=target_reached,
+    )
+    if outcome not in _CONTROLLED_ALTERNATIVE_OUTCOMES:
+        return None
+    rollback_available = metadata.get("rollback_available")
+    verification_level = metadata.get("verification_level")
+    if type(rollback_available) is not bool:
+        return None
+    if verification_level not in _CONTROLLED_ALTERNATIVE_VERIFICATION_LEVELS:
+        return None
+    result_hash = record.result_hash
+    if not isinstance(result_hash, str) or not _RESULT_HASH_RE.fullmatch(result_hash):
+        return None
+    return {
+        "controlled_alternative_id": alternative_id,
+        "controlled_outcome": outcome,
+        "rollback_available": rollback_available,
+        "verification_level": verification_level,
+        "result_hash": result_hash,
+    }
+
+
+def _record_declares_controlled_alternative(record: PendingApproval) -> bool:
+    metadata = parse_action_gate_metadata(record)
+    return isinstance(metadata, Mapping) and "controlled_alternative_id" in metadata
+
+
 def _approved_execution_error(record: PendingApproval) -> bool:
     if record.status != ApprovalStatus.ERROR.value:
         return False
@@ -389,8 +502,15 @@ def build_decision_summary_payload(
 
     proof_status, proof_hash = _resolve_proof(record)
     idempotency_key = _validate_idempotency_key(event_id)
+    controlled_fields = _controlled_summary_fields(record)
+    if _record_declares_controlled_alternative(record) and controlled_fields is None:
+        return None
     return DecisionSummaryPayload(
-        schema_version=_SCHEMA_VERSION,
+        schema_version=(
+            _CONTROLLED_ALTERNATIVE_SCHEMA_VERSION
+            if controlled_fields is not None
+            else _SCHEMA_VERSION
+        ),
         event_id=event_id,
         action_family=action_family,
         decision=decision,
@@ -399,6 +519,7 @@ def build_decision_summary_payload(
         proof_status=proof_status,
         proof_hash=proof_hash,
         idempotency_key=idempotency_key,
+        **(controlled_fields or {}),
     )
 
 
@@ -746,6 +867,11 @@ def best_effort_spawn_hook_denied_summary(
 
 
 def payload_to_request_body(payload: DecisionSummaryPayload) -> dict[str, Any]:
+    if payload.schema_version not in {
+        _SCHEMA_VERSION,
+        _CONTROLLED_ALTERNATIVE_SCHEMA_VERSION,
+    }:
+        raise DecisionSummaryClientError("invalid_request")
     body: dict[str, Any] = {
         "schema_version": payload.schema_version,
         "event_id": payload.event_id,
@@ -759,6 +885,44 @@ def payload_to_request_body(payload: DecisionSummaryPayload) -> dict[str, Any]:
         body["proof_hash"] = payload.proof_hash
     if payload.idempotency_key is not None:
         body["idempotency_key"] = payload.idempotency_key
+    controlled_values = (
+        payload.controlled_alternative_id,
+        payload.controlled_outcome,
+        payload.rollback_available,
+        payload.verification_level,
+        payload.result_hash,
+    )
+    if payload.schema_version == _CONTROLLED_ALTERNATIVE_SCHEMA_VERSION:
+        if any(value is None for value in controlled_values):
+            raise DecisionSummaryClientError("invalid_request")
+        if payload.controlled_alternative_id not in KNOWN_CONTROLLED_ALTERNATIVE_IDS:
+            raise DecisionSummaryClientError("invalid_request")
+        if payload.controlled_outcome not in _CONTROLLED_ALTERNATIVE_OUTCOMES:
+            raise DecisionSummaryClientError("invalid_request")
+        if not _controlled_summary_consistent(
+            alternative_id=payload.controlled_alternative_id,
+            outcome=payload.controlled_outcome,
+            decision=payload.decision,
+            target_reached=payload.target_reached,
+        ):
+            raise DecisionSummaryClientError("invalid_request")
+        if type(payload.rollback_available) is not bool:
+            raise DecisionSummaryClientError("invalid_request")
+        if payload.verification_level not in _CONTROLLED_ALTERNATIVE_VERIFICATION_LEVELS:
+            raise DecisionSummaryClientError("invalid_request")
+        if not isinstance(payload.result_hash, str) or not _RESULT_HASH_RE.fullmatch(
+            payload.result_hash
+        ):
+            raise DecisionSummaryClientError("invalid_request")
+        body.update({
+            "controlled_alternative_id": payload.controlled_alternative_id,
+            "controlled_outcome": payload.controlled_outcome,
+            "rollback_available": payload.rollback_available,
+            "verification_level": payload.verification_level,
+            "result_hash": payload.result_hash,
+        })
+    elif any(value is not None for value in controlled_values):
+        raise DecisionSummaryClientError("invalid_request")
     if set(body.keys()) - _REQUEST_KEYS:
         raise DecisionSummaryClientError("invalid_request")
     if payload.proof_status == _PROOF_UNAVAILABLE and "proof_hash" in body:

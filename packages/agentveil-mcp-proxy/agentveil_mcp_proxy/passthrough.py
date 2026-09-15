@@ -4080,14 +4080,12 @@ class McpPassthrough:
                 },
             )
         response = local_mcp_result(request_id, payload)
-        if (
-            is_semantic_controlled_alternative_tool(tool_name)
-            and self._active_redirect_lineage_claimed
-            and isinstance(classification, ClassifiedToolCall)
-        ):
-            self._record_controlled_alternative_redirect_follow_up(
+        if isinstance(classification, ClassifiedToolCall):
+            self._record_controlled_alternative_result(
                 classification,
+                approval_outcome,
                 request_id,
+                alternative_id_from_arguments(normalized_arguments),
                 payload,
                 response,
             )
@@ -5075,47 +5073,93 @@ class McpPassthrough:
             return
         manager._notify_terminal_evidence(updated)
 
-    def _record_controlled_alternative_redirect_follow_up(
+    def _record_controlled_alternative_result(
         self,
         classification: ClassifiedToolCall,
+        approval_outcome: ApprovalOutcome | None,
         request_id: Any,
+        alternative_id: str,
         payload: Mapping[str, Any],
         response: dict[str, Any],
     ) -> None:
-        """Persist verified redirect lineage for one local semantic follow-up."""
+        """Persist one validated CA result before best-effort Console upload."""
 
-        if not self._active_redirect_lineage_claimed:
+        if payload.get("mechanism_status") != "success":
             return
-        redirect_context = self._active_redirect_context
-        if redirect_context is None:
+        target_reached = payload.get("target_reached")
+        rollback_available = payload.get("rollback_available")
+        verification_level = payload.get("verification_level")
+        if type(target_reached) is not bool or type(rollback_available) is not bool:
             return
-        if payload.get("mechanism_status") != "success" or payload.get("target_reached") is not True:
+        if verification_level not in {
+            "mechanism_verified",
+            "not_verified",
+            "public_source_absent",
+        }:
             return
         store = self._controlled_path_store()
         manager = self.approval_manager
         if store is None or manager is None:
             return
         request_id_text = str(request_id) if request_id is not None else str(uuid.uuid4())
-        metadata = build_redirect_automation_metadata(
-            fixture_id=self._controlled_path_fixture_id(classification),
-            tool_name=classification.tool,
-            policy_decision=classification.policy_evaluation.decision.value,
-            policy_rule_id=classification.policy_evaluation.policy_rule_id,
-            approval_status=ApprovalStatus.EXECUTED.value,
-            execution_status=ApprovalStatus.EXECUTED.value,
-            target_reached=True,
-            request_id=request_id_text,
-            request_chain=[redirect_context.original_request_id, request_id_text],
-            payload_hash=classification.payload_hash,
-            redirect_role=REDIRECT_ROLE_FOLLOW_UP,
-            redirect_playbook_id=redirect_context.redirect_playbook_id,
-            redirect_parent_request_id=redirect_context.original_request_id,
-            original_request_id=redirect_context.original_request_id,
-            **self._least_agency_metadata_fields(classification),
-        )
-        metadata = self._apply_verified_lineage_metadata(metadata)
+        redirect_context = self._active_redirect_context
+        if self._active_redirect_lineage_claimed and redirect_context is not None:
+            metadata = build_redirect_automation_metadata(
+                fixture_id=self._controlled_path_fixture_id(classification),
+                tool_name=classification.tool,
+                policy_decision=classification.policy_evaluation.decision.value,
+                policy_rule_id=classification.policy_evaluation.policy_rule_id,
+                approval_status=ApprovalStatus.EXECUTED.value,
+                execution_status=ApprovalStatus.EXECUTED.value,
+                target_reached=target_reached,
+                request_id=request_id_text,
+                request_chain=[redirect_context.original_request_id, request_id_text],
+                payload_hash=classification.payload_hash,
+                redirect_role=REDIRECT_ROLE_FOLLOW_UP,
+                redirect_playbook_id=redirect_context.redirect_playbook_id,
+                redirect_parent_request_id=redirect_context.original_request_id,
+                original_request_id=redirect_context.original_request_id,
+                **self._least_agency_metadata_fields(classification),
+            )
+            metadata = self._apply_verified_lineage_metadata(metadata)
+        else:
+            metadata = build_controlled_path_metadata(
+                fixture_id=self._controlled_path_fixture_id(classification),
+                tool_name=classification.tool,
+                policy_decision=classification.policy_evaluation.decision.value,
+                policy_rule_id=classification.policy_evaluation.policy_rule_id,
+                approval_status=ApprovalStatus.EXECUTED.value,
+                execution_status=ApprovalStatus.EXECUTED.value,
+                target_reached=target_reached,
+                request_id=request_id_text,
+                payload_hash=classification.payload_hash,
+                **self._least_agency_metadata_fields(classification),
+            )
+        metadata.update({
+            "controlled_alternative_id": alternative_id,
+            "rollback_available": rollback_available,
+            "verification_level": verification_level,
+        })
         try:
-            store.record_allow_execution(
+            if approval_outcome is not None and approval_outcome.approved:
+                annotate = getattr(store, "annotate_controlled_path_metadata", None)
+                record_result = getattr(manager, "record_execution_result", None)
+                if not callable(annotate) or not callable(record_result):
+                    return
+                annotate(
+                    approval_outcome.request_id,
+                    metadata_jcs=self._metadata_jcs(metadata, classification),
+                )
+                record_result(
+                    approval_outcome,
+                    response,
+                    downstream_tool_call_seen=True,
+                )
+                return
+            record_allow = getattr(store, "record_allow_execution", None)
+            if not callable(record_allow):
+                return
+            updated = record_allow(
                 request_id=request_id_text,
                 session_id=getattr(manager, "session_id", None) or str(uuid.uuid4()),
                 client_id=getattr(manager, "client_id", None),
@@ -5134,6 +5178,9 @@ class McpPassthrough:
             )
         except ApprovalEvidenceError:
             return
+        notify = getattr(manager, "_notify_terminal_evidence", None)
+        if callable(notify):
+            notify(updated)
 
     def _record_allow_controlled_path_if_needed(
         self,

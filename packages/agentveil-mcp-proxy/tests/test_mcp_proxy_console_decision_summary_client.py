@@ -45,7 +45,7 @@ from agentveil_mcp_proxy.console_decision_summary_client import (
     wait_for_hook_denied_uploads_for_tests,
 )
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore, ApprovalStatus, PendingApproval
-from agentveil_mcp_proxy.passthrough import McpPassthrough
+from agentveil_mcp_proxy.passthrough import DownstreamConfig, McpPassthrough
 from agentveil_mcp_proxy.policy import (
     PolicyDecision,
     PolicyEvaluation,
@@ -68,6 +68,7 @@ TOKEN = "console-device-token-secret-canary"
 SECRET = "SECRET_DECISION_SUMMARY_CANARY"
 EVENT_ID = "canary-event-id-001"
 PROOF_HASH = "a" * 64
+RESULT_HASH = "sha256:" + ("b" * 64)
 PAYLOAD_HASH = "sha256:" + "a" * 64
 RESOURCE_HASH = "sha256:" + "b" * 64
 POLICY_CONTEXT_HASH = "c" * 64
@@ -176,6 +177,18 @@ def _metadata(**extra):
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
+def _controlled_metadata(alternative_id: str, **extra) -> str:
+    payload = {
+        "action_family": "filesystem_write",
+        "controlled_alternative_id": alternative_id,
+        "rollback_available": False,
+        "target_reached": False,
+        "verification_level": "mechanism_verified",
+    }
+    payload.update(extra)
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
 def _payload(**overrides) -> DecisionSummaryPayload:
     base = DecisionSummaryPayload(
         schema_version="1",
@@ -254,7 +267,11 @@ def _seed_approved_record(store: ApprovalEvidenceStore) -> None:
     )
 
 
-def _classification(*, tool: str = "read_file") -> ClassifiedToolCall:
+def _classification(
+    *,
+    tool: str = "read_file",
+    controlled_alternative_id: str | None = None,
+) -> ClassifiedToolCall:
     evaluation = PolicyEvaluation(
         decision=PolicyDecision.APPROVAL,
         risk_class=RiskClass.READ,
@@ -276,6 +293,7 @@ def _classification(*, tool: str = "read_file") -> ClassifiedToolCall:
         risk_class=RiskClass.READ,
         policy_evaluation=evaluation,
         action_family=infer_action_family(tool),
+        controlled_alternative_id=controlled_alternative_id,
     )
 
 
@@ -352,6 +370,158 @@ def test_build_payload_uses_unavailable_when_receipt_digest_lacks_audit_binding(
     body = payload_to_request_body(payload)
     assert body["proof_status"] == "unavailable"
     assert "proof_hash" not in body
+
+
+@pytest.mark.parametrize(
+    ("alternative_id", "outcome", "target_reached", "rollback_available"),
+    [
+        ("filesystem.stage_delete.v1", "completed_safely", True, True),
+        ("filesystem.restore_staged.v1", "restored", True, False),
+        ("filesystem.cleanup_staged.v1", "cleanup_completed", True, False),
+        ("protected_write.prepare_patch.v1", "prepared_for_review", False, False),
+        ("protected_write.apply_prepared_patch.v1", "completed_safely", True, False),
+        ("git.prepare_local_change.v1", "prepared_for_review", False, False),
+    ],
+)
+def test_build_payload_emits_bounded_v2_controlled_alternative_summary(
+    alternative_id,
+    outcome,
+    target_reached,
+    rollback_available,
+):
+    payload = build_decision_summary_payload(
+        _record(
+            action_gate_metadata_jcs=_controlled_metadata(
+                alternative_id,
+                target_reached=target_reached,
+                rollback_available=rollback_available,
+            ),
+            result_hash=RESULT_HASH,
+        )
+    )
+    assert payload is not None
+    body = payload_to_request_body(payload)
+    assert body == {
+        "schema_version": "2",
+        "event_id": EVENT_ID,
+        "action_family": "filesystem_write",
+        "decision": "allowed",
+        "occurred_at": "2023-11-14T22:13:30Z",
+        "target_reached": target_reached,
+        "proof_status": "intact",
+        "proof_hash": PROOF_HASH,
+        "idempotency_key": EVENT_ID,
+        "controlled_alternative_id": alternative_id,
+        "controlled_outcome": outcome,
+        "rollback_available": rollback_available,
+        "verification_level": "mechanism_verified",
+        "result_hash": RESULT_HASH,
+    }
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        _controlled_metadata("unknown.route.v1"),
+        _controlled_metadata("filesystem.stage_delete.v1", rollback_available="true"),
+        _controlled_metadata("filesystem.stage_delete.v1", verification_level="verified"),
+    ],
+)
+def test_build_payload_does_not_downgrade_invalid_ca_metadata_to_v1(metadata):
+    record = _record(action_gate_metadata_jcs=metadata, result_hash=RESULT_HASH)
+    assert build_decision_summary_payload(record) is None
+
+
+@pytest.mark.parametrize(
+    "alternative_id",
+    [
+        "filesystem.stage_delete.v1",
+        "filesystem.restore_staged.v1",
+        "filesystem.cleanup_staged.v1",
+        "protected_write.apply_prepared_patch.v1",
+    ],
+)
+@pytest.mark.parametrize("target_reached", [False, None, "true"])
+def test_completed_ca_summary_requires_boolean_true_target(
+    alternative_id,
+    target_reached,
+):
+    record = _record(
+        action_gate_metadata_jcs=_controlled_metadata(
+            alternative_id,
+            target_reached=target_reached,
+        ),
+        result_hash=RESULT_HASH,
+    )
+    assert build_decision_summary_payload(record) is None
+
+
+@pytest.mark.parametrize(
+    "alternative_id",
+    [
+        "protected_write.prepare_patch.v1",
+        "git.prepare_local_change.v1",
+    ],
+)
+def test_prepared_ca_summary_requires_boolean_false_target(alternative_id):
+    valid = _record(
+        action_gate_metadata_jcs=_controlled_metadata(
+            alternative_id,
+            target_reached=False,
+        ),
+        result_hash=RESULT_HASH,
+    )
+    assert build_decision_summary_payload(valid) is not None
+    for invalid_target in (True, None, "false"):
+        invalid = _record(
+            action_gate_metadata_jcs=_controlled_metadata(
+                alternative_id,
+                target_reached=invalid_target,
+            ),
+            result_hash=RESULT_HASH,
+        )
+        assert build_decision_summary_payload(invalid) is None
+
+
+def test_v1_payload_rejects_controlled_fields():
+    with pytest.raises(DecisionSummaryClientError, match="invalid_request"):
+        payload_to_request_body(
+            replace(
+                _payload(),
+                controlled_alternative_id="filesystem.stage_delete.v1",
+            )
+        )
+
+
+def test_v2_serializer_rejects_false_completion_claim():
+    valid = build_decision_summary_payload(
+        _record(
+            action_gate_metadata_jcs=_controlled_metadata(
+                "filesystem.stage_delete.v1",
+                target_reached=True,
+                rollback_available=True,
+            ),
+            result_hash=RESULT_HASH,
+        )
+    )
+    assert valid is not None
+    with pytest.raises(DecisionSummaryClientError, match="invalid_request"):
+        payload_to_request_body(replace(valid, target_reached=False))
+
+
+def test_v2_serializer_rejects_completed_outcome_for_prepare():
+    valid = build_decision_summary_payload(
+        _record(
+            action_gate_metadata_jcs=_controlled_metadata(
+                "protected_write.prepare_patch.v1",
+                target_reached=False,
+            ),
+            result_hash=RESULT_HASH,
+        )
+    )
+    assert valid is not None
+    with pytest.raises(DecisionSummaryClientError, match="invalid_request"):
+        payload_to_request_body(replace(valid, controlled_outcome="completed_safely"))
 
 
 def test_build_payload_uploads_runtime_gate_execution_error():
@@ -930,6 +1100,126 @@ def test_passthrough_finalizes_controlled_metadata_before_terminal_notification(
     )
 
     assert calls == ["annotate", "notify"]
+
+
+def test_passthrough_persists_ca_result_before_v2_summary_notification(tmp_path):
+    store = ApprovalEvidenceStore(tmp_path / "evidence.sqlite")
+    server = ApprovalServer()
+    server.start()
+    manager = ApprovalManager(
+        evidence_store=store,
+        approval_server=server,
+        config=_config(),
+        client_id="pytest",
+        wait_for_decision=False,
+    )
+    observed: list[PendingApproval] = []
+    manager.terminal_evidence_observer = observed.append
+    proxy = McpPassthrough(
+        downstream=DownstreamConfig(command="python", args=(), name="filesystem"),
+        approval_manager=manager,
+    )
+    classification = replace(
+        _classification(
+            tool="agentveil_stage_delete",
+            controlled_alternative_id="filesystem.stage_delete.v1",
+        ),
+        action_family="delete",
+    )
+    result = {
+        "mechanism_status": "success",
+        "target_reached": True,
+        "rollback_available": True,
+        "verification_level": "public_source_absent",
+    }
+    response = {
+        "jsonrpc": "2.0",
+        "id": "ca-stage-1",
+        "result": {"content": [{"type": "text", "text": json.dumps(result)}]},
+    }
+    try:
+        proxy._record_controlled_alternative_result(
+            classification,
+            None,
+            "ca-stage-1",
+            "filesystem.stage_delete.v1",
+            result,
+            response,
+        )
+        assert len(observed) == 1
+        persisted = store.get_pending("ca-stage-1")
+        assert persisted == observed[0]
+        payload = build_decision_summary_payload(observed[0])
+        assert payload is not None
+        body = payload_to_request_body(payload)
+        assert body["schema_version"] == "2"
+        assert body["controlled_outcome"] == "completed_safely"
+        assert body["rollback_available"] is True
+        assert body["verification_level"] == "public_source_absent"
+        encoded = json.dumps(body)
+        assert "notes.txt" not in encoded
+        assert "/Users/" not in encoded
+    finally:
+        server.stop()
+        store.close()
+
+
+def test_passthrough_finalizes_approved_ca_before_v2_summary_notification(tmp_path):
+    store = ApprovalEvidenceStore(tmp_path / "evidence.sqlite")
+    server = ApprovalServer()
+    server.start()
+    manager = ApprovalManager(
+        evidence_store=store,
+        approval_server=server,
+        config=_config(),
+        client_id="pytest",
+        wait_for_decision=False,
+    )
+    observed: list[PendingApproval] = []
+    manager.terminal_evidence_observer = observed.append
+    _seed_approved_record(store)
+    proxy = McpPassthrough(
+        downstream=DownstreamConfig(command="python", args=(), name="filesystem"),
+        approval_manager=manager,
+    )
+    classification = replace(
+        _classification(
+            tool="agentveil_apply_prepared_patch",
+            controlled_alternative_id="protected_write.apply_prepared_patch.v1",
+        ),
+        action_family="update",
+    )
+    result = {
+        "mechanism_status": "success",
+        "target_reached": True,
+        "rollback_available": False,
+        "verification_level": "mechanism_verified",
+    }
+    response = {
+        "jsonrpc": "2.0",
+        "id": EVENT_ID,
+        "result": {"content": [{"type": "text", "text": json.dumps(result)}]},
+    }
+    try:
+        proxy._record_controlled_alternative_result(
+            classification,
+            ApprovalOutcome(EVENT_ID, ApprovalStatus.APPROVED.value, "approved"),
+            EVENT_ID,
+            "protected_write.apply_prepared_patch.v1",
+            result,
+            response,
+        )
+        assert len(observed) == 1
+        assert observed[0].status == ApprovalStatus.EXECUTED.value
+        payload = build_decision_summary_payload(observed[0])
+        assert payload is not None
+        body = payload_to_request_body(payload)
+        assert body["schema_version"] == "2"
+        assert body["controlled_outcome"] == "completed_safely"
+        assert body["target_reached"] is True
+    finally:
+        server.stop()
+        store.close()
 
 
 def test_manager_observer_swallows_exceptions(tmp_path):
