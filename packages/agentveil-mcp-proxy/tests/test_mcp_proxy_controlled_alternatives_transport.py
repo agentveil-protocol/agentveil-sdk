@@ -2,6 +2,7 @@
 
 import gzip
 import hashlib
+import json
 import re
 import socketserver
 import threading
@@ -22,9 +23,9 @@ def identity():
     return key, SimpleNamespace(private_key_hex=bytes(key).hex(), did="did:key:test-identity")
 
 
-def context(identity, tmp_path):
+def context(identity, tmp_path, *, base_url="https://agentveil.example"):
     return transport.build_controlled_alternative_context(
-        agent=identity[1], base_url="https://agentveil.example", state_root=tmp_path,
+        agent=identity[1], base_url=base_url, state_root=tmp_path,
     )
 
 
@@ -61,6 +62,87 @@ def test_signs_exact_bounded_body_without_disclosing_identity(identity, tmp_path
     assert seen[0].url.path.endswith("/hybrid/preflight")
     assert identity[1].private_key_hex not in repr(bound)
     assert str(tmp_path) not in repr(bound)
+
+
+def test_runtime_heartbeat_uses_signed_fixed_path_and_distinct_credential_header(
+    identity,
+    tmp_path,
+    monkeypatch,
+):
+    credential = "console-device-token-canary-001"
+    observed_at = "2026-09-15T12:00:00Z"
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        assert request.url.path == "/v1/controlled-alternatives/hybrid/runtime-status"
+        assert request.headers[transport.CONSOLE_CREDENTIAL_HEADER] == credential
+        assert request.headers["Accept-Encoding"] == "identity"
+        assert json.loads(request.content) == {
+            "schema_version": "1",
+            "status": "active",
+            "observed_at": observed_at,
+        }
+        header = dict(
+            re.findall(r'(\w+)="([^"]+)"', request.headers["Authorization"])
+        )
+        message = (
+            f'POST:{request.url.path}:{header["ts"]}:{header["nonce"]}:'
+            f"{hashlib.sha256(request.content).hexdigest()}"
+        )
+        identity[0].verify_key.verify(message.encode(), bytes.fromhex(header["sig"]))
+        return httpx.Response(
+            200,
+            json={
+                "schema_version": "1",
+                "status": "active",
+                "observed_at": observed_at,
+                "result": "accepted",
+            },
+        )
+
+    mock_http(monkeypatch, handler)
+    bound = context(identity, tmp_path, base_url="https://agentveil.dev")
+    assert callable(bound.heartbeat)
+    assert bound.heartbeat(credential, observed_at) == (
+        200,
+        {
+            "schema_version": "1",
+            "status": "active",
+            "observed_at": observed_at,
+            "result": "accepted",
+        },
+    )
+    assert len(seen) == 1
+    assert credential not in repr(bound)
+
+
+@pytest.mark.parametrize(
+    ("credential", "observed_at"),
+    [
+        ("short", "2026-09-15T12:00:00Z"),
+        ("console device token canary", "2026-09-15T12:00:00Z"),
+        ("console-device-token-canary-001", "/Users/canary"),
+        ("console-device-token-canary-001", "2026-09-15T12:00:00+00:00"),
+    ],
+)
+def test_invalid_runtime_heartbeat_never_reaches_network(
+    identity,
+    tmp_path,
+    monkeypatch,
+    credential,
+    observed_at,
+):
+    mock_http(monkeypatch, lambda _request: pytest.fail("unexpected HTTP request"))
+    bound = context(identity, tmp_path, base_url="https://agentveil.dev")
+    assert callable(bound.heartbeat)
+    assert bound.heartbeat(credential, observed_at) == (400, {})
+
+
+def test_runtime_heartbeat_is_absent_for_non_console_origin(identity, tmp_path) -> None:
+    bound = context(identity, tmp_path, base_url="https://self-hosted.example")
+    assert bound is not None
+    assert bound.heartbeat is None
 
 
 @pytest.mark.parametrize("payload", [{"path": "/private/canary"}, {"content": "secret"}, {"token": "canary"}])

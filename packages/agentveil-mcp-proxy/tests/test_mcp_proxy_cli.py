@@ -572,7 +572,14 @@ def test_run_proxy_starts_and_stops_decision_summary_dispatcher(tmp_path, monkey
         "args": ["-c", "import time; time.sleep(3600)"],
     }
     (home / "mcp-proxy" / "config.json").write_text(json.dumps(config), encoding="utf-8")
-    lifecycle = {"decision_started": 0, "decision_stopped": 0, "approval_started": 0, "approval_stopped": 0}
+    lifecycle = {
+        "decision_started": 0,
+        "decision_stopped": 0,
+        "approval_started": 0,
+        "approval_stopped": 0,
+        "ca_status_started": 0,
+        "ca_status_stopped": 0,
+    }
     dispatcher_homes = {}
 
     class RecordingDecisionDispatcher:
@@ -607,6 +614,18 @@ def test_run_proxy_starts_and_stops_decision_summary_dispatcher(tmp_path, monkey
         def request_snapshot(self):
             return None
 
+    class RecordingControlledStatusDispatcher:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            dispatcher_homes["ca_status"] = kwargs["home"]
+            assert kwargs["runtime_context"] is None
+
+        def start(self):
+            lifecycle["ca_status_started"] += 1
+
+        def stop(self, **kwargs):
+            lifecycle["ca_status_stopped"] += 1
+
     monkeypatch.setattr(
         proxy_cli,
         "ConsoleDecisionSummaryDispatcher",
@@ -616,6 +635,11 @@ def test_run_proxy_starts_and_stops_decision_summary_dispatcher(tmp_path, monkey
         proxy_cli,
         "ConsoleApprovalSummaryDispatcher",
         RecordingApprovalDispatcher,
+    )
+    monkeypatch.setattr(
+        proxy_cli,
+        "ControlledAlternativesStatusDispatcher",
+        RecordingControlledStatusDispatcher,
     )
 
     assert run_proxy(
@@ -629,11 +653,14 @@ def test_run_proxy_starts_and_stops_decision_summary_dispatcher(tmp_path, monkey
         "decision_stopped": 1,
         "approval_started": 1,
         "approval_stopped": 1,
+        "ca_status_started": 1,
+        "ca_status_stopped": 1,
     }
     expected_console_home = tmp_path.home() / ".avp"
     assert dispatcher_homes == {
         "decision": expected_console_home,
         "approval": expected_console_home,
+        "ca_status": expected_console_home,
     }
 
 
@@ -4781,3 +4808,50 @@ def test_run_proxy_provider_absent_does_not_bind_controlled_runtime(tmp_path, mo
     assert captured.get("controlled_runtime") is None
     assert captured["runtime_context"] is not None
     assert captured["runtime_context"].state_root == str(home)
+
+
+def test_run_proxy_starts_ca_status_only_after_runtime_binding(tmp_path, monkeypatch):
+    home = tmp_path / "project" / ".avp"
+    monkeypatch.delenv("AVP_HOME", raising=False)
+    init_proxy(home=home, agent_name="proxy", plaintext=True)
+    config = json.loads((home / "mcp-proxy" / "config.json").read_text(encoding="utf-8"))
+    config["downstream"] = {
+        "name": "idle",
+        "command": sys.executable,
+        "args": ["-c", "import time; time.sleep(3600)"],
+    }
+    (home / "mcp-proxy" / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    bound = object()
+    captured = {"started": 0, "stopped": 0}
+
+    def bind(**kwargs):
+        captured["runtime_context"] = kwargs["runtime_context"]
+        return bound
+
+    class RecordingDispatcher:
+        def __init__(self, **kwargs):
+            captured["dispatcher_context"] = kwargs["runtime_context"]
+            captured["home"] = kwargs["home"]
+
+        def start(self):
+            captured["started"] += 1
+
+        def stop(self, **_kwargs):
+            captured["stopped"] += 1
+
+    monkeypatch.setattr(proxy_cli, "bind_controlled_alternative_runtime", bind)
+    monkeypatch.setattr(
+        proxy_cli,
+        "ControlledAlternativesStatusDispatcher",
+        RecordingDispatcher,
+    )
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(""),
+        out=io.StringIO(),
+        approval_ui_mode="none",
+    ) == 0
+    assert captured["dispatcher_context"] is captured["runtime_context"]
+    assert captured["home"] == tmp_path.home() / ".avp"
+    assert captured["started"] == 1
+    assert captured["stopped"] == 1

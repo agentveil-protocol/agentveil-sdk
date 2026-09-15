@@ -19,12 +19,19 @@ CONTEXT_VERSION = "1"
 _PATHS = {
     "preflight": "/v1/controlled-alternatives/hybrid/preflight",
     "decide": "/v1/controlled-alternatives/hybrid/decide",
+    "runtime_status": "/v1/controlled-alternatives/hybrid/runtime-status",
 }
 _FIELDS = frozenset({
     "contract_version", "profile_id", "alternative_id", "operation_ref",
     "action_family", "semantic_category", "invocation_phase", "basename_hash",
 })
 _TOKEN = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
+_CONSOLE_CREDENTIAL = re.compile(r"[A-Za-z0-9._~-]{20,128}\Z")
+_OBSERVED_AT = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z\Z"
+)
+CONSOLE_CREDENTIAL_HEADER = "X-AgentVeil-Console-Credential"
+CONSOLE_ORIGIN = "https://agentveil.dev"
 _MAX_RESPONSE = 16384
 _REQUEST_DEADLINE_SECONDS = 5.0
 _MAX_WORKER_INPUT = 8192
@@ -100,6 +107,10 @@ class ControlledAlternativeRuntimeContext:
     request: Callable[[str, Mapping[str, str]], tuple[int, Mapping[str, Any]]] = field(repr=False)
     state_root: str = field(repr=False)
     contract_version: str = CONTEXT_VERSION
+    heartbeat: Callable[[str, str], tuple[int, Mapping[str, Any]]] | None = field(
+        default=None,
+        repr=False,
+    )
 
 
 def bind_installed_runtime_context(instance: Any, context: Any) -> Any:
@@ -149,11 +160,49 @@ def build_controlled_alternative_context(
             path = _PATHS[operation]
             headers = build_auth_header(key, did, "POST", path, body)
             headers["Accept-Encoding"] = "identity"
+            return _run_bounded_exchange(CONSOLE_ORIGIN + path, headers, body.decode())
+        except Exception:
+            return 503, {}
+
+    def heartbeat(
+        console_credential: str,
+        observed_at: str,
+    ) -> tuple[int, Mapping[str, Any]]:
+        try:
+            from agentveil.auth import build_auth_header
+
+            if not isinstance(console_credential, str) or not _CONSOLE_CREDENTIAL.fullmatch(
+                console_credential
+            ):
+                return 400, {}
+            if not isinstance(observed_at, str) or not _OBSERVED_AT.fullmatch(observed_at):
+                return 400, {}
+            body = json.dumps(
+                {
+                    "schema_version": "1",
+                    "status": "active",
+                    "observed_at": observed_at,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            path = _PATHS["runtime_status"]
+            headers = build_auth_header(key, did, "POST", path, body)
+            headers[CONSOLE_CREDENTIAL_HEADER] = console_credential
+            headers["Accept-Encoding"] = "identity"
             return _run_bounded_exchange(base_url.rstrip("/") + path, headers, body.decode())
         except Exception:
             return 503, {}
 
-    return ControlledAlternativeRuntimeContext(request=request, state_root=str(state_root))
+    return ControlledAlternativeRuntimeContext(
+        request=request,
+        state_root=str(state_root),
+        heartbeat=(
+            heartbeat
+            if url.scheme == "https" and url.netloc == "agentveil.dev"
+            else None
+        ),
+    )
 
 
 if __name__ == "__main__":
