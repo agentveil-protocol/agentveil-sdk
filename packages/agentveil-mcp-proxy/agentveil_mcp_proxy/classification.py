@@ -43,6 +43,7 @@ from agentveil_mcp_proxy.policy import (
 from agentveil_mcp_proxy.content_risk_signals import derive_content_risk_signals
 from agentveil_mcp_proxy.controlled_alternatives import (
     GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+    SEMANTIC_ALTERNATIVE_ID_BY_TOOL,
     SEMANTIC_TOOL_BY_ALTERNATIVE_ID,
     is_semantic_controlled_alternative_tool,
 )
@@ -437,7 +438,9 @@ class ToolCallClassifier:
             alternative_id in rule.match.controlled_alternative_id for rule in self.config.policy.rules
         ):
             policy_aliases = tuple(name for name in (
-                GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME, SEMANTIC_TOOL_BY_ALTERNATIVE_ID[alternative_id],
+                GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+                *(semantic_name for semantic_name, semantic_id in SEMANTIC_ALTERNATIVE_ID_BY_TOOL.items()
+                  if semantic_id == alternative_id),
             ) if name != tool)
         context = ToolCallContext(
             server=self.server_name,

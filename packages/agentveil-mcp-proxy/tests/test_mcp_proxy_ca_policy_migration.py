@@ -43,7 +43,7 @@ def classify(payload, tool, alternative=STAGE):
     (STAGE, PolicyDecision.ALLOW),
     ("filesystem.restore_staged.v1", PolicyDecision.ALLOW),
     ("filesystem.cleanup_staged.v1", PolicyDecision.APPROVAL),
-    ("protected_write.prepare_patch.v1", PolicyDecision.ASK_BACKEND),
+    ("protected_write.prepare_patch.v1", PolicyDecision.ALLOW),
     ("not.implemented.v1", PolicyDecision.ASK_BACKEND),
 ])
 def test_generic_exact_operation_policy(alternative, expected):
@@ -52,12 +52,21 @@ def test_generic_exact_operation_policy(alternative, expected):
 
 @pytest.mark.parametrize("restriction", ["block", "approval", "ask_backend"])
 @pytest.mark.parametrize("match_key", ["tool", "action"])
-@pytest.mark.parametrize("restricted_tool,called_tool", [(GENERIC, "agentveil_stage_delete"), ("agentveil_stage_delete", GENERIC)])
-def test_restrictions_survive_switching_call_form(restriction, match_key, restricted_tool, called_tool):
+@pytest.mark.parametrize("restricted_tool,called_tool,alternative", [
+    (GENERIC, "agentveil_stage_delete", STAGE),
+    ("agentveil_stage_delete", GENERIC, STAGE),
+    ("agentveil_git_operation", "agentveil_prepare_git_change", "git.prepare_local_change.v1"),
+    ("agentveil_prepare_git_change", "agentveil_git_operation", "git.prepare_local_change.v1"),
+    (GENERIC, "agentveil_git_operation", "git.prepare_local_change.v1"),
+    ("agentveil_git_operation", GENERIC, "git.prepare_local_change.v1"),
+])
+def test_restrictions_survive_switching_call_form(
+    restriction, match_key, restricted_tool, called_tool, alternative,
+):
     payload = config_payload()
     payload["policy"]["rules"].append({"id": "user-explicit", "source": "user", "decision": restriction,
         "match": {match_key: [restricted_tool if match_key == "tool" else "filesystem." + restricted_tool]}})
-    assert classify(payload, called_tool).policy_evaluation.decision.value == restriction
+    assert classify(payload, called_tool, alternative).policy_evaluation.decision.value == restriction
 
 
 def test_preview_apply_preserves_all_other_config_and_identity(tmp_path):
@@ -67,7 +76,7 @@ def test_preview_apply_preserves_all_other_config_and_identity(tmp_path):
     raw = path.read_bytes()
     before_names = set(tmp_path.iterdir())
     plan = migrate_filesystem_ca_policy(path)
-    assert not plan["applied"] and len(plan["added_rule_ids"]) == 4
+    assert not plan["applied"] and len(plan["added_rule_ids"]) == 9
     assert path.read_bytes() == raw and set(tmp_path.iterdir()) == before_names
     result = migrate_filesystem_ca_policy(path, apply=True, expected_sha256=plan["config_sha256"])
     assert result["applied"] and result["reload_required"]

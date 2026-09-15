@@ -14,7 +14,7 @@ import stat
 
 from agentveil_mcp_proxy.policy import ProxyConfig, builtin_policy_pack
 
-MIGRATION_ID = "filesystem_ca_policy_v1"
+MIGRATION_ID = "filesystem_ca_policy_v2"
 MAX_CONFIG_BYTES = 1024 * 1024
 
 
@@ -109,7 +109,7 @@ def migrate_filesystem_ca_policy(
     try:
         parent = _open_parent(path)
         if apply:
-            _write_exclusive(parent, lock, b"filesystem_ca_policy_v1\n")
+            _write_exclusive(parent, lock, (MIGRATION_ID + "\n").encode())
             locked = True
         raw = _read(parent, path.name)
         digest = hashlib.sha256(raw).hexdigest()

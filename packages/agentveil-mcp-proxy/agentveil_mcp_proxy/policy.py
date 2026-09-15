@@ -1474,6 +1474,64 @@ def builtin_policy_pack(name: str) -> PolicyConfig:
         ],
         "filesystem": [
             {
+                "id": "filesystem-ca-generic-prepare-v2",
+                "source": "builtin",
+                "decision": "allow",
+                "risk_class": "write",
+                "match": {
+                    "server": ["filesystem"],
+                    "tool": ["agentveil_controlled_alternative"],
+                    "controlled_alternative_id": [
+                        "protected_write.prepare_patch.v1",
+                        "git.prepare_local_change.v1",
+                    ],
+                },
+            },
+            {
+                "id": "filesystem-ca-generic-apply-v2",
+                "source": "builtin",
+                "decision": "approval",
+                "risk_class": "write",
+                "match": {
+                    "server": ["filesystem"],
+                    "tool": ["agentveil_controlled_alternative"],
+                    "controlled_alternative_id": ["protected_write.apply_prepared_patch.v1"],
+                },
+            },
+            {
+                "id": "filesystem-ca-semantic-patch-prepare-v2",
+                "source": "builtin",
+                "decision": "allow",
+                "risk_class": "write",
+                "match": {
+                    "server": ["filesystem"],
+                    "tool": ["agentveil_prepare_patch"],
+                    "controlled_alternative_id": ["protected_write.prepare_patch.v1"],
+                },
+            },
+            {
+                "id": "filesystem-ca-semantic-git-prepare-v2",
+                "source": "builtin",
+                "decision": "allow",
+                "risk_class": "write",
+                "match": {
+                    "server": ["filesystem"],
+                    "tool": ["agentveil_prepare_git_change", "agentveil_git_operation"],
+                    "controlled_alternative_id": ["git.prepare_local_change.v1"],
+                },
+            },
+            {
+                "id": "filesystem-ca-semantic-apply-v2",
+                "source": "builtin",
+                "decision": "approval",
+                "risk_class": "write",
+                "match": {
+                    "server": ["filesystem"],
+                    "tool": ["agentveil_apply_prepared_patch"],
+                    "controlled_alternative_id": ["protected_write.apply_prepared_patch.v1"],
+                },
+            },
+            {
                 "id": "filesystem-ca-generic-recoverable-v1",
                 "source": "builtin",
                 "decision": "allow",
@@ -1592,6 +1650,28 @@ def builtin_policy_pack(name: str) -> PolicyConfig:
         # so this pack does not shadow the github pack (negative test covers
         # server "github" not matching "git" / "git-*" / "git_*").
         "git": [
+            {
+                "id": "git-ca-generic-prepare-v2",
+                "source": "builtin",
+                "decision": "allow",
+                "risk_class": "write",
+                "match": {
+                    "server": ["git"],
+                    "tool": ["agentveil_controlled_alternative"],
+                    "controlled_alternative_id": ["git.prepare_local_change.v1"],
+                },
+            },
+            {
+                "id": "git-ca-semantic-prepare-v2",
+                "source": "builtin",
+                "decision": "allow",
+                "risk_class": "write",
+                "match": {
+                    "server": ["git"],
+                    "tool": ["agentveil_prepare_git_change", "agentveil_git_operation"],
+                    "controlled_alternative_id": ["git.prepare_local_change.v1"],
+                },
+            },
             {
                 "id": "git-read",
                 "source": "builtin",

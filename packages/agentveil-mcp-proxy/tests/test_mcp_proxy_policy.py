@@ -443,6 +443,29 @@ def test_existing_serialized_default_policy_does_not_gain_ca_permission():
     assert result.decision is PolicyDecision.ASK_BACKEND
 
 
+@pytest.mark.parametrize(
+    "server,tool,alternative,expected",
+    [
+        ("filesystem", "agentveil_prepare_patch", "protected_write.prepare_patch.v1", PolicyDecision.ALLOW),
+        ("filesystem", "agentveil_apply_prepared_patch", "protected_write.apply_prepared_patch.v1", PolicyDecision.APPROVAL),
+        ("filesystem", "agentveil_git_operation", "git.prepare_local_change.v1", PolicyDecision.ALLOW),
+        ("git", "agentveil_prepare_git_change", "git.prepare_local_change.v1", PolicyDecision.ALLOW),
+        ("fs", "agentveil_prepare_patch", "protected_write.prepare_patch.v1", PolicyDecision.ASK_BACKEND),
+        ("project-filesystem", "agentveil_prepare_patch", "protected_write.prepare_patch.v1", PolicyDecision.ASK_BACKEND),
+        ("git-prod", "agentveil_git_operation", "git.prepare_local_change.v1", PolicyDecision.ASK_BACKEND),
+        ("filesystem", "agentveil_prepare_patch", "unknown.operation.v1", PolicyDecision.ASK_BACKEND),
+    ],
+)
+def test_patch_git_rules_require_exact_server_tool_and_operation(
+    server, tool, alternative, expected,
+):
+    cfg = _pack_config("git" if server.startswith("git") else "filesystem")
+    result = PolicyEngine(cfg).evaluate({
+        "server": server, "tool": tool, "controlled_alternative_id": alternative,
+    })
+    assert result.decision is expected
+
+
 @pytest.mark.parametrize("tool", ["agentveil_stage_delete", "agentveil_restore_staged", "agentveil_cleanup_staged"])
 def test_filesystem_ca_rules_without_binding_never_forward(tool):
     import json
