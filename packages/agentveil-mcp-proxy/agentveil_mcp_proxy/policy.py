@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 import fnmatch
 import hashlib
+import re
 from types import MappingProxyType
 from typing import Any, Deque, Iterable, Mapping, Sequence
 
@@ -439,13 +440,14 @@ class PolicyMatch:
     role: tuple[str, ...] = ()
     authority: tuple[str, ...] = ()
     action_family: tuple[str, ...] = ()
+    controlled_alternative_id: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any] | None = None) -> "PolicyMatch":
         data = _require_mapping(data or {}, "policy.rules[].match")
         _reject_unknown(
             data,
-            {"server", "tool", "action", "risk_class", "role", "authority", "action_family"},
+            {"server", "tool", "action", "risk_class", "role", "authority", "action_family", "controlled_alternative_id"},
             "policy.rules[].match",
         )
         return cls(
@@ -459,18 +461,29 @@ class PolicyMatch:
                 data.get("action_family"),
                 "policy.rules[].match.action_family",
             ),
+            controlled_alternative_id=_exact_ca_ids(data.get("controlled_alternative_id")),
         )
 
     def matches(self, context: "ToolCallContext") -> bool:
         return (
             _patterns_match(self.server, context.server)
-            and _patterns_match(self.tool, context.tool)
-            and _patterns_match(self.action, context.action)
+            and any(_patterns_match(self.tool, tool) for tool in (context.tool, *context.policy_tool_aliases))
+            and any(_patterns_match(self.action, action) for action in (
+                context.action, *(f"{context.server}.{tool}" for tool in context.policy_tool_aliases),
+            ))
             and _risk_match(self.risk_class, context.risk_class)
             and _patterns_match(self.role, context.role)
             and _patterns_match(self.authority, context.authority)
             and _patterns_match(self.action_family, context.action_family)
+            and (not self.controlled_alternative_id or context.controlled_alternative_id in self.controlled_alternative_id)
         )
+
+
+def _exact_ca_ids(value: Any) -> tuple[str, ...]:
+    ids = _string_patterns(value, "policy.rules[].match.controlled_alternative_id")
+    if any(re.fullmatch(r"[a-z][a-z0-9_.-]{0,127}", item) is None for item in ids):
+        raise ProxyConfigError("controlled_alternative_id must contain exact bounded identifiers")
+    return ids
 
 
 @dataclass(frozen=True)
@@ -1200,13 +1213,16 @@ class ToolCallContext:
     role: str | None = None
     authority: str | None = None
     action_family: str | None = None
+    controlled_alternative_id: str | None = None
+    # Internal normalized aliases are excluded from caller-provided mappings.
+    policy_tool_aliases: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "ToolCallContext":
         data = _require_mapping(data, "tool_call_context")
         _reject_unknown(
             data,
-            {"server", "tool", "action", "risk_class", "role", "authority", "action_family"},
+            {"server", "tool", "action", "risk_class", "role", "authority", "action_family", "controlled_alternative_id"},
             "tool_call_context",
         )
         action = data.get("action")
@@ -1215,6 +1231,9 @@ class ToolCallContext:
         role = data.get("role")
         authority = data.get("authority")
         action_family = data.get("action_family")
+        ca_id = data.get("controlled_alternative_id")
+        if ca_id is not None:
+            ca_id = _exact_ca_ids([ca_id])[0]
         if role is not None:
             role = _non_empty_str(role, "tool_call_context.role")
         if authority is not None:
@@ -1229,6 +1248,7 @@ class ToolCallContext:
             role=role,
             authority=authority,
             action_family=action_family,
+            controlled_alternative_id=ca_id,
         )
 
 
@@ -1453,6 +1473,51 @@ def builtin_policy_pack(name: str) -> PolicyConfig:
             },
         ],
         "filesystem": [
+            {
+                "id": "filesystem-ca-generic-recoverable-v1",
+                "source": "builtin",
+                "decision": "allow",
+                "risk_class": "write",
+                "match": {
+                    "server": ["filesystem", "fs", "*filesystem*"],
+                    "tool": ["agentveil_controlled_alternative"],
+                    "controlled_alternative_id": ["filesystem.stage_delete.v1", "filesystem.restore_staged.v1"],
+                },
+            },
+            {
+                "id": "filesystem-ca-generic-cleanup-v1",
+                "source": "builtin",
+                "decision": "approval",
+                "risk_class": "destructive",
+                "match": {
+                    "server": ["filesystem", "fs", "*filesystem*"],
+                    "tool": ["agentveil_controlled_alternative"],
+                    "controlled_alternative_id": ["filesystem.cleanup_staged.v1"],
+                },
+            },
+            # Serialized into newly generated routes only. The passthrough
+            # still requires an advertised, authority-bound CA implementation
+            # and validates its local inputs before executing these tools.
+            {
+                "id": "filesystem-ca-recoverable-v1",
+                "source": "builtin",
+                "decision": "allow",
+                "risk_class": "write",
+                "match": {
+                    "server": ["filesystem", "fs", "*filesystem*"],
+                    "tool": ["agentveil_stage_delete", "agentveil_restore_staged"],
+                },
+            },
+            {
+                "id": "filesystem-ca-cleanup-v1",
+                "source": "builtin",
+                "decision": "approval",
+                "risk_class": "destructive",
+                "match": {
+                    "server": ["filesystem", "fs", "*filesystem*"],
+                    "tool": ["agentveil_cleanup_staged"],
+                },
+            },
             {
                 "id": "filesystem-read",
                 "source": "builtin",

@@ -43,6 +43,32 @@ Use credential custody, egress boundaries, or API gates when an action must be
 controlled below the agent process. Those boundary patterns are preview and
 design-partner work, not general public release paths in this package.
 
+## Updating an existing filesystem CA policy
+
+Package installation does not rewrite saved policy rules. To explicitly add
+stage/restore rules and approval-gated cleanup to an existing `filesystem`
+policy, preview the change:
+
+```bash
+agentveil-mcp-proxy upgrade-ca-policy --home <project-avp-home> --json
+```
+
+Review `added_rule_ids`, stop the proxy and any config editors, then apply with
+the `config_sha256` returned by that preview:
+
+```bash
+agentveil-mcp-proxy upgrade-ca-policy --home <project-avp-home> --apply --expected-config-sha256 <preview-hash> --json
+```
+
+The command appends the versioned CA rules, preserves other config fields and
+user rules, and saves the original bytes beside the config in a hash-named
+`.bak` file. A changed config hash, conflicting rule ID or symlink stops the
+operation. Restart the proxy afterward. The rules require a working CA binding;
+they do not activate an unavailable provider or authorize irreversible cleanup.
+Generic and semantic forms share restrictions for the explicitly matched CA
+operation IDs. Older runtimes that do not support this matcher reject the
+updated config; restore the saved config before downgrading.
+
 ## What This Package Adds
 
 Agent runtimes execute agents and expose tools. `agentveil-mcp-proxy` adds a

@@ -252,10 +252,10 @@ def _validate_artifact_size_bytes(value: object) -> int:
 
 
 def _validate_eligible_package_name(value: object) -> str:
-    from agentveil_mcp_proxy.paid_install import validate_bounded_package_name
+    from agentveil_mcp_proxy.paid_install import validate_free_builder_package_name
 
     try:
-        return validate_bounded_package_name(_require_response_string(value))
+        return validate_free_builder_package_name(_require_response_string(value))
     except Exception as exc:
         raise FreeBuilderClientError("malformed_body") from exc
 

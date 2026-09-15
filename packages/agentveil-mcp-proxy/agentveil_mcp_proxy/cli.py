@@ -712,6 +712,8 @@ def _policy_to_dict(policy: PolicyConfig) -> dict[str, Any]:
             match["action"] = list(rule.match.action)
         if rule.match.risk_class:
             match["risk_class"] = [risk.value for risk in rule.match.risk_class]
+        if rule.match.controlled_alternative_id:
+            match["controlled_alternative_id"] = list(rule.match.controlled_alternative_id)
         item: dict[str, Any] = {
             "id": rule.id,
             "source": rule.source,
@@ -4364,6 +4366,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_passphrase_args(register)
     _add_json_arg(register)
 
+    ca_upgrade = subparsers.add_parser(
+        "upgrade-ca-policy", help="Preview or explicitly enable filesystem CA rules in an existing route",
+    )
+    _add_common_path_args(ca_upgrade)
+    ca_upgrade.add_argument("--apply", action="store_true")
+    ca_upgrade.add_argument("--expected-config-sha256")
+    _add_json_arg(ca_upgrade)
+
     configure = subparsers.add_parser(
         "configure-downstream",
         help="Write downstream MCP server config into the proxy config",
@@ -7090,6 +7100,22 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     try:
+        if args.command == "upgrade-ca-policy":
+            from agentveil_mcp_proxy.ca_policy_migration import CAPolicyMigrationError, migrate_filesystem_ca_policy
+            if args.apply and not args.expected_config_sha256:
+                raise ProxyCliError("--apply requires --expected-config-sha256 from preview", exit_code=2)
+            try:
+                result = migrate_filesystem_ca_policy(
+                    proxy_paths(args.home, args.config).config_path,
+                    apply=args.apply, expected_sha256=args.expected_config_sha256,
+                )
+            except CAPolicyMigrationError as exc:
+                raise ProxyCliError(str(exc), exit_code=1) from exc
+            if args.json_output:
+                _print_json(result)
+            else:
+                print(json.dumps(result, sort_keys=True))
+            return 0
         if args.command == "login":
             return run_console_login_cli(open_browser=not args.no_open)
         if args.command == "logout":

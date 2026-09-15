@@ -56,7 +56,7 @@ from agentveil_mcp_proxy.paid_provider import (
 
 TOKEN = "console-device-token-secret"
 SECRET = "SECRET_FREE_BUILDER_CANARY"
-PACKAGE_NAME = "agentveil-private-policy"
+PACKAGE_NAME = "agentveil-private-policy-thin"
 PACKAGE_VERSION = "0.1.0"
 MODULE_NAME = PACKAGE_NAME.replace("-", "_")
 
@@ -404,6 +404,38 @@ def test_sync_happy_path_installs(tmp_path):
     assert set(download_body) == {"platform", "python_version"}
     assert TOKEN not in json.dumps(download_body)
     assert SECRET not in json.dumps(download_body)
+
+
+def test_sync_rejects_legacy_eligibility_before_download(tmp_path):
+    save_credential(TOKEN, home=tmp_path)
+    wheel_bytes, artifact_hash = _build_wheel(tmp_path / "wheel")
+    transport = BackendEchoTransport(responses=[_json_response(
+        200, _eligible_response(wheel_bytes, artifact_hash, package_name="agentveil-private-policy"),
+    )])
+    result = sync_free_builder_install(
+        home=tmp_path, transport=transport,
+        discover_paid_provider_fn=lambda: PaidProviderSnapshot(provider_present=False),
+    )
+    assert result == "rejected"
+    assert len(transport.calls) == 1
+    assert not (tmp_path / "paid").exists()
+
+
+@pytest.mark.parametrize("expected_name", [PACKAGE_NAME, "agentveil-private-policy"])
+def test_free_builder_rejects_legacy_wheel_before_install(tmp_path, expected_name):
+    wheel_bytes, artifact_hash = _build_wheel(
+        tmp_path / "wheel", package_name="agentveil-private-policy",
+    )
+    home = tmp_path / "home"
+    with pytest.raises(FreeBuilderInstallError, match=ERROR_PACKAGE_NAME_MISMATCH):
+        run_free_builder_install_flow(
+            wheel_bytes=wheel_bytes, home=home, activation_credential=TOKEN,
+            expectations=FreeBuilderWheelExpectations(
+                artifact_hash=artifact_hash, artifact_size_bytes=len(wheel_bytes),
+                package_name=expected_name, package_version=PACKAGE_VERSION,
+            ),
+        )
+    assert not home.exists()
 
 
 def test_sync_production_path_rejects_hash_mismatch(tmp_path):

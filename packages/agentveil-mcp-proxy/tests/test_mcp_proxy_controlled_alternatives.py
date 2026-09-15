@@ -96,7 +96,8 @@ from agentveil_mcp_proxy.paid_install import (
     run_free_builder_install_flow,
     sha256_hex,
     vendor_root,
-    verify_free_builder_wheel_artifact,
+    parse_wheel_metadata,
+    verify_wheel_artifact,
     write_install_state,
 )
 from agentveil_mcp_proxy.paid_provider import (
@@ -2118,9 +2119,102 @@ def test_importlib_metadata_discovery_reports_missing_duplicate_and_load_failed(
     assert "cannot load" not in str(load_failed)
 
 
-VENDORED_CA_PACKAGE_NAME = "agentveil-private-policy"
+VENDORED_CA_PACKAGE_NAME = "agentveil-private-policy-thin"
 VENDORED_CA_PACKAGE_VERSION = "0.1.0"
 VENDORED_CA_MODULE_NAME = VENDORED_CA_PACKAGE_NAME.replace("-", "_")
+
+
+def test_vendored_authority_requires_context_and_preflight(tmp_path, monkeypatch):
+    from agentveil_mcp_proxy.controlled_alternatives_transport import ControlledAlternativeRuntimeContext
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    monkeypatch.setattr(ca_mod, "entry_points", lambda **kwargs: [])
+    snapshot = _active_ca_authority().to_dict()
+    source = f'''
+class Authority:
+    def __init__(self, context=None):
+        self.context = context
+    def bind_runtime_context(self, context):
+        return Authority(context)
+    def authority(self):
+        from agentveil_mcp_proxy.controlled_alternatives import ControlledAlternativeAuthoritySnapshot
+        if self.context is None:
+            return ControlledAlternativeAuthoritySnapshot().to_dict()
+        status, payload = self.context.request("preflight", {{}})
+        if status != 200 or payload.get("ok") is not True:
+            return ControlledAlternativeAuthoritySnapshot().to_dict()
+        return {snapshot!r}
+def build_provider():
+    return Authority()
+'''
+    entries = (
+        "[agentveil_mcp_proxy.controlled_alternative_authorities]\n"
+        f"ca_route_v1 = {VENDORED_CA_MODULE_NAME}.controlled_provider:build_provider\n"
+    )
+    wheel = _build_controlled_alternative_wheel(tmp_path / "wheel", source=source, entry_points=entries)
+    _install_active_controlled_alternative_vendor(home, wheel_bytes=wheel)
+    assert discover_controlled_alternative_authority().route_ready is False
+    calls = []
+    def preflight(operation, payload):
+        calls.append((operation, payload))
+        return 200, {"ok": True}
+    context = ControlledAlternativeRuntimeContext(request=preflight, state_root=str(home))
+    assert discover_controlled_alternative_authority(runtime_context=context).route_ready is True
+    assert calls == [("preflight", {})]
+    denied = ControlledAlternativeRuntimeContext(request=lambda *args: (401, {}), state_root=str(home))
+    assert discover_controlled_alternative_authority(runtime_context=denied).route_ready is False
+
+
+@pytest.mark.parametrize("entry_text", [
+    "ca_route_v1 = os:getcwd\n",
+    "ca_route_v1 = missing_package:build_provider\n",
+    "ca_route_v1 = missing_package:build_provider\nca_route_v1 = other:factory\n",
+])
+def test_vendored_authority_rejects_invalid_or_duplicate_entry(tmp_path, monkeypatch, entry_text):
+    home = tmp_path / "home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    monkeypatch.setattr(ca_mod, "entry_points", lambda **kwargs: [])
+    wheel = _build_controlled_alternative_wheel(
+        tmp_path / "wheel", entry_points="[agentveil_mcp_proxy.controlled_alternative_authorities]\n" + entry_text,
+    )
+    _install_active_controlled_alternative_vendor(home, wheel_bytes=wheel)
+    result = discover_controlled_alternative_authority()
+    assert result.route_ready is False
+    assert result.error_code in {"authority_invalid", "authority_duplicate"}
+
+
+def test_vendored_authority_rejects_symlink_metadata(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    monkeypatch.setattr(ca_mod, "entry_points", lambda **kwargs: [])
+    wheel = _build_controlled_alternative_wheel(tmp_path / "wheel")
+    _install_active_controlled_alternative_vendor(home, wheel_bytes=wheel)
+    metadata = next((home / "paid").rglob("entry_points.txt"))
+    outside = tmp_path / "outside.txt"
+    outside.write_text("[agentveil_mcp_proxy.controlled_alternative_authorities]\nca_route_v1 = os:getcwd\n")
+    metadata.unlink()
+    metadata.symlink_to(outside)
+    assert discover_controlled_alternative_authority().route_ready is False
+
+
+@pytest.mark.parametrize("duplicate", [False, True])
+def test_global_authority_failure_never_falls_back_to_vendor(monkeypatch, duplicate):
+    from agentveil_mcp_proxy import paid_install
+    class Entry:
+        name = "ca_route_v1"
+        def load(self):
+            raise RuntimeError("load failed")
+    monkeypatch.setattr(ca_mod, "entry_points", lambda **kwargs: [Entry()] * (2 if duplicate else 1))
+    calls = []
+    def unexpected_vendor_load():
+        calls.append(True)
+        raise AssertionError("must not replace a broken global authority")
+    monkeypatch.setattr(paid_install, "resolve_vendored_controlled_alternative_authority", unexpected_vendor_load)
+    result = discover_controlled_alternative_authority()
+    assert result.route_ready is False
+    assert result.error_code == ("authority_duplicate" if duplicate else "authority_invalid")
+    assert calls == []
 
 VENDORED_CA_PROVIDER_SOURCE = '''
 class _Provider:
@@ -2196,14 +2290,15 @@ def _build_controlled_alternative_wheel(
 
 
 def _install_active_controlled_alternative_vendor(home: Path, *, wheel_bytes: bytes) -> None:
-    metadata = verify_free_builder_wheel_artifact(
+    # This fixture also loads the legacy private wheel for compatibility tests;
+    # Free Builder itself is exercised separately through its thin-only flow.
+    expected = parse_wheel_metadata(wheel_bytes)
+    metadata = verify_wheel_artifact(
         wheel_bytes,
-        expectations=FreeBuilderWheelExpectations(
-            artifact_hash=sha256_hex(wheel_bytes),
-            artifact_size_bytes=len(wheel_bytes),
-            package_name=VENDORED_CA_PACKAGE_NAME,
-            package_version=VENDORED_CA_PACKAGE_VERSION,
-        ),
+        expected_hash=sha256_hex(wheel_bytes),
+        expected_size=len(wheel_bytes),
+        expected_package_name=expected.package_name,
+        expected_package_version=VENDORED_CA_PACKAGE_VERSION,
     )
     vendor_dir = vendor_root(home) / f"{metadata.package_name}-{metadata.package_version}"
     wheel_path = home / "paid" / "cache" / f"{metadata.package_name}-{metadata.package_version}.whl"

@@ -1847,7 +1847,27 @@ def discover_controlled_alternative_authority(*, runtime_context: Any = None) ->
     if len(matches) > 1:
         return _fail_closed_authority_snapshot(ERROR_AUTHORITY_DUPLICATE)
     if not matches:
-        return _fail_closed_authority_snapshot(ERROR_AUTHORITY_MISSING)
+        from agentveil_mcp_proxy.paid_install import (
+            ERROR_VENDORED_PROVIDER_MISSING,
+            ERROR_VENDORED_PROVIDER_MULTIPLE,
+            resolve_vendored_controlled_alternative_authority,
+        )
+
+        loaded, error = resolve_vendored_controlled_alternative_authority()
+        if error is not None or loaded is None:
+            code = (
+                ERROR_AUTHORITY_MISSING if error == ERROR_VENDORED_PROVIDER_MISSING
+                else ERROR_AUTHORITY_DUPLICATE if error == ERROR_VENDORED_PROVIDER_MULTIPLE
+                else ERROR_AUTHORITY_INVALID
+            )
+            return _fail_closed_authority_snapshot(code)
+        try:
+            return _load_authority_object(loaded, runtime_context)
+        except ControlledAlternativeValidationError as exc:
+            code = str(exc.args[0]) if exc.args else ERROR_AUTHORITY_INVALID
+            return _fail_closed_authority_snapshot(code)
+        except Exception:
+            return _fail_closed_authority_snapshot(ERROR_AUTHORITY_INVALID)
     try:
         loaded = matches[0].load()
     except Exception:

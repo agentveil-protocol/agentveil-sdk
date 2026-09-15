@@ -43,6 +43,7 @@ from agentveil_mcp_proxy.policy import (
 from agentveil_mcp_proxy.content_risk_signals import derive_content_risk_signals
 from agentveil_mcp_proxy.controlled_alternatives import (
     GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+    SEMANTIC_TOOL_BY_ALTERNATIVE_ID,
     is_semantic_controlled_alternative_tool,
 )
 
@@ -429,6 +430,15 @@ class ToolCallClassifier:
             action_family = "write"
             heuristic_risk = RiskClass.WRITE
         role_authority = self.config.role_authority
+        policy_aliases = ()
+        # Alias-aware restrictions activate only in policies that explicitly
+        # match this operation ID (new or explicitly migrated CA policies).
+        if alternative_id in SEMANTIC_TOOL_BY_ALTERNATIVE_ID and any(
+            alternative_id in rule.match.controlled_alternative_id for rule in self.config.policy.rules
+        ):
+            policy_aliases = tuple(name for name in (
+                GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME, SEMANTIC_TOOL_BY_ALTERNATIVE_ID[alternative_id],
+            ) if name != tool)
         context = ToolCallContext(
             server=self.server_name,
             tool=tool,
@@ -437,6 +447,8 @@ class ToolCallClassifier:
             role=role_authority.role if role_authority.is_enforced() else None,
             authority=role_authority.authority if role_authority.is_enforced() else None,
             action_family=action_family,
+            controlled_alternative_id=alternative_id,
+            policy_tool_aliases=policy_aliases,
         )
         evaluation = self.engine.evaluate(context)
         if tool == GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME or is_semantic_controlled_alternative_tool(tool):

@@ -58,7 +58,8 @@ DEFAULT_ARTIFACT_ID = "art_pkg_private_policy_001"
 # Packaged zero-config paid backend. Explicit blank AVP_PAID_API_BASE_URL
 # disables network (offline/test). Unset env uses this default.
 DEFAULT_PAID_API_BASE_URL = "https://agentveil.dev"
-ALLOWED_PACKAGE_NAMES = frozenset({DEFAULT_PACKAGE_NAME})
+FREE_BUILDER_PACKAGE_NAME = "agentveil-private-policy-thin"
+ALLOWED_PACKAGE_NAMES = frozenset({DEFAULT_PACKAGE_NAME, FREE_BUILDER_PACKAGE_NAME})
 _BOUNDED_PACKAGE_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[a-zA-Z0-9.-]{0,16})?$")
 
 BOUNDED_INSTALL_KEYS = frozenset(
@@ -533,12 +534,20 @@ def scan_paid_output_for_leaks(text: str, *, secrets: tuple[str, ...] = ()) -> N
 
 
 def validate_bounded_package_name(name: str) -> str:
-    """Accept only the allowlisted private package distribution name."""
+    """Accept only known installable distribution names; this grants no access."""
 
     normalized = name.strip()
     if normalized not in ALLOWED_PACKAGE_NAMES:
         raise PaidInstallError(ERROR_PACKAGE_NAME_MISMATCH, exit_code=1)
     if any(separator in normalized for separator in ("/", "\\", "..")):
+        raise PaidInstallError(ERROR_PACKAGE_NAME_MISMATCH, exit_code=1)
+    return normalized
+
+
+def validate_free_builder_package_name(name: str) -> str:
+    """Keep Console basic delivery restricted to the thin distribution."""
+    normalized = validate_bounded_package_name(name)
+    if normalized != FREE_BUILDER_PACKAGE_NAME:
         raise PaidInstallError(ERROR_PACKAGE_NAME_MISMATCH, exit_code=1)
     return normalized
 
@@ -750,10 +759,10 @@ def verify_free_builder_wheel_artifact(
         raise FreeBuilderInstallError("artifact_size_required")
     try:
         metadata = parse_wheel_metadata(wheel_bytes)
-        expected_package_name = validate_bounded_package_name(metadata.package_name)
+        expected_package_name = validate_free_builder_package_name(metadata.package_name)
         expected_package_version = validate_bounded_package_version(metadata.package_version)
         if bounded.package_name is not None:
-            bounded_name = validate_bounded_package_name(bounded.package_name)
+            bounded_name = validate_free_builder_package_name(bounded.package_name)
             if metadata.package_name != bounded_name:
                 raise FreeBuilderInstallError(ERROR_PACKAGE_NAME_MISMATCH)
             expected_package_name = bounded_name
@@ -1267,6 +1276,18 @@ def discover_exact_vendored_controlled_alternative_provider_entry(
 ) -> tuple[str, str]:
     """Discover the exact private_v1 controlled-alternative entry from one vendor dir."""
 
+    return _discover_exact_vendored_ca_entry(
+        vendor_dir, package_name=package_name, package_version=package_version,
+        group=_CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP,
+        entry_name=_CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_NAME,
+    )
+
+
+def _discover_exact_vendored_ca_entry(
+    vendor_dir: Path, *, package_name: str, package_version: str,
+    group: str, entry_name: str,
+) -> tuple[str, str]:
+
     dist_info_dir = _find_exact_dist_info_dir(
         vendor_dir,
         package_name=package_name,
@@ -1283,11 +1304,11 @@ def discover_exact_vendored_controlled_alternative_provider_entry(
         max_bytes=MAX_HANDOFF_ENTRY_POINTS_BYTES,
     )
     grouped = parse_vendored_entry_points(entry_points_text)
-    candidates = grouped.get(_CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP, [])
+    candidates = grouped.get(group, [])
     compatible = [
         (name, target)
         for name, target in candidates
-        if name == _CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_NAME and target
+        if name == entry_name and target
     ]
     if not compatible:
         raise PaidInstallError(ERROR_VENDORED_PROVIDER_MISSING, exit_code=1)
@@ -1315,6 +1336,26 @@ def resolve_vendored_controlled_alternative_provider(
     home: Path | None = None,
 ) -> tuple[Any | None, str | None]:
     """Load the exact vendored private_v1 controlled alternative provider object."""
+
+    return _resolve_vendored_ca_object(
+        home=home, group=_CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP,
+        entry_name=_CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_NAME,
+    )
+
+
+def resolve_vendored_controlled_alternative_authority(
+    *, home: Path | None = None,
+) -> tuple[Any | None, str | None]:
+    """Load the installed authority adapter; install state is not route authority."""
+    return _resolve_vendored_ca_object(
+        home=home, group="agentveil_mcp_proxy.controlled_alternative_authorities",
+        entry_name="ca_route_v1",
+    )
+
+
+def _resolve_vendored_ca_object(
+    *, home: Path | None, group: str, entry_name: str,
+) -> tuple[Any | None, str | None]:
 
     resolved_home = (home or Path(os.environ.get("AVP_HOME", "~/.avp"))).expanduser()
     try:
@@ -1350,10 +1391,12 @@ def resolve_vendored_controlled_alternative_provider(
 
     try:
         _assert_non_symlink_vendor_path(resolved_home, vendor_dir)
-        module_path, attr_name = discover_exact_vendored_controlled_alternative_provider_entry(
+        module_path, attr_name = _discover_exact_vendored_ca_entry(
             vendor_dir,
             package_name=expected_package_name,
             package_version=expected_package_version,
+            group=group,
+            entry_name=entry_name,
         )
         factory = load_vendored_hook_callable(
             vendor_dir,
