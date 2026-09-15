@@ -115,6 +115,7 @@ _REQUEST_KEYS = frozenset({
     "rollback_available",
     "verification_level",
     "result_hash",
+    "redirected",
 })
 _RESPONSE_KEYS = frozenset({
     "schema_version",
@@ -196,6 +197,7 @@ class DecisionSummaryPayload:
     rollback_available: bool | None = None
     verification_level: str | None = None
     result_hash: str | None = None
+    redirected: bool | None = None
 
 
 Transport = Callable[..., RawResponse]
@@ -404,18 +406,29 @@ def _controlled_summary_consistent(
     outcome: object,
     decision: object,
     target_reached: object,
+    rollback_available: object,
 ) -> bool:
-    if type(target_reached) is not bool:
+    if type(target_reached) is not bool or type(rollback_available) is not bool:
         return False
     if outcome == "denied_safely":
-        return decision == _DECISION_DENIED and target_reached is False
+        return (
+            decision == _DECISION_DENIED
+            and target_reached is False
+            and rollback_available is False
+        )
     if decision != _DECISION_ALLOWED:
         return False
     if alternative_id in _CONTROLLED_ALTERNATIVE_PREPARED_IDS:
-        return outcome == "prepared_for_review" and target_reached is False
+        return (
+            outcome == "prepared_for_review"
+            and target_reached is False
+            and rollback_available is False
+        )
     return (
         _CONTROLLED_ALTERNATIVE_COMPLETED_OUTCOMES.get(alternative_id) == outcome
         and target_reached is True
+        and rollback_available
+        is (alternative_id == "filesystem.stage_delete.v1")
     )
 
 
@@ -440,10 +453,32 @@ def _controlled_summary_fields(record: PendingApproval) -> dict[str, Any] | None
     verification_level = metadata.get("verification_level")
     if type(rollback_available) is not bool:
         return None
+    if not _controlled_summary_consistent(
+        alternative_id=alternative_id,
+        outcome=outcome,
+        decision=(
+            _DECISION_DENIED
+            # claim-check: allow evidence status enum in bounded summary mapping.
+            if record.status in {ApprovalStatus.DENIED.value, ApprovalStatus.BLOCKED.value}
+            else _DECISION_ALLOWED
+        ),
+        target_reached=target_reached,
+        rollback_available=rollback_available,
+    ):
+        return None
     if verification_level not in _CONTROLLED_ALTERNATIVE_VERIFICATION_LEVELS:
         return None
     result_hash = record.result_hash
     if not isinstance(result_hash, str) or not _RESULT_HASH_RE.fullmatch(result_hash):
+        return None
+    redirect_fields_present = any(
+        key in metadata for key in ("redirect_role", "lineage_status")
+    )
+    redirected = (
+        metadata.get("redirect_role") == "follow_up"
+        and metadata.get("lineage_status") == "verified"
+    )
+    if redirect_fields_present and not redirected:
         return None
     return {
         "controlled_alternative_id": alternative_id,
@@ -451,6 +486,7 @@ def _controlled_summary_fields(record: PendingApproval) -> dict[str, Any] | None
         "rollback_available": rollback_available,
         "verification_level": verification_level,
         "result_hash": result_hash,
+        "redirected": redirected,
     }
 
 
@@ -891,6 +927,7 @@ def payload_to_request_body(payload: DecisionSummaryPayload) -> dict[str, Any]:
         payload.rollback_available,
         payload.verification_level,
         payload.result_hash,
+        payload.redirected,
     )
     if payload.schema_version == _CONTROLLED_ALTERNATIVE_SCHEMA_VERSION:
         if any(value is None for value in controlled_values):
@@ -904,6 +941,7 @@ def payload_to_request_body(payload: DecisionSummaryPayload) -> dict[str, Any]:
             outcome=payload.controlled_outcome,
             decision=payload.decision,
             target_reached=payload.target_reached,
+            rollback_available=payload.rollback_available,
         ):
             raise DecisionSummaryClientError("invalid_request")
         if type(payload.rollback_available) is not bool:
@@ -914,12 +952,15 @@ def payload_to_request_body(payload: DecisionSummaryPayload) -> dict[str, Any]:
             payload.result_hash
         ):
             raise DecisionSummaryClientError("invalid_request")
+        if type(payload.redirected) is not bool:
+            raise DecisionSummaryClientError("invalid_request")
         body.update({
             "controlled_alternative_id": payload.controlled_alternative_id,
             "controlled_outcome": payload.controlled_outcome,
             "rollback_available": payload.rollback_available,
             "verification_level": payload.verification_level,
             "result_hash": payload.result_hash,
+            "redirected": payload.redirected,
         })
     elif any(value is not None for value in controlled_values):
         raise DecisionSummaryClientError("invalid_request")

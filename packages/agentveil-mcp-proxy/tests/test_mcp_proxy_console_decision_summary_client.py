@@ -416,6 +416,7 @@ def test_build_payload_emits_bounded_v2_controlled_alternative_summary(
         "rollback_available": rollback_available,
         "verification_level": "mechanism_verified",
         "result_hash": RESULT_HASH,
+        "redirected": False,
     }
 
 
@@ -450,6 +451,33 @@ def test_completed_ca_summary_requires_boolean_true_target(
         action_gate_metadata_jcs=_controlled_metadata(
             alternative_id,
             target_reached=target_reached,
+        ),
+        result_hash=RESULT_HASH,
+    )
+    assert build_decision_summary_payload(record) is None
+
+
+@pytest.mark.parametrize(
+    ("alternative_id", "target_reached", "invalid_rollback"),
+    [
+        ("filesystem.stage_delete.v1", True, False),
+        ("filesystem.restore_staged.v1", True, True),
+        ("filesystem.cleanup_staged.v1", True, True),
+        ("protected_write.prepare_patch.v1", False, True),
+        ("protected_write.apply_prepared_patch.v1", True, True),
+        ("git.prepare_local_change.v1", False, True),
+    ],
+)
+def test_ca_summary_rejects_operation_inconsistent_rollback(
+    alternative_id,
+    target_reached,
+    invalid_rollback,
+):
+    record = _record(
+        action_gate_metadata_jcs=_controlled_metadata(
+            alternative_id,
+            target_reached=target_reached,
+            rollback_available=invalid_rollback,
         ),
         result_hash=RESULT_HASH,
     )
@@ -493,6 +521,40 @@ def test_v1_payload_rejects_controlled_fields():
         )
 
 
+def test_v2_redirected_requires_verified_lineage_metadata():
+    verified = _record(
+        action_gate_metadata_jcs=_controlled_metadata(
+            "filesystem.stage_delete.v1",
+            target_reached=True,
+            rollback_available=True,
+            redirect_role="follow_up",
+            lineage_status="verified",
+        ),
+        result_hash=RESULT_HASH,
+    )
+    payload = build_decision_summary_payload(verified)
+    assert payload is not None
+    assert payload_to_request_body(payload)["redirected"] is True
+
+    for metadata in (
+        _controlled_metadata(
+            "filesystem.stage_delete.v1",
+            target_reached=True,
+            rollback_available=True,
+            redirect_role="follow_up",
+        ),
+        _controlled_metadata(
+            "filesystem.stage_delete.v1",
+            target_reached=True,
+            rollback_available=True,
+            lineage_status="verified",
+        ),
+    ):
+        assert build_decision_summary_payload(
+            _record(action_gate_metadata_jcs=metadata, result_hash=RESULT_HASH)
+        ) is None
+
+
 def test_v2_serializer_rejects_false_completion_claim():
     valid = build_decision_summary_payload(
         _record(
@@ -507,6 +569,22 @@ def test_v2_serializer_rejects_false_completion_claim():
     assert valid is not None
     with pytest.raises(DecisionSummaryClientError, match="invalid_request"):
         payload_to_request_body(replace(valid, target_reached=False))
+
+
+def test_v2_serializer_rejects_false_restore_availability_claim():
+    valid = build_decision_summary_payload(
+        _record(
+            action_gate_metadata_jcs=_controlled_metadata(
+                "filesystem.stage_delete.v1",
+                target_reached=True,
+                rollback_available=True,
+            ),
+            result_hash=RESULT_HASH,
+        )
+    )
+    assert valid is not None
+    with pytest.raises(DecisionSummaryClientError, match="invalid_request"):
+        payload_to_request_body(replace(valid, rollback_available=False))
 
 
 def test_v2_serializer_rejects_completed_outcome_for_prepare():
