@@ -87,6 +87,8 @@ def _pack_config(name: str) -> ProxyConfig:
             data["tool"] = list(rule.match.tool)
         if rule.match.action:
             data["action"] = list(rule.match.action)
+        if rule.match.controlled_alternative_id:
+            data["controlled_alternative_id"] = list(rule.match.controlled_alternative_id)
         if rule.match.risk_class:
             data["risk_class"] = [risk.value for risk in rule.match.risk_class]
         return data
@@ -410,6 +412,75 @@ def test_filesystem_pack_blocks_purge_tools():
     result = _evaluate_builtin_pack("filesystem", server="filesystem", tool="purge_logs")
     assert result.decision is PolicyDecision.BLOCK
     assert result.policy_rule_id == "filesystem-delete"
+
+
+@pytest.mark.parametrize("tool,expected", [
+    ("agentveil_stage_delete", PolicyDecision.ALLOW),
+    ("agentveil_restore_staged", PolicyDecision.ALLOW),
+    ("agentveil_cleanup_staged", PolicyDecision.APPROVAL),
+    ("agentveil_unknown_operation", PolicyDecision.ASK_BACKEND),
+])
+def test_new_filesystem_pack_routes_exact_ca_tools(tool, expected):
+    result = PolicyEngine(_pack_config("filesystem")).evaluate({"server": "filesystem", "tool": tool})
+    assert result.decision is expected
+
+
+@pytest.mark.parametrize("decision", [PolicyDecision.BLOCK, PolicyDecision.APPROVAL, PolicyDecision.ASK_BACKEND])
+def test_ca_rules_preserve_explicit_user_restrictions(decision):
+    from dataclasses import replace
+    from agentveil_mcp_proxy.policy import PolicyRule, PolicyMatch
+    cfg = _pack_config("filesystem")
+    user_rule = PolicyRule(id="user-restriction", source="user", decision=decision,
+                           match=PolicyMatch(tool=("agentveil_stage_delete",)))
+    cfg = replace(cfg, policy=replace(cfg.policy, rules=cfg.policy.rules + (user_rule,)))
+    result = PolicyEngine(cfg).evaluate({"server": "filesystem", "tool": "agentveil_stage_delete"})
+    assert result.decision is decision
+
+
+def test_existing_serialized_default_policy_does_not_gain_ca_permission():
+    cfg = ProxyConfig.from_dict(_base_config())
+    result = PolicyEngine(cfg).evaluate({"server": "filesystem", "tool": "agentveil_stage_delete"})
+    assert result.decision is PolicyDecision.ASK_BACKEND
+
+
+@pytest.mark.parametrize(
+    "server,tool,alternative,expected",
+    [
+        ("filesystem", "agentveil_prepare_patch", "protected_write.prepare_patch.v1", PolicyDecision.ALLOW),
+        ("filesystem", "agentveil_apply_prepared_patch", "protected_write.apply_prepared_patch.v1", PolicyDecision.APPROVAL),
+        ("filesystem", "agentveil_git_operation", "git.prepare_local_change.v1", PolicyDecision.ALLOW),
+        ("git", "agentveil_prepare_git_change", "git.prepare_local_change.v1", PolicyDecision.ALLOW),
+        ("fs", "agentveil_prepare_patch", "protected_write.prepare_patch.v1", PolicyDecision.ASK_BACKEND),
+        ("project-filesystem", "agentveil_prepare_patch", "protected_write.prepare_patch.v1", PolicyDecision.ASK_BACKEND),
+        ("git-prod", "agentveil_git_operation", "git.prepare_local_change.v1", PolicyDecision.ASK_BACKEND),
+        ("filesystem", "agentveil_prepare_patch", "unknown.operation.v1", PolicyDecision.ASK_BACKEND),
+    ],
+)
+def test_patch_git_rules_require_exact_server_tool_and_operation(
+    server, tool, alternative, expected,
+):
+    cfg = _pack_config("git" if server.startswith("git") else "filesystem")
+    result = PolicyEngine(cfg).evaluate({
+        "server": server, "tool": tool, "controlled_alternative_id": alternative,
+    })
+    assert result.decision is expected
+
+
+@pytest.mark.parametrize("tool", ["agentveil_stage_delete", "agentveil_restore_staged", "agentveil_cleanup_staged"])
+def test_filesystem_ca_rules_without_binding_never_forward(tool):
+    import json
+    from agentveil_mcp_proxy.classification import ToolCallClassifier
+    from agentveil_mcp_proxy.passthrough import McpPassthrough, DownstreamConfig
+    proxy = McpPassthrough(
+        DownstreamConfig(command="python", args=(), name="filesystem"),
+        classifier=ToolCallClassifier(_pack_config("filesystem"), server_name="filesystem"),
+    )
+    response = proxy.handle_client_line(json.dumps({
+        "jsonrpc": "2.0", "id": "unbound", "method": "tools/call",
+        "params": {"name": tool, "arguments": {"path": "note.txt"}},
+    }))
+    assert response[0]["error"]["data"]["reason"] == "unknown_tool"
+    assert proxy._downstream_tool_calls_forwarded == 0
 
 
 def test_filesystem_pack_blocks_truncate_tools():

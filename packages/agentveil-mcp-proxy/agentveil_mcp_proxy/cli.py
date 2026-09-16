@@ -230,6 +230,9 @@ from agentveil_mcp_proxy.console_decision_summary_client import (
     ConsoleDecisionSummaryDispatcher,
     attach_terminal_evidence_observer,
 )
+from agentveil_mcp_proxy.console_controlled_alternatives_status_client import (
+    ControlledAlternativesStatusDispatcher,
+)
 from agentveil_mcp_proxy.console_approval_summary_client import (
     ConsoleApprovalSummaryDispatcher,
     attach_approval_state_observer,
@@ -712,6 +715,8 @@ def _policy_to_dict(policy: PolicyConfig) -> dict[str, Any]:
             match["action"] = list(rule.match.action)
         if rule.match.risk_class:
             match["risk_class"] = [risk.value for risk in rule.match.risk_class]
+        if rule.match.controlled_alternative_id:
+            match["controlled_alternative_id"] = list(rule.match.controlled_alternative_id)
         item: dict[str, Any] = {
             "id": rule.id,
             "source": rule.source,
@@ -3057,13 +3062,22 @@ def run_proxy(
             agent_cls=AVPAgent,
             passphrase=identity_passphrase,
         )
+        controlled_runtime_context = build_controlled_alternative_context(
+            agent=proxy_agent,
+            base_url=config.avp.base_url,
+            state_root=paths.home,
+        )
         controlled_runtime = bind_controlled_alternative_runtime(
             home=paths.home,
             downstream=dict(config.downstream),
             paid_snapshot=discover_paid_provider(),
-            runtime_context=build_controlled_alternative_context(
-                agent=proxy_agent, base_url=config.avp.base_url, state_root=paths.home,
+            runtime_context=controlled_runtime_context,
+        )
+        controlled_status_dispatcher = ControlledAlternativesStatusDispatcher(
+            runtime_context=(
+                controlled_runtime_context if controlled_runtime is not None else None
             ),
+            home=console_credential_home,
         )
         passthrough = McpPassthrough(
             downstream,
@@ -3074,11 +3088,13 @@ def run_proxy(
         )
         previous_handlers = _install_run_proxy_signal_handlers(client_in)
         try:
+            controlled_status_dispatcher.start()
             return passthrough.run_stdio(client_in, out)
         except _RunProxySignalExit:
             return 0
         finally:
             _restore_signal_handlers(previous_handlers)
+            controlled_status_dispatcher.stop()
             if decision_summary_dispatcher.is_active:
                 decision_summary_dispatcher.stop()
             if approval_summary_dispatcher.is_active:
@@ -4363,6 +4379,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_path_args(register)
     _add_passphrase_args(register)
     _add_json_arg(register)
+
+    ca_upgrade = subparsers.add_parser(
+        "upgrade-ca-policy", help="Preview or explicitly enable filesystem CA rules in an existing route",
+    )
+    _add_common_path_args(ca_upgrade)
+    ca_upgrade.add_argument("--apply", action="store_true")
+    ca_upgrade.add_argument("--expected-config-sha256")
+    _add_json_arg(ca_upgrade)
 
     configure = subparsers.add_parser(
         "configure-downstream",
@@ -7090,6 +7114,22 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     try:
+        if args.command == "upgrade-ca-policy":
+            from agentveil_mcp_proxy.ca_policy_migration import CAPolicyMigrationError, migrate_filesystem_ca_policy
+            if args.apply and not args.expected_config_sha256:
+                raise ProxyCliError("--apply requires --expected-config-sha256 from preview", exit_code=2)
+            try:
+                result = migrate_filesystem_ca_policy(
+                    proxy_paths(args.home, args.config).config_path,
+                    apply=args.apply, expected_sha256=args.expected_config_sha256,
+                )
+            except CAPolicyMigrationError as exc:
+                raise ProxyCliError(str(exc), exit_code=1) from exc
+            if args.json_output:
+                _print_json(result)
+            else:
+                print(json.dumps(result, sort_keys=True))
+            return 0
         if args.command == "login":
             return run_console_login_cli(open_browser=not args.no_open)
         if args.command == "logout":

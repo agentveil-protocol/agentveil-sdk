@@ -770,23 +770,25 @@ def test_paid_activate_rejects_extra_safety_check_field(tmp_path, mock_paid_back
 
 
 def test_verify_free_builder_wheel_artifact_accepts_bounded_metadata(tmp_path):
-    wheel_path, artifact_hash = _build_test_wheel(tmp_path / "wheel-build")
+    thin_name = "agentveil-private-policy-thin"
+    wheel_path, artifact_hash = _build_test_wheel(tmp_path / "wheel-build", package_name=thin_name)
     wheel_bytes = wheel_path.read_bytes()
     metadata = verify_free_builder_wheel_artifact(
         wheel_bytes,
         expectations=FreeBuilderWheelExpectations(
             artifact_hash=artifact_hash,
             artifact_size_bytes=len(wheel_bytes),
-            package_name=PACKAGE_NAME,
+            package_name=thin_name,
             package_version=PACKAGE_VERSION,
         ),
     )
-    assert metadata.package_name == PACKAGE_NAME
+    assert metadata.package_name == thin_name
     assert metadata.package_version == PACKAGE_VERSION
 
 
 def test_verify_free_builder_wheel_artifact_rejects_hash_mismatch(tmp_path):
-    wheel_path, artifact_hash = _build_test_wheel(tmp_path / "wheel-build")
+    thin_name = "agentveil-private-policy-thin"
+    wheel_path, artifact_hash = _build_test_wheel(tmp_path / "wheel-build", package_name=thin_name)
     wheel_bytes = wheel_path.read_bytes()
     with pytest.raises(FreeBuilderInstallError):
         verify_free_builder_wheel_artifact(
@@ -794,7 +796,7 @@ def test_verify_free_builder_wheel_artifact_rejects_hash_mismatch(tmp_path):
             expectations=FreeBuilderWheelExpectations(
                 artifact_hash="0" * 64,
                 artifact_size_bytes=len(wheel_bytes),
-                package_name=PACKAGE_NAME,
+                package_name=thin_name,
                 package_version=PACKAGE_VERSION,
             ),
         )
