@@ -93,6 +93,28 @@ def test_codex_hook_allows_local_git_add_and_commit():
         assert out.getvalue() == ""
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rg --pre ./preprocessor needle ordinary.txt",
+        "rg --pre=./preprocessor needle ordinary.txt",
+        "find . -execdir touch audit-marker {} +",
+        "find . -fprint output.txt",
+        "find . -fprintf output.txt %p",
+        "find . -fls output.txt",
+        "git diff --output=output.txt",
+        "git diff --output output.txt",
+        "git show --output=output.txt",
+        "git show --output output.txt",
+    ],
+)
+def test_codex_hook_denies_audited_shell_classification_bypasses(command: str) -> None:
+    out = io.StringIO()
+    decision = codex_hook.process_hook(_payload("Bash", {"command": command}), out=out)
+    assert decision.hook_action == "deny"
+    assert classify_codex_tool("Bash", {"command": command}) is not RiskClass.READ
+
+
 def test_codex_hook_denies_broad_git_add():
     out = io.StringIO()
     decision = codex_hook.process_hook(_payload("Bash", {"command": "git add ."}), out=out)
