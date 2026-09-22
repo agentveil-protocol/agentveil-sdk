@@ -89,11 +89,15 @@ from agentveil_mcp_proxy.controlled_alternatives import (
     validate_resource_locator,
 )
 from agentveil_mcp_proxy.paid_install import (
+    COMPOSED_BASE_PACKAGE_NAME,
+    COMPOSED_BASE_PACKAGE_VERSION,
+    COMPOSED_THIN_PACKAGE_VERSION,
     FreeBuilderInstallError,
     FreeBuilderWheelExpectations,
     install_state_path,
     install_wheel_to_vendor,
     run_free_builder_install_flow,
+    run_free_builder_paired_install_flow,
     sha256_hex,
     vendor_root,
     parse_wheel_metadata,
@@ -2658,6 +2662,97 @@ def test_run_free_builder_install_flow_restores_prior_state_when_provider_inacti
     vendor_dir = vendor_root(home) / f"{VENDORED_CA_PACKAGE_NAME}-{VENDORED_CA_PACKAGE_VERSION}"
     assert not vendor_dir.exists()
     assert FREE_BUILDER_CREDENTIAL not in install_state_path(home).read_text(encoding="utf-8")
+
+
+def test_run_free_builder_paired_install_flow_discovers_controlled_alternative(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "paired-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    monkeypatch.setattr(ca_mod, "entry_points", _no_global_controlled_entries)
+    set_paid_provider_loader(None)
+    base_module = COMPOSED_BASE_PACKAGE_NAME.replace("-", "_")
+    base_wheel_dir = tmp_path / "paired-base"
+    base_wheel_dir.mkdir(parents=True, exist_ok=True)
+    base_wheel_path = base_wheel_dir / f"{COMPOSED_BASE_PACKAGE_NAME}-{COMPOSED_BASE_PACKAGE_VERSION}.whl"
+    with zipfile.ZipFile(base_wheel_path, "w") as archive:
+        archive.writestr(f"{base_module}/__init__.py", "provider_id = 'private_v1'\n")
+        archive.writestr(f"{base_module}/handoff_hook.py", HANDOFF_HOOK_SOURCE)
+        archive.writestr(f"{base_module}/vendored_provider.py", PAID_PROVIDER_SOURCE)
+        archive.writestr(
+            f"{base_module}-{COMPOSED_BASE_PACKAGE_VERSION}.dist-info/METADATA",
+            f"Name: {COMPOSED_BASE_PACKAGE_NAME}\nVersion: {COMPOSED_BASE_PACKAGE_VERSION}\n",
+        )
+        archive.writestr(
+            f"{base_module}-{COMPOSED_BASE_PACKAGE_VERSION}.dist-info/entry_points.txt",
+            (
+                f"[{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP}]\n"
+                f"{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME} = "
+                f"{base_module}.handoff_hook:run_activation_handoff\n\n"
+                f"[{PAID_PROVIDER_ENTRYPOINT_GROUP}]\n"
+                f"private_v1 = {base_module}.vendored_provider:build_vendored_provider\n"
+            ),
+        )
+        archive.writestr(
+            f"{base_module}-{COMPOSED_BASE_PACKAGE_VERSION}.dist-info/WHEEL",
+            "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        )
+    base_bytes = base_wheel_path.read_bytes()
+    base_hash = sha256_hex(base_bytes)
+    thin_module = "agentveil_private_policy_thin"
+    thin_name = "agentveil-private-policy-thin"
+    thin_wheel_path = tmp_path / "paired-thin" / f"{thin_name}-{COMPOSED_THIN_PACKAGE_VERSION}.whl"
+    thin_wheel_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(thin_wheel_path, "w") as archive:
+        archive.writestr(f"{thin_module}/__init__.py", "provider_id = 'private_v1'\n")
+        archive.writestr(f"{thin_module}/controlled_provider.py", VENDORED_CA_PROVIDER_SOURCE)
+        archive.writestr(
+            f"{thin_module}-{COMPOSED_THIN_PACKAGE_VERSION}.dist-info/METADATA",
+            f"Name: {thin_name}\nVersion: {COMPOSED_THIN_PACKAGE_VERSION}\n",
+        )
+        archive.writestr(
+            f"{thin_module}-{COMPOSED_THIN_PACKAGE_VERSION}.dist-info/entry_points.txt",
+            (
+                f"[{CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP}]\n"
+                f"private_v1 = {thin_module}.controlled_provider:build_provider\n"
+                "[agentveil_mcp_proxy.controlled_alternative_authorities]\n"
+                f"ca_route_v1 = {thin_module}.controlled_provider:build_provider\n"
+            ),
+        )
+        archive.writestr(
+            f"{thin_module}-{COMPOSED_THIN_PACKAGE_VERSION}.dist-info/WHEEL",
+            "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        )
+    thin_bytes = thin_wheel_path.read_bytes()
+    thin_hash = sha256_hex(thin_bytes)
+
+    run_free_builder_paired_install_flow(
+        base_wheel_bytes=base_bytes,
+        thin_wheel_bytes=thin_bytes,
+        home=home,
+        activation_credential=FREE_BUILDER_CREDENTIAL,
+        base_expectations=FreeBuilderWheelExpectations(
+            artifact_hash=base_hash,
+            artifact_size_bytes=len(base_bytes),
+            package_name=COMPOSED_BASE_PACKAGE_NAME,
+            package_version=COMPOSED_BASE_PACKAGE_VERSION,
+        ),
+        thin_expectations=FreeBuilderWheelExpectations(
+            artifact_hash=thin_hash,
+            artifact_size_bytes=len(thin_bytes),
+            package_name=thin_name,
+            package_version=COMPOSED_THIN_PACKAGE_VERSION,
+        ),
+    )
+    paid_snapshot = discover_paid_provider()
+    controlled = discover_controlled_alternative_provider(
+        paid_snapshot,
+        authority=_active_ca_authority(),
+    )
+    assert controlled.available is True
+    assert controlled.error_code is None
+    assert FREE_BUILDER_CREDENTIAL not in repr(controlled)
 
 
 def test_semantic_tool_constants_and_mapping() -> None:

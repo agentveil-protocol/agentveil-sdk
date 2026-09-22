@@ -68,6 +68,7 @@ from agentveil_mcp_proxy.paid_install import (
     verify_free_builder_wheel_artifact,
     verify_wheel_artifact,
     write_install_state,
+    run_free_builder_paired_install_flow,
 )
 from agentveil_mcp_proxy.controlled_alternatives import (
     CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP,
@@ -85,6 +86,76 @@ PRESIGNED_URL = (
     "?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=secret"
 )
 CUSTOMER_REF = "cust_demo0001"
+
+_VENDORED_PROVIDER_DEFAULT_HOME_SOURCE = """
+from agentveil_mcp_proxy.paid_activation import default_home
+
+class _Provider:
+    provider_id = 'private_v1'
+    provider_contract_version = '1'
+
+    def status(self):
+        install_path = default_home() / 'paid' / 'install.json'
+        if install_path.is_file():
+            return {
+                'provider_present': True,
+                'provider_id': 'private_v1',
+                'provider_contract_version': '1',
+                'status': 'active',
+                'private_provider_enabled': True,
+                'public_fallback_available': True,
+                'summary': 'ok',
+                'error_code': None,
+            }
+        return {
+            'provider_present': True,
+            'provider_id': 'private_v1',
+            'provider_contract_version': '1',
+            'status': 'missing',
+            'private_provider_enabled': False,
+            'public_fallback_available': True,
+            'summary': 'awaiting install state',
+            'error_code': None,
+        }
+
+def build_vendored_provider():
+    return _Provider()
+"""
+
+_VENDORED_PROVIDER_REQUIRES_ACTIVATION_JSON = """
+from agentveil_mcp_proxy.paid_activation import default_home
+
+class _Provider:
+    provider_id = 'private_v1'
+    provider_contract_version = '1'
+
+    def status(self):
+        activation_path = default_home() / 'paid' / 'activation.json'
+        if activation_path.is_file():
+            return {
+                'provider_present': True,
+                'provider_id': 'private_v1',
+                'provider_contract_version': '1',
+                'status': 'active',
+                'private_provider_enabled': True,
+                'public_fallback_available': True,
+                'summary': 'ok',
+                'error_code': None,
+            }
+        return {
+            'provider_present': True,
+            'provider_id': 'private_v1',
+            'provider_contract_version': '1',
+            'status': 'missing',
+            'private_provider_enabled': False,
+            'public_fallback_available': True,
+            'summary': 'awaiting activation state',
+            'error_code': None,
+        }
+
+def build_vendored_provider():
+    return _Provider()
+"""
 
 
 @dataclass
@@ -359,10 +430,23 @@ def _build_composed_base_wheel(
     module = COMPOSED_BASE_PACKAGE_NAME.replace("-", "_")
     extra = {
         f"{module}/vendored_provider.py": (
+            "import os\n"
+            "from pathlib import Path\n"
             "class _Provider:\n"
             "    provider_id = 'private_v1'\n"
             "    provider_contract_version = '1'\n"
+            "    def _install_path(self):\n"
+            "        home = os.environ.get('AVP_HOME')\n"
+            "        if not home:\n"
+            "            return None\n"
+            "        return Path(home) / 'paid' / 'install.json'\n"
             "    def status(self):\n"
+            "        install_path = self._install_path()\n"
+            "        if install_path is None or not install_path.is_file():\n"
+            "            return {'provider_present': True, 'provider_id': 'private_v1', "
+            "'provider_contract_version': '1', 'status': 'missing', "
+            "'private_provider_enabled': False, 'public_fallback_available': True, "
+            "'summary': 'awaiting install state', 'error_code': None}\n"
             "        return {'provider_present': True, 'provider_id': 'private_v1', "
             "'provider_contract_version': '1', 'status': 'active', "
             "'private_provider_enabled': True, 'public_fallback_available': True, "
@@ -415,6 +499,34 @@ def _build_composed_thin_wheel(
         package_version=COMPOSED_THIN_PACKAGE_VERSION,
         extra_entries=extra,
     )
+
+
+def _start_mock_paid_backend(
+    tmp_path: Path,
+    *,
+    base_extra_entries: dict[str, str] | None = None,
+) -> tuple[str, ThreadingHTTPServer, threading.Thread]:
+    base_wheel_path, base_hash = _build_composed_base_wheel(
+        tmp_path / "wheel-base",
+        extra_entries=base_extra_entries,
+    )
+    thin_wheel_path, thin_hash = _build_composed_thin_wheel(tmp_path / "wheel-thin")
+    state = _MockBackendState(
+        base_wheel_bytes=base_wheel_path.read_bytes(),
+        base_artifact_hash=base_hash,
+        base_artifact_size=len(base_wheel_path.read_bytes()),
+        thin_wheel_bytes=thin_wheel_path.read_bytes(),
+        thin_artifact_hash=thin_hash,
+        thin_artifact_size=len(thin_wheel_path.read_bytes()),
+        post_paths=[],
+        authorize_artifact_ids=[],
+    )
+    _MockPaidBackendHandler.state = state
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _MockPaidBackendHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    return base_url, server, thread
 
 
 @pytest.fixture
@@ -482,6 +594,38 @@ def _run_main_with_backend(
             os.environ.pop("AVP_HOME", None)
         else:
             os.environ["AVP_HOME"] = previous_home
+        if previous_base is None:
+            os.environ["AVP_PAID_API_BASE_URL"] = ""
+        else:
+            os.environ["AVP_PAID_API_BASE_URL"] = previous_base
+        set_paid_backend_client(None)
+    return code, stdout.getvalue(), stderr.getvalue()
+
+
+def _run_main_with_backend_preserve_ambient_avp_home(
+    argv: list[str],
+    *,
+    base_url: str,
+    stdin_text: str | None = None,
+) -> tuple[int, str, str]:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    previous_base = os.environ.get("AVP_PAID_API_BASE_URL")
+    os.environ["AVP_PAID_API_BASE_URL"] = base_url
+    set_paid_backend_client(HttpPaidBackendClient(base_url=base_url))
+    previous_stdout = sys.stdout
+    previous_stderr = sys.stderr
+    previous_stdin = sys.stdin
+    sys.stdout = stdout
+    sys.stderr = stderr
+    if stdin_text is not None:
+        sys.stdin = io.StringIO(stdin_text)
+    try:
+        code = main(argv)
+    finally:
+        sys.stdout = previous_stdout
+        sys.stderr = previous_stderr
+        sys.stdin = previous_stdin
         if previous_base is None:
             os.environ["AVP_PAID_API_BASE_URL"] = ""
         else:
@@ -938,6 +1082,360 @@ def test_verify_free_builder_wheel_artifact_rejects_hash_mismatch(tmp_path):
                 package_version=PACKAGE_VERSION,
             ),
         )
+
+
+def test_run_free_builder_paired_install_flow_persists_split_state(tmp_path, monkeypatch):
+    from agentveil_mcp_proxy.paid_provider import (
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP,
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME,
+        PAID_PROVIDER_ENTRYPOINT_GROUP,
+    )
+
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    base_module = COMPOSED_BASE_PACKAGE_NAME.replace("-", "_")
+    handoff_source = """
+def run_activation_handoff(request):
+    return {
+        "contract_version": "1",
+        "status": "active",
+        "public_fallback_available": True,
+        "summary": "Installed hook completed.",
+        "error_code": None,
+    }
+"""
+    base_wheel_path, base_hash = _build_composed_base_wheel(
+        tmp_path / "wheel-base",
+        extra_entries={
+            f"{base_module}/handoff_hook.py": handoff_source,
+            f"{base_module}-{COMPOSED_BASE_PACKAGE_VERSION}.dist-info/entry_points.txt": (
+                f"[{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP}]\n"
+                f"{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME} = "
+                f"{base_module}.handoff_hook:run_activation_handoff\n\n"
+                f"[{PAID_PROVIDER_ENTRYPOINT_GROUP}]\n"
+                f"private_v1 = {base_module}.vendored_provider:build_vendored_provider\n"
+            ),
+        },
+    )
+    thin_wheel_path, thin_hash = _build_composed_thin_wheel(tmp_path / "wheel-thin")
+    base_bytes = base_wheel_path.read_bytes()
+    thin_bytes = thin_wheel_path.read_bytes()
+    result = run_free_builder_paired_install_flow(
+        base_wheel_bytes=base_bytes,
+        thin_wheel_bytes=thin_bytes,
+        home=home,
+        activation_credential=RAW_LICENSE_KEY,
+        base_expectations=FreeBuilderWheelExpectations(
+            artifact_hash=base_hash,
+            artifact_size_bytes=len(base_bytes),
+            package_name=COMPOSED_BASE_PACKAGE_NAME,
+            package_version=COMPOSED_BASE_PACKAGE_VERSION,
+        ),
+        thin_expectations=FreeBuilderWheelExpectations(
+            artifact_hash=thin_hash,
+            artifact_size_bytes=len(thin_bytes),
+            package_name=THIN_PACKAGE_NAME,
+            package_version=COMPOSED_THIN_PACKAGE_VERSION,
+        ),
+    )
+    assert result.install_state["install_composition_version"] == COMPOSED_INSTALL_COMPOSITION_VERSION
+    roles = {entry["role"] for entry in result.install_state["install_components"]}
+    assert roles == {COMPONENT_ROLE_BASE, COMPONENT_ROLE_THIN}
+    assert resolve_vendored_paid_provider(home=home) is not None
+    provider, error = resolve_vendored_controlled_alternative_provider(home=home)
+    assert error is None and provider is not None
+
+
+def test_run_free_builder_paired_install_honors_explicit_home_over_ambient_avp_home(
+    tmp_path, monkeypatch,
+):
+    from agentveil_mcp_proxy.paid_provider import (
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP,
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME,
+        PAID_PROVIDER_ENTRYPOINT_GROUP,
+    )
+
+    explicit_home = tmp_path / "explicit-home"
+    ambient_home = tmp_path / "ambient-home"
+    monkeypatch.setenv("AVP_HOME", str(ambient_home))
+    base_module = COMPOSED_BASE_PACKAGE_NAME.replace("-", "_")
+    handoff_source = """
+def run_activation_handoff(request):
+    return {
+        "contract_version": "1",
+        "status": "active",
+        "public_fallback_available": True,
+        "summary": "Installed hook completed.",
+        "error_code": None,
+    }
+"""
+    base_wheel_path, base_hash = _build_composed_base_wheel(
+        tmp_path / "wheel-base",
+        extra_entries={
+            f"{base_module}/vendored_provider.py": _VENDORED_PROVIDER_DEFAULT_HOME_SOURCE,
+            f"{base_module}/handoff_hook.py": handoff_source,
+            f"{base_module}-{COMPOSED_BASE_PACKAGE_VERSION}.dist-info/entry_points.txt": (
+                f"[{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP}]\n"
+                f"{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME} = "
+                f"{base_module}.handoff_hook:run_activation_handoff\n\n"
+                f"[{PAID_PROVIDER_ENTRYPOINT_GROUP}]\n"
+                f"private_v1 = {base_module}.vendored_provider:build_vendored_provider\n"
+            ),
+        },
+    )
+    thin_wheel_path, thin_hash = _build_composed_thin_wheel(tmp_path / "wheel-thin")
+    base_bytes = base_wheel_path.read_bytes()
+    thin_bytes = thin_wheel_path.read_bytes()
+    result = run_free_builder_paired_install_flow(
+        base_wheel_bytes=base_bytes,
+        thin_wheel_bytes=thin_bytes,
+        home=explicit_home,
+        activation_credential=RAW_LICENSE_KEY,
+        base_expectations=FreeBuilderWheelExpectations(
+            artifact_hash=base_hash,
+            artifact_size_bytes=len(base_bytes),
+            package_name=COMPOSED_BASE_PACKAGE_NAME,
+            package_version=COMPOSED_BASE_PACKAGE_VERSION,
+        ),
+        thin_expectations=FreeBuilderWheelExpectations(
+            artifact_hash=thin_hash,
+            artifact_size_bytes=len(thin_bytes),
+            package_name=THIN_PACKAGE_NAME,
+            package_version=COMPOSED_THIN_PACKAGE_VERSION,
+        ),
+    )
+    assert result.install_state["status"] == STATUS_ACTIVE
+    assert install_state_path(explicit_home).is_file()
+    assert not install_state_path(ambient_home).exists()
+    _assert_no_paid_leaks(json.dumps(result.install_state))
+
+
+def test_run_free_builder_paired_rollback_preserves_prior_state_with_ambient_home_mismatch(
+    tmp_path, monkeypatch,
+):
+    import agentveil_mcp_proxy.paid_install as paid_install_module
+    from agentveil_mcp_proxy.paid_provider import (
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP,
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME,
+        PAID_PROVIDER_ENTRYPOINT_GROUP,
+    )
+
+    explicit_home = tmp_path / "explicit-home"
+    ambient_home = tmp_path / "ambient-home"
+    monkeypatch.setenv("AVP_HOME", str(ambient_home))
+    install_path = install_state_path(explicit_home)
+    install_path.parent.mkdir(parents=True, exist_ok=True)
+    install_path.write_text(
+        json.dumps(
+            {
+                "status": STATUS_ACTIVE,
+                "provider_id": "private_v1",
+                "package_name": PACKAGE_NAME,
+                "package_version": PACKAGE_VERSION,
+                "public_fallback_available": True,
+                "error_code": None,
+                "last_installed_at": "2026-08-08T12:00:00+00:00",
+                "install_safety_state": INSTALL_SAFETY_STATE_VERIFIED,
+                "install_safety_reason": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    prior_install_bytes = install_path.read_bytes()
+
+    base_module = COMPOSED_BASE_PACKAGE_NAME.replace("-", "_")
+    handoff_source = """
+def run_activation_handoff(request):
+    return {
+        "contract_version": "1",
+        "status": "active",
+        "public_fallback_available": True,
+        "summary": "Installed hook completed.",
+        "error_code": None,
+    }
+"""
+    base_wheel_path, base_hash = _build_composed_base_wheel(
+        tmp_path / "wheel-base",
+        extra_entries={
+            f"{base_module}/vendored_provider.py": _VENDORED_PROVIDER_DEFAULT_HOME_SOURCE,
+            f"{base_module}/handoff_hook.py": handoff_source,
+            f"{base_module}-{COMPOSED_BASE_PACKAGE_VERSION}.dist-info/entry_points.txt": (
+                f"[{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP}]\n"
+                f"{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME} = "
+                f"{base_module}.handoff_hook:run_activation_handoff\n\n"
+                f"[{PAID_PROVIDER_ENTRYPOINT_GROUP}]\n"
+                f"private_v1 = {base_module}.vendored_provider:build_vendored_provider\n"
+            ),
+        },
+    )
+    thin_wheel_path, thin_hash = _build_composed_thin_wheel(tmp_path / "wheel-thin")
+    base_bytes = base_wheel_path.read_bytes()
+    thin_bytes = thin_wheel_path.read_bytes()
+
+    original_install = paid_install_module.install_wheel_to_vendor
+    install_calls = {"count": 0}
+
+    def fail_on_second_install(**kwargs):  # noqa: ANN003
+        install_calls["count"] += 1
+        if install_calls["count"] == 2:
+            raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
+        return original_install(**kwargs)
+
+    monkeypatch.setattr(paid_install_module, "install_wheel_to_vendor", fail_on_second_install)
+    with pytest.raises(FreeBuilderInstallError):
+        run_free_builder_paired_install_flow(
+            base_wheel_bytes=base_bytes,
+            thin_wheel_bytes=thin_bytes,
+            home=explicit_home,
+            activation_credential=RAW_LICENSE_KEY,
+            base_expectations=FreeBuilderWheelExpectations(
+                artifact_hash=base_hash,
+                artifact_size_bytes=len(base_bytes),
+                package_name=COMPOSED_BASE_PACKAGE_NAME,
+                package_version=COMPOSED_BASE_PACKAGE_VERSION,
+            ),
+            thin_expectations=FreeBuilderWheelExpectations(
+                artifact_hash=thin_hash,
+                artifact_size_bytes=len(thin_bytes),
+                package_name=THIN_PACKAGE_NAME,
+                package_version=COMPOSED_THIN_PACKAGE_VERSION,
+            ),
+        )
+    assert install_path.read_bytes() == prior_install_bytes
+    assert not (vendor_root(explicit_home) / f"{COMPOSED_BASE_PACKAGE_NAME}-{COMPOSED_BASE_PACKAGE_VERSION}").exists()
+
+
+def test_paid_activate_explicit_home_with_ambient_avp_home_mismatch(tmp_path, monkeypatch):
+    explicit_home = tmp_path / "explicit-home"
+    ambient_home = tmp_path / "ambient-home"
+    monkeypatch.setenv("AVP_HOME", str(ambient_home))
+    base_module = COMPOSED_BASE_PACKAGE_NAME.replace("-", "_")
+    base_url, server, thread = _start_mock_paid_backend(
+        tmp_path / "backend",
+        base_extra_entries={
+            f"{base_module}/vendored_provider.py": _VENDORED_PROVIDER_DEFAULT_HOME_SOURCE,
+        },
+    )
+    try:
+        code, out, err = _run_main_with_backend_preserve_ambient_avp_home(
+            ["paid", "activate", "--license-key-stdin", "--home", str(explicit_home)],
+            base_url=base_url,
+            stdin_text=f"{RAW_LICENSE_KEY}\n",
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+    assert code == 0, err
+    assert install_state_path(explicit_home).is_file()
+    assert not install_state_path(ambient_home).exists()
+    _assert_no_paid_leaks(out + err)
+
+
+def test_paid_activate_succeeds_when_provider_active_only_after_activation_json(
+    tmp_path, monkeypatch,
+):
+    """Regression: paid install must not require live provider.active before activation.json."""
+
+    from agentveil_mcp_proxy.paid_activation import build_paid_activate_payload
+
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    base_module = COMPOSED_BASE_PACKAGE_NAME.replace("-", "_")
+    base_url, server, thread = _start_mock_paid_backend(
+        tmp_path / "backend",
+        base_extra_entries={
+            f"{base_module}/vendored_provider.py": _VENDORED_PROVIDER_REQUIRES_ACTIVATION_JSON,
+        },
+    )
+    try:
+        set_paid_backend_client(HttpPaidBackendClient(base_url=base_url))
+        payload = build_paid_activate_payload(license_key=RAW_LICENSE_KEY, home=home)
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+    assert payload["activation"]["status"] == STATUS_ACTIVE
+    install_file = home / "paid" / INSTALL_FILENAME
+    activation_file = home / "paid" / ACTIVATION_FILENAME
+    assert install_file.is_file()
+    assert activation_file.is_file()
+    saved_install = json.loads(install_file.read_text(encoding="utf-8"))
+    assert saved_install["status"] == STATUS_ACTIVE
+    assert saved_install["install_composition_version"] == COMPOSED_INSTALL_COMPOSITION_VERSION
+    roles = {entry["role"] for entry in saved_install["install_components"]}
+    assert roles == {COMPONENT_ROLE_BASE, COMPONENT_ROLE_THIN}
+    _assert_no_paid_leaks("", file_text=install_file.read_text(encoding="utf-8"))
+    _assert_no_paid_leaks("", file_text=activation_file.read_text(encoding="utf-8"))
+
+
+def test_run_free_builder_paired_install_proves_missing_preinstall_then_active_post_state(
+    tmp_path, monkeypatch,
+):
+    """Fake base reports missing before durable install state, active after publish."""
+
+    from agentveil_mcp_proxy.console_project_status_client import (
+        resolve_private_guardrails_status,
+    )
+    from agentveil_mcp_proxy.paid_provider import (
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP,
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME,
+        PAID_PROVIDER_ENTRYPOINT_GROUP,
+        normalize_provider_response,
+    )
+
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    base_module = COMPOSED_BASE_PACKAGE_NAME.replace("-", "_")
+    handoff_source = """
+def run_activation_handoff(request):
+    return {
+        "contract_version": "1",
+        "status": "active",
+        "public_fallback_available": True,
+        "summary": "Installed hook completed.",
+        "error_code": None,
+    }
+"""
+    base_wheel_path, base_hash = _build_composed_base_wheel(
+        tmp_path / "wheel-base",
+        extra_entries={
+            f"{base_module}/handoff_hook.py": handoff_source,
+            f"{base_module}-{COMPOSED_BASE_PACKAGE_VERSION}.dist-info/entry_points.txt": (
+                f"[{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP}]\n"
+                f"{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME} = "
+                f"{base_module}.handoff_hook:run_activation_handoff\n\n"
+                f"[{PAID_PROVIDER_ENTRYPOINT_GROUP}]\n"
+                f"private_v1 = {base_module}.vendored_provider:build_vendored_provider\n"
+            ),
+        },
+    )
+    thin_wheel_path, thin_hash = _build_composed_thin_wheel(tmp_path / "wheel-thin")
+    base_bytes = base_wheel_path.read_bytes()
+    thin_bytes = thin_wheel_path.read_bytes()
+    preinstall_provider = resolve_vendored_paid_provider(home=home)
+    assert preinstall_provider is None
+    result = run_free_builder_paired_install_flow(
+        base_wheel_bytes=base_bytes,
+        thin_wheel_bytes=thin_bytes,
+        home=home,
+        activation_credential=RAW_LICENSE_KEY,
+        base_expectations=FreeBuilderWheelExpectations(
+            artifact_hash=base_hash,
+            artifact_size_bytes=len(base_bytes),
+            package_name=COMPOSED_BASE_PACKAGE_NAME,
+            package_version=COMPOSED_BASE_PACKAGE_VERSION,
+        ),
+        thin_expectations=FreeBuilderWheelExpectations(
+            artifact_hash=thin_hash,
+            artifact_size_bytes=len(thin_bytes),
+            package_name=THIN_PACKAGE_NAME,
+            package_version=COMPOSED_THIN_PACKAGE_VERSION,
+        ),
+    )
+    live_provider = resolve_vendored_paid_provider(home=home)
+    assert live_provider is not None
+    snapshot = normalize_provider_response(live_provider.status())
+    assert resolve_private_guardrails_status(snapshot) == "active"
+    assert result.install_state["status"] == STATUS_ACTIVE
 
 
 CA_MODULE_NAME = PACKAGE_NAME.replace("-", "_")
@@ -1727,3 +2225,485 @@ def test_repeated_composed_install_leaves_no_staging_residue(tmp_path, mock_paid
     assert list(vendor_root(home).glob("*.backup")) == []
     assert list((home / "paid" / "cache").glob("*.backup")) == []
     _assert_no_paid_leaks(out + err)
+
+
+def test_run_free_builder_paired_rejects_expectation_metadata_mismatch(tmp_path):
+    base_wheel_path, base_hash = _build_composed_base_wheel(tmp_path / "wheel-base")
+    thin_wheel_path, thin_hash = _build_composed_thin_wheel(tmp_path / "wheel-thin")
+    base_bytes = base_wheel_path.read_bytes()
+    thin_bytes = thin_wheel_path.read_bytes()
+    with pytest.raises(FreeBuilderInstallError, match=ERROR_PACKAGE_NAME_MISMATCH):
+        run_free_builder_paired_install_flow(
+            base_wheel_bytes=base_bytes,
+            thin_wheel_bytes=thin_bytes,
+            home=tmp_path / "avp-home",
+            activation_credential=RAW_LICENSE_KEY,
+            base_expectations=FreeBuilderWheelExpectations(
+                artifact_hash=base_hash,
+                artifact_size_bytes=len(base_bytes),
+                package_name=THIN_PACKAGE_NAME,
+                package_version=COMPOSED_BASE_PACKAGE_VERSION,
+            ),
+            thin_expectations=FreeBuilderWheelExpectations(
+                artifact_hash=thin_hash,
+                artifact_size_bytes=len(thin_bytes),
+                package_name=THIN_PACKAGE_NAME,
+                package_version=COMPOSED_THIN_PACKAGE_VERSION,
+            ),
+        )
+
+
+def test_run_free_builder_paired_fails_before_commit_when_paid_provider_missing(
+    tmp_path, monkeypatch,
+):
+    from agentveil_mcp_proxy.paid_provider import (
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP,
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME,
+    )
+
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    base_module = COMPOSED_BASE_PACKAGE_NAME.replace("-", "_")
+    handoff_source = """
+def run_activation_handoff(request):
+    return {
+        "contract_version": "1",
+        "status": "active",
+        "public_fallback_available": True,
+        "summary": "Installed hook completed.",
+        "error_code": None,
+    }
+"""
+    handoff_only_entry_points = (
+        f"[{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP}]\n"
+        f"{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME} = "
+        f"{base_module}.handoff_hook:run_activation_handoff\n"
+    )
+    base_wheel_path, base_hash = _build_composed_base_wheel(
+        tmp_path / "wheel-base",
+        extra_entries={
+            f"{base_module}/handoff_hook.py": handoff_source,
+            f"{base_module}-{COMPOSED_BASE_PACKAGE_VERSION}.dist-info/entry_points.txt": (
+                handoff_only_entry_points
+            ),
+        },
+    )
+    thin_wheel_path, thin_hash = _build_composed_thin_wheel(tmp_path / "wheel-thin")
+    base_bytes = base_wheel_path.read_bytes()
+    thin_bytes = thin_wheel_path.read_bytes()
+    with pytest.raises(FreeBuilderInstallError, match=ERROR_VENDORED_PROVIDER_MISSING):
+        run_free_builder_paired_install_flow(
+            base_wheel_bytes=base_bytes,
+            thin_wheel_bytes=thin_bytes,
+            home=home,
+            activation_credential=RAW_LICENSE_KEY,
+            base_expectations=FreeBuilderWheelExpectations(
+                artifact_hash=base_hash,
+                artifact_size_bytes=len(base_bytes),
+                package_name=COMPOSED_BASE_PACKAGE_NAME,
+                package_version=COMPOSED_BASE_PACKAGE_VERSION,
+            ),
+            thin_expectations=FreeBuilderWheelExpectations(
+                artifact_hash=thin_hash,
+                artifact_size_bytes=len(thin_bytes),
+                package_name=THIN_PACKAGE_NAME,
+                package_version=COMPOSED_THIN_PACKAGE_VERSION,
+            ),
+        )
+    assert not install_state_path(home).exists()
+    assert RAW_LICENSE_KEY not in (home / "paid").as_posix()
+    assert list(vendor_root(home).glob(".staging-*")) == []
+    assert list((home / "paid" / "cache").glob(".staging-*")) == []
+
+
+def test_run_free_builder_paired_rejects_inactive_base_provider_before_commit(
+    tmp_path, monkeypatch,
+):
+    from agentveil_mcp_proxy.paid_provider import (
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP,
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME,
+        PAID_PROVIDER_ENTRYPOINT_GROUP,
+    )
+
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    install_path = install_state_path(home)
+    install_path.parent.mkdir(parents=True, exist_ok=True)
+    install_path.write_text(
+        json.dumps(
+            {
+                "status": STATUS_ACTIVE,
+                "provider_id": "private_v1",
+                "package_name": PACKAGE_NAME,
+                "package_version": PACKAGE_VERSION,
+                "public_fallback_available": True,
+                "error_code": None,
+                "last_installed_at": "2026-08-08T12:00:00+00:00",
+                "install_safety_state": INSTALL_SAFETY_STATE_VERIFIED,
+                "install_safety_reason": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    prior_install_bytes = install_path.read_bytes()
+    legacy_vendor = vendor_root(home) / f"{PACKAGE_NAME}-{PACKAGE_VERSION}"
+    legacy_wheel, _ = _build_test_wheel(tmp_path / "legacy-wheel")
+    install_wheel_to_vendor(
+        home=home,
+        wheel_path=legacy_wheel,
+        target_dir=legacy_vendor,
+        expected_package_name=PACKAGE_NAME,
+        expected_package_version=PACKAGE_VERSION,
+        require_empty_target=True,
+    )
+    legacy_marker = legacy_vendor / "legacy-marker.txt"
+    legacy_marker.write_text("keep-me", encoding="utf-8")
+    prior_vendor_bytes = legacy_marker.read_bytes()
+    cache_path = home / "paid" / "cache" / f"{PACKAGE_NAME}-{PACKAGE_VERSION}.whl"
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_bytes(b"prior-cache-wheel")
+    prior_cache_bytes = cache_path.read_bytes()
+
+    base_module = COMPOSED_BASE_PACKAGE_NAME.replace("-", "_")
+    handoff_source = """
+def run_activation_handoff(request):
+    return {
+        "contract_version": "1",
+        "status": "active",
+        "public_fallback_available": True,
+        "summary": "Installed hook completed.",
+        "error_code": None,
+    }
+"""
+    inactive_provider_source = """
+class _Provider:
+    provider_id = 'private_v1'
+    provider_contract_version = '1'
+    def status(self):
+        return {
+            'provider_present': True,
+            'provider_id': 'private_v1',
+            'provider_contract_version': '1',
+            'status': 'revoked',
+            'private_provider_enabled': False,
+            'public_fallback_available': True,
+            'summary': 'inactive',
+            'error_code': None,
+        }
+def build_vendored_provider():
+    return _Provider()
+"""
+    base_wheel_path, base_hash = _build_composed_base_wheel(
+        tmp_path / "wheel-base",
+        extra_entries={
+            f"{base_module}/handoff_hook.py": handoff_source,
+            f"{base_module}/vendored_provider.py": inactive_provider_source,
+            f"{base_module}-{COMPOSED_BASE_PACKAGE_VERSION}.dist-info/entry_points.txt": (
+                f"[{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP}]\n"
+                f"{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME} = "
+                f"{base_module}.handoff_hook:run_activation_handoff\n\n"
+                f"[{PAID_PROVIDER_ENTRYPOINT_GROUP}]\n"
+                f"private_v1 = {base_module}.vendored_provider:build_vendored_provider\n"
+            ),
+        },
+    )
+    thin_wheel_path, thin_hash = _build_composed_thin_wheel(tmp_path / "wheel-thin")
+    with pytest.raises(FreeBuilderInstallError, match=ERROR_VENDORED_PROVIDER_MALFORMED):
+        run_free_builder_paired_install_flow(
+            base_wheel_bytes=base_wheel_path.read_bytes(),
+            thin_wheel_bytes=thin_wheel_path.read_bytes(),
+            home=home,
+            activation_credential=RAW_LICENSE_KEY,
+            base_expectations=FreeBuilderWheelExpectations(
+                artifact_hash=base_hash,
+                artifact_size_bytes=len(base_wheel_path.read_bytes()),
+                package_name=COMPOSED_BASE_PACKAGE_NAME,
+                package_version=COMPOSED_BASE_PACKAGE_VERSION,
+            ),
+            thin_expectations=FreeBuilderWheelExpectations(
+                artifact_hash=thin_hash,
+                artifact_size_bytes=len(thin_wheel_path.read_bytes()),
+                package_name=THIN_PACKAGE_NAME,
+                package_version=COMPOSED_THIN_PACKAGE_VERSION,
+            ),
+        )
+    assert install_path.read_bytes() == prior_install_bytes
+    assert legacy_marker.read_bytes() == prior_vendor_bytes
+    assert cache_path.read_bytes() == prior_cache_bytes
+    assert not (vendor_root(home) / f"{COMPOSED_BASE_PACKAGE_NAME}-{COMPOSED_BASE_PACKAGE_VERSION}").exists()
+    assert not (vendor_root(home) / f"{THIN_PACKAGE_NAME}-{COMPOSED_THIN_PACKAGE_VERSION}").exists()
+    assert list(vendor_root(home).glob(".staging-*")) == []
+    assert list((home / "paid" / "cache").glob(".staging-*")) == []
+
+
+def test_run_free_builder_paired_rejects_thin_authority_missing_before_commit(
+    tmp_path, monkeypatch,
+):
+    from agentveil_mcp_proxy.paid_provider import (
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP,
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME,
+        PAID_PROVIDER_ENTRYPOINT_GROUP,
+    )
+
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    install_path = install_state_path(home)
+    install_path.parent.mkdir(parents=True, exist_ok=True)
+    install_path.write_text(
+        json.dumps(
+            {
+                "status": STATUS_ACTIVE,
+                "provider_id": "private_v1",
+                "package_name": PACKAGE_NAME,
+                "package_version": PACKAGE_VERSION,
+                "public_fallback_available": True,
+                "error_code": None,
+                "last_installed_at": "2026-08-08T12:00:00+00:00",
+                "install_safety_state": INSTALL_SAFETY_STATE_VERIFIED,
+                "install_safety_reason": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    prior_install_bytes = install_path.read_bytes()
+
+    base_module = COMPOSED_BASE_PACKAGE_NAME.replace("-", "_")
+    thin_module = THIN_PACKAGE_NAME.replace("-", "_")
+    handoff_source = """
+def run_activation_handoff(request):
+    return {
+        "contract_version": "1",
+        "status": "active",
+        "public_fallback_available": True,
+        "summary": "Installed hook completed.",
+        "error_code": None,
+    }
+"""
+    base_wheel_path, base_hash = _build_composed_base_wheel(
+        tmp_path / "wheel-base",
+        extra_entries={
+            f"{base_module}/handoff_hook.py": handoff_source,
+            f"{base_module}-{COMPOSED_BASE_PACKAGE_VERSION}.dist-info/entry_points.txt": (
+                f"[{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP}]\n"
+                f"{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME} = "
+                f"{base_module}.handoff_hook:run_activation_handoff\n\n"
+                f"[{PAID_PROVIDER_ENTRYPOINT_GROUP}]\n"
+                f"private_v1 = {base_module}.vendored_provider:build_vendored_provider\n"
+            ),
+        },
+    )
+    thin_wheel_path, thin_hash = _build_composed_thin_wheel(
+        tmp_path / "wheel-thin",
+        extra_entries={
+            f"{thin_module}-{COMPOSED_THIN_PACKAGE_VERSION}.dist-info/entry_points.txt": (
+                f"[{CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP}]\n"
+                f"private_v1 = {thin_module}.controlled_provider:build_provider\n"
+            ),
+        },
+    )
+    with pytest.raises(FreeBuilderInstallError, match=ERROR_VENDORED_PROVIDER_MISSING):
+        run_free_builder_paired_install_flow(
+            base_wheel_bytes=base_wheel_path.read_bytes(),
+            thin_wheel_bytes=thin_wheel_path.read_bytes(),
+            home=home,
+            activation_credential=RAW_LICENSE_KEY,
+            base_expectations=FreeBuilderWheelExpectations(
+                artifact_hash=base_hash,
+                artifact_size_bytes=len(base_wheel_path.read_bytes()),
+                package_name=COMPOSED_BASE_PACKAGE_NAME,
+                package_version=COMPOSED_BASE_PACKAGE_VERSION,
+            ),
+            thin_expectations=FreeBuilderWheelExpectations(
+                artifact_hash=thin_hash,
+                artifact_size_bytes=len(thin_wheel_path.read_bytes()),
+                package_name=THIN_PACKAGE_NAME,
+                package_version=COMPOSED_THIN_PACKAGE_VERSION,
+            ),
+        )
+    assert install_path.read_bytes() == prior_install_bytes
+    assert list(vendor_root(home).glob(".staging-*")) == []
+    assert list((home / "paid" / "cache").glob(".staging-*")) == []
+
+
+def test_run_free_builder_paired_rejects_malformed_thin_authority_before_commit(
+    tmp_path, monkeypatch,
+):
+    from agentveil_mcp_proxy.paid_provider import (
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP,
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME,
+        PAID_PROVIDER_ENTRYPOINT_GROUP,
+    )
+
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    install_path = install_state_path(home)
+    install_path.parent.mkdir(parents=True, exist_ok=True)
+    install_path.write_text(
+        json.dumps(
+            {
+                "status": STATUS_ACTIVE,
+                "provider_id": "private_v1",
+                "package_name": PACKAGE_NAME,
+                "package_version": PACKAGE_VERSION,
+                "public_fallback_available": True,
+                "error_code": None,
+                "last_installed_at": "2026-08-08T12:00:00+00:00",
+                "install_safety_state": INSTALL_SAFETY_STATE_VERIFIED,
+                "install_safety_reason": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    prior_install_bytes = install_path.read_bytes()
+
+    base_module = COMPOSED_BASE_PACKAGE_NAME.replace("-", "_")
+    thin_module = THIN_PACKAGE_NAME.replace("-", "_")
+    handoff_source = """
+def run_activation_handoff(request):
+    return {
+        "contract_version": "1",
+        "status": "active",
+        "public_fallback_available": True,
+        "summary": "Installed hook completed.",
+        "error_code": None,
+    }
+"""
+    base_wheel_path, base_hash = _build_composed_base_wheel(
+        tmp_path / "wheel-base",
+        extra_entries={
+            f"{base_module}/handoff_hook.py": handoff_source,
+            f"{base_module}-{COMPOSED_BASE_PACKAGE_VERSION}.dist-info/entry_points.txt": (
+                f"[{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP}]\n"
+                f"{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME} = "
+                f"{base_module}.handoff_hook:run_activation_handoff\n\n"
+                f"[{PAID_PROVIDER_ENTRYPOINT_GROUP}]\n"
+                f"private_v1 = {base_module}.vendored_provider:build_vendored_provider\n"
+            ),
+        },
+    )
+    thin_wheel_path, thin_hash = _build_composed_thin_wheel(
+        tmp_path / "wheel-thin",
+        extra_entries={
+            f"{thin_module}-{COMPOSED_THIN_PACKAGE_VERSION}.dist-info/entry_points.txt": (
+                f"[{CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP}]\n"
+                f"private_v1 = {thin_module}.controlled_provider:build_provider\n"
+                "[agentveil_mcp_proxy.controlled_alternative_authorities]\n"
+                "ca_route_v1 = missing_authority_module:build_authority\n"
+            ),
+        },
+    )
+    with pytest.raises(FreeBuilderInstallError, match=ERROR_HANDOFF_HOOK_IMPORT_FAILED):
+        run_free_builder_paired_install_flow(
+            base_wheel_bytes=base_wheel_path.read_bytes(),
+            thin_wheel_bytes=thin_wheel_path.read_bytes(),
+            home=home,
+            activation_credential=RAW_LICENSE_KEY,
+            base_expectations=FreeBuilderWheelExpectations(
+                artifact_hash=base_hash,
+                artifact_size_bytes=len(base_wheel_path.read_bytes()),
+                package_name=COMPOSED_BASE_PACKAGE_NAME,
+                package_version=COMPOSED_BASE_PACKAGE_VERSION,
+            ),
+            thin_expectations=FreeBuilderWheelExpectations(
+                artifact_hash=thin_hash,
+                artifact_size_bytes=len(thin_wheel_path.read_bytes()),
+                package_name=THIN_PACKAGE_NAME,
+                package_version=COMPOSED_THIN_PACKAGE_VERSION,
+            ),
+        )
+    assert install_path.read_bytes() == prior_install_bytes
+    assert list(vendor_root(home).glob(".staging-*")) == []
+    assert list((home / "paid" / "cache").glob(".staging-*")) == []
+
+
+def test_run_free_builder_paired_second_component_stage_failure_cleans_and_preserves_prior(
+    tmp_path, monkeypatch,
+):
+    import agentveil_mcp_proxy.paid_install as paid_install_module
+
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    legacy_wheel, _legacy_hash = _build_test_wheel(tmp_path / "legacy-wheel")
+    legacy_vendor = vendor_root(home) / f"{PACKAGE_NAME}-{PACKAGE_VERSION}"
+    install_wheel_to_vendor(
+        home=home,
+        wheel_path=legacy_wheel,
+        target_dir=legacy_vendor,
+        expected_package_name=PACKAGE_NAME,
+        expected_package_version=PACKAGE_VERSION,
+        require_empty_target=True,
+    )
+    marker = legacy_vendor / "legacy-marker.txt"
+    marker.write_text("keep-me", encoding="utf-8")
+    prior_vendor_bytes = marker.read_bytes()
+
+    from agentveil_mcp_proxy.paid_provider import (
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP,
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME,
+        PAID_PROVIDER_ENTRYPOINT_GROUP,
+    )
+
+    base_module = COMPOSED_BASE_PACKAGE_NAME.replace("-", "_")
+    handoff_source = """
+def run_activation_handoff(request):
+    return {
+        "contract_version": "1",
+        "status": "active",
+        "public_fallback_available": True,
+        "summary": "Installed hook completed.",
+        "error_code": None,
+    }
+"""
+    base_wheel_path, base_hash = _build_composed_base_wheel(
+        tmp_path / "wheel-base",
+        extra_entries={
+            f"{base_module}/handoff_hook.py": handoff_source,
+            f"{base_module}-{COMPOSED_BASE_PACKAGE_VERSION}.dist-info/entry_points.txt": (
+                f"[{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP}]\n"
+                f"{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME} = "
+                f"{base_module}.handoff_hook:run_activation_handoff\n\n"
+                f"[{PAID_PROVIDER_ENTRYPOINT_GROUP}]\n"
+                f"private_v1 = {base_module}.vendored_provider:build_vendored_provider\n"
+            ),
+        },
+    )
+    thin_wheel_path, thin_hash = _build_composed_thin_wheel(tmp_path / "wheel-thin")
+    base_bytes = base_wheel_path.read_bytes()
+    thin_bytes = thin_wheel_path.read_bytes()
+
+    original_install = paid_install_module.install_wheel_to_vendor
+    install_calls = {"count": 0}
+
+    def fail_on_second_install(**kwargs):  # noqa: ANN003
+        install_calls["count"] += 1
+        if install_calls["count"] == 2:
+            raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
+        return original_install(**kwargs)
+
+    monkeypatch.setattr(paid_install_module, "install_wheel_to_vendor", fail_on_second_install)
+    with pytest.raises(FreeBuilderInstallError):
+        run_free_builder_paired_install_flow(
+            base_wheel_bytes=base_bytes,
+            thin_wheel_bytes=thin_bytes,
+            home=home,
+            activation_credential=RAW_LICENSE_KEY,
+            base_expectations=FreeBuilderWheelExpectations(
+                artifact_hash=base_hash,
+                artifact_size_bytes=len(base_bytes),
+                package_name=COMPOSED_BASE_PACKAGE_NAME,
+                package_version=COMPOSED_BASE_PACKAGE_VERSION,
+            ),
+            thin_expectations=FreeBuilderWheelExpectations(
+                artifact_hash=thin_hash,
+                artifact_size_bytes=len(thin_bytes),
+                package_name=THIN_PACKAGE_NAME,
+                package_version=COMPOSED_THIN_PACKAGE_VERSION,
+            ),
+        )
+    assert marker.read_bytes() == prior_vendor_bytes
+    assert not install_state_path(home).exists()
+    assert not (vendor_root(home) / f"{COMPOSED_BASE_PACKAGE_NAME}-{COMPOSED_BASE_PACKAGE_VERSION}").exists()
+    assert not (vendor_root(home) / f"{THIN_PACKAGE_NAME}-{COMPOSED_THIN_PACKAGE_VERSION}").exists()
+    assert list(vendor_root(home).glob(".staging-*")) == []
+    assert list((home / "paid" / "cache").glob(".staging-*")) == []
+    _assert_no_paid_leaks(marker.read_text(encoding="utf-8"))

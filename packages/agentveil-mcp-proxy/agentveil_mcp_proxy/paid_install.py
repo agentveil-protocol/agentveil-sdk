@@ -35,6 +35,7 @@ from agentveil_mcp_proxy.paid_provider import (
     PAID_PROVIDER_ENTRYPOINT_GROUP,
     PUBLIC_PAID_PROVIDER_CONTRACT_VERSION,
     STATUS_ACTIVE,
+    STATUS_MISSING,
     PaidProviderSnapshot,
     assert_handoff_entrypoint_target,
     assert_handoff_request_fields_bounded,
@@ -958,6 +959,43 @@ def _restore_install_state_bytes(path: Path, prior_bytes: bytes | None) -> None:
     path.write_bytes(prior_bytes)
 
 
+def _read_prior_activation_bytes(home: Path) -> bytes | None:
+    from agentveil_mcp_proxy.paid_activation import activation_path
+
+    path = activation_path(home)
+    return path.read_bytes() if path.is_file() else None
+
+
+def _restore_activation_state_bytes(path: Path, prior_bytes: bytes | None) -> None:
+    if prior_bytes is None:
+        if path.exists():
+            path.unlink()
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(prior_bytes)
+
+
+def _rollback_composed_install_durable_state(
+    *,
+    home: Path,
+    install_path: Path,
+    prior_install_bytes: bytes | None,
+    prior_activation_bytes: bytes | None,
+    published_vendors: list[tuple[_StagedComposedComponent, _VendorPublishRollback]],
+    published_caches: list[tuple[Path, _WheelCacheRollback]],
+) -> None:
+    from agentveil_mcp_proxy.paid_activation import activation_path
+
+    with contextlib.suppress(Exception):
+        _restore_activation_state_bytes(activation_path(home), prior_activation_bytes)
+    with contextlib.suppress(Exception):
+        _restore_install_state_bytes(install_path, prior_install_bytes)
+    with contextlib.suppress(Exception):
+        _rollback_published_wheel_caches(published=published_caches)
+    with contextlib.suppress(Exception):
+        _rollback_published_components(published=published_vendors)
+
+
 def verify_free_builder_wheel_artifact(
     wheel_bytes: bytes,
     *,
@@ -1477,6 +1515,10 @@ _CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP = (
     "agentveil_mcp_proxy.controlled_alternative_providers"
 )
 _CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_NAME = PROVIDER_ID
+_CONTROLLED_ALTERNATIVE_AUTHORITY_ENTRYPOINT_GROUP = (
+    "agentveil_mcp_proxy.controlled_alternative_authorities"
+)
+_CONTROLLED_ALTERNATIVE_AUTHORITY_ENTRYPOINT_NAME = "ca_route_v1"
 
 
 def discover_exact_vendored_controlled_alternative_provider_entry(
@@ -1559,8 +1601,9 @@ def resolve_vendored_controlled_alternative_authority(
 ) -> tuple[Any | None, str | None]:
     """Load the installed authority adapter; install state is not route authority."""
     return _resolve_vendored_ca_object(
-        home=home, group="agentveil_mcp_proxy.controlled_alternative_authorities",
-        entry_name="ca_route_v1",
+        home=home,
+        group=_CONTROLLED_ALTERNATIVE_AUTHORITY_ENTRYPOINT_GROUP,
+        entry_name=_CONTROLLED_ALTERNATIVE_AUTHORITY_ENTRYPOINT_NAME,
     )
 
 
@@ -1816,6 +1859,198 @@ def _discard_staged_composed_components(components: list[_StagedComposedComponen
             _discard_staged_composed_component(component)
 
 
+def _validate_free_builder_paired_expectations(
+    spec: _ComposedInstallComponentSpec,
+    expectations: FreeBuilderWheelExpectations,
+) -> None:
+    if expectations.package_name is not None:
+        try:
+            normalized_name = validate_bounded_package_name(expectations.package_name)
+        except PaidInstallError as exc:
+            raise FreeBuilderInstallError(str(exc.args[0])) from exc
+        if normalized_name != spec.package_name:
+            raise FreeBuilderInstallError(ERROR_PACKAGE_NAME_MISMATCH)
+    if expectations.package_version is not None:
+        try:
+            normalized_version = validate_bounded_package_version(expectations.package_version)
+        except PaidInstallError as exc:
+            raise FreeBuilderInstallError(str(exc.args[0])) from exc
+        if normalized_version != spec.package_version:
+            raise FreeBuilderInstallError(ERROR_VERSION_MISMATCH)
+
+
+def _snapshot_from_staged_vendored_paid_provider(
+    *,
+    home: Path,
+    vendor_dir: Path,
+    package_name: str,
+    package_version: str,
+    provider_id: str,
+) -> PaidProviderSnapshot:
+    from agentveil_mcp_proxy.paid_provider import normalize_provider_response
+
+    module_path, attr_name = discover_exact_vendored_paid_provider_entry(
+        vendor_dir,
+        package_name=package_name,
+        package_version=package_version,
+        provider_id=provider_id,
+    )
+    factory = load_vendored_hook_callable(
+        vendor_dir,
+        home=home,
+        module_path=module_path,
+        attr_name=attr_name,
+    )
+    from agentveil_mcp_proxy.paid_activation import bound_avp_home
+
+    with bound_avp_home(home):
+        loaded = factory()
+        provider = loaded() if callable(loaded) else loaded
+        if provider is None:
+            raise PaidInstallError(ERROR_VENDORED_PROVIDER_MISSING, exit_code=1)
+        discovered_id = getattr(provider, "provider_id", None)
+        if discovered_id is not None and str(discovered_id) != provider_id:
+            raise PaidInstallError(ERROR_VENDORED_PROVIDER_MALFORMED, exit_code=1)
+        status_fn = getattr(provider, "status", None)
+        if not callable(status_fn):
+            raise PaidInstallError(ERROR_VENDORED_PROVIDER_MALFORMED, exit_code=1)
+        try:
+            return normalize_provider_response(status_fn())
+        except Exception as exc:
+            raise PaidInstallError(ERROR_VENDORED_PROVIDER_MALFORMED, exit_code=1) from exc
+
+
+def _prove_staged_vendored_paid_provider_preinstall_contract(
+    *,
+    home: Path,
+    vendor_dir: Path,
+    package_name: str,
+    package_version: str,
+    provider_id: str,
+) -> None:
+    snapshot = _snapshot_from_staged_vendored_paid_provider(
+        home=home,
+        vendor_dir=vendor_dir,
+        package_name=package_name,
+        package_version=package_version,
+        provider_id=provider_id,
+    )
+    if snapshot.error_code:
+        raise PaidInstallError(ERROR_VENDORED_PROVIDER_MALFORMED, exit_code=1)
+    if snapshot.provider_id != provider_id:
+        raise PaidInstallError(ERROR_VENDORED_PROVIDER_MALFORMED, exit_code=1)
+    if snapshot.provider_contract_version != PUBLIC_PAID_PROVIDER_CONTRACT_VERSION:
+        raise PaidInstallError(ERROR_VENDORED_PROVIDER_MALFORMED, exit_code=1)
+    if snapshot.status not in {STATUS_MISSING, STATUS_ACTIVE}:
+        raise PaidInstallError(ERROR_VENDORED_PROVIDER_MALFORMED, exit_code=1)
+
+
+def _assert_live_vendored_paid_provider_active(
+    *,
+    home: Path,
+    vendor_dir: Path,
+    package_name: str,
+    package_version: str,
+    provider_id: str,
+) -> None:
+    from agentveil_mcp_proxy.console_project_status_client import (
+        resolve_private_guardrails_status,
+    )
+
+    snapshot = _snapshot_from_staged_vendored_paid_provider(
+        home=home,
+        vendor_dir=vendor_dir,
+        package_name=package_name,
+        package_version=package_version,
+        provider_id=provider_id,
+    )
+    if snapshot.error_code:
+        raise PaidInstallError(ERROR_VENDORED_PROVIDER_MALFORMED, exit_code=1)
+    if resolve_private_guardrails_status(snapshot) != "active":
+        raise PaidInstallError(ERROR_VENDORED_PROVIDER_MALFORMED, exit_code=1)
+
+
+def _assert_staged_vendored_controlled_alternative_resolves(
+    *,
+    home: Path,
+    vendor_dir: Path,
+    package_name: str,
+    package_version: str,
+) -> None:
+    module_path, attr_name = discover_exact_vendored_controlled_alternative_provider_entry(
+        vendor_dir,
+        package_name=package_name,
+        package_version=package_version,
+    )
+    factory = load_vendored_hook_callable(
+        vendor_dir,
+        home=home,
+        module_path=module_path,
+        attr_name=attr_name,
+    )
+    loaded = factory()
+    provider = loaded() if callable(loaded) else loaded
+    if provider is None:
+        raise PaidInstallError(ERROR_VENDORED_PROVIDER_MISSING, exit_code=1)
+
+
+def _assert_staged_vendored_controlled_alternative_authority_loadable(
+    *,
+    home: Path,
+    vendor_dir: Path,
+    package_name: str,
+    package_version: str,
+) -> None:
+    module_path, attr_name = _discover_exact_vendored_ca_entry(
+        vendor_dir,
+        package_name=package_name,
+        package_version=package_version,
+        group=_CONTROLLED_ALTERNATIVE_AUTHORITY_ENTRYPOINT_GROUP,
+        entry_name=_CONTROLLED_ALTERNATIVE_AUTHORITY_ENTRYPOINT_NAME,
+    )
+    factory = load_vendored_hook_callable(
+        vendor_dir,
+        home=home,
+        module_path=module_path,
+        attr_name=attr_name,
+    )
+    loaded = factory()
+    authority = loaded() if callable(loaded) else loaded
+    if authority is None:
+        raise PaidInstallError(ERROR_VENDORED_PROVIDER_MISSING, exit_code=1)
+
+
+def _prove_free_builder_paired_staged_readiness(
+    *,
+    home: Path,
+    staged_components: list[_StagedComposedComponent],
+) -> None:
+    base_component = staged_components[0]
+    thin_component = staged_components[1]
+    try:
+        _prove_staged_vendored_paid_provider_preinstall_contract(
+            home=home,
+            vendor_dir=base_component.stage_dir,
+            package_name=base_component.spec.package_name,
+            package_version=base_component.spec.package_version,
+            provider_id=PROVIDER_ID,
+        )
+        _assert_staged_vendored_controlled_alternative_resolves(
+            home=home,
+            vendor_dir=thin_component.stage_dir,
+            package_name=thin_component.spec.package_name,
+            package_version=thin_component.spec.package_version,
+        )
+        _assert_staged_vendored_controlled_alternative_authority_loadable(
+            home=home,
+            vendor_dir=thin_component.stage_dir,
+            package_name=thin_component.spec.package_name,
+            package_version=thin_component.spec.package_version,
+        )
+    except PaidInstallError as exc:
+        raise FreeBuilderInstallError(str(exc.args[0])) from exc
+
+
 def run_paid_activate_install_flow(
     *,
     license_key: str,
@@ -1852,6 +2087,7 @@ def run_paid_activate_install_flow(
 
     install_path = install_state_path(home)
     prior_install_bytes = install_path.read_bytes() if install_path.is_file() else None
+    prior_activation_bytes = _read_prior_activation_bytes(home)
     public_fallback_available = validation.public_fallback_available
     wheel_dir = home / "paid" / "cache"
     staged_components: list[_StagedComposedComponent] = []
@@ -1901,6 +2137,16 @@ def run_paid_activate_install_flow(
             if target_dir.exists():
                 _assert_non_symlink_vendor_path(home, target_dir)
 
+            staged_components.append(
+                _StagedComposedComponent(
+                    spec=spec,
+                    wheel_stage_path=wheel_stage_path,
+                    wheel_path=wheel_path,
+                    stage_dir=stage_dir,
+                    target_dir=target_dir,
+                )
+            )
+
             wheel_stage_path.parent.mkdir(parents=True, exist_ok=True)
             wheel_stage_path.write_bytes(wheel_bytes)
             os.chmod(wheel_stage_path, 0o600)
@@ -1914,18 +2160,8 @@ def run_paid_activate_install_flow(
                 require_empty_target=True,
             )
 
-            staged_components.append(
-                _StagedComposedComponent(
-                    spec=spec,
-                    wheel_stage_path=wheel_stage_path,
-                    wheel_path=wheel_path,
-                    stage_dir=stage_dir,
-                    target_dir=target_dir,
-                )
-            )
-
+        base_component = staged_components[0]
         if validation.provider_handoff_required:
-            base_component = staged_components[0]
             handoff = invoke_installed_provider_activation_handoff(
                 license_key=license_key,
                 validation=validation,
@@ -1939,6 +2175,13 @@ def run_paid_activate_install_flow(
                 public_fallback_available,
                 handoff.public_fallback_available,
             )
+        _prove_staged_vendored_paid_provider_preinstall_contract(
+            home=home,
+            vendor_dir=base_component.stage_dir,
+            package_name=base_component.spec.package_name,
+            package_version=base_component.spec.package_version,
+            provider_id=PROVIDER_ID,
+        )
 
         install_state = {
             "status": STATUS_ACTIVE,
@@ -1976,18 +2219,26 @@ def run_paid_activate_install_flow(
                     if rollback.backup_dir is not None:
                         _discard_staged_vendor(rollback.backup_dir)
         except Exception as exc:
-            with contextlib.suppress(Exception):
-                _restore_install_state_bytes(install_path, prior_install_bytes)
-            with contextlib.suppress(Exception):
-                _rollback_published_wheel_caches(published=published_caches)
-            with contextlib.suppress(Exception):
-                _rollback_published_components(published=published_vendors)
+            _rollback_composed_install_durable_state(
+                home=home,
+                install_path=install_path,
+                prior_install_bytes=prior_install_bytes,
+                prior_activation_bytes=prior_activation_bytes,
+                published_vendors=published_vendors,
+                published_caches=published_caches,
+            )
             _raise_bounded_composed_install_failure(exc)
     except PaidInstallError:
+        from agentveil_mcp_proxy.paid_activation import activation_path
+
         _discard_staged_composed_components(staged_components)
+        _restore_activation_state_bytes(activation_path(home), prior_activation_bytes)
         raise
     except Exception as exc:
+        from agentveil_mcp_proxy.paid_activation import activation_path
+
         _discard_staged_composed_components(staged_components)
+        _restore_activation_state_bytes(activation_path(home), prior_activation_bytes)
         _raise_bounded_composed_install_failure(exc)
 
     provider = PaidProviderSnapshot(
@@ -2098,6 +2349,7 @@ def run_free_builder_install_flow(
 
     install_path = install_state_path(home)
     prior_install_bytes = install_path.read_bytes() if install_path.is_file() else None
+    prior_activation_bytes = _read_prior_activation_bytes(home)
     public_fallback_available = True
     discover = discover_paid_provider_fn or discover_paid_provider
     try:
@@ -2144,6 +2396,9 @@ def run_free_builder_install_flow(
             )
             _commit_wheel_cache(wheel_stage_path=wheel_stage_path, wheel_path=wheel_path)
         except Exception as exc:
+            from agentveil_mcp_proxy.paid_activation import activation_path
+
+            _restore_activation_state_bytes(activation_path(home), prior_activation_bytes)
             _restore_install_state_bytes(install_path, prior_install_bytes)
             if vendor_publish_rollback is not None:
                 _rollback_published_vendor(live_dir=target_dir, rollback=vendor_publish_rollback)
@@ -2155,20 +2410,29 @@ def run_free_builder_install_flow(
             ):
                 _discard_staged_vendor(vendor_publish_rollback.backup_dir)
     except PaidInstallError as exc:
+        from agentveil_mcp_proxy.paid_activation import activation_path
+
         _discard_staged_vendor(stage_dir)
         if wheel_stage_path.exists():
             wheel_stage_path.unlink()
+        _restore_activation_state_bytes(activation_path(home), prior_activation_bytes)
         _restore_install_state_bytes(install_path, prior_install_bytes)
         raise FreeBuilderInstallError(exc.args[0]) from exc
     except Exception:
+        from agentveil_mcp_proxy.paid_activation import activation_path
+
         _discard_staged_vendor(stage_dir)
         if wheel_stage_path.exists():
             wheel_stage_path.unlink()
+        _restore_activation_state_bytes(activation_path(home), prior_activation_bytes)
         _restore_install_state_bytes(install_path, prior_install_bytes)
         raise
 
     try:
         if resolve_private_guardrails_status(discover()) != "active":
+            from agentveil_mcp_proxy.paid_activation import activation_path
+
+            _restore_activation_state_bytes(activation_path(home), prior_activation_bytes)
             _restore_install_state_bytes(install_path, prior_install_bytes)
             if target_dir.exists():
                 shutil.rmtree(target_dir, ignore_errors=True)
@@ -2176,10 +2440,212 @@ def run_free_builder_install_flow(
     except FreeBuilderInstallError:
         raise
     except Exception as exc:
+        from agentveil_mcp_proxy.paid_activation import activation_path
+
+        _restore_activation_state_bytes(activation_path(home), prior_activation_bytes)
         _restore_install_state_bytes(install_path, prior_install_bytes)
         if target_dir.exists():
             shutil.rmtree(target_dir, ignore_errors=True)
         raise FreeBuilderInstallError("provider_not_active") from exc
+
+    return FreeBuilderInstallResult(
+        install_state=install_state,
+        public_fallback_available=public_fallback_available,
+    )
+
+
+def run_free_builder_paired_install_flow(
+    *,
+    base_wheel_bytes: bytes,
+    thin_wheel_bytes: bytes,
+    home: Path,
+    activation_credential: str,
+    base_expectations: FreeBuilderWheelExpectations,
+    thin_expectations: FreeBuilderWheelExpectations,
+    discover_paid_provider_fn: Callable[[], PaidProviderSnapshot] | None = None,
+) -> FreeBuilderInstallResult:
+    """Verify, stage, hand off, and publish a Console v2 paired free Builder install."""
+
+    del discover_paid_provider_fn
+
+    from agentveil_mcp_proxy.paid_activation import utc_now_iso
+
+    base_spec = COMPOSED_PAID_INSTALL_COMPONENTS[0]
+    thin_spec = COMPOSED_PAID_INSTALL_COMPONENTS[1]
+    if (
+        base_expectations.artifact_hash is None
+        or base_expectations.artifact_size_bytes is None
+        or thin_expectations.artifact_hash is None
+        or thin_expectations.artifact_size_bytes is None
+    ):
+        raise FreeBuilderInstallError("artifact_hash_required")
+
+    _validate_free_builder_paired_expectations(base_spec, base_expectations)
+    _validate_free_builder_paired_expectations(thin_spec, thin_expectations)
+
+    verify_wheel_artifact(
+        base_wheel_bytes,
+        expected_hash=base_expectations.artifact_hash,
+        expected_size=base_expectations.artifact_size_bytes,
+        expected_package_name=base_spec.package_name,
+        expected_package_version=base_spec.package_version,
+    )
+    verify_free_builder_wheel_artifact(
+        thin_wheel_bytes,
+        expectations=FreeBuilderWheelExpectations(
+            artifact_hash=thin_expectations.artifact_hash,
+            artifact_size_bytes=thin_expectations.artifact_size_bytes,
+            package_name=thin_spec.package_name,
+            package_version=thin_spec.package_version,
+        ),
+    )
+
+    _assert_trusted_home_path(home, home / "paid")
+    _assert_trusted_home_path(home, vendor_root(home))
+
+    wheel_dir = home / "paid" / "cache"
+    install_path = install_state_path(home)
+    prior_install_bytes = install_path.read_bytes() if install_path.is_file() else None
+    prior_activation_bytes = _read_prior_activation_bytes(home)
+    public_fallback_available = True
+    staged_components: list[_StagedComposedComponent] = []
+    published_vendors: list[tuple[_StagedComposedComponent, _VendorPublishRollback]] = []
+    published_caches: list[tuple[Path, _WheelCacheRollback]] = []
+
+    wheel_payloads = (
+        (base_spec, base_wheel_bytes),
+        (thin_spec, thin_wheel_bytes),
+    )
+
+    try:
+        for spec, wheel_bytes in wheel_payloads:
+            wheel_path = wheel_dir / f"{spec.package_name}-{spec.package_version}.whl"
+            wheel_stage_path = wheel_dir / (
+                f".staging-{spec.package_name}-{spec.package_version}-{secrets.token_hex(8)}.whl"
+            )
+            target_dir = _vendor_live_dir(
+                home,
+                package_name=spec.package_name,
+                package_version=spec.package_version,
+            )
+            stage_dir = _vendor_stage_dir(
+                home,
+                package_name=spec.package_name,
+                package_version=spec.package_version,
+            )
+            if target_dir.exists():
+                _assert_non_symlink_vendor_path(home, target_dir)
+
+            staged_components.append(
+                _StagedComposedComponent(
+                    spec=spec,
+                    wheel_stage_path=wheel_stage_path,
+                    wheel_path=wheel_path,
+                    stage_dir=stage_dir,
+                    target_dir=target_dir,
+                )
+            )
+
+            wheel_stage_path.parent.mkdir(parents=True, exist_ok=True)
+            wheel_stage_path.write_bytes(wheel_bytes)
+            os.chmod(wheel_stage_path, 0o600)
+
+            install_wheel_to_vendor(
+                home=home,
+                wheel_path=wheel_stage_path,
+                target_dir=stage_dir,
+                expected_package_name=spec.package_name,
+                expected_package_version=spec.package_version,
+                require_empty_target=True,
+            )
+
+        base_component = staged_components[0]
+        handoff = invoke_console_free_builder_activation_handoff(
+            activation_credential=activation_credential,
+            home=home,
+            package_name=base_component.spec.package_name,
+            package_version=base_component.spec.package_version,
+            provider_id=PROVIDER_ID,
+            vendor_dir=base_component.stage_dir,
+        )
+        public_fallback_available = handoff.public_fallback_available
+        _prove_free_builder_paired_staged_readiness(home=home, staged_components=staged_components)
+
+        install_state = {
+            "status": STATUS_ACTIVE,
+            "provider_id": PROVIDER_ID,
+            "package_name": base_spec.package_name,
+            "package_version": base_spec.package_version,
+            "install_composition_version": COMPOSED_INSTALL_COMPOSITION_VERSION,
+            "install_components": _build_split_install_components(),
+            "public_fallback_available": public_fallback_available,
+            "error_code": None,
+            "last_installed_at": utc_now_iso(),
+            "install_safety_state": INSTALL_SAFETY_STATE_VERIFIED,
+            "install_safety_reason": None,
+        }
+        try:
+            for component in staged_components:
+                vendor_publish_rollback = _publish_staged_vendor(
+                    home=home,
+                    stage_dir=component.stage_dir,
+                    live_dir=component.target_dir,
+                )
+                published_vendors.append((component, vendor_publish_rollback))
+                cache_rollback = _commit_wheel_cache(
+                    wheel_stage_path=component.wheel_stage_path,
+                    wheel_path=component.wheel_path,
+                    retain_backup=True,
+                )
+                published_caches.append((component.wheel_path, cache_rollback))
+            write_install_state(install_path, install_state)
+            _assert_live_vendored_paid_provider_active(
+                home=home,
+                vendor_dir=base_component.target_dir,
+                package_name=base_component.spec.package_name,
+                package_version=base_component.spec.package_version,
+                provider_id=PROVIDER_ID,
+            )
+            for _wheel_path, cache_rollback in published_caches:
+                with contextlib.suppress(Exception):
+                    _release_wheel_cache_backup(cache_rollback)
+            for component, rollback in published_vendors:
+                with contextlib.suppress(Exception):
+                    if rollback.backup_dir is not None:
+                        _discard_staged_vendor(rollback.backup_dir)
+        except Exception as exc:
+            _rollback_composed_install_durable_state(
+                home=home,
+                install_path=install_path,
+                prior_install_bytes=prior_install_bytes,
+                prior_activation_bytes=prior_activation_bytes,
+                published_vendors=published_vendors,
+                published_caches=published_caches,
+            )
+            if isinstance(exc, PaidInstallError):
+                raise FreeBuilderInstallError(str(exc.args[0])) from exc
+            raise FreeBuilderInstallError("install_publish_failed") from exc
+    except PaidInstallError as exc:
+        from agentveil_mcp_proxy.paid_activation import activation_path
+
+        _discard_staged_composed_components(staged_components)
+        _restore_activation_state_bytes(activation_path(home), prior_activation_bytes)
+        _restore_install_state_bytes(install_path, prior_install_bytes)
+        raise FreeBuilderInstallError(str(exc.args[0])) from exc
+    except FreeBuilderInstallError:
+        from agentveil_mcp_proxy.paid_activation import activation_path
+
+        _discard_staged_composed_components(staged_components)
+        _restore_activation_state_bytes(activation_path(home), prior_activation_bytes)
+        _restore_install_state_bytes(install_path, prior_install_bytes)
+        raise
+    except Exception:
+        from agentveil_mcp_proxy.paid_activation import activation_path
+
+        _discard_staged_composed_components(staged_components)
+        _restore_activation_state_bytes(activation_path(home), prior_activation_bytes)
+        _restore_install_state_bytes(install_path, prior_install_bytes)
+        raise FreeBuilderInstallError("free_builder_install_failed")
 
     return FreeBuilderInstallResult(
         install_state=install_state,
