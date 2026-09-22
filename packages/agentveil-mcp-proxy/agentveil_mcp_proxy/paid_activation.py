@@ -5,13 +5,15 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 import hashlib
 import json
 import os
 from pathlib import Path
 import sys
-from typing import Any, Mapping, TextIO
+from typing import Any, Iterator, Mapping, TextIO
 
 from agentveil_mcp_proxy.evidence.proof import _fsync_parent_directory
 from agentveil_mcp_proxy.paid_install import (
@@ -80,8 +82,25 @@ class PaidActivationError(ValueError):
         self.exit_code = exit_code
 
 
+_scoped_avp_home: ContextVar[Path | None] = ContextVar("_scoped_avp_home", default=None)
+
+
 def default_home() -> Path:
+    scoped = _scoped_avp_home.get()
+    if scoped is not None:
+        return scoped.expanduser()
     return Path(os.environ.get("AVP_HOME", "~/.avp")).expanduser()
+
+
+@contextmanager
+def bound_avp_home(home: Path) -> Iterator[None]:
+    """Bind ``default_home()`` to *home* for vendored provider status checks."""
+
+    token = _scoped_avp_home.set(home.expanduser().resolve())
+    try:
+        yield
+    finally:
+        _scoped_avp_home.reset(token)
 
 
 def activation_path(home: Path | None = None) -> Path:

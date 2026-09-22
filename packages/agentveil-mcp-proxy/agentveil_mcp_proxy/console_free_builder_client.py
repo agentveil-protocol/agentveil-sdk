@@ -33,9 +33,16 @@ from agentveil_mcp_proxy.console_project_status_client import (
     resolve_private_guardrails_status,
 )
 from agentveil_mcp_proxy.paid_install import (
+    COMPOSED_BASE_PACKAGE_NAME,
+    COMPOSED_BASE_PACKAGE_VERSION,
+    COMPOSED_THIN_PACKAGE_VERSION,
+    COMPONENT_ROLE_BASE,
+    COMPONENT_ROLE_THIN,
+    FREE_BUILDER_PACKAGE_NAME,
     FreeBuilderInstallError,
     FreeBuilderWheelExpectations,
     run_free_builder_install_flow,
+    run_free_builder_paired_install_flow,
 )
 from agentveil_mcp_proxy.paid_provider import discover_paid_provider
 
@@ -43,6 +50,9 @@ CONSOLE_ORIGIN = "https://agentveil.dev"
 _ORIGIN_HOST = "agentveil.dev"
 _ELIGIBILITY_PATH = "/console/free-builder/package/eligibility"
 _DOWNLOAD_PATH = "/console/free-builder/package/download"
+_ELIGIBILITY_V2_PATH = "/console/free-builder/package/v2/eligibility"
+_DOWNLOAD_V2_PATH = "/console/free-builder/package/v2/download"
+_V2_CONTRACT_VERSION = "v2"
 
 _REQUEST_TIMEOUT_SECONDS = 10.0
 _MAX_JSON_RESPONSE_BYTES = 16 * 1024
@@ -63,6 +73,22 @@ _ELIGIBILITY_ELIGIBLE_KEYS = frozenset(
     }
 )
 _DOWNLOAD_REQUEST_KEYS = frozenset({"platform", "python_version"})
+_V2_DOWNLOAD_REQUEST_KEYS = frozenset({"role", "platform", "python_version"})
+_V2_ELIGIBILITY_INELIGIBLE_KEYS = frozenset({"eligible", "error_code"})
+_V2_ELIGIBILITY_ELIGIBLE_KEYS = frozenset({"eligible", "contract_version", "components"})
+_V2_COMPONENT_KEYS = frozenset(
+    {
+        "role",
+        "package_name",
+        "package_version",
+        "artifact_hash",
+        "artifact_size_bytes",
+    }
+)
+_V2_EXPECTED_COMPONENTS: tuple[tuple[str, str, str], ...] = (
+    (COMPONENT_ROLE_BASE, COMPOSED_BASE_PACKAGE_NAME, COMPOSED_BASE_PACKAGE_VERSION),
+    (COMPONENT_ROLE_THIN, FREE_BUILDER_PACKAGE_NAME, COMPOSED_THIN_PACKAGE_VERSION),
+)
 _FORBIDDEN_DOWNLOAD_REQUEST_KEYS = frozenset(
     {
         "artifact_id",
@@ -113,6 +139,22 @@ class FreeBuilderEligibility:
     artifact_size_bytes: int | None = None
     package_name: str | None = None
     package_version: str | None = None
+
+
+@dataclass(frozen=True)
+class FreeBuilderV2Component:
+    role: str
+    package_name: str
+    package_version: str
+    artifact_hash: str
+    artifact_size_bytes: int
+
+
+@dataclass(frozen=True)
+class FreeBuilderEligibilityV2:
+    eligible: bool
+    components: tuple[FreeBuilderV2Component, ...] = ()
+    error_code: str | None = None
 
 
 Transport = Callable[..., RawResponse]
@@ -223,11 +265,34 @@ def build_download_request_payload(*, platform: str, python_version: str) -> dic
     return payload
 
 
+def build_v2_download_request_payload(
+    *,
+    role: str,
+    platform: str,
+    python_version: str,
+) -> dict[str, str]:
+    bounded_role = _require_response_string(role).strip()
+    if bounded_role not in {COMPONENT_ROLE_BASE, COMPONENT_ROLE_THIN}:
+        raise FreeBuilderClientError("invalid_request")
+    payload = {
+        "role": bounded_role,
+        "platform": _validate_platform(platform),
+        "python_version": _validate_python_version(python_version),
+    }
+    if set(payload) != _V2_DOWNLOAD_REQUEST_KEYS:
+        raise FreeBuilderClientError("invalid_request")
+    return payload
+
+
 def assert_download_request_public_bounded(payload: Mapping[str, Any]) -> None:
-    extra = set(payload) - _DOWNLOAD_REQUEST_KEYS
+    allowed = _DOWNLOAD_REQUEST_KEYS | _V2_DOWNLOAD_REQUEST_KEYS
+    extra = set(payload) - allowed
     forbidden = set(payload) & _FORBIDDEN_DOWNLOAD_REQUEST_KEYS
     if extra or forbidden:
         raise FreeBuilderClientError("invalid_request")
+    if set(payload) == _DOWNLOAD_REQUEST_KEYS or set(payload) == _V2_DOWNLOAD_REQUEST_KEYS:
+        return
+    raise FreeBuilderClientError("invalid_request")
 
 
 def _require_response_string(value: object) -> str:
@@ -260,6 +325,15 @@ def _validate_eligible_package_name(value: object) -> str:
         raise FreeBuilderClientError("malformed_body") from exc
 
 
+def _validate_v2_component_package_name(value: object) -> str:
+    from agentveil_mcp_proxy.paid_install import validate_bounded_package_name
+
+    try:
+        return validate_bounded_package_name(_require_response_string(value))
+    except Exception as exc:
+        raise FreeBuilderClientError("malformed_body") from exc
+
+
 def _validate_eligible_package_version(value: object) -> str:
     from agentveil_mcp_proxy.paid_install import validate_bounded_package_version
 
@@ -267,6 +341,17 @@ def _validate_eligible_package_version(value: object) -> str:
         return validate_bounded_package_version(_require_response_string(value))
     except Exception as exc:
         raise FreeBuilderClientError("malformed_body") from exc
+
+
+def expectations_from_v2_component(
+    component: FreeBuilderV2Component,
+) -> FreeBuilderWheelExpectations:
+    return FreeBuilderWheelExpectations(
+        artifact_hash=component.artifact_hash,
+        artifact_size_bytes=component.artifact_size_bytes,
+        package_name=component.package_name,
+        package_version=component.package_version,
+    )
 
 
 def expectations_from_eligibility(
@@ -289,6 +374,70 @@ def expectations_from_eligibility(
         package_name=eligibility.package_name,
         package_version=eligibility.package_version,
     )
+
+
+def _decode_v2_component(entry: object) -> FreeBuilderV2Component:
+    if not isinstance(entry, dict):
+        raise FreeBuilderClientError("malformed_body")
+    if set(entry) != _V2_COMPONENT_KEYS:
+        raise FreeBuilderClientError("malformed_body")
+    role = _require_response_string(entry["role"]).strip()
+    package_name = _validate_v2_component_package_name(entry["package_name"])
+    package_version = _validate_eligible_package_version(entry["package_version"])
+    return FreeBuilderV2Component(
+        role=role,
+        package_name=package_name,
+        package_version=package_version,
+        artifact_hash=_validate_artifact_hash(entry["artifact_hash"]),
+        artifact_size_bytes=_validate_artifact_size_bytes(entry["artifact_size_bytes"]),
+    )
+
+
+def _decode_eligibility_v2_response(response: RawResponse) -> FreeBuilderEligibilityV2:
+    if response.status == 404:
+        raise FreeBuilderClientError("v2_not_found")
+    if response.status != 200:
+        raise FreeBuilderClientError("unexpected_status")
+    if len(response.content_types) != 1:
+        raise FreeBuilderClientError("bad_content_type")
+    _validate_json_content_type(response.content_types[0])
+    if len(response.body) > _MAX_JSON_RESPONSE_BYTES:
+        raise FreeBuilderClientError("response_too_large")
+    try:
+        parsed = json.loads(response.body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise FreeBuilderClientError("malformed_body") from exc
+    if not isinstance(parsed, dict):
+        raise FreeBuilderClientError("malformed_body")
+    eligible = parsed.get("eligible")
+    if not isinstance(eligible, bool):
+        raise FreeBuilderClientError("malformed_body")
+    if not eligible:
+        if set(parsed) - _V2_ELIGIBILITY_INELIGIBLE_KEYS:
+            raise FreeBuilderClientError("malformed_body")
+        error_code = parsed.get("error_code")
+        if error_code is not None and (not isinstance(error_code, str) or not error_code):
+            raise FreeBuilderClientError("malformed_body")
+        return FreeBuilderEligibilityV2(eligible=False, error_code=error_code)
+    if set(parsed) != _V2_ELIGIBILITY_ELIGIBLE_KEYS:
+        raise FreeBuilderClientError("malformed_body")
+    contract_version = parsed.get("contract_version")
+    if contract_version != _V2_CONTRACT_VERSION:
+        raise FreeBuilderClientError("malformed_body")
+    components_raw = parsed.get("components")
+    if not isinstance(components_raw, list) or len(components_raw) != len(_V2_EXPECTED_COMPONENTS):
+        raise FreeBuilderClientError("malformed_body")
+    parsed_components = [_decode_v2_component(entry) for entry in components_raw]
+    roles = [component.role for component in parsed_components]
+    if len(set(roles)) != len(roles):
+        raise FreeBuilderClientError("malformed_body")
+    for component, expected in zip(parsed_components, _V2_EXPECTED_COMPONENTS, strict=True):
+        expected_role, expected_name, expected_version = expected
+        if component.role != expected_role:
+            raise FreeBuilderClientError("malformed_body")
+        if component.package_name != expected_name or component.package_version != expected_version:
+            raise FreeBuilderClientError("malformed_body")
+    return FreeBuilderEligibilityV2(eligible=True, components=tuple(parsed_components))
 
 
 def _decode_eligibility_response(response: RawResponse) -> FreeBuilderEligibility:
@@ -407,6 +556,28 @@ class ConsoleFreeBuilderClient:
         )
         return _decode_eligibility_response(response)
 
+    def check_eligibility_v2(
+        self,
+        *,
+        bearer_token: str,
+        platform: str,
+        python_version: str,
+    ) -> FreeBuilderEligibilityV2:
+        bounded_platform = _validate_platform(platform)
+        bounded_python = _validate_python_version(python_version)
+        path = (
+            f"{_ELIGIBILITY_V2_PATH}?platform={bounded_platform}"
+            f"&python_version={bounded_python}"
+        )
+        response = self._request(
+            "GET",
+            path,
+            bearer_token=bearer_token,
+            body=None,
+            accept="application/json",
+        )
+        return _decode_eligibility_v2_response(response)
+
     def download_package(
         self,
         *,
@@ -423,6 +594,31 @@ class ConsoleFreeBuilderClient:
         response = self._request(
             "POST",
             _DOWNLOAD_PATH,
+            bearer_token=bearer_token,
+            body=body,
+            accept="application/octet-stream",
+            content_type="application/json",
+        )
+        return _decode_download_wheel(response)
+
+    def download_package_v2(
+        self,
+        *,
+        bearer_token: str,
+        role: str,
+        platform: str,
+        python_version: str,
+    ) -> bytes:
+        payload = build_v2_download_request_payload(
+            role=role,
+            platform=platform,
+            python_version=python_version,
+        )
+        assert_download_request_public_bounded(payload)
+        body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        response = self._request(
+            "POST",
+            _DOWNLOAD_V2_PATH,
             bearer_token=bearer_token,
             body=body,
             accept="application/octet-stream",
@@ -494,9 +690,92 @@ def sync_free_builder_install(
     resolved_platform = _validate_platform(platform or current_platform_name())
     resolved_python = _validate_python_version(python_version or current_python_version())
     client = ConsoleFreeBuilderClient(transport=transport)
+    assert credential is not None
 
     try:
-        assert credential is not None
+        eligibility_v2 = client.check_eligibility_v2(
+            bearer_token=credential.token,
+            platform=resolved_platform,
+            python_version=resolved_python,
+        )
+    except FreeBuilderClientError as exc:
+        if exc.code == "v2_not_found":
+            return _sync_free_builder_install_v1(
+                client=client,
+                credential=credential,
+                resolved_home=resolved_home,
+                resolved_platform=resolved_platform,
+                resolved_python=resolved_python,
+                discover=discover,
+                install_flow_fn=install_flow_fn,
+            )
+        if exc.code in {"transport_failed", "unavailable"}:
+            return "unavailable"
+        return "rejected"
+
+    if not eligibility_v2.eligible:
+        return "skipped_ineligible"
+
+    if len(eligibility_v2.components) != 2:
+        return "rejected"
+
+    base_component = eligibility_v2.components[0]
+    thin_component = eligibility_v2.components[1]
+    base_expectations = expectations_from_v2_component(base_component)
+    thin_expectations = expectations_from_v2_component(thin_component)
+
+    try:
+        base_wheel_bytes = client.download_package_v2(
+            bearer_token=credential.token,
+            role=base_component.role,
+            platform=resolved_platform,
+            python_version=resolved_python,
+        )
+        thin_wheel_bytes = client.download_package_v2(
+            bearer_token=credential.token,
+            role=thin_component.role,
+            platform=resolved_platform,
+            python_version=resolved_python,
+        )
+    except FreeBuilderClientError as exc:
+        if exc.code in {"transport_failed", "unavailable"}:
+            return "unavailable"
+        return "rejected"
+
+    paired_install = _default_paired_install_flow
+    try:
+        paired_install(
+            base_wheel_bytes=base_wheel_bytes,
+            thin_wheel_bytes=thin_wheel_bytes,
+            home=resolved_home,
+            activation_credential=credential.token,
+            base_expectations=base_expectations,
+            thin_expectations=thin_expectations,
+            discover_paid_provider_fn=discover,
+        )
+    except FreeBuilderInstallError:
+        return "skipped_install_failed"
+    except Exception:
+        return "skipped_install_failed"
+
+    return "installed"
+
+
+def _sync_free_builder_install_v1(
+    *,
+    client: ConsoleFreeBuilderClient,
+    credential: StoredCredential,
+    resolved_home: Path,
+    resolved_platform: str,
+    resolved_python: str,
+    discover: DiscoverPaidProvider,
+    install_flow_fn: InstallFreeBuilder | None,
+) -> str:
+    from agentveil_mcp_proxy.console_project_status_client import (
+        resolve_private_guardrails_status,
+    )
+
+    try:
         eligibility = client.check_eligibility(bearer_token=credential.token)
     except FreeBuilderClientError as exc:
         if exc.code in {"transport_failed", "unavailable"}:
@@ -562,16 +841,41 @@ def _default_install_flow(
     )
 
 
+def _default_paired_install_flow(
+    *,
+    base_wheel_bytes: bytes,
+    thin_wheel_bytes: bytes,
+    home: Path,
+    activation_credential: str,
+    base_expectations: FreeBuilderWheelExpectations,
+    thin_expectations: FreeBuilderWheelExpectations,
+    discover_paid_provider_fn: DiscoverPaidProvider,
+) -> None:
+    run_free_builder_paired_install_flow(
+        base_wheel_bytes=base_wheel_bytes,
+        thin_wheel_bytes=thin_wheel_bytes,
+        home=home,
+        activation_credential=activation_credential,
+        base_expectations=base_expectations,
+        thin_expectations=thin_expectations,
+        discover_paid_provider_fn=discover_paid_provider_fn,
+    )
+
+
 __all__ = [
     "CONSOLE_ORIGIN",
     "ConsoleFreeBuilderClient",
     "FreeBuilderClientError",
     "FreeBuilderEligibility",
+    "FreeBuilderEligibilityV2",
+    "FreeBuilderV2Component",
     "RawResponse",
     "Transport",
     "TransportError",
     "assert_download_request_public_bounded",
     "build_download_request_payload",
+    "build_v2_download_request_payload",
     "expectations_from_eligibility",
+    "expectations_from_v2_component",
     "sync_free_builder_install",
 ]

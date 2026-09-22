@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import concurrent.futures
 import io
 import json
 from pathlib import Path
+import threading
 import zipfile
 
 import pytest
@@ -15,6 +17,8 @@ from agentveil_mcp_proxy.paid_activation import (
     BOUNDED_ACTIVATION_KEYS,
     ERROR_ACTIVATION_STATE_UNREADABLE,
     STATUS_ACTIVE,
+    bound_avp_home,
+    default_home,
     STATUS_ERROR,
     STATUS_EXPIRED,
     STATUS_MISSING,
@@ -674,3 +678,34 @@ def test_malformed_install_bytes_are_ignored_for_enablement(tmp_path, raw):
         load_activation_state(activation_path(home)),
         load_install_state(install_path),
     )[1] is False
+
+
+def test_bound_avp_home_restores_ambient_and_nests(tmp_path, monkeypatch):
+    ambient = tmp_path / "ambient-home"
+    first = tmp_path / "first-home"
+    second = tmp_path / "second-home"
+    monkeypatch.setenv("AVP_HOME", str(ambient))
+    assert default_home().resolve() == ambient.resolve()
+    with bound_avp_home(first):
+        assert default_home().resolve() == first.resolve()
+        with bound_avp_home(second):
+            assert default_home().resolve() == second.resolve()
+        assert default_home().resolve() == first.resolve()
+    assert default_home().resolve() == ambient.resolve()
+
+
+def test_bound_avp_home_isolates_concurrent_contexts(tmp_path, monkeypatch):
+    ambient = tmp_path / "ambient-home"
+    monkeypatch.setenv("AVP_HOME", str(ambient))
+    homes = [tmp_path / f"worker-home-{index}" for index in range(4)]
+    barrier = threading.Barrier(len(homes))
+
+    def worker(home: Path) -> Path:
+        with bound_avp_home(home):
+            barrier.wait(timeout=5)
+            return default_home()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(homes)) as pool:
+        observed = list(pool.map(worker, homes))
+    assert [path.resolve() for path in observed] == [home.resolve() for home in homes]
+    assert default_home().resolve() == ambient.resolve()
