@@ -1,5 +1,5 @@
 {
-  "schema_version": "avp.paid_activation.public_contract.v1",
+  "schema_version": "avp.paid_activation.public_contract.v2",
   "default_paid_api_base_url": "https://agentveil.dev",
   "env": {
     "AVP_PAID_API_BASE_URL": {
@@ -44,13 +44,33 @@
         "error_code",
         "last_installed_at",
         "install_safety_state",
-        "install_safety_reason"
+        "install_safety_reason",
+        "install_composition_version",
+        "install_components"
+      ],
+      "install_component_allowed_keys": [
+        "role",
+        "package_name",
+        "package_version"
       ],
       "active_example": {
         "status": "active",
         "provider_id": "private_v1",
-        "package_name": "agentveil-private-policy",
+        "package_name": "agentveil-private-guardrails-base",
         "package_version": "0.1.0",
+        "install_composition_version": "1",
+        "install_components": [
+          {
+            "role": "base_private_guardrails",
+            "package_name": "agentveil-private-guardrails-base",
+            "package_version": "0.1.0"
+          },
+          {
+            "role": "controlled_alternatives_basic",
+            "package_name": "agentveil-private-policy-thin",
+            "package_version": "0.1.3"
+          }
+        ],
         "public_fallback_available": true,
         "error_code": null,
         "last_installed_at": "2026-07-23T00:00:00+00:00",
@@ -83,6 +103,7 @@
     "artifact_id"
   ],
   "notes": {
-    "private_consumer": "Private Runtime Gate is expected to consume the same durable filenames, allowed keys, and enablement matrix from this fixture in its own gate. Public tests validate public outputs against this artifact only; they do not import private code or claim private selection internals."
+    "private_consumer": "Private Runtime Gate is expected to consume the same durable filenames, allowed keys, and enablement matrix from this fixture in its own gate. Public tests validate public outputs against this artifact only; they do not import private code or claim private selection internals.",
+    "install_composition": "schema v2 documents composed install writes (install_composition_version plus bounded install_components). Legacy install.json without composition fields remains readable in public code for existing status and core-fallback paths."
   }
 }

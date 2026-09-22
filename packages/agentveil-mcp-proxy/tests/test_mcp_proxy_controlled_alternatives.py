@@ -3721,3 +3721,50 @@ def test_prepare_patch_keeps_existing_file_update_payloads() -> None:
         {"path": "notes.txt", "patch": literal},
     )
     assert literal_update.patch == literal
+
+
+def test_legacy_single_package_install_state_still_resolves_controlled_provider(tmp_path, monkeypatch):
+    from agentveil_mcp_proxy.paid_install import resolve_vendored_controlled_alternative_provider
+
+    legacy_name = "agentveil-private-policy"
+    legacy_version = "0.1.0"
+    module = legacy_name.replace("-", "_")
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    wheel_path = tmp_path / "legacy-ca.whl"
+    with zipfile.ZipFile(wheel_path, "w") as archive:
+        archive.writestr(f"{module}/controlled_provider.py", "def build_provider():\n    return object()\n")
+        archive.writestr(
+            f"{module}-{legacy_version}.dist-info/METADATA",
+            f"Name: {legacy_name}\nVersion: {legacy_version}\n",
+        )
+        archive.writestr(
+            f"{module}-{legacy_version}.dist-info/entry_points.txt",
+            f"[{CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP}]\n"
+            f"private_v1 = {module}.controlled_provider:build_provider\n",
+        )
+    install_wheel_to_vendor(
+        home=home,
+        wheel_path=wheel_path,
+        target_dir=vendor_root(home) / f"{legacy_name}-{legacy_version}",
+        expected_package_name=legacy_name,
+        expected_package_version=legacy_version,
+        require_empty_target=True,
+    )
+    write_install_state(
+        install_state_path(home),
+        {
+            "status": STATUS_ACTIVE,
+            "provider_id": "private_v1",
+            "package_name": legacy_name,
+            "package_version": legacy_version,
+            "public_fallback_available": True,
+            "error_code": None,
+            "last_installed_at": "2026-08-08T12:00:00+00:00",
+            "install_safety_state": "verified",
+            "install_safety_reason": None,
+        },
+    )
+    provider, error = resolve_vendored_controlled_alternative_provider(home=home)
+    assert error is None
+    assert provider is not None

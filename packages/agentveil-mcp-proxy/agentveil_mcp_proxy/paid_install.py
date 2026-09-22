@@ -55,11 +55,24 @@ PROVIDER_ID = "private_v1"
 DEFAULT_PACKAGE_NAME = "agentveil-private-policy"
 DEFAULT_PACKAGE_VERSION = "0.1.0"
 DEFAULT_ARTIFACT_ID = "art_pkg_private_policy_001"
+COMPOSED_BASE_ARTIFACT_ID = "art_pkg_private_guardrails_base_001"
+COMPOSED_BASE_PACKAGE_NAME = "agentveil-private-guardrails-base"
+COMPOSED_BASE_PACKAGE_VERSION = "0.1.0"
+COMPOSED_THIN_ARTIFACT_ID = "art_pkg_ca_basic_004"
+COMPOSED_THIN_PACKAGE_VERSION = "0.1.3"
+COMPOSED_INSTALL_COMPOSITION_VERSION = "1"
+COMPONENT_ROLE_BASE = "base_private_guardrails"
+COMPONENT_ROLE_THIN = "controlled_alternatives_basic"
+BOUNDED_INSTALL_COMPONENT_KEYS = frozenset({"role", "package_name", "package_version"})
+MAX_INSTALL_COMPONENTS = 2
 # Packaged zero-config paid backend. Explicit blank AVP_PAID_API_BASE_URL
 # disables network (offline/test). Unset env uses this default.
 DEFAULT_PAID_API_BASE_URL = "https://agentveil.dev"
 FREE_BUILDER_PACKAGE_NAME = "agentveil-private-policy-thin"
-ALLOWED_PACKAGE_NAMES = frozenset({DEFAULT_PACKAGE_NAME, FREE_BUILDER_PACKAGE_NAME})
+ALLOWED_PACKAGE_NAMES = frozenset(
+    {DEFAULT_PACKAGE_NAME, FREE_BUILDER_PACKAGE_NAME, COMPOSED_BASE_PACKAGE_NAME}
+)
+COMPOSED_ARTIFACT_IDS = frozenset({COMPOSED_BASE_ARTIFACT_ID, COMPOSED_THIN_ARTIFACT_ID})
 _BOUNDED_PACKAGE_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[a-zA-Z0-9.-]{0,16})?$")
 
 BOUNDED_INSTALL_KEYS = frozenset(
@@ -73,6 +86,8 @@ BOUNDED_INSTALL_KEYS = frozenset(
         "last_installed_at",
         "install_safety_state",
         "install_safety_reason",
+        "install_composition_version",
+        "install_components",
     }
 )
 
@@ -474,10 +489,184 @@ def evaluate_install_safety(result: InstallSafetyResult) -> tuple[str | None, st
     raise PaidInstallError(ERROR_INSTALL_SAFETY_MALFORMED, exit_code=1)
 
 
+@dataclass(frozen=True)
+class _ComposedInstallComponentSpec:
+    role: str
+    artifact_id: str
+    package_name: str
+    package_version: str
+
+
+COMPOSED_PAID_INSTALL_COMPONENTS: tuple[_ComposedInstallComponentSpec, ...] = (
+    _ComposedInstallComponentSpec(
+        role=COMPONENT_ROLE_BASE,
+        artifact_id=COMPOSED_BASE_ARTIFACT_ID,
+        package_name=COMPOSED_BASE_PACKAGE_NAME,
+        package_version=COMPOSED_BASE_PACKAGE_VERSION,
+    ),
+    _ComposedInstallComponentSpec(
+        role=COMPONENT_ROLE_THIN,
+        artifact_id=COMPOSED_THIN_ARTIFACT_ID,
+        package_name=FREE_BUILDER_PACKAGE_NAME,
+        package_version=COMPOSED_THIN_PACKAGE_VERSION,
+    ),
+)
+
+
+def _assert_no_composed_artifact_escape(*, artifact_id: str | None) -> None:
+    override = (artifact_id or os.environ.get("AVP_PAID_ARTIFACT_ID") or "").strip()
+    if not override:
+        return
+    if override not in COMPOSED_ARTIFACT_IDS:
+        raise PaidInstallError(ERROR_DOWNLOAD_DENIED, exit_code=1)
+
+
+def _assert_install_components_bounded(components: Any) -> list[dict[str, str]]:
+    if not isinstance(components, list) or not components or len(components) > MAX_INSTALL_COMPONENTS:
+        raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
+    parsed: list[dict[str, str]] = []
+    roles: set[str] = set()
+    for entry in components:
+        if not isinstance(entry, dict):
+            raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
+        extra = set(entry) - BOUNDED_INSTALL_COMPONENT_KEYS
+        if extra:
+            raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
+        role = entry.get("role")
+        package_name = entry.get("package_name")
+        package_version = entry.get("package_version")
+        if not isinstance(role, str) or not role.strip():
+            raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
+        if not isinstance(package_name, str) or not isinstance(package_version, str):
+            raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
+        if role in roles:
+            raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
+        roles.add(role)
+        parsed.append(
+            {
+                "role": role.strip(),
+                "package_name": validate_bounded_package_name(package_name),
+                "package_version": validate_bounded_package_version(package_version),
+            }
+        )
+    return parsed
+
+
+def _validate_split_install_state(data: Mapping[str, Any]) -> None:
+    version = data.get("install_composition_version")
+    if version is None and data.get("install_components") is None:
+        return
+    if not isinstance(version, str) or version != COMPOSED_INSTALL_COMPOSITION_VERSION:
+        raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
+    components = _assert_install_components_bounded(data.get("install_components"))
+    expected_roles = {spec.role for spec in COMPOSED_PAID_INSTALL_COMPONENTS}
+    if {entry["role"] for entry in components} != expected_roles:
+        raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
+    by_role = {entry["role"]: entry for entry in components}
+    for spec in COMPOSED_PAID_INSTALL_COMPONENTS:
+        entry = by_role[spec.role]
+        if entry["package_name"] != spec.package_name:
+            raise PaidInstallError(ERROR_PACKAGE_NAME_MISMATCH, exit_code=1)
+        if entry["package_version"] != spec.package_version:
+            raise PaidInstallError(ERROR_VERSION_MISMATCH, exit_code=1)
+    top_name = data.get("package_name")
+    top_version = data.get("package_version")
+    base = by_role[COMPONENT_ROLE_BASE]
+    if top_name != base["package_name"] or top_version != base["package_version"]:
+        raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
+
+
+def _resolve_install_component_target(
+    install_state: Mapping[str, Any],
+    *,
+    role: str,
+) -> tuple[str, str] | None:
+    if install_state.get("install_composition_version") is not None:
+        try:
+            _validate_split_install_state(install_state)
+        except PaidInstallError:
+            return None
+        components = install_state.get("install_components")
+        if not isinstance(components, list):
+            return None
+        for entry in components:
+            if isinstance(entry, dict) and entry.get("role") == role:
+                package_name = entry.get("package_name")
+                package_version = entry.get("package_version")
+                if not isinstance(package_name, str) or not isinstance(package_version, str):
+                    return None
+                try:
+                    return (
+                        validate_bounded_package_name(package_name),
+                        validate_bounded_package_version(package_version),
+                    )
+                except PaidInstallError:
+                    return None
+        return None
+
+    package_name = install_state.get("package_name")
+    package_version = install_state.get("package_version")
+    if not isinstance(package_name, str) or not isinstance(package_version, str):
+        return None
+    if role == COMPONENT_ROLE_THIN:
+        try:
+            expected_name = validate_bounded_package_name(package_name)
+            expected_version = validate_bounded_package_version(package_version)
+        except PaidInstallError:
+            return None
+        if expected_name == FREE_BUILDER_PACKAGE_NAME:
+            return expected_name, expected_version
+        if expected_name != DEFAULT_PACKAGE_NAME:
+            return None
+        return expected_name, expected_version
+    if role != COMPONENT_ROLE_BASE:
+        return None
+    try:
+        return (
+            validate_bounded_package_name(package_name),
+            validate_bounded_package_version(package_version),
+        )
+    except PaidInstallError:
+        return None
+
+
+def _build_split_install_components() -> list[dict[str, str]]:
+    return [
+        {
+            "role": spec.role,
+            "package_name": spec.package_name,
+            "package_version": spec.package_version,
+        }
+        for spec in COMPOSED_PAID_INSTALL_COMPONENTS
+    ]
+
+
+def _strict_package_authorization(
+    authorization: PackageAuthorizeResult,
+    *,
+    spec: _ComposedInstallComponentSpec,
+) -> PackageAuthorizeResult:
+    if not authorization.download_authorized:
+        raise PaidInstallError(authorization.error_code or ERROR_DOWNLOAD_DENIED, exit_code=1)
+    if authorization.artifact_id != spec.artifact_id:
+        raise PaidInstallError(ERROR_DOWNLOAD_DENIED, exit_code=1)
+    if not authorization.package_name or authorization.package_name != spec.package_name:
+        raise PaidInstallError(ERROR_PACKAGE_NAME_MISMATCH, exit_code=1)
+    if not authorization.package_version or authorization.package_version != spec.package_version:
+        raise PaidInstallError(ERROR_VERSION_MISMATCH, exit_code=1)
+    if not authorization.artifact_hash or authorization.artifact_size_bytes is None:
+        raise PaidInstallError(ERROR_DOWNLOAD_DENIED, exit_code=1)
+    if not authorization.download_authorization_id:
+        raise PaidInstallError(ERROR_DOWNLOAD_DENIED, exit_code=1)
+    return authorization
+
+
 def assert_install_metadata_bounded(data: Mapping[str, Any]) -> None:
     extra = set(data) - BOUNDED_INSTALL_KEYS
     if extra:
         raise PaidInstallError(f"install metadata contains unexpected keys: {sorted(extra)}")
+    if data.get("install_composition_version") is not None or data.get("install_components") is not None:
+        _validate_split_install_state(data)
 
 
 def load_install_state(path: Path) -> dict[str, Any] | None:
@@ -711,7 +900,25 @@ def _rollback_wheel_cache(*, wheel_path: Path, rollback: _WheelCacheRollback) ->
         wheel_path.unlink(missing_ok=True)
 
 
-def _commit_wheel_cache(*, wheel_stage_path: Path, wheel_path: Path) -> None:
+def _release_wheel_cache_backup(rollback: _WheelCacheRollback) -> None:
+    if rollback.backup_path is not None and rollback.backup_path.exists():
+        rollback.backup_path.unlink(missing_ok=True)
+
+
+def _rollback_published_wheel_caches(
+    *,
+    published: list[tuple[Path, _WheelCacheRollback]],
+) -> None:
+    for wheel_path, rollback in reversed(published):
+        _rollback_wheel_cache(wheel_path=wheel_path, rollback=rollback)
+
+
+def _commit_wheel_cache(
+    *,
+    wheel_stage_path: Path,
+    wheel_path: Path,
+    retain_backup: bool = False,
+) -> _WheelCacheRollback:
     wheel_path.parent.mkdir(parents=True, exist_ok=True)
     if wheel_path.exists():
         backup_path = wheel_path.with_name(f"{wheel_path.name}.backup")
@@ -722,11 +929,12 @@ def _commit_wheel_cache(*, wheel_stage_path: Path, wheel_path: Path) -> None:
         try:
             os.replace(wheel_stage_path, wheel_path)
             os.chmod(wheel_path, 0o600)
-            backup_path.unlink(missing_ok=True)
+            if not retain_backup:
+                backup_path.unlink(missing_ok=True)
         except OSError:
             _rollback_wheel_cache(wheel_path=wheel_path, rollback=rollback)
             raise
-        return
+        return rollback
     rollback = _WheelCacheRollback(backup_path=None, created_live=True)
     try:
         os.replace(wheel_stage_path, wheel_path)
@@ -734,6 +942,11 @@ def _commit_wheel_cache(*, wheel_stage_path: Path, wheel_path: Path) -> None:
     except OSError:
         _rollback_wheel_cache(wheel_path=wheel_path, rollback=rollback)
         raise
+    return rollback
+
+
+def _conservative_public_fallback(current: bool, candidate: bool) -> bool:
+    return current and candidate
 
 
 def _restore_install_state_bytes(path: Path, prior_bytes: bytes | None) -> None:
@@ -1213,20 +1426,18 @@ def resolve_vendored_paid_provider(*, home: Path | None = None) -> Any | None:
         return None
 
     provider_id = install_state.get("provider_id")
-    package_name = install_state.get("package_name")
-    package_version = install_state.get("package_version")
     if not isinstance(provider_id, str) or not provider_id.strip():
-        return None
-    if not isinstance(package_name, str) or not isinstance(package_version, str):
         return None
     if len(provider_id) > MAX_HANDOFF_PROVIDER_ID_LENGTH:
         return None
 
-    try:
-        expected_package_name = validate_bounded_package_name(package_name)
-        expected_package_version = validate_bounded_package_version(package_version)
-    except PaidInstallError:
+    resolved_target = _resolve_install_component_target(
+        install_state,
+        role=COMPONENT_ROLE_BASE,
+    )
+    if resolved_target is None:
         return None
+    expected_package_name, expected_package_version = resolved_target
 
     vendor_dir = _vendor_live_dir(
         resolved_home,
@@ -1368,18 +1579,16 @@ def _resolve_vendored_ca_object(
         return None, ERROR_VENDORED_PROVIDER_MISSING
 
     provider_id = install_state.get("provider_id")
-    package_name = install_state.get("package_name")
-    package_version = install_state.get("package_version")
     if provider_id != PROVIDER_ID:
         return None, ERROR_VENDORED_PROVIDER_MISSING
-    if not isinstance(package_name, str) or not isinstance(package_version, str):
-        return None, ERROR_VENDORED_PROVIDER_MISSING
 
-    try:
-        expected_package_name = validate_bounded_package_name(package_name)
-        expected_package_version = validate_bounded_package_version(package_version)
-    except PaidInstallError:
-        return None, ERROR_VENDORED_PROVIDER_MALFORMED
+    resolved_target = _resolve_install_component_target(
+        install_state,
+        role=COMPONENT_ROLE_THIN,
+    )
+    if resolved_target is None:
+        return None, ERROR_VENDORED_PROVIDER_MISSING
+    expected_package_name, expected_package_version = resolved_target
 
     vendor_dir = _vendor_live_dir(
         resolved_home,
@@ -1572,6 +1781,41 @@ def invoke_installed_provider_activation_handoff(
     return result
 
 
+@dataclass
+class _StagedComposedComponent:
+    spec: _ComposedInstallComponentSpec
+    wheel_stage_path: Path
+    wheel_path: Path
+    stage_dir: Path
+    target_dir: Path
+
+
+def _discard_staged_composed_component(component: _StagedComposedComponent) -> None:
+    _discard_staged_vendor(component.stage_dir)
+    if component.wheel_stage_path.exists():
+        component.wheel_stage_path.unlink(missing_ok=True)
+
+
+def _rollback_published_components(
+    *,
+    published: list[tuple[_StagedComposedComponent, _VendorPublishRollback]],
+) -> None:
+    for component, rollback in reversed(published):
+        _rollback_published_vendor(live_dir=component.target_dir, rollback=rollback)
+
+
+def _raise_bounded_composed_install_failure(exc: BaseException) -> None:
+    if isinstance(exc, PaidInstallError):
+        raise exc
+    raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1) from None
+
+
+def _discard_staged_composed_components(components: list[_StagedComposedComponent]) -> None:
+    for component in components:
+        with contextlib.suppress(Exception):
+            _discard_staged_composed_component(component)
+
+
 def run_paid_activate_install_flow(
     *,
     license_key: str,
@@ -1579,11 +1823,13 @@ def run_paid_activate_install_flow(
     client: PaidBackendClient | None = None,
     artifact_id: str | None = None,
 ) -> PaidActivateInstallResult:
-    """Run validate -> entitlement -> authorize -> download -> verify -> install."""
+    """Run validate -> entitlement -> composed authorize/download/install."""
 
     backend = client or resolve_paid_backend_client()
     if backend is None:
         raise PaidInstallError(ERROR_BACKEND_UNAVAILABLE, exit_code=1)
+
+    _assert_no_composed_artifact_escape(artifact_id=artifact_id)
 
     validation = backend.validate_activation(license_key)
     if not validation.valid:
@@ -1593,123 +1839,156 @@ def run_paid_activate_install_flow(
         )
 
     entitlement = backend.issue_entitlement(license_key, validation)
-    resolved_artifact_id = artifact_id or os.environ.get("AVP_PAID_ARTIFACT_ID", DEFAULT_ARTIFACT_ID)
     # claim-check: allow "safety" is advisory-only; install still verifies hash/metadata.
     install_check = backend.check_install_safety(entitlement.entitlement_token)
     install_safety_advisory, install_safety_state, install_safety_reason = evaluate_install_safety(
         install_check,
     )
-    authorization = backend.authorize_package(
-        entitlement.entitlement_token,
-        artifact_id=resolved_artifact_id,
-        platform_name=current_platform_name(),
-        python_version=current_python_version(),
-    )
-    if not authorization.download_authorized:
-        raise PaidInstallError(authorization.error_code or ERROR_DOWNLOAD_DENIED, exit_code=1)
-    if not authorization.artifact_hash:
-        raise PaidInstallError(ERROR_DOWNLOAD_DENIED, exit_code=1)
 
-    wheel_bytes = backend.download_package(authorization)
-    expected_package_name = validate_bounded_package_name(
-        authorization.package_name or DEFAULT_PACKAGE_NAME,
-    )
-    expected_package_version = validate_bounded_package_version(
-        authorization.package_version or DEFAULT_PACKAGE_VERSION,
-    )
-    verify_wheel_artifact(
-        wheel_bytes,
-        expected_hash=authorization.artifact_hash,
-        expected_size=authorization.artifact_size_bytes,
-        expected_package_name=expected_package_name,
-        expected_package_version=expected_package_version,
-    )
-
-    wheel_dir = home / "paid" / "cache"
-    wheel_path = wheel_dir / f"{expected_package_name}-{expected_package_version}.whl"
-    wheel_stage_path = wheel_dir / f".staging-{expected_package_name}-{expected_package_version}-{secrets.token_hex(8)}.whl"
-
-    target_dir = _vendor_live_dir(
-        home,
-        package_name=expected_package_name,
-        package_version=expected_package_version,
-    )
-    stage_dir = _vendor_stage_dir(
-        home,
-        package_name=expected_package_name,
-        package_version=expected_package_version,
-    )
     _assert_trusted_home_path(home, home / "paid")
     _assert_trusted_home_path(home, vendor_root(home))
-    if target_dir.exists():
-        _assert_non_symlink_vendor_path(home, target_dir)
 
     from agentveil_mcp_proxy.paid_activation import synthetic_license_id, utc_now_iso
 
     install_path = install_state_path(home)
     prior_install_bytes = install_path.read_bytes() if install_path.is_file() else None
-    public_fallback_available = authorization.public_fallback_available
-    try:
-        wheel_stage_path.parent.mkdir(parents=True, exist_ok=True)
-        wheel_stage_path.write_bytes(wheel_bytes)
-        os.chmod(wheel_stage_path, 0o600)
+    public_fallback_available = validation.public_fallback_available
+    wheel_dir = home / "paid" / "cache"
+    staged_components: list[_StagedComposedComponent] = []
+    published_vendors: list[tuple[_StagedComposedComponent, _VendorPublishRollback]] = []
+    published_caches: list[tuple[Path, _WheelCacheRollback]] = []
+    base_spec = COMPOSED_PAID_INSTALL_COMPONENTS[0]
 
-        install_wheel_to_vendor(
-            home=home,
-            wheel_path=wheel_stage_path,
-            target_dir=stage_dir,
-            expected_package_name=expected_package_name,
-            expected_package_version=expected_package_version,
-            require_empty_target=True,
-        )
+    try:
+        for spec in COMPOSED_PAID_INSTALL_COMPONENTS:
+            authorization = _strict_package_authorization(
+                backend.authorize_package(
+                    entitlement.entitlement_token,
+                    artifact_id=spec.artifact_id,
+                    platform_name=current_platform_name(),
+                    python_version=current_python_version(),
+                ),
+                spec=spec,
+            )
+            public_fallback_available = _conservative_public_fallback(
+                public_fallback_available,
+                authorization.public_fallback_available,
+            )
+
+            wheel_bytes = backend.download_package(authorization)
+            verify_wheel_artifact(
+                wheel_bytes,
+                expected_hash=authorization.artifact_hash,
+                expected_size=authorization.artifact_size_bytes,
+                expected_package_name=spec.package_name,
+                expected_package_version=spec.package_version,
+            )
+
+            wheel_path = wheel_dir / f"{spec.package_name}-{spec.package_version}.whl"
+            wheel_stage_path = wheel_dir / (
+                f".staging-{spec.package_name}-{spec.package_version}-{secrets.token_hex(8)}.whl"
+            )
+            target_dir = _vendor_live_dir(
+                home,
+                package_name=spec.package_name,
+                package_version=spec.package_version,
+            )
+            stage_dir = _vendor_stage_dir(
+                home,
+                package_name=spec.package_name,
+                package_version=spec.package_version,
+            )
+            if target_dir.exists():
+                _assert_non_symlink_vendor_path(home, target_dir)
+
+            wheel_stage_path.parent.mkdir(parents=True, exist_ok=True)
+            wheel_stage_path.write_bytes(wheel_bytes)
+            os.chmod(wheel_stage_path, 0o600)
+
+            install_wheel_to_vendor(
+                home=home,
+                wheel_path=wheel_stage_path,
+                target_dir=stage_dir,
+                expected_package_name=spec.package_name,
+                expected_package_version=spec.package_version,
+                require_empty_target=True,
+            )
+
+            staged_components.append(
+                _StagedComposedComponent(
+                    spec=spec,
+                    wheel_stage_path=wheel_stage_path,
+                    wheel_path=wheel_path,
+                    stage_dir=stage_dir,
+                    target_dir=target_dir,
+                )
+            )
+
         if validation.provider_handoff_required:
+            base_component = staged_components[0]
             handoff = invoke_installed_provider_activation_handoff(
                 license_key=license_key,
                 validation=validation,
                 home=home,
-                package_name=expected_package_name,
-                package_version=expected_package_version,
+                package_name=base_component.spec.package_name,
+                package_version=base_component.spec.package_version,
                 provider_id=PROVIDER_ID,
-                vendor_dir=stage_dir,
+                vendor_dir=base_component.stage_dir,
             )
-            public_fallback_available = handoff.public_fallback_available
+            public_fallback_available = _conservative_public_fallback(
+                public_fallback_available,
+                handoff.public_fallback_available,
+            )
 
         install_state = {
             "status": STATUS_ACTIVE,
             "provider_id": PROVIDER_ID,
-            "package_name": expected_package_name,
-            "package_version": expected_package_version,
+            "package_name": base_spec.package_name,
+            "package_version": base_spec.package_version,
+            "install_composition_version": COMPOSED_INSTALL_COMPOSITION_VERSION,
+            "install_components": _build_split_install_components(),
             "public_fallback_available": public_fallback_available,
             "error_code": None,
             "last_installed_at": utc_now_iso(),
             "install_safety_state": install_safety_state,
             "install_safety_reason": install_safety_reason,
         }
-        write_install_state(install_path, install_state)
-        vendor_publish_rollback: _VendorPublishRollback | None = None
         try:
-            vendor_publish_rollback = _publish_staged_vendor(
-                home=home,
-                stage_dir=stage_dir,
-                live_dir=target_dir,
-            )
-            _commit_wheel_cache(wheel_stage_path=wheel_stage_path, wheel_path=wheel_path)
-        except Exception:
-            _restore_install_state_bytes(install_path, prior_install_bytes)
-            if vendor_publish_rollback is not None:
-                _rollback_published_vendor(live_dir=target_dir, rollback=vendor_publish_rollback)
-            raise
-        finally:
-            if (
-                vendor_publish_rollback is not None
-                and vendor_publish_rollback.backup_dir is not None
-            ):
-                _discard_staged_vendor(vendor_publish_rollback.backup_dir)
-    except Exception:
-        _discard_staged_vendor(stage_dir)
-        if wheel_stage_path.exists():
-            wheel_stage_path.unlink()
+            for component in staged_components:
+                vendor_publish_rollback = _publish_staged_vendor(
+                    home=home,
+                    stage_dir=component.stage_dir,
+                    live_dir=component.target_dir,
+                )
+                published_vendors.append((component, vendor_publish_rollback))
+                cache_rollback = _commit_wheel_cache(
+                    wheel_stage_path=component.wheel_stage_path,
+                    wheel_path=component.wheel_path,
+                    retain_backup=True,
+                )
+                published_caches.append((component.wheel_path, cache_rollback))
+            write_install_state(install_path, install_state)
+            for _wheel_path, cache_rollback in published_caches:
+                with contextlib.suppress(Exception):
+                    _release_wheel_cache_backup(cache_rollback)
+            for component, rollback in published_vendors:
+                with contextlib.suppress(Exception):
+                    if rollback.backup_dir is not None:
+                        _discard_staged_vendor(rollback.backup_dir)
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                _restore_install_state_bytes(install_path, prior_install_bytes)
+            with contextlib.suppress(Exception):
+                _rollback_published_wheel_caches(published=published_caches)
+            with contextlib.suppress(Exception):
+                _rollback_published_components(published=published_vendors)
+            _raise_bounded_composed_install_failure(exc)
+    except PaidInstallError:
+        _discard_staged_composed_components(staged_components)
         raise
+    except Exception as exc:
+        _discard_staged_composed_components(staged_components)
+        _raise_bounded_composed_install_failure(exc)
 
     provider = PaidProviderSnapshot(
         provider_present=True,

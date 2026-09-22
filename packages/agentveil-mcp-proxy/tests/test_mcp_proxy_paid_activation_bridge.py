@@ -29,8 +29,17 @@ from agentveil_mcp_proxy.paid_activation import (
     write_activation_state,
 )
 from agentveil_mcp_proxy.paid_install import (
+    BOUNDED_INSTALL_COMPONENT_KEYS,
     BOUNDED_INSTALL_KEYS,
+    COMPOSED_BASE_ARTIFACT_ID,
+    COMPOSED_BASE_PACKAGE_NAME,
+    COMPOSED_BASE_PACKAGE_VERSION,
+    COMPOSED_THIN_ARTIFACT_ID,
+    COMPOSED_THIN_PACKAGE_VERSION,
+    COMPONENT_ROLE_BASE,
+    COMPONENT_ROLE_THIN,
     DEFAULT_PAID_API_BASE_URL,
+    FREE_BUILDER_PACKAGE_NAME,
     INSTALL_FILENAME,
     PROVIDER_ID,
     ActivationValidateResult,
@@ -45,9 +54,13 @@ from agentveil_mcp_proxy.paid_install import (
     sha256_hex,
     write_install_state,
 )
+from agentveil_mcp_proxy.paid_provider import PAID_PROVIDER_ENTRYPOINT_GROUP
+from agentveil_mcp_proxy.controlled_alternatives import (
+    CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP,
+)
 
-PACKAGE_NAME = "agentveil-private-policy"
-PACKAGE_VERSION = "0.1.0"
+LEGACY_PACKAGE_NAME = "agentveil-private-policy"
+LEGACY_PACKAGE_VERSION = "0.1.0"
 RAW_LICENSE_KEY = "avp_live_bridge_secret_key_do_not_leak_abcdef"
 ENTITLEMENT_TOKEN = "avp_ent_bridge.token.secret.do.not.leak"
 _CONTRACT_PATH = (
@@ -77,17 +90,88 @@ def _public_paid_contract() -> dict:
     return json.loads(_CONTRACT_PATH.read_text(encoding="utf-8"))
 
 
+def _build_composed_base_wheel(tmp_path: Path) -> tuple[bytes, str]:
+    module = COMPOSED_BASE_PACKAGE_NAME.replace("-", "_")
+    wheel_path = tmp_path / f"{COMPOSED_BASE_PACKAGE_NAME}-{COMPOSED_BASE_PACKAGE_VERSION}.whl"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(wheel_path, "w") as archive:
+        archive.writestr(
+            f"{module}/vendored_provider.py",
+            "class _Provider:\n"
+            "    provider_id = 'private_v1'\n"
+            "    provider_contract_version = '1'\n"
+            "    def status(self):\n"
+            "        return {'provider_present': True, 'provider_id': 'private_v1', "
+            "'provider_contract_version': '1', 'status': 'active', "
+            "'private_provider_enabled': True, 'public_fallback_available': True, "
+            "'summary': 'ok', 'error_code': None}\n"
+            "def build_vendored_provider():\n"
+            "    return _Provider()\n",
+        )
+        archive.writestr(
+            f"{module}-{COMPOSED_BASE_PACKAGE_VERSION}.dist-info/METADATA",
+            f"Name: {COMPOSED_BASE_PACKAGE_NAME}\nVersion: {COMPOSED_BASE_PACKAGE_VERSION}\n",
+        )
+        archive.writestr(
+            f"{module}-{COMPOSED_BASE_PACKAGE_VERSION}.dist-info/entry_points.txt",
+            f"[{PAID_PROVIDER_ENTRYPOINT_GROUP}]\n"
+            f"private_v1 = {module}.vendored_provider:build_vendored_provider\n",
+        )
+        archive.writestr(
+            f"{module}-{COMPOSED_BASE_PACKAGE_VERSION}.dist-info/WHEEL",
+            "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        )
+    data = wheel_path.read_bytes()
+    return data, sha256_hex(data)
+
+
+def _build_composed_thin_wheel(tmp_path: Path) -> tuple[bytes, str]:
+    module = FREE_BUILDER_PACKAGE_NAME.replace("-", "_")
+    wheel_path = tmp_path / f"{FREE_BUILDER_PACKAGE_NAME}-{COMPOSED_THIN_PACKAGE_VERSION}.whl"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    thin_provider_source = (
+        "class _Provider:\n"
+        "    calls = []\n"
+        "    def descriptor(self):\n"
+        "        self.calls.append('descriptor')\n"
+        "        return {'provider_id': 'private_v1'}\n"
+        "def build_provider():\n"
+        "    return _Provider()\n"
+    )
+    with zipfile.ZipFile(wheel_path, "w") as archive:
+        archive.writestr(f"{module}/controlled_provider.py", thin_provider_source)
+        archive.writestr(
+            f"{module}-{COMPOSED_THIN_PACKAGE_VERSION}.dist-info/METADATA",
+            f"Name: {FREE_BUILDER_PACKAGE_NAME}\nVersion: {COMPOSED_THIN_PACKAGE_VERSION}\n",
+        )
+        archive.writestr(
+            f"{module}-{COMPOSED_THIN_PACKAGE_VERSION}.dist-info/entry_points.txt",
+            f"[{CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP}]\n"
+            f"private_v1 = {module}.controlled_provider:build_provider\n"
+            "[agentveil_mcp_proxy.controlled_alternative_authorities]\n"
+            f"ca_route_v1 = {module}.controlled_provider:build_provider\n",
+        )
+        archive.writestr(
+            f"{module}-{COMPOSED_THIN_PACKAGE_VERSION}.dist-info/WHEEL",
+            "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        )
+    data = wheel_path.read_bytes()
+    return data, sha256_hex(data)
+
+
 @dataclass
-class _FakeBackend:
-    wheel_bytes: bytes
-    artifact_hash: str
-    artifact_size: int
+class _FakeComposedBackend:
+    base_wheel_bytes: bytes
+    base_artifact_hash: str
+    base_artifact_size: int
+    thin_wheel_bytes: bytes
+    thin_artifact_hash: str
+    thin_artifact_size: int
 
     def validate_activation(self, license_key: str) -> ActivationValidateResult:
         assert license_key == RAW_LICENSE_KEY
-        activation_accepted = True
         return ActivationValidateResult(
-            valid=activation_accepted,
+            valid=True,  # claim-check: allow fake-backend fixture, not product truth.
             customer_ref_fingerprint="cust_fp",
             plan="builder",
             license_status="active",
@@ -125,41 +209,63 @@ class _FakeBackend:
         platform_name: str,
         python_version: str,
     ) -> PackageAuthorizeResult:
-        del artifact_id, platform_name, python_version
+        del platform_name, python_version
         assert entitlement_token == ENTITLEMENT_TOKEN
+        if artifact_id == COMPOSED_BASE_ARTIFACT_ID:
+            return PackageAuthorizeResult(
+                download_authorized=True,
+                artifact_id=COMPOSED_BASE_ARTIFACT_ID,
+                package_name=COMPOSED_BASE_PACKAGE_NAME,
+                package_version=COMPOSED_BASE_PACKAGE_VERSION,
+                artifact_hash=self.base_artifact_hash,
+                artifact_size_bytes=self.base_artifact_size,
+                download_authorization_id="dlauth_bridge_base_001",
+                public_fallback_available=True,
+                error_code=None,
+            )
+        if artifact_id == COMPOSED_THIN_ARTIFACT_ID:
+            return PackageAuthorizeResult(
+                download_authorized=True,
+                artifact_id=COMPOSED_THIN_ARTIFACT_ID,
+                package_name=FREE_BUILDER_PACKAGE_NAME,
+                package_version=COMPOSED_THIN_PACKAGE_VERSION,
+                artifact_hash=self.thin_artifact_hash,
+                artifact_size_bytes=self.thin_artifact_size,
+                download_authorization_id="dlauth_bridge_thin_001",
+                public_fallback_available=True,
+                error_code=None,
+            )
         return PackageAuthorizeResult(
-            download_authorized=True,
-            artifact_id="art_pkg_private_policy_001",
-            package_name=PACKAGE_NAME,
-            package_version=PACKAGE_VERSION,
-            artifact_hash=self.artifact_hash,
-            artifact_size_bytes=self.artifact_size,
-            download_authorization_id="dlauth_bridge_001",
+            download_authorized=False,
+            artifact_id=artifact_id,
+            package_name=None,
+            package_version=None,
+            artifact_hash=None,
+            artifact_size_bytes=None,
+            download_authorization_id=None,
             public_fallback_available=True,
-            error_code=None,
+            error_code="download_denied",
         )
 
     def download_package(self, authorization: PackageAuthorizeResult) -> bytes:
-        assert authorization.download_authorization_id == "dlauth_bridge_001"
-        return self.wheel_bytes
+        if authorization.download_authorization_id == "dlauth_bridge_base_001":
+            return self.base_wheel_bytes
+        if authorization.download_authorization_id == "dlauth_bridge_thin_001":
+            return self.thin_wheel_bytes
+        raise AssertionError("unexpected download authorization")
 
 
-def _wheel_bytes(tmp_path: Path) -> tuple[bytes, str]:
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    wheel_path = tmp_path / f"{PACKAGE_NAME}-{PACKAGE_VERSION}.whl"
-    module = PACKAGE_NAME.replace("-", "_")
-    with zipfile.ZipFile(wheel_path, "w") as archive:
-        archive.writestr(f"{module}/__init__.py", "provider_id = 'private_v1'\n")
-        archive.writestr(
-            f"{module}-{PACKAGE_VERSION}.dist-info/METADATA",
-            f"Name: {PACKAGE_NAME}\nVersion: {PACKAGE_VERSION}\n",
-        )
-        archive.writestr(
-            f"{module}-{PACKAGE_VERSION}.dist-info/WHEEL",
-            "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
-        )
-    data = wheel_path.read_bytes()
-    return data, sha256_hex(data)
+def _composed_fake_backend(tmp_path: Path) -> _FakeComposedBackend:
+    base_wheel, base_digest = _build_composed_base_wheel(tmp_path / "wheel-base")
+    thin_wheel, thin_digest = _build_composed_thin_wheel(tmp_path / "wheel-thin")
+    return _FakeComposedBackend(
+        base_wheel_bytes=base_wheel,
+        base_artifact_hash=base_digest,
+        base_artifact_size=len(base_wheel),
+        thin_wheel_bytes=thin_wheel,
+        thin_artifact_hash=thin_digest,
+        thin_artifact_size=len(thin_wheel),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -175,15 +281,27 @@ def _assert_privacy(text: str) -> None:
         assert marker not in text
 
 
+def _fixture_install_active_example() -> dict:
+    return dict(_public_paid_contract()["durable_files"]["install_json"]["active_example"])
+
+
 def test_public_paid_contract_fixture_is_stable_and_privacy_safe():
     contract = _public_paid_contract()
-    assert contract["schema_version"] == "avp.paid_activation.public_contract.v1"
+    assert contract["schema_version"] == "avp.paid_activation.public_contract.v2"
     assert contract["default_paid_api_base_url"] == DEFAULT_PAID_API_BASE_URL
     activation_keys = set(contract["durable_files"]["activation_json"]["allowed_keys"])
     install_keys = set(contract["durable_files"]["install_json"]["allowed_keys"])
+    component_keys = set(contract["durable_files"]["install_json"]["install_component_allowed_keys"])
     assert activation_keys == set(BOUNDED_ACTIVATION_KEYS)
     assert install_keys == set(BOUNDED_INSTALL_KEYS)
-    assert contract["durable_files"]["install_json"]["active_example"]["provider_id"] == PROVIDER_ID
+    assert component_keys == set(BOUNDED_INSTALL_COMPONENT_KEYS)
+    example = contract["durable_files"]["install_json"]["active_example"]
+    assert example["provider_id"] == PROVIDER_ID
+    assert example["package_name"] == COMPOSED_BASE_PACKAGE_NAME
+    assert example["package_version"] == COMPOSED_BASE_PACKAGE_VERSION
+    roles = {entry["role"] for entry in example["install_components"]}
+    assert roles == {COMPONENT_ROLE_BASE, COMPONENT_ROLE_THIN}
+    assert "install_composition" in contract["notes"]
     assert "private_consumer" in contract["notes"]
 
 
@@ -200,19 +318,17 @@ def test_blank_paid_api_base_url_disables_network(monkeypatch):
     assert resolve_paid_backend_client() is None
 
 
-def test_activate_writes_compatible_activation_and_install(tmp_path):
+def test_activate_writes_v2_composed_install_matching_public_contract(tmp_path):
     home = tmp_path / "avp-home"
-    wheel, digest = _wheel_bytes(tmp_path / "wheel")
-    set_paid_backend_client(
-        _FakeBackend(wheel_bytes=wheel, artifact_hash=digest, artifact_size=len(wheel))
-    )
+    backend = _composed_fake_backend(tmp_path / "wheels")
+    set_paid_backend_client(backend)
 
     from agentveil_mcp_proxy.paid_activation import build_paid_activate_payload
 
     payload = build_paid_activate_payload(license_key=RAW_LICENSE_KEY, home=home)
     assert payload["activation"]["status"] == STATUS_ACTIVE
     assert payload["install"]["provider_id"] == PROVIDER_ID
-    assert payload["install"]["package_name"] == PACKAGE_NAME
+    assert payload["install"]["package_name"] == COMPOSED_BASE_PACKAGE_NAME
 
     activation_file = home / "paid" / ACTIVATION_FILENAME
     install_file = home / "paid" / INSTALL_FILENAME
@@ -227,16 +343,26 @@ def test_activate_writes_compatible_activation_and_install(tmp_path):
         contract["durable_files"]["activation_json"]["allowed_keys"]
     )
     assert set(saved_install) <= set(contract["durable_files"]["install_json"]["allowed_keys"])
+    for entry in saved_install["install_components"]:
+        assert set(entry) <= set(
+            contract["durable_files"]["install_json"]["install_component_allowed_keys"]
+        )
+    expected_install = _fixture_install_active_example()
+    assert saved_install["status"] == expected_install["status"]
+    assert saved_install["provider_id"] == expected_install["provider_id"]
+    assert saved_install["package_name"] == expected_install["package_name"]
+    assert saved_install["package_version"] == expected_install["package_version"]
+    assert saved_install["install_composition_version"] == expected_install["install_composition_version"]
+    assert saved_install["install_components"] == expected_install["install_components"]
     assert saved_activation["status"] == STATUS_ACTIVE
     assert saved_install["status"] == STATUS_ACTIVE
-    assert saved_install["provider_id"] == "private_v1"
     entitlement_status, enabled = map_public_paid_enablement(saved_activation, saved_install)
     assert entitlement_status == STATUS_ACTIVE
     assert enabled is True
     hints = public_install_hints(saved_install)
     assert hints == {
-        "package_name": PACKAGE_NAME,
-        "package_version": PACKAGE_VERSION,
+        "package_name": COMPOSED_BASE_PACKAGE_NAME,
+        "package_version": COMPOSED_BASE_PACKAGE_VERSION,
         "provider_id": "private_v1",
     }
     _assert_privacy(activation_file.read_text(encoding="utf-8"))
@@ -246,10 +372,7 @@ def test_activate_writes_compatible_activation_and_install(tmp_path):
 
 def test_stdin_activate_cli_writes_bridge_files(tmp_path):
     home = tmp_path / "avp-home"
-    wheel, digest = _wheel_bytes(tmp_path / "wheel")
-    set_paid_backend_client(
-        _FakeBackend(wheel_bytes=wheel, artifact_hash=digest, artifact_size=len(wheel))
-    )
+    set_paid_backend_client(_composed_fake_backend(tmp_path / "wheels"))
     out = io.StringIO()
     code = run_paid_activate_cli(
         license_key=None,
@@ -267,6 +390,7 @@ def test_stdin_activate_cli_writes_bridge_files(tmp_path):
     install = load_install_state(install_state_path(home))
     assert activation is not None and install is not None
     assert map_public_paid_enablement(activation, install) == (STATUS_ACTIVE, True)
+    assert install["install_composition_version"] == _fixture_install_active_example()["install_composition_version"]
     assert "provider_id=" not in text
     assert "package_name=" not in text
 
@@ -309,8 +433,8 @@ def test_enablement_matrix_matches_public_contract_fixture(row):
     install = {
         "status": row["install_status"],
         "provider_id": "private_v1",
-        "package_name": PACKAGE_NAME,
-        "package_version": PACKAGE_VERSION,
+        "package_name": LEGACY_PACKAGE_NAME,
+        "package_version": LEGACY_PACKAGE_VERSION,
         "public_fallback_available": True,
         "error_code": None,
         "last_installed_at": "2026-07-23T00:00:00+00:00",
@@ -321,6 +445,48 @@ def test_enablement_matrix_matches_public_contract_fixture(row):
         row["entitlement_status"],
         row["provider_enabled"],
     )
+
+
+def test_legacy_v1_install_json_remains_readable_for_status_and_enablement(tmp_path):
+    home = tmp_path / "avp-home"
+    write_activation_state(
+        activation_path(home),
+        {
+            "status": STATUS_ACTIVE,
+            "provider_present": True,
+            "license_id": "lic_legacy",
+            "customer_id": None,
+            "expires_at": None,
+            "last_checked_at": "2026-07-23T00:00:00+00:00",
+            "public_fallback_available": True,
+            "error_code": None,
+        },
+    )
+    write_install_state(
+        install_state_path(home),
+        {
+            "status": STATUS_ACTIVE,
+            "provider_id": "private_v1",
+            "package_name": LEGACY_PACKAGE_NAME,
+            "package_version": LEGACY_PACKAGE_VERSION,
+            "public_fallback_available": True,
+            "error_code": None,
+            "last_installed_at": "2026-07-01T00:00:00+00:00",
+            "install_safety_state": "verified",
+            "install_safety_reason": None,
+        },
+    )
+    install = load_install_state(install_state_path(home))
+    assert install is not None
+    assert "install_composition_version" not in install
+    assert map_public_paid_enablement(
+        load_activation_state(activation_path(home)),
+        install,
+    ) == (STATUS_ACTIVE, True)
+    payload = build_paid_status_payload(home=home)
+    assert payload["activation"]["status"] == STATUS_ACTIVE
+    assert payload["paid_activation_available"] is True
+    _assert_privacy(json.dumps(payload, sort_keys=True))
 
 
 def test_status_preserves_expired_activation_for_core_fallback(tmp_path):
@@ -343,8 +509,8 @@ def test_status_preserves_expired_activation_for_core_fallback(tmp_path):
         {
             "status": STATUS_ACTIVE,
             "provider_id": "private_v1",
-            "package_name": PACKAGE_NAME,
-            "package_version": PACKAGE_VERSION,
+            "package_name": LEGACY_PACKAGE_NAME,
+            "package_version": LEGACY_PACKAGE_VERSION,
             "public_fallback_available": True,
             "error_code": None,
             "last_installed_at": "2026-07-01T00:00:00+00:00",
@@ -387,8 +553,8 @@ def test_deactivate_disables_paid_state(tmp_path):
         {
             "status": STATUS_ACTIVE,
             "provider_id": "private_v1",
-            "package_name": PACKAGE_NAME,
-            "package_version": PACKAGE_VERSION,
+            "package_name": LEGACY_PACKAGE_NAME,
+            "package_version": LEGACY_PACKAGE_VERSION,
             "public_fallback_available": True,
             "error_code": None,
             "last_installed_at": "2026-07-23T00:00:00+00:00",
