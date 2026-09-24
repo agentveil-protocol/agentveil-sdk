@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import zipfile
@@ -27,8 +28,11 @@ from agentveil_mcp_proxy.console_free_builder_client import (
     TransportError,
     assert_download_request_public_bounded,
     build_download_request_payload,
+    run_paid_upgrade_free_builder_cli,
     sync_free_builder_install,
+    upgrade_free_builder_to_paired,
 )
+from agentveil_mcp_proxy.paid_activation import activation_path
 from agentveil_mcp_proxy.console_project_status_client import resolve_private_guardrails_status
 from agentveil_mcp_proxy.paid_install import (
     COMPOSED_BASE_PACKAGE_NAME,
@@ -37,18 +41,22 @@ from agentveil_mcp_proxy.paid_install import (
     COMPOSED_THIN_PACKAGE_VERSION,
     COMPONENT_ROLE_BASE,
     COMPONENT_ROLE_THIN,
+    DEFAULT_PACKAGE_NAME,
     ERROR_PACKAGE_NAME_MISMATCH,
     FreeBuilderInstallError,
     FreeBuilderWheelExpectations,
     install_state_path,
+    install_wheel_to_vendor,
     resolve_vendored_controlled_alternative_authority,
     resolve_vendored_controlled_alternative_provider,
     resolve_vendored_paid_provider,
     run_free_builder_install_flow,
     run_free_builder_paired_install_flow,
+    scan_paid_output_for_leaks,
     sha256_hex,
     vendor_root,
     verify_free_builder_wheel_artifact,
+    write_install_state,
 )
 from agentveil_mcp_proxy.paid_provider import (
     PUBLIC_PAID_PROVIDER_CONTRACT_VERSION,
@@ -56,6 +64,7 @@ from agentveil_mcp_proxy.paid_provider import (
     STATUS_DISABLED,
     STATUS_EXPIRED,
     STATUS_REVOKED,
+    STATUS_WITHIN_GRACE,
     PaidProviderSnapshot,
     discover_paid_provider,
     set_paid_provider_loader,
@@ -1200,3 +1209,643 @@ def run_activation_handoff(request):
     assert not (vendor_root(home) / f"{PACKAGE_NAME}-{COMPOSED_THIN_PACKAGE_VERSION}").exists()
     assert list(vendor_root(home).glob(".staging-*")) == []
     assert list((home / "paid" / "cache").glob(".staging-*")) == []
+
+
+_PROXY_CONFIG_SENTINEL = b'{"schema":"sentinel-proxy-config-unchanged-v1"}\n'
+_EVIDENCE_HISTORY_SENTINEL = b"SQLITE_SENTINEL_EVIDENCE_HISTORY_UNCHANGED_V1\n"
+
+
+def _seed_proxy_config_and_evidence_sentinels(home: Path) -> tuple[bytes, bytes]:
+    proxy_dir = home / "mcp-proxy"
+    proxy_dir.mkdir(parents=True, exist_ok=True)
+    (proxy_dir / "config.json").write_bytes(_PROXY_CONFIG_SENTINEL)
+    (proxy_dir / "evidence.sqlite").write_bytes(_EVIDENCE_HISTORY_SENTINEL)
+    return _PROXY_CONFIG_SENTINEL, _EVIDENCE_HISTORY_SENTINEL
+
+
+def _assert_proxy_config_and_evidence_unchanged(
+    home: Path,
+    *,
+    config_sentinel: bytes,
+    evidence_sentinel: bytes,
+) -> None:
+    proxy_dir = home / "mcp-proxy"
+    assert (proxy_dir / "config.json").read_bytes() == config_sentinel
+    assert (proxy_dir / "evidence.sqlite").read_bytes() == evidence_sentinel
+
+
+def _seed_legacy_active_thin_install(tmp_path, monkeypatch) -> Path:
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    save_credential(TOKEN, home=home)
+    wheel_bytes, artifact_hash = _build_wheel(tmp_path / "legacy-wheel")
+    run_free_builder_install_flow(
+        wheel_bytes=wheel_bytes,
+        home=home,
+        activation_credential=TOKEN,
+        expectations=_expectations_for_wheel(wheel_bytes, artifact_hash),
+    )
+    install_state = json.loads(install_state_path(home).read_text(encoding="utf-8"))
+    assert install_state.get("install_composition_version") is None
+    skip = sync_free_builder_install(
+        home=home,
+        transport=BackendEchoTransport(
+            responses=_with_v1_fallback([_json_response(200, {"eligible": True})])
+        ),
+        discover_paid_provider_fn=lambda: _active_provider_snapshot(),
+    )
+    assert skip == "skipped_already_active"
+    return home
+
+
+def test_upgrade_preview_without_apply_does_not_mutate_or_download(tmp_path, monkeypatch):
+    home = _seed_legacy_active_thin_install(tmp_path, monkeypatch)
+    config_sentinel, evidence_sentinel = _seed_proxy_config_and_evidence_sentinels(home)
+    prior_install_bytes = install_state_path(home).read_bytes()
+    activation_file = activation_path(home)
+    prior_activation_bytes = (
+        activation_file.read_bytes() if activation_file.is_file() else None
+    )
+    legacy_marker_file = vendor_root(home) / f"{PACKAGE_NAME}-{PACKAGE_VERSION}" / "legacy-marker.txt"
+    legacy_marker_file.write_text("keep-me", encoding="utf-8")
+    prior_marker_bytes = legacy_marker_file.read_bytes()
+
+    base_bytes, base_hash = _build_base_wheel(tmp_path / "base")
+    thin_bytes, thin_hash = _build_thin_wheel(tmp_path / "thin")
+    transport = BackendEchoTransport(
+        responses=[
+            _json_response(
+                200,
+                _v2_eligible_response(
+                    base_hash=base_hash,
+                    base_size=len(base_bytes),
+                    thin_hash=thin_hash,
+                    thin_size=len(thin_bytes),
+                ),
+            ),
+        ]
+    )
+    payload = upgrade_free_builder_to_paired(home=home, apply=False, transport=transport)
+    assert payload["result_code"] == "preview_ready"
+    assert payload["apply"] is False
+    assert payload["upgrade_available"] is True
+    assert len(transport.calls) == 1
+    assert install_state_path(home).read_bytes() == prior_install_bytes
+    if prior_activation_bytes is None:
+        assert not activation_file.is_file()
+    else:
+        assert activation_file.read_bytes() == prior_activation_bytes
+    assert legacy_marker_file.read_bytes() == prior_marker_bytes
+    _assert_proxy_config_and_evidence_unchanged(
+        home,
+        config_sentinel=config_sentinel,
+        evidence_sentinel=evidence_sentinel,
+    )
+    rendered = json.dumps(payload, sort_keys=True)
+    scan_paid_output_for_leaks(rendered, secrets=(TOKEN, SECRET))
+    assert TOKEN not in rendered
+
+
+def test_upgrade_apply_installs_exact_v2_pair_and_retains_legacy_vendor(tmp_path, monkeypatch):
+    home = _seed_legacy_active_thin_install(tmp_path, monkeypatch)
+    config_sentinel, evidence_sentinel = _seed_proxy_config_and_evidence_sentinels(home)
+    legacy_vendor = vendor_root(home) / f"{PACKAGE_NAME}-{PACKAGE_VERSION}"
+    legacy_marker = legacy_vendor / "legacy-marker.txt"
+    legacy_marker.write_text("keep-me", encoding="utf-8")
+    prior_marker_bytes = legacy_marker.read_bytes()
+    prior_cache = home / "paid" / "cache" / f"{PACKAGE_NAME}-{PACKAGE_VERSION}.whl"
+    prior_cache_bytes = prior_cache.read_bytes()
+
+    base_bytes, base_hash = _build_base_wheel(tmp_path / "base")
+    thin_bytes, thin_hash = _build_thin_wheel(tmp_path / "thin")
+    transport = BackendEchoTransport(
+        responses=[
+            _json_response(
+                200,
+                _v2_eligible_response(
+                    base_hash=base_hash,
+                    base_size=len(base_bytes),
+                    thin_hash=thin_hash,
+                    thin_size=len(thin_bytes),
+                ),
+            ),
+            _octet_response(200, base_bytes),
+            _octet_response(200, thin_bytes),
+        ]
+    )
+    payload = upgrade_free_builder_to_paired(home=home, apply=True, transport=transport)
+    assert payload["result_code"] == "upgraded"
+    assert len(transport.calls) == 3
+    install_state = json.loads(install_state_path(home).read_text(encoding="utf-8"))
+    assert install_state["install_composition_version"] == COMPOSED_INSTALL_COMPOSITION_VERSION
+    assert legacy_marker.read_bytes() == prior_marker_bytes
+    assert prior_cache.read_bytes() == prior_cache_bytes
+    assert resolve_vendored_paid_provider(home=home) is not None
+    _assert_proxy_config_and_evidence_unchanged(
+        home,
+        config_sentinel=config_sentinel,
+        evidence_sentinel=evidence_sentinel,
+    )
+
+
+def test_upgrade_v2_404_never_falls_back_to_v1(tmp_path, monkeypatch):
+    home = _seed_legacy_active_thin_install(tmp_path, monkeypatch)
+    prior_install_bytes = install_state_path(home).read_bytes()
+    transport = BackendEchoTransport(responses=[_v2_not_found_response()])
+    payload = upgrade_free_builder_to_paired(home=home, apply=True, transport=transport)
+    assert payload["result_code"] == "rejected"
+    assert len(transport.calls) == 1
+    assert "/v2/eligibility" in transport.calls[0][1]
+    assert install_state_path(home).read_bytes() == prior_install_bytes
+
+
+def test_upgrade_rejects_already_composed_install(tmp_path, monkeypatch):
+    home = _seed_legacy_active_thin_install(tmp_path, monkeypatch)
+    install_path = install_state_path(home)
+    composed = {
+        "status": STATUS_ACTIVE,
+        "provider_id": "private_v1",
+        "package_name": COMPOSED_BASE_PACKAGE_NAME,
+        "package_version": COMPOSED_BASE_PACKAGE_VERSION,
+        "install_composition_version": COMPOSED_INSTALL_COMPOSITION_VERSION,
+        "install_components": [
+            {
+                "role": COMPONENT_ROLE_BASE,
+                "package_name": COMPOSED_BASE_PACKAGE_NAME,
+                "package_version": COMPOSED_BASE_PACKAGE_VERSION,
+            },
+            {
+                "role": COMPONENT_ROLE_THIN,
+                "package_name": PACKAGE_NAME,
+                "package_version": COMPOSED_THIN_PACKAGE_VERSION,
+            },
+        ],
+        "public_fallback_available": True,
+        "error_code": None,
+        "last_installed_at": "2026-01-01T00:00:00+00:00",
+        "install_safety_state": "verified",
+        "install_safety_reason": None,
+    }
+    write_install_state(install_path, composed)
+    transport = BackendEchoTransport()
+    payload = upgrade_free_builder_to_paired(home=home, apply=False, transport=transport)
+    assert payload["result_code"] == "rejected_already_composed"
+    assert transport.calls == []
+
+
+def test_upgrade_rejects_paid_license_install(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    save_credential(TOKEN, home=home)
+    wheel_bytes, _ = _build_wheel(
+        tmp_path / "paid-wheel",
+        package_name=DEFAULT_PACKAGE_NAME,
+        package_version="0.1.0",
+    )
+    wheel_path = tmp_path / f"{DEFAULT_PACKAGE_NAME}-0.1.0.whl"
+    wheel_path.write_bytes(wheel_bytes)
+    target_dir = vendor_root(home) / f"{DEFAULT_PACKAGE_NAME}-0.1.0"
+    install_wheel_to_vendor(
+        home=home,
+        wheel_path=wheel_path,
+        target_dir=target_dir,
+        expected_package_name=DEFAULT_PACKAGE_NAME,
+        expected_package_version="0.1.0",
+        require_empty_target=True,
+    )
+    write_install_state(
+        install_state_path(home),
+        {
+            "status": STATUS_ACTIVE,
+            "provider_id": "private_v1",
+            "package_name": DEFAULT_PACKAGE_NAME,
+            "package_version": "0.1.0",
+            "public_fallback_available": True,
+            "error_code": None,
+            "last_installed_at": "2026-01-01T00:00:00+00:00",
+            "install_safety_state": "verified",
+            "install_safety_reason": None,
+        },
+    )
+    payload = upgrade_free_builder_to_paired(
+        home=home,
+        apply=False,
+        transport=BackendEchoTransport(),
+        discover_paid_provider_fn=lambda: _active_provider_snapshot(),
+    )
+    assert payload["result_code"] == "rejected_paid_license_state"
+
+
+def test_upgrade_apply_post_commit_failure_restores_prior_bytes(tmp_path, monkeypatch):
+    home = _seed_legacy_active_thin_install(tmp_path, monkeypatch)
+    config_sentinel, evidence_sentinel = _seed_proxy_config_and_evidence_sentinels(home)
+    install_path = install_state_path(home)
+    prior_install_bytes = install_path.read_bytes()
+    activation_file = activation_path(home)
+    prior_activation_bytes = (
+        activation_file.read_bytes() if activation_file.is_file() else None
+    )
+    legacy_vendor = vendor_root(home) / f"{PACKAGE_NAME}-{PACKAGE_VERSION}"
+    legacy_marker = legacy_vendor / "legacy-marker.txt"
+    legacy_marker.write_text("keep-me", encoding="utf-8")
+    prior_marker_bytes = legacy_marker.read_bytes()
+    cache_path = home / "paid" / "cache" / f"{PACKAGE_NAME}-{PACKAGE_VERSION}.whl"
+    prior_cache_bytes = cache_path.read_bytes()
+
+    base_bytes, base_hash = _build_base_wheel(tmp_path / "base")
+    thin_bytes, thin_hash = _build_thin_wheel(tmp_path / "thin")
+
+    module = COMPOSED_BASE_PACKAGE_NAME.replace("-", "_")
+    postcommit_inactive_provider = """
+import os
+from pathlib import Path
+
+class _Provider:
+    provider_id = 'private_v1'
+    provider_contract_version = '1'
+
+    def status(self):
+        home = os.environ.get('AVP_HOME')
+        install_path = Path(home) / 'paid' / 'install.json' if home else None
+        if install_path is not None and install_path.is_file():
+            return {
+                'provider_present': True,
+                'provider_id': 'private_v1',
+                'provider_contract_version': '1',
+                'status': 'revoked',
+                'private_provider_enabled': False,
+                'public_fallback_available': True,
+                'summary': 'inactive after install',
+                'error_code': None,
+            }
+        return {
+            'provider_present': True,
+            'provider_id': 'private_v1',
+            'provider_contract_version': '1',
+            'status': 'missing',
+            'private_provider_enabled': False,
+            'public_fallback_available': True,
+            'summary': 'awaiting install state',
+            'error_code': None,
+        }
+
+def build_vendored_provider():
+    return _Provider()
+"""
+    handoff_writes_activation = """
+def run_activation_handoff(request):
+    from pathlib import Path
+    import json
+    activation = Path(request.avp_home) / 'paid' / 'activation.json'
+    activation.parent.mkdir(parents=True, exist_ok=True)
+    activation.write_text(json.dumps({
+        "status": "active",
+        "provider_present": True,
+        "license_id": "lic_new",
+        "customer_id": None,
+        "expires_at": None,
+        "last_checked_at": "2026-01-01T00:00:00+00:00",
+        "public_fallback_available": True,
+        "error_code": None,
+    }))
+    return {
+        "contract_version": "1",
+        "status": "active",
+        "public_fallback_available": True,
+        "summary": "Installed hook completed.",
+        "error_code": None,
+    }
+"""
+    base_dir = tmp_path / "rollback-base"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    base_wheel_path = base_dir / f"{COMPOSED_BASE_PACKAGE_NAME}-{COMPOSED_BASE_PACKAGE_VERSION}.whl"
+    with zipfile.ZipFile(base_wheel_path, "w") as archive:
+        archive.writestr(f"{module}/__init__.py", "provider_id = 'private_v1'\n")
+        archive.writestr(f"{module}/handoff_hook.py", handoff_writes_activation)
+        archive.writestr(f"{module}/vendored_provider.py", postcommit_inactive_provider)
+        archive.writestr(
+            f"{module}-{COMPOSED_BASE_PACKAGE_VERSION}.dist-info/METADATA",
+            f"Name: {COMPOSED_BASE_PACKAGE_NAME}\nVersion: {COMPOSED_BASE_PACKAGE_VERSION}\n",
+        )
+        archive.writestr(
+            f"{module}-{COMPOSED_BASE_PACKAGE_VERSION}.dist-info/entry_points.txt",
+            (
+                f"[{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP}]\n"
+                f"{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME} = "
+                f"{module}.handoff_hook:run_activation_handoff\n\n"
+                f"[{PAID_PROVIDER_ENTRYPOINT_GROUP}]\n"
+                f"private_v1 = {module}.vendored_provider:build_vendored_provider\n"
+            ),
+        )
+        archive.writestr(
+            f"{module}-{COMPOSED_BASE_PACKAGE_VERSION}.dist-info/WHEEL",
+            "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        )
+    rollback_base_bytes = base_wheel_path.read_bytes()
+    rollback_base_hash = sha256_hex(rollback_base_bytes)
+
+    transport = BackendEchoTransport(
+        responses=[
+            _json_response(
+                200,
+                _v2_eligible_response(
+                    base_hash=rollback_base_hash,
+                    base_size=len(rollback_base_bytes),
+                    thin_hash=thin_hash,
+                    thin_size=len(thin_bytes),
+                ),
+            ),
+            _octet_response(200, rollback_base_bytes),
+            _octet_response(200, thin_bytes),
+        ]
+    )
+    payload = upgrade_free_builder_to_paired(home=home, apply=True, transport=transport)
+    assert payload["result_code"] == "skipped_install_failed"
+    assert len(transport.calls) == 3
+    assert install_path.read_bytes() == prior_install_bytes
+    if prior_activation_bytes is None:
+        assert not activation_file.is_file()
+    else:
+        assert activation_file.read_bytes() == prior_activation_bytes
+    assert legacy_marker.read_bytes() == prior_marker_bytes
+    assert cache_path.read_bytes() == prior_cache_bytes
+    assert not (
+        vendor_root(home) / f"{COMPOSED_BASE_PACKAGE_NAME}-{COMPOSED_BASE_PACKAGE_VERSION}"
+    ).exists()
+    assert not (vendor_root(home) / f"{PACKAGE_NAME}-{COMPOSED_THIN_PACKAGE_VERSION}").exists()
+    assert list(vendor_root(home).glob(".staging-*")) == []
+    assert list((home / "paid" / "cache").glob(".staging-*")) == []
+    _assert_proxy_config_and_evidence_unchanged(
+        home,
+        config_sentinel=config_sentinel,
+        evidence_sentinel=evidence_sentinel,
+    )
+
+
+@pytest.mark.parametrize(
+    "install_safety_state",
+    ["blocked", "malformed", "review_recommended", "unknown", None],  # claim-check: allow negative install_safety_state fixture labels for fail-closed safety-state test.
+)
+def test_upgrade_fail_closed_unverified_install_safety_skips_network(
+    tmp_path, monkeypatch, install_safety_state,
+):
+    home = _seed_legacy_active_thin_install(tmp_path, monkeypatch)
+    install_path = install_state_path(home)
+    install_state = json.loads(install_path.read_text(encoding="utf-8"))
+    install_state["install_safety_state"] = install_safety_state
+    write_install_state(install_path, install_state)
+    transport = BackendEchoTransport(
+        responses=[_json_response(200, {"eligible": True})],
+    )
+    payload = upgrade_free_builder_to_paired(home=home, apply=False, transport=transport)
+    assert payload["result_code"] == "rejected_ineligible_local_state"
+    assert transport.calls == []
+
+
+def test_upgrade_fail_closed_terminal_activation_skips_network(tmp_path, monkeypatch):
+    home = _seed_legacy_active_thin_install(tmp_path, monkeypatch)
+    activation_file = activation_path(home)
+    activation_file.parent.mkdir(parents=True, exist_ok=True)
+    activation_file.write_text(
+        json.dumps(
+            {
+                "status": STATUS_REVOKED,
+                "provider_present": True,
+                "license_id": "lic_prior",
+                "customer_id": None,
+                "expires_at": None,
+                "last_checked_at": "2026-01-01T00:00:00+00:00",
+                "public_fallback_available": True,
+                "error_code": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    transport = BackendEchoTransport(responses=[_json_response(200, {"eligible": True})])
+    payload = upgrade_free_builder_to_paired(home=home, apply=False, transport=transport)
+    assert payload["result_code"] == "rejected_paid_terminal_state"
+    assert transport.calls == []
+
+
+def test_upgrade_fail_closed_paid_license_activation_skips_network(tmp_path, monkeypatch):
+    home = _seed_legacy_active_thin_install(tmp_path, monkeypatch)
+    activation_file = activation_path(home)
+    activation_file.write_text(
+        json.dumps(
+            {
+                "status": STATUS_WITHIN_GRACE,
+                "provider_present": True,
+                "license_id": "lic_paid",
+                "customer_id": None,
+                "expires_at": None,
+                "last_checked_at": "2026-01-01T00:00:00+00:00",
+                "public_fallback_available": True,
+                "error_code": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    transport = BackendEchoTransport(responses=[_json_response(200, {"eligible": True})])
+    payload = upgrade_free_builder_to_paired(home=home, apply=False, transport=transport)
+    assert payload["result_code"] == "rejected_paid_terminal_state"
+    assert transport.calls == []
+
+
+def test_upgrade_fail_closed_symlink_vendor_skips_network(tmp_path, monkeypatch):
+    home = _seed_legacy_active_thin_install(tmp_path, monkeypatch)
+    vendor_dir = vendor_root(home) / f"{PACKAGE_NAME}-{PACKAGE_VERSION}"
+    real_dir = tmp_path / "real-vendor"
+    real_dir.mkdir()
+    for child in list(vendor_dir.iterdir()):
+        if child.is_file():
+            shutil.copy2(child, real_dir / child.name)
+    shutil.rmtree(vendor_dir)
+    vendor_dir.symlink_to(real_dir, target_is_directory=True)
+    transport = BackendEchoTransport(responses=[_json_response(200, {"eligible": True})])
+    payload = upgrade_free_builder_to_paired(home=home, apply=False, transport=transport)
+    assert payload["result_code"] == "rejected_ineligible_local_state"
+    assert transport.calls == []
+
+
+def test_upgrade_fail_closed_symlink_install_json_skips_network(tmp_path, monkeypatch):
+    home = _seed_legacy_active_thin_install(tmp_path, monkeypatch)
+    install_path = install_state_path(home)
+    prior_install_bytes = install_path.read_bytes()
+    real_install = tmp_path / "real-install.json"
+    real_install.write_bytes(prior_install_bytes)
+    install_path.unlink()
+    install_path.symlink_to(real_install)
+    transport = BackendEchoTransport(
+        responses=[
+            _json_response(
+                200,
+                _v2_eligible_response(
+                    base_hash="a" * 64,
+                    base_size=1,
+                    thin_hash="b" * 64,
+                    thin_size=1,
+                ),
+            ),
+        ]
+    )
+    payload = upgrade_free_builder_to_paired(home=home, apply=False, transport=transport)
+    assert payload["result_code"] == "rejected_ineligible_local_state"
+    assert transport.calls == []
+    assert real_install.read_bytes() == prior_install_bytes
+
+
+def test_upgrade_fail_closed_symlink_activation_json_skips_network(tmp_path, monkeypatch):
+    home = _seed_legacy_active_thin_install(tmp_path, monkeypatch)
+    activation_file = activation_path(home)
+    activation_file.parent.mkdir(parents=True, exist_ok=True)
+    activation_payload = {
+        "status": STATUS_ACTIVE,
+        "provider_present": True,
+        "license_id": "lic_legacy_synthetic",
+        "customer_id": None,
+        "expires_at": None,
+        "last_checked_at": "2026-01-01T00:00:00+00:00",
+        "public_fallback_available": True,
+        "error_code": None,
+    }
+    prior_activation_bytes = json.dumps(activation_payload, sort_keys=True).encode("utf-8")
+    real_activation = tmp_path / "real-activation.json"
+    real_activation.write_bytes(prior_activation_bytes)
+    activation_file.symlink_to(real_activation)
+    transport = BackendEchoTransport(responses=[_json_response(200, {"eligible": True})])
+    payload = upgrade_free_builder_to_paired(home=home, apply=False, transport=transport)
+    assert payload["result_code"] == "rejected_ineligible_local_state"
+    assert transport.calls == []
+    assert real_activation.read_bytes() == prior_activation_bytes
+
+
+def test_upgrade_fail_closed_symlink_paid_parent_skips_network(tmp_path, monkeypatch):
+    home = _seed_legacy_active_thin_install(tmp_path, monkeypatch)
+    paid_dir = home / "paid"
+    real_paid = tmp_path / "real-paid"
+    shutil.move(str(paid_dir), str(real_paid))
+    paid_dir.symlink_to(real_paid, target_is_directory=True)
+    transport = BackendEchoTransport(responses=[_json_response(200, {"eligible": True})])
+    payload = upgrade_free_builder_to_paired(home=home, apply=False, transport=transport)
+    assert payload["result_code"] == "rejected_ineligible_local_state"
+    assert transport.calls == []
+
+
+def test_upgrade_preview_allows_active_activation_with_license_id(tmp_path, monkeypatch):
+    home = _seed_legacy_active_thin_install(tmp_path, monkeypatch)
+    activation_file = activation_path(home)
+    activation_file.write_text(
+        json.dumps(
+            {
+                "status": STATUS_ACTIVE,
+                "provider_present": True,
+                "license_id": "lic_legacy_synthetic",
+                "customer_id": None,
+                "expires_at": None,
+                "last_checked_at": "2026-01-01T00:00:00+00:00",
+                "public_fallback_available": True,
+                "error_code": None,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    base_bytes, base_hash = _build_base_wheel(tmp_path / "base")
+    thin_bytes, thin_hash = _build_thin_wheel(tmp_path / "thin")
+    transport = BackendEchoTransport(
+        responses=[
+            _json_response(
+                200,
+                _v2_eligible_response(
+                    base_hash=base_hash,
+                    base_size=len(base_bytes),
+                    thin_hash=thin_hash,
+                    thin_size=len(thin_bytes),
+                ),
+            ),
+        ]
+    )
+    payload = upgrade_free_builder_to_paired(home=home, apply=False, transport=transport)
+    assert payload["result_code"] == "preview_ready"
+    assert len(transport.calls) == 1
+
+
+_UPGRADE_JSON_KEYS = frozenset(
+    {
+        "action",
+        "apply",
+        "current_package_name",
+        "current_package_version",
+        "result_code",
+        "target_components",
+        "target_install_composition_version",
+        "upgrade_available",
+    }
+)
+
+
+def test_upgrade_cli_emits_human_output_without_secrets(tmp_path, monkeypatch, capsys):
+    from agentveil_mcp_proxy.paid_activation import assert_paid_human_output_no_overclaim
+
+    home = _seed_legacy_active_thin_install(tmp_path, monkeypatch)
+    base_bytes, base_hash = _build_base_wheel(tmp_path / "base")
+    thin_bytes, thin_hash = _build_thin_wheel(tmp_path / "thin")
+    transport = BackendEchoTransport(
+        responses=[
+            _json_response(
+                200,
+                _v2_eligible_response(
+                    base_hash=base_hash,
+                    base_size=len(base_bytes),
+                    thin_hash=thin_hash,
+                    thin_size=len(thin_bytes),
+                ),
+            ),
+        ]
+    )
+    code = run_paid_upgrade_free_builder_cli(
+        home=home,
+        apply=False,
+        output_json=False,
+        transport=transport,
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert out.startswith("Upgrade action:")
+    assert "Result: preview_ready" in out
+    assert not out.strip().startswith("{")
+    assert_paid_human_output_no_overclaim(out)
+    scan_paid_output_for_leaks(out, secrets=(TOKEN, SECRET))
+    assert TOKEN not in out
+
+
+def test_upgrade_cli_emits_bounded_json_without_secrets(tmp_path, monkeypatch, capsys):
+    home = _seed_legacy_active_thin_install(tmp_path, monkeypatch)
+    base_bytes, base_hash = _build_base_wheel(tmp_path / "base")
+    thin_bytes, thin_hash = _build_thin_wheel(tmp_path / "thin")
+    transport = BackendEchoTransport(
+        responses=[
+            _json_response(
+                200,
+                _v2_eligible_response(
+                    base_hash=base_hash,
+                    base_size=len(base_bytes),
+                    thin_hash=thin_hash,
+                    thin_size=len(thin_bytes),
+                ),
+            ),
+        ]
+    )
+    code = run_paid_upgrade_free_builder_cli(
+        home=home,
+        apply=False,
+        output_json=True,
+        transport=transport,
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    assert set(payload) <= _UPGRADE_JSON_KEYS
+    scan_paid_output_for_leaks(out, secrets=(TOKEN, SECRET))
+    assert TOKEN not in out
+    assert "Bearer" not in out

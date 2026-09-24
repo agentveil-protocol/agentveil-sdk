@@ -95,6 +95,26 @@ def test_discover_paid_provider_absent_by_default():
     )
 
 
+def test_paid_upgrade_free_builder_cli_rejects_missing_credential(tmp_path):
+    code, out, err = _run_main(["paid", "upgrade-free-builder", "--json"], home=tmp_path)
+    assert code == 1
+    payload = json.loads(out)
+    assert payload["action"] == "upgrade-free-builder"
+    assert payload["result_code"] == "skipped_no_credential"
+    assert payload["apply"] is False
+    assert err == ""
+
+
+def test_paid_upgrade_free_builder_cli_human_output_rejects_missing_credential(tmp_path):
+    code, out, err = _run_main(["paid", "upgrade-free-builder"], home=tmp_path)
+    assert code == 1
+    assert out.startswith("Upgrade action:")
+    assert "Result: skipped_no_credential" in out
+    assert not out.strip().startswith("{")
+    assert_paid_human_output_no_overclaim(out)
+    assert err == ""
+
+
 def test_paid_activate_status_deactivate_cli_contract(tmp_path):
     home = tmp_path / "avp-home"
     code, out, err = _run_main(

@@ -4568,6 +4568,18 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_path_args(paid_deactivate)
     _add_json_arg(paid_deactivate)
 
+    paid_upgrade_free_builder = paid_subparsers.add_parser(
+        "upgrade-free-builder",
+        help="Preview or apply upgrade from legacy Console free Builder to paired delivery",
+    )
+    _add_common_path_args(paid_upgrade_free_builder)
+    paid_upgrade_free_builder.add_argument(
+        "--apply",
+        action="store_true",
+        help="Perform the paired upgrade after preview validation",
+    )
+    _add_json_arg(paid_upgrade_free_builder)
+
     permission_doctor = subparsers.add_parser(
         "permission-doctor",
         help="Show setup mode, control boundaries, and redirect coverage",
@@ -7468,7 +7480,19 @@ def main(argv: list[str] | None = None) -> int:
                     home=args.home,
                     output_json=args.json_output,
                 )
-            raise ProxyCliError("paid action must be activate, status, or deactivate")
+            if args.paid_action == "upgrade-free-builder":
+                from agentveil_mcp_proxy.console_free_builder_client import (
+                    run_paid_upgrade_free_builder_cli,
+                )
+
+                return run_paid_upgrade_free_builder_cli(
+                    home=args.home,
+                    apply=args.apply,
+                    output_json=args.json_output,
+                )
+            raise ProxyCliError(
+                "paid action must be activate, status, deactivate, or upgrade-free-builder"
+            )
         if args.command == "permission-doctor":
             return print_permission_doctor_cli(
                 home=args.home,

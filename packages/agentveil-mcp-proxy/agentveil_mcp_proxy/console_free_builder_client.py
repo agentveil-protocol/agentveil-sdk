@@ -17,9 +17,10 @@ import socket
 import ssl
 import urllib.error
 import urllib.request
+import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, TextIO
 from urllib.parse import urlsplit
 
 from agentveil_mcp_proxy.console_credentials import (
@@ -657,6 +658,412 @@ def _resolve_provider_guard(snapshot: object) -> str | None:
     return None
 
 
+_UPGRADE_BOUNDED_PAYLOAD_KEYS = frozenset(
+    {
+        "action",
+        "apply",
+        "current_package_name",
+        "current_package_version",
+        "result_code",
+        "target_components",
+        "target_install_composition_version",
+        "upgrade_available",
+    }
+)
+_UPGRADE_TARGET_COMPONENT_KEYS = frozenset({"role", "package_name", "package_version"})
+
+
+def _upgrade_untrusted_local_paths_issue(home: Path) -> str | None:
+    """Reject symlink or untrusted path components before reading paid local state."""
+
+    from agentveil_mcp_proxy.paid_activation import activation_path
+    from agentveil_mcp_proxy.paid_install import (
+        PaidInstallError,
+        _assert_trusted_home_path,
+        install_state_path,
+        vendor_root,
+    )
+
+    try:
+        paid_dir = home / "paid"
+        _assert_trusted_home_path(home, paid_dir)
+        install_path = install_state_path(home)
+        if install_path.is_symlink() or install_path.exists():
+            _assert_trusted_home_path(home, install_path)
+        activation = activation_path(home)
+        if activation.is_symlink() or activation.exists():
+            _assert_trusted_home_path(home, activation)
+        _assert_trusted_home_path(home, vendor_root(home))
+    except PaidInstallError:
+        return "rejected_ineligible_local_state"
+    return None
+
+
+def _bounded_v2_component_summary(
+    components: tuple[FreeBuilderV2Component, ...],
+) -> list[dict[str, str]]:
+    return [
+        {
+            "role": component.role,
+            "package_name": component.package_name,
+            "package_version": component.package_version,
+        }
+        for component in components
+    ]
+
+
+def _legacy_console_thin_upgrade_issue(
+    *,
+    home: Path,
+    discover_paid_provider_fn: DiscoverPaidProvider,
+) -> str | None:
+    """Return a rejection code when local state is not an active legacy thin install."""
+
+    from agentveil_mcp_proxy.paid_activation import (
+        PaidActivationError,
+        TERMINAL_INACTIVE_ACTIVATION_STATUSES,
+        activation_path,
+        assert_activation_metadata_bounded,
+        load_activation_state,
+    )
+    from agentveil_mcp_proxy.paid_install import (
+        BOUNDED_INSTALL_KEYS,
+        DEFAULT_PACKAGE_NAME,
+        FREE_BUILDER_PACKAGE_NAME,
+        INSTALL_SAFETY_STATE_VERIFIED,
+        PROVIDER_ID,
+        install_state_path,
+        load_install_state,
+        resolve_vendored_paid_provider,
+        validate_bounded_package_name,
+        validate_bounded_package_version,
+        vendor_root,
+    )
+    from agentveil_mcp_proxy.paid_provider import (
+        STATUS_ACTIVE,
+        STATUS_MISSING,
+        STATUS_WITHIN_GRACE,
+    )
+
+    install_path = install_state_path(home)
+    install_state = load_install_state(install_path)
+    if install_state is None or install_state.get("status") != STATUS_ACTIVE:
+        return "rejected_ineligible_local_state"
+    if set(install_state) - BOUNDED_INSTALL_KEYS:
+        return "rejected_ineligible_local_state"
+    if install_state.get("install_composition_version") is not None:
+        return "rejected_already_composed"
+
+    safety_state = install_state.get("install_safety_state")
+    if safety_state != INSTALL_SAFETY_STATE_VERIFIED:
+        return "rejected_ineligible_local_state"
+
+    provider_id = install_state.get("provider_id")
+    if not isinstance(provider_id, str) or provider_id != PROVIDER_ID:
+        return "rejected_ineligible_local_state"
+
+    try:
+        snapshot = discover_paid_provider_fn()
+    except Exception:
+        return "rejected_ineligible_local_state"
+
+    guard = _resolve_provider_guard(snapshot)
+    if guard == "skipped_existing_paid_state":
+        return "rejected_paid_terminal_state"
+    if guard != "skipped_already_active":
+        return "rejected_ineligible_local_state"
+
+    discovered_id = getattr(snapshot, "provider_id", None)
+    discovered_status = getattr(snapshot, "status", None)
+    if discovered_status != STATUS_ACTIVE:
+        return "rejected_ineligible_local_state"
+    if discovered_id is not None and str(discovered_id) != provider_id:
+        return "rejected_ineligible_local_state"
+
+    package_name = install_state.get("package_name")
+    package_version = install_state.get("package_version")
+    if not isinstance(package_name, str) or not isinstance(package_version, str):
+        return "rejected_ineligible_local_state"
+    if package_name == DEFAULT_PACKAGE_NAME:
+        return "rejected_paid_license_state"
+    try:
+        bounded_name = validate_bounded_package_name(package_name)
+        bounded_version = validate_bounded_package_version(package_version)
+    except Exception:
+        return "rejected_ineligible_local_state"
+    if bounded_name != FREE_BUILDER_PACKAGE_NAME:
+        return "rejected_ineligible_local_state"
+
+    vendor_dir = vendor_root(home) / f"{bounded_name}-{bounded_version}"
+    if not vendor_dir.is_dir():
+        return "rejected_ineligible_local_state"
+
+    if resolve_vendored_paid_provider(home=home) is None:
+        return "rejected_ineligible_local_state"
+
+    activation = load_activation_state(activation_path(home))
+    if activation is not None:
+        try:
+            assert_activation_metadata_bounded(activation)
+        except PaidActivationError:
+            return "rejected_ineligible_local_state"
+        status = activation.get("status")
+        if status in TERMINAL_INACTIVE_ACTIVATION_STATUSES:
+            return "rejected_paid_terminal_state"
+        if status in {STATUS_WITHIN_GRACE}:
+            return "rejected_paid_terminal_state"
+        if status not in {STATUS_ACTIVE, STATUS_MISSING}:
+            return "rejected_ineligible_local_state"
+
+    return None
+
+
+def format_upgrade_free_builder_human_output(payload: Mapping[str, Any]) -> str:
+    lines = [
+        f"Upgrade action: {payload['action']}",
+        f"Apply: {'yes' if payload.get('apply') else 'no'}",
+        f"Result: {payload['result_code']}",
+        f"Upgrade available: {'yes' if payload.get('upgrade_available') else 'no'}",
+    ]
+    current_name = payload.get("current_package_name")
+    current_version = payload.get("current_package_version")
+    if isinstance(current_name, str) and isinstance(current_version, str):
+        lines.append(f"Current package: {current_name}")
+        lines.append(f"Current version: {current_version}")
+    target_components = payload.get("target_components")
+    if isinstance(target_components, list) and target_components:
+        lines.append("Target components:")
+        for entry in target_components:
+            if not isinstance(entry, dict):
+                continue
+            role = entry.get("role")
+            name = entry.get("package_name")
+            version = entry.get("package_version")
+            if isinstance(role, str) and isinstance(name, str) and isinstance(version, str):
+                lines.append(f"  - {role}: {name} {version}")
+    composition = payload.get("target_install_composition_version")
+    if isinstance(composition, str) and composition:
+        lines.append(f"Target composition version: {composition}")
+    return "\n".join(lines)
+
+
+def _build_upgrade_payload(
+    *,
+    result_code: str,
+    apply: bool,
+    current_package_name: str | None = None,
+    current_package_version: str | None = None,
+    target_components: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    from agentveil_mcp_proxy.paid_install import COMPOSED_INSTALL_COMPOSITION_VERSION
+
+    payload: dict[str, Any] = {
+        "action": "upgrade-free-builder",
+        "apply": bool(apply),
+        "result_code": str(result_code),
+        "upgrade_available": result_code == "preview_ready",
+    }
+    if current_package_name is not None:
+        payload["current_package_name"] = current_package_name
+    if current_package_version is not None:
+        payload["current_package_version"] = current_package_version
+    if target_components is not None:
+        payload["target_components"] = target_components
+        payload["target_install_composition_version"] = COMPOSED_INSTALL_COMPOSITION_VERSION
+    extra = set(payload) - _UPGRADE_BOUNDED_PAYLOAD_KEYS
+    if extra:
+        raise FreeBuilderClientError("invalid_upgrade_payload")
+    if target_components is not None:
+        for entry in target_components:
+            if set(entry) != _UPGRADE_TARGET_COMPONENT_KEYS:
+                raise FreeBuilderClientError("invalid_upgrade_payload")
+    return payload
+
+
+def upgrade_free_builder_to_paired(
+    *,
+    home: Path | None = None,
+    apply: bool = False,
+    platform: str | None = None,
+    python_version: str | None = None,
+    load_credential_fn: LoadCredential = load_credential,
+    discover_paid_provider_fn: DiscoverPaidProvider | None = None,
+    transport: Transport | None = None,
+    paired_install_flow_fn: Callable[..., None] | None = None,
+) -> dict[str, Any]:
+    """Explicit legacy Console thin -> v2 paired upgrade; preview unless apply=True."""
+
+    from agentveil_mcp_proxy.paid_activation import bound_avp_home
+    from agentveil_mcp_proxy.paid_install import (
+        current_platform_name,
+        current_python_version,
+        install_state_path,
+        load_install_state,
+    )
+
+    resolved_home = credential_home(home)
+    with bound_avp_home(resolved_home):
+        credential, skip = _resolve_credential(home=home, load_credential_fn=load_credential_fn)
+        if skip is not None:
+            return _build_upgrade_payload(result_code=skip, apply=apply)
+
+        path_issue = _upgrade_untrusted_local_paths_issue(resolved_home)
+        if path_issue is not None:
+            return _build_upgrade_payload(result_code=path_issue, apply=apply)
+
+        discover = discover_paid_provider_fn or discover_paid_provider
+        local_issue = _legacy_console_thin_upgrade_issue(
+            home=resolved_home,
+            discover_paid_provider_fn=discover,
+        )
+        if local_issue is not None:
+            return _build_upgrade_payload(result_code=local_issue, apply=apply)
+
+        install_state = load_install_state(install_state_path(resolved_home))
+        if install_state is None:
+            return _build_upgrade_payload(
+                result_code="rejected_ineligible_local_state",
+                apply=apply,
+            )
+        current_name = str(install_state.get("package_name"))
+        current_version = str(install_state.get("package_version"))
+
+        resolved_platform = _validate_platform(platform or current_platform_name())
+        resolved_python = _validate_python_version(python_version or current_python_version())
+        client = ConsoleFreeBuilderClient(transport=transport)
+        assert credential is not None
+
+        try:
+            eligibility_v2 = client.check_eligibility_v2(
+                bearer_token=credential.token,
+                platform=resolved_platform,
+                python_version=resolved_python,
+            )
+        except FreeBuilderClientError as exc:
+            if exc.code == "v2_not_found":
+                return _build_upgrade_payload(result_code="rejected", apply=apply)
+            if exc.code in {"transport_failed", "unavailable"}:
+                return _build_upgrade_payload(result_code="unavailable", apply=apply)
+            return _build_upgrade_payload(result_code="rejected", apply=apply)
+
+        if not eligibility_v2.eligible:
+            return _build_upgrade_payload(result_code="skipped_ineligible", apply=apply)
+        if len(eligibility_v2.components) != 2:
+            return _build_upgrade_payload(result_code="rejected", apply=apply)
+
+        target_summary = _bounded_v2_component_summary(eligibility_v2.components)
+        if not apply:
+            return _build_upgrade_payload(
+                result_code="preview_ready",
+                apply=False,
+                current_package_name=current_name,
+                current_package_version=current_version,
+                target_components=target_summary,
+            )
+
+        base_component = eligibility_v2.components[0]
+        thin_component = eligibility_v2.components[1]
+        base_expectations = expectations_from_v2_component(base_component)
+        thin_expectations = expectations_from_v2_component(thin_component)
+
+        try:
+            base_wheel_bytes = client.download_package_v2(
+                bearer_token=credential.token,
+                role=base_component.role,
+                platform=resolved_platform,
+                python_version=resolved_python,
+            )
+            thin_wheel_bytes = client.download_package_v2(
+                bearer_token=credential.token,
+                role=thin_component.role,
+                platform=resolved_platform,
+                python_version=resolved_python,
+            )
+        except FreeBuilderClientError as exc:
+            if exc.code in {"transport_failed", "unavailable"}:
+                return _build_upgrade_payload(result_code="unavailable", apply=True)
+            return _build_upgrade_payload(result_code="rejected", apply=True)
+
+        paired_install = paired_install_flow_fn or _default_paired_install_flow
+        try:
+            paired_install(
+                base_wheel_bytes=base_wheel_bytes,
+                thin_wheel_bytes=thin_wheel_bytes,
+                home=resolved_home,
+                activation_credential=credential.token,
+                base_expectations=base_expectations,
+                thin_expectations=thin_expectations,
+                discover_paid_provider_fn=discover,
+            )
+        except FreeBuilderInstallError:
+            return _build_upgrade_payload(result_code="skipped_install_failed", apply=True)
+        except Exception:
+            return _build_upgrade_payload(result_code="skipped_install_failed", apply=True)
+
+        return _build_upgrade_payload(
+            result_code="upgraded",
+            apply=True,
+            current_package_name=current_name,
+            current_package_version=current_version,
+            target_components=target_summary,
+        )
+
+
+def _emit_upgrade_payload(
+    payload: Mapping[str, Any],
+    *,
+    output_json: bool,
+    out: TextIO,
+    secrets: tuple[str, ...] = (),
+) -> None:
+    from agentveil_mcp_proxy.client_config import assert_proxy_cli_json_is_privacy_safe
+    from agentveil_mcp_proxy.paid_activation import assert_paid_human_output_no_overclaim
+    from agentveil_mcp_proxy.paid_install import scan_paid_output_for_leaks
+
+    bounded = dict(payload)
+    if output_json:
+        assert_proxy_cli_json_is_privacy_safe(bounded)
+        rendered = json.dumps(bounded, sort_keys=True)
+    else:
+        text = format_upgrade_free_builder_human_output(bounded)
+        assert_paid_human_output_no_overclaim(text)
+        rendered = text
+    scan_paid_output_for_leaks(rendered, secrets=secrets)
+    print(rendered, file=out)
+
+
+def run_paid_upgrade_free_builder_cli(
+    *,
+    home: Path | None,
+    apply: bool = False,
+    output_json: bool = False,
+    out: TextIO | None = None,
+    load_credential_fn: LoadCredential = load_credential,
+    discover_paid_provider_fn: DiscoverPaidProvider | None = None,
+    transport: Transport | None = None,
+    paired_install_flow_fn: Callable[..., None] | None = None,
+) -> int:
+    """Run bounded preview/apply upgrade for legacy Console free Builder installs."""
+
+    stream = out or sys.stdout
+    credential, _skip = _resolve_credential(home=home, load_credential_fn=load_credential_fn)
+    secret_markers: tuple[str, ...] = ()
+    if credential is not None and credential.token:
+        secret_markers = (credential.token,)
+    payload = upgrade_free_builder_to_paired(
+        home=home,
+        apply=apply,
+        load_credential_fn=load_credential_fn,
+        discover_paid_provider_fn=discover_paid_provider_fn,
+        transport=transport,
+        paired_install_flow_fn=paired_install_flow_fn,
+    )
+    _emit_upgrade_payload(payload, output_json=output_json, out=stream, secrets=secret_markers)
+    if payload.get("result_code") in {"preview_ready", "upgraded"}:
+        return 0
+    return 1
+
+
 def sync_free_builder_install(
     *,
     home: Path | None = None,
@@ -877,5 +1284,7 @@ __all__ = [
     "build_v2_download_request_payload",
     "expectations_from_eligibility",
     "expectations_from_v2_component",
+    "run_paid_upgrade_free_builder_cli",
     "sync_free_builder_install",
+    "upgrade_free_builder_to_paired",
 ]
