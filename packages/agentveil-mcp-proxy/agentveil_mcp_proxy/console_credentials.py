@@ -19,6 +19,7 @@ import os
 import secrets
 import stat
 from contextlib import contextmanager
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,9 +30,11 @@ from agentveil_mcp_proxy.control_artifacts import (
 
 CREDENTIAL_SCHEMA_VERSION = 1
 CREDENTIAL_SCOPE = "bounded_summary_upload"
+RUNTIME_BINDING_SCOPE = "controlled_alternatives_runtime_binding"
 
 _CREDENTIAL_DIRNAME = "console"
 _CREDENTIAL_FILENAME = "device-token.json"
+_RUNTIME_BINDING_FILENAME = "runtime-binding-credential.json"
 _LOGIN_LOCK_FILENAME = ".login.lock"
 
 _MAX_CREDENTIAL_FILE_BYTES = 8192
@@ -53,6 +56,7 @@ _WINDOWS_METADATA_KEYS = (
     "token_byte_length",
 )
 _WINDOWS_TARGET_PREFIX = "AgentVeil.Console.DeviceToken.v1"
+_WINDOWS_BINDING_TARGET_PREFIX = "AgentVeil.Console.RuntimeBindingCredential.v1"
 _WINDOWS_WAIT_OBJECT_0 = 0
 _WINDOWS_WAIT_ABANDONED = 0x80
 _WINDOWS_WAIT_TIMEOUT = 0x102
@@ -86,6 +90,9 @@ class StoredCredential:
 
     scope: str
     token: str
+
+    def __repr__(self) -> str:
+        return f"StoredCredential(scope={self.scope!r})"
 
 
 def _uses_posix_filesystem_custody() -> bool:
@@ -236,6 +243,12 @@ def credential_path(home: Path | None = None) -> Path:
     """Return the single Console device-token path under the AVP home."""
 
     return credential_home(home) / _CREDENTIAL_DIRNAME / _CREDENTIAL_FILENAME
+
+
+def runtime_binding_credential_path(home: Path | None = None) -> Path:
+    """Return the AV-02 runtime binding credential path under the AVP home."""
+
+    return credential_home(home) / _CREDENTIAL_DIRNAME / _RUNTIME_BINDING_FILENAME
 
 
 def credential_directory(home: Path | None = None) -> Path:
@@ -392,10 +405,10 @@ def _windows_credential_backend() -> _WindowsCredentialBackend:
     return _WindowsCredentialBackend()
 
 
-def _windows_namespace(home: Path | None) -> str:
+def _windows_namespace(home: Path | None, *, prefix: str = _WINDOWS_TARGET_PREFIX) -> str:
     canonical_home = os.path.normcase(os.path.abspath(str(credential_home(home))))
     digest = hashlib.sha256(canonical_home.encode("utf-8", "surrogatepass")).hexdigest()
-    return f"{_WINDOWS_TARGET_PREFIX}.{digest}"
+    return f"{prefix}.{digest}"
 
 
 def _windows_active_target(home: Path | None) -> str:
@@ -445,6 +458,12 @@ def _validate_scope(scope: object) -> str:
     if scope != CREDENTIAL_SCOPE:
         raise CredentialError("credential_invalid")
     return CREDENTIAL_SCOPE
+
+
+def _validate_runtime_binding_scope(scope: object) -> str:
+    if scope != RUNTIME_BINDING_SCOPE:
+        raise CredentialError("credential_invalid")
+    return RUNTIME_BINDING_SCOPE
 
 
 def _windows_metadata_bytes(
@@ -625,6 +644,189 @@ def _delete_windows_credential(home: Path | None) -> bool:
             return False
         try:
             deleted = backend.delete(_windows_active_target(home))
+        except _WindowsCredentialBackendError as exc:
+            raise CredentialError("credential_delete_failed") from exc
+        if not deleted:
+            return False
+        _delete_windows_generation(
+            backend,
+            namespace=namespace,
+            generation=metadata[0],
+            chunk_count=metadata[1],
+        )
+        return True
+
+
+def _windows_binding_active_target(home: Path | None) -> str:
+    return f"{_windows_namespace(home, prefix=_WINDOWS_BINDING_TARGET_PREFIX)}.active"
+
+
+def _windows_binding_metadata_bytes(
+    *,
+    generation: str,
+    chunk_count: int,
+    token_byte_length: int,
+) -> bytes:
+    payload = {
+        "schema_version": CREDENTIAL_SCHEMA_VERSION,
+        "scope": RUNTIME_BINDING_SCOPE,
+        "generation": generation,
+        "chunk_count": chunk_count,
+        "token_byte_length": token_byte_length,
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _load_windows_binding_metadata(
+    backend: _WindowsCredentialBackend,
+    home: Path | None,
+) -> tuple[str, int, int] | None:
+    try:
+        raw = backend.read(_windows_binding_active_target(home))
+    except _WindowsCredentialBackendError as exc:
+        raise CredentialError("credential_unreadable") from exc
+    if raw is None:
+        return None
+    if not isinstance(raw, bytes) or len(raw) > _WINDOWS_CREDENTIAL_BLOB_BYTES:
+        raise CredentialError("credential_invalid")
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise CredentialError("credential_invalid") from exc
+    if not isinstance(parsed, dict) or set(parsed) != set(_WINDOWS_METADATA_KEYS):
+        raise CredentialError("credential_invalid")
+    if parsed["schema_version"] != CREDENTIAL_SCHEMA_VERSION or isinstance(
+        parsed["schema_version"], bool
+    ):
+        raise CredentialError("credential_invalid")
+    _validate_runtime_binding_scope(parsed["scope"])
+    generation = parsed["generation"]
+    chunk_count = parsed["chunk_count"]
+    token_byte_length = parsed["token_byte_length"]
+    if (
+        not isinstance(generation, str)
+        or len(generation) != 32
+        or any(character not in "0123456789abcdef" for character in generation)
+    ):
+        raise CredentialError("credential_invalid")
+    if (
+        isinstance(chunk_count, bool)
+        or not isinstance(chunk_count, int)
+        or not 1 <= chunk_count <= _WINDOWS_MAX_CHUNKS
+    ):
+        raise CredentialError("credential_invalid")
+    if (
+        isinstance(token_byte_length, bool)
+        or not isinstance(token_byte_length, int)
+        or not 1 <= token_byte_length <= _WINDOWS_MAX_TOKEN_BYTES
+    ):
+        raise CredentialError("credential_invalid")
+    expected_chunks = (
+        token_byte_length + _WINDOWS_CREDENTIAL_BLOB_BYTES - 1
+    ) // _WINDOWS_CREDENTIAL_BLOB_BYTES
+    if chunk_count != expected_chunks:
+        raise CredentialError("credential_invalid")
+    return generation, chunk_count, token_byte_length
+
+
+def _save_windows_runtime_binding_credential(
+    credential: StoredCredential,
+    home: Path | None,
+) -> None:
+    token_bytes = credential.token.encode("utf-8")
+    if not token_bytes or len(token_bytes) > _WINDOWS_MAX_TOKEN_BYTES:
+        raise CredentialError("credential_invalid")
+    chunks = [
+        token_bytes[offset : offset + _WINDOWS_CREDENTIAL_BLOB_BYTES]
+        for offset in range(0, len(token_bytes), _WINDOWS_CREDENTIAL_BLOB_BYTES)
+    ]
+    generation = secrets.token_hex(16)
+    namespace = _windows_namespace(home, prefix=_WINDOWS_BINDING_TARGET_PREFIX)
+    metadata = _windows_binding_metadata_bytes(
+        generation=generation,
+        chunk_count=len(chunks),
+        token_byte_length=len(token_bytes),
+    )
+
+    with _windows_credential_lock(
+        home,
+        purpose="runtime_binding_custody",
+        nonblocking=False,
+    ) as backend:
+        previous = _load_windows_binding_metadata(backend, home)
+        written_targets: list[str] = []
+        try:
+            for index, chunk in enumerate(chunks):
+                target = _windows_chunk_target(namespace, generation, index)
+                backend.write(target, chunk)
+                written_targets.append(target)
+            backend.write(_windows_binding_active_target(home), metadata)
+        except _WindowsCredentialBackendError as exc:
+            for target in written_targets:
+                try:
+                    backend.delete(target)
+                except _WindowsCredentialBackendError:
+                    pass
+            raise CredentialError("credential_write_failed") from exc
+
+        if previous is not None:
+            _delete_windows_generation(
+                backend,
+                namespace=namespace,
+                generation=previous[0],
+                chunk_count=previous[1],
+            )
+
+
+def _load_windows_runtime_binding_credential(home: Path | None) -> StoredCredential | None:
+    namespace = _windows_namespace(home, prefix=_WINDOWS_BINDING_TARGET_PREFIX)
+    with _windows_credential_lock(
+        home,
+        purpose="runtime_binding_custody",
+        nonblocking=False,
+    ) as backend:
+        metadata = _load_windows_binding_metadata(backend, home)
+        if metadata is None:
+            return None
+        generation, chunk_count, token_byte_length = metadata
+        chunks: list[bytes] = []
+        try:
+            for index in range(chunk_count):
+                chunk = backend.read(_windows_chunk_target(namespace, generation, index))
+                if (
+                    chunk is None
+                    or not isinstance(chunk, bytes)
+                    or len(chunk) > _WINDOWS_CREDENTIAL_BLOB_BYTES
+                ):
+                    raise CredentialError("credential_invalid")
+                chunks.append(chunk)
+        except _WindowsCredentialBackendError as exc:
+            raise CredentialError("credential_unreadable") from exc
+    token_bytes = b"".join(chunks)
+    if len(token_bytes) != token_byte_length:
+        raise CredentialError("credential_invalid")
+    try:
+        token = token_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise CredentialError("credential_invalid") from exc
+    return StoredCredential(
+        scope=RUNTIME_BINDING_SCOPE,
+        token=_validate_token(token),
+    )
+
+
+def _delete_windows_runtime_binding_credential(home: Path | None) -> bool:
+    namespace = _windows_namespace(home, prefix=_WINDOWS_BINDING_TARGET_PREFIX)
+    with _windows_credential_lock(
+        home,
+        purpose="runtime_binding_custody",
+        nonblocking=False,
+    ) as backend:
+        metadata = _load_windows_binding_metadata(backend, home)
+        if metadata is None:
+            return False
+        try:
+            deleted = backend.delete(_windows_binding_active_target(home))
         except _WindowsCredentialBackendError as exc:
             raise CredentialError("credential_delete_failed") from exc
         if not deleted:
@@ -865,6 +1067,142 @@ def _load_from_directory_fd(dir_fd: int) -> StoredCredential | None:
     )
 
 
+def _load_scoped_credential_from_directory_fd(
+    dir_fd: int,
+    *,
+    filename: str,
+    scope_validator: Callable[[object], str],
+) -> StoredCredential | None:
+    try:
+        info = _stat_in_directory(dir_fd, filename)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise CredentialError("credential_unreadable") from exc
+
+    _assert_safe_regular_file(info)
+    if info.st_size > _MAX_CREDENTIAL_FILE_BYTES:
+        raise CredentialError("credential_invalid")
+
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        fd = os.open(filename, flags, dir_fd=dir_fd)
+    except OSError as exc:
+        raise CredentialError("credential_unreadable") from exc
+    try:
+        _assert_safe_regular_file(os.fstat(fd))
+        raw = os.read(fd, _MAX_CREDENTIAL_FILE_BYTES + 1)
+    except OSError as exc:
+        raise CredentialError("credential_unreadable") from exc
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    if len(raw) > _MAX_CREDENTIAL_FILE_BYTES:
+        raise CredentialError("credential_invalid")
+
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise CredentialError("credential_invalid") from exc
+
+    if not isinstance(parsed, dict) or set(parsed) != set(_ALLOWED_KEYS):
+        raise CredentialError("credential_invalid")
+    version = parsed["schema_version"]
+    if isinstance(version, bool) or version != CREDENTIAL_SCHEMA_VERSION:
+        raise CredentialError("credential_invalid")
+    return StoredCredential(
+        scope=scope_validator(parsed["scope"]),
+        token=_validate_token(parsed["token"]),
+    )
+
+
+def save_runtime_binding_credential(
+    token: str,
+    *,
+    scope: str = RUNTIME_BINDING_SCOPE,
+    home: Path | None = None,
+) -> None:
+    """Atomically persist the AV-02 runtime binding credential."""
+
+    credential = StoredCredential(
+        scope=_validate_runtime_binding_scope(scope),
+        token=_validate_token(token),
+    )
+    if _uses_windows_credential_manager():
+        _save_windows_runtime_binding_credential(credential, home)
+        return
+    dir_fd = _open_pinned_credential_directory(home, create=True)
+    try:
+        _atomic_write_to_directory_fd(
+            dir_fd, _RUNTIME_BINDING_FILENAME, _serialize(credential)
+        )
+    finally:
+        try:
+            os.close(dir_fd)
+        except OSError:
+            pass
+
+
+def load_runtime_binding_credential(home: Path | None = None) -> StoredCredential | None:
+    """Return the stored runtime binding credential or ``None`` when absent."""
+
+    if _uses_windows_credential_manager():
+        return _load_windows_runtime_binding_credential(home)
+    try:
+        dir_fd = _open_pinned_credential_directory(home, create=False)
+    except FileNotFoundError:
+        return None
+    try:
+        return _load_scoped_credential_from_directory_fd(
+            dir_fd,
+            filename=_RUNTIME_BINDING_FILENAME,
+            scope_validator=_validate_runtime_binding_scope,
+        )
+    finally:
+        try:
+            os.close(dir_fd)
+        except OSError:
+            pass
+
+
+def delete_runtime_binding_credential(home: Path | None = None) -> bool:
+    """Safely remove only the runtime binding credential file."""
+
+    if _uses_windows_credential_manager():
+        return _delete_windows_runtime_binding_credential(home)
+    try:
+        dir_fd = _open_pinned_credential_directory(home, create=False)
+    except FileNotFoundError:
+        return False
+    try:
+        try:
+            info = _stat_in_directory(dir_fd, _RUNTIME_BINDING_FILENAME)
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise CredentialError("credential_unreadable") from exc
+
+        _assert_safe_regular_file(info)
+        try:
+            os.unlink(_RUNTIME_BINDING_FILENAME, dir_fd=dir_fd)
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise CredentialError("credential_delete_failed") from exc
+        _fsync_directory_fd(dir_fd)
+        return True
+    finally:
+        try:
+            os.close(dir_fd)
+        except OSError:
+            pass
+
+
 def save_credential(
     token: str,
     *,
@@ -998,13 +1336,18 @@ def console_login_lock(home: Path | None = None):
 __all__ = [
     "CREDENTIAL_SCHEMA_VERSION",
     "CREDENTIAL_SCOPE",
+    "RUNTIME_BINDING_SCOPE",
     "CredentialError",
     "StoredCredential",
     "credential_home",
     "credential_path",
+    "runtime_binding_credential_path",
     "credential_directory",
     "console_login_lock",
     "delete_credential",
+    "delete_runtime_binding_credential",
     "load_credential",
+    "load_runtime_binding_credential",
     "save_credential",
+    "save_runtime_binding_credential",
 ]

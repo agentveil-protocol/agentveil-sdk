@@ -12,14 +12,20 @@ import pytest
 from agentveil_mcp_proxy.console_attach_client import (
     CONSOLE_ORIGIN,
     AttachClientError,
+    AttachToken,
     ConsoleAttachClient,
     RawResponse,
     TransportError,
     _NoRedirectHandler,
 )
+from agentveil_mcp_proxy.console_credentials import (
+    CREDENTIAL_SCOPE,
+    RUNTIME_BINDING_SCOPE,
+)
 
 DEVICE_CODE = "device-code-secret-xyz"
 TOKEN = "confirmed-device-token-secret"
+BINDING_TOKEN = "paired-runtime-binding-token-secret"
 ATTACH_STATE = "abcdefghijklmnopqrstuvwxyz0123456789ABCD"
 ATTACH_URI = f"/console/attach?state={ATTACH_STATE}"
 
@@ -381,3 +387,71 @@ def _start(payload):
         expires_in=payload["expires_in"],
         interval=payload["interval"],
     )
+
+
+def test_poll_dual_consumed_response_returns_both_credentials():
+    client = _client(
+        [
+            _json_response(
+                200,
+                {
+                    "status": "consumed",
+                    "token": TOKEN,
+                    "scope": CREDENTIAL_SCOPE,
+                    "runtime_binding_token": BINDING_TOKEN,
+                    "runtime_binding_scope": RUNTIME_BINDING_SCOPE,
+                },
+            )
+        ]
+    )
+    result = client.poll_for_token(_start(_start_payload()))
+    assert result.token == TOKEN
+    assert result.scope == CREDENTIAL_SCOPE
+    assert result.runtime_binding_token == BINDING_TOKEN
+    assert result.runtime_binding_scope == RUNTIME_BINDING_SCOPE
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "status": "consumed",
+            "token": TOKEN,
+            "scope": CREDENTIAL_SCOPE,
+            "runtime_binding_scope": RUNTIME_BINDING_SCOPE,
+        },
+        {
+            "status": "consumed",
+            "token": TOKEN,
+            "scope": CREDENTIAL_SCOPE,
+            "runtime_binding_token": BINDING_TOKEN,
+            "runtime_binding_scope": "other_scope",
+        },
+        {
+            "status": "consumed",
+            "token": TOKEN,
+            "scope": CREDENTIAL_SCOPE,
+            "runtime_binding_token": BINDING_TOKEN,
+            "runtime_binding_scope": RUNTIME_BINDING_SCOPE,
+            "extra": "field",
+        },
+    ],
+)
+def test_poll_dual_consumed_malformed_or_unexpected_binding_fails_closed(payload):
+    client = _client([_json_response(200, payload)])
+    with pytest.raises(AttachClientError) as exc:
+        client.poll_for_token(_start(_start_payload()))
+    assert exc.value.code in {"malformed_consume", "unexpected_binding_scope"}
+
+
+def test_runtime_binding_credential_is_redacted_and_owner_only():
+    token = AttachToken(
+        token=TOKEN,
+        scope=CREDENTIAL_SCOPE,
+        runtime_binding_token=BINDING_TOKEN,
+        runtime_binding_scope=RUNTIME_BINDING_SCOPE,
+    )
+    text = repr(token)
+    assert TOKEN not in text
+    assert BINDING_TOKEN not in text
+    assert "has_runtime_binding=True" in text

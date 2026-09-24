@@ -3677,6 +3677,33 @@ def test_console_logout_without_credential_is_idempotent(tmp_path, monkeypatch, 
     assert "Not connected to AgentVeil Console." in out
 
 
+def test_console_logout_revokes_source_and_removes_both_credentials(
+    tmp_path, monkeypatch, capsys,
+):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    from agentveil_mcp_proxy.console_credentials import (
+        RUNTIME_BINDING_SCOPE,
+        load_runtime_binding_credential,
+        save_runtime_binding_credential,
+    )
+
+    save_credential(CONSOLE_TOKEN, home=home)
+    save_runtime_binding_credential("runtime-binding-token-logout", home=home)
+    client = _FakeConsoleClient(revoke_result=RevokeOutcome.REVOKED)
+    _install_console_client(monkeypatch, client)
+
+    exit_code = main(["logout"])
+    out, _err = capsys.readouterr()
+
+    assert exit_code == 0
+    assert client.revoke_calls == [CONSOLE_TOKEN, "runtime-binding-token-logout"]
+    assert load_credential(home=home) is None
+    assert load_runtime_binding_credential(home=home) is None
+    assert "runtime-binding-token-logout" not in out
+    assert RUNTIME_BINDING_SCOPE not in out
+
+
 def test_console_logout_revoked_removes_credential(tmp_path, monkeypatch, capsys):
     home = tmp_path / "avp-home"
     monkeypatch.setenv("AVP_HOME", str(home))

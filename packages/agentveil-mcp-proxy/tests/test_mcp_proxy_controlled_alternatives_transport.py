@@ -4,6 +4,7 @@ import gzip
 import hashlib
 import json
 import re
+import secrets
 import socketserver
 import threading
 import time
@@ -15,6 +16,10 @@ import pytest
 
 from agentveil_mcp_proxy import controlled_alternatives as ca
 from agentveil_mcp_proxy import controlled_alternatives_transport as transport
+from agentveil_mcp_proxy.console_credentials import (
+    save_credential,
+    save_runtime_binding_credential,
+)
 
 
 @pytest.fixture
@@ -333,6 +338,392 @@ def test_context_bound_before_authority_and_descriptor(identity, tmp_path):
     finally:
         ca.set_controlled_alternative_authority_loader(None)
         ca.set_controlled_alternative_provider_loader(None)
+
+
+BINDING_TOKEN = "paired-runtime-binding-token-001"
+SUMMARY_TOKEN = "bounded-summary-upload-token-001"
+CAPABILITY = "filesystem.stage_delete.v1"
+RUNTIME_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+ISSUER_KEY_ID = "ab" * 32
+PUBLIC_KEY_HEX = ISSUER_KEY_ID
+MISMATCHED_PUBLIC_KEY_HEX = "cd" * 32
+
+
+def _healthy_context() -> dict[str, object]:
+    return {
+        "contains_secret_like_value": False,
+        "destructive_shell_pattern": False,
+        "write_then_execute_risk": False,
+        "credential_exfil_pattern": False,
+        "signal_producer_health": "healthy",
+    }
+
+
+def _register_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": "runtime/register/1",
+        "runtime_version": "1.0.0",
+        "contract_range": "av02.v1",
+        "catalog_digest": "aa" * 32,
+        "declared_executor_capabilities": [CAPABILITY],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _evaluate_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": "policy/evaluate/1",
+        "runtime_installation_id": RUNTIME_ID,
+        "operation_nonce": secrets.token_urlsafe(32),
+        "phase": "propose",
+        "action_family": "filesystem",
+        "target_class": "file",
+        "requested_executor_capability": CAPABILITY,
+        "policy_context": _healthy_context(),
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _install_binding(tmp_path):
+    save_credential(SUMMARY_TOKEN, home=tmp_path)
+    save_runtime_binding_credential(BINDING_TOKEN, home=tmp_path)
+
+
+def test_av02_transport_uses_exact_normative_paths_and_payloads(
+    identity, tmp_path, monkeypatch,
+):
+    seen = []
+    register_payload = _register_payload()
+    evaluate_payload = _evaluate_payload()
+    key_path = f"{transport._DECISION_KEY_PATH_PREFIX}{ISSUER_KEY_ID}"
+
+    def handler(request):
+        seen.append(request)
+        if request.url.path == transport._AV02_PATHS["register"]:
+            assert request.method == "POST"
+            assert json.loads(request.content) == register_payload
+            assert request.headers[transport.RUNTIME_BINDING_HEADER] == BINDING_TOKEN
+            assert transport.CONSOLE_CREDENTIAL_HEADER not in request.headers
+            return httpx.Response(
+                200,
+                json={
+                    "schema_version": "runtime/register-response/1",
+                    "runtime_installation_id": RUNTIME_ID,
+                },
+            )
+        if request.url.path == transport._AV02_PATHS["evaluate"]:
+            assert request.method == "POST"
+            assert json.loads(request.content) == evaluate_payload
+            assert request.headers[transport.RUNTIME_BINDING_HEADER] == BINDING_TOKEN
+            return httpx.Response(
+                200,
+                json={"ok": False, "error_code": "av02_disabled"},
+            )
+        if request.url.path == key_path:
+            assert request.method == "GET"
+            assert request.content in {b"", None}
+            assert request.headers[transport.RUNTIME_BINDING_HEADER] == BINDING_TOKEN
+            return httpx.Response(
+                200,
+                json={
+                    "schema_version": "av02-decision-verification-key/1",
+                    "issuer_key_id": ISSUER_KEY_ID,
+                    "algorithm": "Ed25519",
+                    "key_role": "controlled_alternatives_decision",
+                    "public_key_hex": PUBLIC_KEY_HEX,
+                    "status": "active",
+                },
+            )
+        pytest.fail(f"unexpected path {request.url.path}")
+
+    mock_http(monkeypatch, handler)
+    _install_binding(tmp_path)
+    bound = context(identity, tmp_path, base_url="https://agentveil.dev")
+    assert bound.contract_version == transport.CONTEXT_VERSION_V2
+    assert callable(bound.runtime_register)
+    assert callable(bound.policy_evaluate)
+    assert callable(bound.resolve_decision_verification_key)
+    assert bound.runtime_register(register_payload) == (
+        200,
+        {
+            "schema_version": "runtime/register-response/1",
+            "runtime_installation_id": RUNTIME_ID,
+        },
+    )
+    assert bound.policy_evaluate(evaluate_payload) == (
+        200,
+        {"ok": False, "error_code": "av02_disabled"},
+    )
+    assert bound.resolve_decision_verification_key(ISSUER_KEY_ID) == {
+        "schema_version": "av02-decision-verification-key/1",
+        "issuer_key_id": ISSUER_KEY_ID,
+        "algorithm": "Ed25519",
+        "key_role": "controlled_alternatives_decision",
+        "public_key_hex": PUBLIC_KEY_HEX,
+        "status": "active",
+    }
+    assert {item.url.path for item in seen} == set(transport._AV02_PATHS.values()) | {key_path}
+
+
+def test_av02_transport_signs_exact_body_without_secret_output(
+    identity, tmp_path, monkeypatch,
+):
+    seen = []
+    key_path = f"{transport._DECISION_KEY_PATH_PREFIX}{ISSUER_KEY_ID}"
+
+    def handler(request):
+        seen.append(request)
+        header = dict(re.findall(r'(\w+)="([^"]+)"', request.headers["Authorization"]))
+        assert header.get("v") == "2"
+        body = request.content or b""
+        message = (
+            f'v2:{request.method}:{request.url.path}::{header["ts"]}:{header["nonce"]}:'
+            f"{hashlib.sha256(body).hexdigest()}"
+        )
+        identity[0].verify_key.verify(message.encode(), bytes.fromhex(header["sig"]))
+        if request.url.path == key_path:
+            return httpx.Response(
+                200,
+                json={
+                    "schema_version": "av02-decision-verification-key/1",
+                    "issuer_key_id": ISSUER_KEY_ID,
+                    "algorithm": "Ed25519",
+                    "key_role": "controlled_alternatives_decision",
+                    "public_key_hex": PUBLIC_KEY_HEX,
+                    "status": "active",
+                },
+            )
+        return httpx.Response(200, json={"ok": True})
+
+    mock_http(monkeypatch, handler)
+    _install_binding(tmp_path)
+    bound = context(identity, tmp_path, base_url="https://agentveil.dev")
+    assert bound.runtime_register(_register_payload()) == (200, {"ok": True})
+    assert bound.resolve_decision_verification_key(ISSUER_KEY_ID) is not None
+    assert len(seen) == 2
+    assert seen[1].method == "GET"
+    assert seen[1].url.path == key_path
+    assert BINDING_TOKEN not in repr(bound)
+    assert SUMMARY_TOKEN not in repr(bound)
+    assert PUBLIC_KEY_HEX not in repr(bound)
+    assert identity[1].private_key_hex not in repr(bound)
+
+
+def test_av02_transport_without_binding_never_reaches_network(
+    identity, tmp_path, monkeypatch,
+):
+    mock_http(monkeypatch, lambda _request: pytest.fail("unexpected HTTP request"))
+    bound = context(identity, tmp_path, base_url="https://agentveil.dev")
+    assert bound.contract_version == transport.CONTEXT_VERSION
+    assert bound.runtime_register is None
+    assert bound.policy_evaluate is None
+    assert bound.resolve_decision_verification_key is None
+    save_credential(SUMMARY_TOKEN, home=tmp_path)
+    rebound = context(identity, tmp_path, base_url="https://agentveil.dev")
+    assert rebound.runtime_register is None
+    assert rebound.resolve_decision_verification_key is None
+
+
+def test_av02_transport_uses_dedicated_binding_credential_only(
+    identity, tmp_path, monkeypatch,
+):
+    headers_seen: list[str] = []
+
+    def handler(request):
+        headers_seen.append(request.headers[transport.RUNTIME_BINDING_HEADER])
+        return httpx.Response(
+            200,
+            json={
+                "schema_version": "runtime/register-response/1",
+                "runtime_installation_id": RUNTIME_ID,
+            },
+        )
+
+    mock_http(monkeypatch, handler)
+    save_credential(SUMMARY_TOKEN, home=tmp_path)
+    save_runtime_binding_credential(BINDING_TOKEN, home=tmp_path)
+    bound = context(identity, tmp_path, base_url="https://agentveil.dev")
+    status, _payload = bound.runtime_register(_register_payload())
+    assert status == 200
+    assert headers_seen == [BINDING_TOKEN]
+    assert SUMMARY_TOKEN not in headers_seen
+
+
+def test_av02_transport_requests_use_fresh_signed_nonce(
+    identity, tmp_path, monkeypatch,
+):
+    nonces: list[str] = []
+
+    def handler(request):
+        header = dict(re.findall(r'(\w+)="([^"]+)"', request.headers["Authorization"]))
+        nonces.append(header["nonce"])
+        return httpx.Response(
+            200,
+            json={
+                "schema_version": "runtime/register-response/1",
+                "runtime_installation_id": RUNTIME_ID,
+            },
+        )
+
+    mock_http(monkeypatch, handler)
+    _install_binding(tmp_path)
+    bound = context(identity, tmp_path, base_url="https://agentveil.dev")
+    assert bound.runtime_register is not None
+    bound.runtime_register(_register_payload())
+    bound.runtime_register(_register_payload())
+    assert len(nonces) == 2
+    assert nonces[0] != nonces[1]
+
+
+def test_av02_transport_preserves_handle_without_persisting_or_logging_it(
+    identity, tmp_path, monkeypatch,
+):
+    execute_handle = secrets.token_urlsafe(32)
+    binding_path = tmp_path / "console" / "runtime-binding-credential.json"
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            json={
+                "schema_version": "policy/decision-response/1",
+                "execute_handle": execute_handle,
+            },
+        )
+
+    mock_http(monkeypatch, handler)
+    _install_binding(tmp_path)
+    bound = context(identity, tmp_path, base_url="https://agentveil.dev")
+    assert bound.policy_evaluate is not None
+    status, payload = bound.policy_evaluate(_evaluate_payload(phase="execute"))
+    assert status == 200
+    assert payload.get("execute_handle") == execute_handle
+    assert execute_handle not in repr(bound)
+    if binding_path.exists():
+        assert execute_handle not in binding_path.read_text(encoding="utf-8")
+
+
+def test_attach_and_transport_preserve_legacy_baseline_without_runtime_binding(
+    identity, tmp_path, monkeypatch,
+):
+    mock_http(monkeypatch, lambda _request: pytest.fail("unexpected HTTP request"))
+    bound = context(identity, tmp_path, base_url="https://agentveil.dev")
+    assert bound.contract_version == transport.CONTEXT_VERSION
+    assert bound.runtime_register is None
+    assert bound.policy_evaluate is None
+    assert bound.resolve_decision_verification_key is None
+    legacy = context(identity, tmp_path, base_url="https://agentveil.example")
+    assert legacy.runtime_register is None
+    assert legacy.policy_evaluate is None
+    assert legacy.resolve_decision_verification_key is None
+
+
+def test_decision_verification_key_rejects_mismatched_public_key_hex(
+    identity, tmp_path, monkeypatch,
+):
+    binding_path = tmp_path / "console" / "runtime-binding-credential.json"
+    mock_http(monkeypatch, lambda _request: pytest.fail("unexpected HTTP request"))
+    assert context(identity, tmp_path, base_url="https://agentveil.dev").resolve_decision_verification_key is None
+
+    def handler(_request):
+        return httpx.Response(
+            200,
+            json={
+                "schema_version": "av02-decision-verification-key/1",
+                "issuer_key_id": ISSUER_KEY_ID,
+                "algorithm": "Ed25519",
+                "key_role": "controlled_alternatives_decision",
+                "public_key_hex": MISMATCHED_PUBLIC_KEY_HEX,
+                "status": "active",
+            },
+        )
+
+    mock_http(monkeypatch, handler)
+    _install_binding(tmp_path)
+    bound = context(identity, tmp_path, base_url="https://agentveil.dev")
+    assert bound.resolve_decision_verification_key is not None
+    assert bound.resolve_decision_verification_key(ISSUER_KEY_ID) is None
+    assert MISMATCHED_PUBLIC_KEY_HEX not in repr(bound)
+    if binding_path.exists():
+        stored = binding_path.read_text(encoding="utf-8")
+        assert MISMATCHED_PUBLIC_KEY_HEX not in stored
+        assert ISSUER_KEY_ID not in stored
+
+
+def test_decision_key_resolution_never_persists_public_key_material(
+    identity, tmp_path, monkeypatch,
+):
+    binding_path = tmp_path / "console" / "runtime-binding-credential.json"
+
+    def handler(_request):
+        return httpx.Response(
+            200,
+            json={
+                "schema_version": "av02-decision-verification-key/1",
+                "issuer_key_id": ISSUER_KEY_ID,
+                "algorithm": "Ed25519",
+                "key_role": "controlled_alternatives_decision",
+                "public_key_hex": PUBLIC_KEY_HEX,
+                "status": "active",
+            },
+        )
+
+    mock_http(monkeypatch, handler)
+    _install_binding(tmp_path)
+    bound = context(identity, tmp_path, base_url="https://agentveil.dev")
+    assert bound.resolve_decision_verification_key is not None
+    assert bound.resolve_decision_verification_key(ISSUER_KEY_ID) is not None
+    if binding_path.exists():
+        assert PUBLIC_KEY_HEX not in binding_path.read_text(encoding="utf-8")
+
+
+def test_bind_installed_runtime_context_accepts_explicit_v2_duck_consumer(
+    identity, tmp_path,
+):
+    _install_binding(tmp_path)
+    bound = context(identity, tmp_path, base_url="https://agentveil.dev")
+    assert bound.contract_version == transport.CONTEXT_VERSION_V2
+
+    class ThinConsumer:
+        def __init__(self) -> None:
+            self.context = None
+
+        def bind_runtime_context(self, context):
+            if getattr(context, "contract_version", None) != "2":
+                raise ValueError("expected_v2")
+            for name in (
+                "runtime_register",
+                "policy_evaluate",
+                "resolve_decision_verification_key",
+                "state_root",
+            ):
+                if not callable(getattr(context, name, None)) and name != "state_root":
+                    raise ValueError(f"missing_{name}")
+            if not isinstance(context.state_root, str):
+                raise ValueError("missing_state_root")
+            self.context = context
+            return self
+
+    consumer = transport.bind_installed_runtime_context(ThinConsumer(), bound)
+    assert consumer.context is bound
+
+
+def test_runtime_heartbeat_never_sends_runtime_binding_header(
+    identity, tmp_path, monkeypatch,
+):
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        assert transport.RUNTIME_BINDING_HEADER not in request.headers
+        return httpx.Response(200, json={"ok": True})
+
+    mock_http(monkeypatch, handler)
+    _install_binding(tmp_path)
+    bound = context(identity, tmp_path, base_url="https://agentveil.dev")
+    assert bound.heartbeat(SUMMARY_TOKEN, "2026-09-15T12:00:00Z") == (200, {"ok": True})
+    assert seen[0].headers[transport.CONSOLE_CREDENTIAL_HEADER] == SUMMARY_TOKEN
 
 
 def test_context_without_active_authority_does_not_load_provider(identity, tmp_path):

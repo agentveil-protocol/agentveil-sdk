@@ -17,17 +17,24 @@ import agentveil_mcp_proxy.console_credentials as creds
 from agentveil_mcp_proxy.console_credentials import (
     CREDENTIAL_SCHEMA_VERSION,
     CREDENTIAL_SCOPE,
+    RUNTIME_BINDING_SCOPE,
     CredentialError,
+    StoredCredential,
     console_credential_home_for_runtime,
     console_login_lock,
     credential_path,
     delete_credential,
+    delete_runtime_binding_credential,
     load_credential,
+    load_runtime_binding_credential,
+    runtime_binding_credential_path,
     save_credential,
+    save_runtime_binding_credential,
 )
 
 POSIX = os.name != "nt"
 TOKEN = "opaque-device-token-value"
+BINDING_TOKEN = "paired-runtime-binding-token-value"
 
 
 class _FakeWindowsCredentialBackend:
@@ -89,6 +96,52 @@ def test_save_then_load_round_trip(tmp_path):
     assert loaded is not None
     assert loaded.token == TOKEN
     assert loaded.scope == CREDENTIAL_SCOPE
+
+
+def test_runtime_binding_save_load_round_trip(tmp_path):
+    save_runtime_binding_credential(BINDING_TOKEN, home=tmp_path)
+    loaded = load_runtime_binding_credential(home=tmp_path)
+    assert loaded is not None
+    assert loaded.token == BINDING_TOKEN
+    assert loaded.scope == RUNTIME_BINDING_SCOPE
+    assert credential_path(home=tmp_path) != runtime_binding_credential_path(home=tmp_path)
+
+
+def test_dual_credentials_are_stored_separately(tmp_path):
+    save_credential(TOKEN, home=tmp_path)
+    save_runtime_binding_credential(BINDING_TOKEN, home=tmp_path)
+    summary = load_credential(home=tmp_path)
+    binding = load_runtime_binding_credential(home=tmp_path)
+    assert summary is not None and binding is not None
+    assert summary.token == TOKEN
+    assert binding.token == BINDING_TOKEN
+    assert summary.token != binding.token
+
+
+def test_runtime_binding_credential_is_redacted_and_owner_only(tmp_path):
+    save_runtime_binding_credential(BINDING_TOKEN, home=tmp_path)
+    loaded = load_runtime_binding_credential(home=tmp_path)
+    assert loaded is not None
+    assert repr(loaded) == f"StoredCredential(scope={RUNTIME_BINDING_SCOPE!r})"
+    assert BINDING_TOKEN not in repr(loaded)
+    if POSIX:
+        assert _mode(runtime_binding_credential_path(home=tmp_path)) == 0o600
+
+
+def test_delete_runtime_binding_credential(tmp_path):
+    save_runtime_binding_credential(BINDING_TOKEN, home=tmp_path)
+    assert delete_runtime_binding_credential(home=tmp_path) is True
+    assert load_runtime_binding_credential(home=tmp_path) is None
+    assert load_credential(home=tmp_path) is None
+
+
+def test_runtime_binding_rejects_summary_scope(tmp_path):
+    with pytest.raises(CredentialError):
+        save_runtime_binding_credential(BINDING_TOKEN, scope=CREDENTIAL_SCOPE, home=tmp_path)
+
+
+def test_stored_credential_repr_hides_token():
+    assert TOKEN not in repr(StoredCredential(scope=CREDENTIAL_SCOPE, token=TOKEN))
 
 
 def test_created_directory_and_file_modes(tmp_path):

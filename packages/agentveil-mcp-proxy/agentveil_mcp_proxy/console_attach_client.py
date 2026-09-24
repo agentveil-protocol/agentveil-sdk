@@ -23,7 +23,10 @@ from dataclasses import dataclass
 from typing import Callable, Mapping
 from urllib.parse import urlsplit
 
-from agentveil_mcp_proxy.console_credentials import CREDENTIAL_SCOPE
+from agentveil_mcp_proxy.console_credentials import (
+    CREDENTIAL_SCOPE,
+    RUNTIME_BINDING_SCOPE,
+)
 
 CONSOLE_ORIGIN = "https://agentveil.dev"
 _ORIGIN_HOST = "agentveil.dev"
@@ -49,6 +52,13 @@ _MAX_INTERVAL = 300
 _START_KEYS = frozenset({"device_code", "attach_uri", "expires_in", "interval"})
 _PENDING_KEYS = frozenset({"status"})
 _CONSUMED_KEYS = frozenset({"status", "token", "scope"})
+_CONSUMED_DUAL_KEYS = frozenset({
+    "status",
+    "token",
+    "scope",
+    "runtime_binding_token",
+    "runtime_binding_scope",
+})
 
 
 class AttachClientError(RuntimeError):
@@ -88,6 +98,15 @@ class AttachToken:
 
     token: str
     scope: str
+    runtime_binding_token: str | None = None
+    runtime_binding_scope: str | None = None
+
+    def __repr__(self) -> str:
+        return (
+            "AttachToken("
+            f"scope={self.scope!r}, "
+            f"has_runtime_binding={self.runtime_binding_token is not None})"
+        )
 
 
 Transport = Callable[..., RawResponse]
@@ -231,14 +250,34 @@ class ConsoleAttachClient:
                 self._sleep(min(interval, remaining))
                 continue
             if status == "consumed":
-                if set(payload) != _CONSUMED_KEYS:
-                    raise AttachClientError("malformed_consume")
-                token = _require_secret_str(
-                    payload["token"], _MAX_TOKEN_LENGTH, "malformed_consume"
-                )
-                if payload["scope"] != CREDENTIAL_SCOPE:
-                    raise AttachClientError("unexpected_scope")
-                return AttachToken(token=token, scope=CREDENTIAL_SCOPE)
+                keys = set(payload)
+                if keys == _CONSUMED_KEYS:
+                    token = _require_secret_str(
+                        payload["token"], _MAX_TOKEN_LENGTH, "malformed_consume"
+                    )
+                    if payload["scope"] != CREDENTIAL_SCOPE:
+                        raise AttachClientError("unexpected_scope")
+                    return AttachToken(token=token, scope=CREDENTIAL_SCOPE)
+                if keys == _CONSUMED_DUAL_KEYS:
+                    token = _require_secret_str(
+                        payload["token"], _MAX_TOKEN_LENGTH, "malformed_consume"
+                    )
+                    if payload["scope"] != CREDENTIAL_SCOPE:
+                        raise AttachClientError("unexpected_scope")
+                    binding_token = _require_secret_str(
+                        payload["runtime_binding_token"],
+                        _MAX_TOKEN_LENGTH,
+                        "malformed_consume",
+                    )
+                    if payload["runtime_binding_scope"] != RUNTIME_BINDING_SCOPE:
+                        raise AttachClientError("unexpected_binding_scope")
+                    return AttachToken(
+                        token=token,
+                        scope=CREDENTIAL_SCOPE,
+                        runtime_binding_token=binding_token,
+                        runtime_binding_scope=RUNTIME_BINDING_SCOPE,
+                    )
+                raise AttachClientError("malformed_consume")
             raise AttachClientError("unexpected_status")
 
 

@@ -214,11 +214,15 @@ from agentveil_mcp_proxy.console_credentials import (
     console_login_lock,
     console_credential_home_for_runtime,
     delete_credential,
+    delete_runtime_binding_credential,
     load_credential,
+    load_runtime_binding_credential,
     save_credential,
+    save_runtime_binding_credential,
 )
 from agentveil_mcp_proxy.console_attach_client import (
     AttachClientError,
+    AttachToken,
     ConsoleAttachClient,
 )
 from agentveil_mcp_proxy.console_pairing_client import (
@@ -1711,6 +1715,7 @@ def _best_effort_console_project_status_sync(
     try:
         if not delete_credential():
             return
+        delete_runtime_binding_credential()
     except CredentialError:
         return
     _best_effort_console_attach_credential()
@@ -3960,16 +3965,29 @@ def _acquire_console_credential_via_attach(
     try:
         existing = load_credential()
     except CredentialError:
-        _revoke_orphan_console_token(pairing, token.token)
+        _revoke_orphan_console_token(
+            pairing,
+            token.token,
+            runtime_binding_token=token.runtime_binding_token,
+        )
         return False
     if existing is not None:
-        _revoke_orphan_console_token(pairing, token.token)
+        _revoke_orphan_console_token(
+            pairing,
+            token.token,
+            runtime_binding_token=token.runtime_binding_token,
+        )
         return True
 
     try:
-        save_credential(token.token, scope=token.scope)
+        _store_console_attach_credentials(token)
     except CredentialError:
-        _revoke_orphan_console_token(pairing, token.token)
+        _revoke_orphan_console_token(
+            pairing,
+            token.token,
+            runtime_binding_token=token.runtime_binding_token,
+        )
+        _delete_local_console_credentials()
         return False
     return True
 
@@ -3977,6 +3995,8 @@ def _acquire_console_credential_via_attach(
 def _revoke_orphan_console_token(
     pairing: ConsolePairingClient,
     token: str,
+    *,
+    runtime_binding_token: str | None = None,
 ) -> None:
     """Best-effort revoke when local custody cannot retain a confirmed token."""
 
@@ -3984,6 +4004,30 @@ def _revoke_orphan_console_token(
         pairing.revoke(token)
     except PairingClientError:
         pass
+    if runtime_binding_token:
+        try:
+            pairing.revoke(runtime_binding_token)
+        except PairingClientError:
+            pass
+
+
+def _store_console_attach_credentials(
+    token: AttachToken,
+    *,
+    home: Path | None = None,
+) -> None:
+    """Persist summary and optional runtime binding credentials from attach."""
+
+    save_credential(token.token, scope=token.scope, home=home)
+    binding_token = token.runtime_binding_token
+    if binding_token is None:
+        return
+    save_runtime_binding_credential(binding_token, home=home)
+
+
+def _delete_local_console_credentials(*, home: Path | None = None) -> None:
+    delete_credential(home=home)
+    delete_runtime_binding_credential(home=home)
 
 
 def run_console_login_cli(
@@ -4107,6 +4151,13 @@ def run_console_logout_cli(
         return 0
 
     pairing = client or _console_pairing_client()
+    binding_token: str | None = None
+    try:
+        binding = load_runtime_binding_credential()
+        if binding is not None:
+            binding_token = binding.token
+    except CredentialError:
+        binding_token = None
     try:
         outcome = pairing.revoke(credential.token)
     except PairingClientError as exc:
@@ -4116,8 +4167,14 @@ def run_console_logout_cli(
             exit_code=1,
         ) from exc
 
+    if binding_token:
+        try:
+            pairing.revoke(binding_token)
+        except PairingClientError:
+            pass
+
     try:
-        delete_credential()
+        _delete_local_console_credentials()
     except CredentialError as exc:
         raise ProxyCliError(
             f"Logout revoked the remote token but could not remove the local "
