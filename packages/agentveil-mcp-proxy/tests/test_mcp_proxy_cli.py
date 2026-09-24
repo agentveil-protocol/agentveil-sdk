@@ -4662,9 +4662,16 @@ def test_console_attach_on_setup_for_connectors(
     project.mkdir()
     attach = _FakeAttachClient()
     sync_calls = []
+    free_builder_calls = []
+    runtime_name = ".agentveil" if client == "cursor" else ".avp"
+    expected_runtime_home = (project / runtime_name).resolve()
     monkeypatch.setattr(
         "agentveil_mcp_proxy.cli._console_attach_client",
         lambda: attach,
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_free_builder_client.sync_free_builder_install",
+        lambda **kwargs: free_builder_calls.append(kwargs) or "skipped_no_credential",
     )
     monkeypatch.setattr(
         "agentveil_mcp_proxy.cli.console_login_lock",
@@ -4766,10 +4773,42 @@ def test_console_attach_on_setup_for_connectors(
     assert load_credential(home=avp_home).token == CONSOLE_ATTACH_TOKEN
     assert len(sync_calls) == 1
     assert sync_calls[0]["connector"] == connector
+    assert sync_calls[0]["runtime_home"].resolve() == expected_runtime_home
+    assert free_builder_calls[0]["home"].resolve() == expected_runtime_home
 
     assert main(status) == 0
     capsys.readouterr()
     assert len(sync_calls) == 2
+    assert sync_calls[1]["runtime_home"].resolve() == expected_runtime_home
+    assert free_builder_calls[1]["home"].resolve() == expected_runtime_home
+
+
+def test_run_proxy_scopes_paid_provider_discovery_to_runtime_home(tmp_path, monkeypatch):
+    home = tmp_path / "project" / ".avp"
+    monkeypatch.delenv("AVP_HOME", raising=False)
+    init_proxy(home=home, agent_name="proxy", plaintext=True)
+    config = json.loads((home / "mcp-proxy" / "config.json").read_text(encoding="utf-8"))
+    config["downstream"] = {
+        "name": "idle",
+        "command": sys.executable,
+        "args": ["-c", "import time; time.sleep(3600)"],
+    }
+    (home / "mcp-proxy" / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    provider_homes: list[Path | None] = []
+    real_discover = proxy_cli.discover_paid_provider
+
+    def _recording_discover(*, home=None):
+        provider_homes.append(home)
+        return real_discover(home=home)
+
+    monkeypatch.setattr(proxy_cli, "discover_paid_provider", _recording_discover)
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(""),
+        out=io.StringIO(),
+        approval_ui_mode="none",
+    ) == 0
+    assert provider_homes == [home]
 
 
 def test_run_proxy_provider_absent_does_not_bind_controlled_runtime(tmp_path, monkeypatch):

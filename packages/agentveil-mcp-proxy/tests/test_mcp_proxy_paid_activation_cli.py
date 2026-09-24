@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import zipfile
 
 import pytest
 
@@ -206,6 +207,112 @@ def test_paid_status_without_prior_activation_reports_inactive(tmp_path):
     payload = build_paid_status_payload(home=home)
     assert payload["activation"]["status"] == STATUS_MISSING
     assert payload["public_fallback_active"] is True
+
+
+def test_paid_status_project_home_does_not_inherit_global_provider(tmp_path, monkeypatch):
+    from agentveil_mcp_proxy.paid_install import (
+        install_state_path,
+        install_wheel_to_vendor,
+        vendor_root,
+        write_install_state,
+    )
+    from agentveil_mcp_proxy.paid_provider import STATUS_ACTIVE as PROVIDER_ACTIVE
+
+    global_home = tmp_path / "global.avp"
+    project_home = tmp_path / "project" / ".avp"
+    project_home.mkdir(parents=True)
+    wheel_path = tmp_path / "wheel.whl"
+    module = "agentveil_private_policy_thin"
+    package_name = "agentveil-private-policy-thin"
+    package_version = "0.1.0"
+    with zipfile.ZipFile(wheel_path, "w") as archive:
+        archive.writestr(
+            f"{module}-{package_version}.dist-info/METADATA",
+            f"Name: {package_name}\nVersion: {package_version}\n",
+        )
+    vendor_dir = vendor_root(global_home) / f"{package_name}-{package_version}"
+    install_wheel_to_vendor(
+        home=global_home,
+        wheel_path=wheel_path,
+        target_dir=vendor_dir,
+        expected_package_name=package_name,
+        expected_package_version=package_version,
+        require_empty_target=True,
+    )
+    write_install_state(
+        install_state_path(global_home),
+        {
+            "status": PROVIDER_ACTIVE,
+            "provider_id": "private_v1",
+            "package_name": package_name,
+            "package_version": package_version,
+            "public_fallback_available": True,
+            "error_code": None,
+            "last_installed_at": "2026-08-08T12:00:00+00:00",
+            "install_safety_state": "verified",
+            "install_safety_reason": None,
+        },
+    )
+    monkeypatch.setenv("AVP_HOME", str(global_home))
+
+    payload = build_paid_status_payload(home=project_home)
+    assert payload["activation"]["status"] == STATUS_MISSING
+    assert payload["paid_provider_present"] is False
+    assert payload["paid_activation_available"] is False
+
+
+def test_paid_status_arbitrary_explicit_home_does_not_inherit_global_provider(
+    tmp_path, monkeypatch,
+):
+    from agentveil_mcp_proxy.paid_install import (
+        install_state_path,
+        install_wheel_to_vendor,
+        vendor_root,
+        write_install_state,
+    )
+    from agentveil_mcp_proxy.paid_provider import STATUS_ACTIVE as PROVIDER_ACTIVE
+
+    global_home = tmp_path / "global.avp"
+    global_home.mkdir()
+    arbitrary_home = tmp_path / "empty-custom-home"
+    arbitrary_home.mkdir()
+    wheel_path = tmp_path / "wheel.whl"
+    module = "agentveil_private_policy_thin"
+    package_name = "agentveil-private-policy-thin"
+    package_version = "0.1.0"
+    with zipfile.ZipFile(wheel_path, "w") as archive:
+        archive.writestr(
+            f"{module}-{package_version}.dist-info/METADATA",
+            f"Name: {package_name}\nVersion: {package_version}\n",
+        )
+    vendor_dir = vendor_root(global_home) / f"{package_name}-{package_version}"
+    install_wheel_to_vendor(
+        home=global_home,
+        wheel_path=wheel_path,
+        target_dir=vendor_dir,
+        expected_package_name=package_name,
+        expected_package_version=package_version,
+        require_empty_target=True,
+    )
+    write_install_state(
+        install_state_path(global_home),
+        {
+            "status": PROVIDER_ACTIVE,
+            "provider_id": "private_v1",
+            "package_name": package_name,
+            "package_version": package_version,
+            "public_fallback_available": True,
+            "error_code": None,
+            "last_installed_at": "2026-08-08T12:00:00+00:00",
+            "install_safety_state": "verified",
+            "install_safety_reason": None,
+        },
+    )
+    monkeypatch.setenv("AVP_HOME", str(global_home))
+
+    payload = build_paid_status_payload(home=arbitrary_home)
+    assert payload["activation"]["status"] == STATUS_MISSING
+    assert payload["paid_provider_present"] is False
 
 
 def test_paid_json_output_is_privacy_safe(tmp_path):

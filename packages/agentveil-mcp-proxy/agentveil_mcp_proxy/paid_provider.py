@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib.metadata import entry_points
+from pathlib import Path
 import re
 from typing import Any, Callable, Mapping, Protocol
 
@@ -302,7 +303,14 @@ def _load_provider_from_entry_points() -> PaidActivationProvider | None:
     return None
 
 
-def _resolve_provider() -> PaidActivationProvider | None:
+def _resolve_provider(*, home: Path | None = None) -> PaidActivationProvider | None:
+    from agentveil_mcp_proxy.console_credentials import (
+        requires_scoped_paid_provider_discovery,
+    )
+    from agentveil_mcp_proxy.paid_install import resolve_vendored_paid_provider
+
+    if home is not None and requires_scoped_paid_provider_discovery(home.expanduser()):
+        return resolve_vendored_paid_provider(home=home)
     if _provider_loader is not None:
         try:
             loaded = _provider_loader()
@@ -313,15 +321,11 @@ def _resolve_provider() -> PaidActivationProvider | None:
     provider = _load_provider_from_entry_points()
     if provider is not None:
         return provider
-    from agentveil_mcp_proxy.paid_install import resolve_vendored_paid_provider
-
     return resolve_vendored_paid_provider()
 
 
-def discover_paid_provider() -> PaidProviderSnapshot:
-    """Discover an optional local paid provider using the bounded public contract."""
-
-    provider = _resolve_provider()
+def _discover_paid_provider_at_home(*, home: Path | None) -> PaidProviderSnapshot:
+    provider = _resolve_provider(home=home)
     if provider is None:
         return absent_provider_snapshot()
     try:
@@ -333,6 +337,25 @@ def discover_paid_provider() -> PaidProviderSnapshot:
             provider_contract_version=_optional_str(getattr(provider, "provider_contract_version", None)),
             error_code=ERROR_PROVIDER_RESPONSE_INVALID,
         )
+
+
+def discover_paid_provider(*, home: Path | None = None) -> PaidProviderSnapshot:
+    """Discover an optional local paid provider using the bounded public contract."""
+
+    scoped_home: Path | None = None
+    if home is not None:
+        from agentveil_mcp_proxy.console_credentials import (
+            requires_scoped_paid_provider_discovery,
+        )
+
+        if requires_scoped_paid_provider_discovery(home.expanduser()):
+            scoped_home = home.expanduser()
+    if scoped_home is None:
+        return _discover_paid_provider_at_home(home=None)
+    from agentveil_mcp_proxy.paid_activation import bound_avp_home
+
+    with bound_avp_home(scoped_home):
+        return _discover_paid_provider_at_home(home=scoped_home)
 
 
 def activate_with_paid_provider(*, license_key: str) -> PaidProviderSnapshot:

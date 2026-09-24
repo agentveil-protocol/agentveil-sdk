@@ -864,6 +864,187 @@ def test_sync_v2_paired_install_success(tmp_path, monkeypatch):
     assert authority_error is None and authority is not None
 
 
+def _configure_two_home_global_legacy(
+    tmp_path,
+    monkeypatch,
+    *,
+    project_home: Path,
+) -> tuple[Path, str]:
+    from test_mcp_proxy_paid_provider import _build_wheel, _install_active_state
+
+    global_home = tmp_path / "global.avp"
+    global_home.mkdir()
+    project_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("AVP_HOME", str(project_home))
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_credentials._global_console_credential_home",
+        lambda: global_home,
+    )
+    save_credential(TOKEN, home=global_home)
+    wheel_bytes, _artifact_hash = _build_wheel(tmp_path / "legacy-wheel")
+    _install_active_state(global_home, wheel_bytes=wheel_bytes)
+    return global_home, install_state_path(global_home).read_text(encoding="utf-8")
+
+
+def _two_home_v2_transport(tmp_path: Path) -> BackendEchoTransport:
+    base_bytes, base_hash = _build_base_wheel(tmp_path / "base")
+    thin_bytes, thin_hash = _build_thin_wheel(tmp_path / "thin")
+    return BackendEchoTransport(
+        responses=[
+            _json_response(
+                200,
+                _v2_eligible_response(
+                    base_hash=base_hash,
+                    base_size=len(base_bytes),
+                    thin_hash=thin_hash,
+                    thin_size=len(thin_bytes),
+                ),
+            ),
+            _octet_response(200, base_bytes),
+            _octet_response(200, thin_bytes),
+        ]
+    )
+
+
+@pytest.mark.parametrize("runtime_name", [".avp", ".agentveil"])
+def test_sync_symlink_project_runtime_home_skips_before_network(
+    tmp_path,
+    monkeypatch,
+    runtime_name,
+):
+    global_home = tmp_path / "global.avp"
+    global_home.mkdir()
+    project_home = tmp_path / "project" / runtime_name
+    project_home.parent.mkdir(parents=True)
+    project_home.symlink_to(global_home)
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_credentials._global_console_credential_home",
+        lambda: global_home,
+    )
+    save_credential(TOKEN, home=global_home)
+    global_install_before = (
+        install_state_path(global_home).read_text(encoding="utf-8")
+        if install_state_path(global_home).is_file()
+        else None
+    )
+    from agentveil_mcp_proxy.console_credentials import CREDENTIAL_SCOPE
+
+    transport = _two_home_v2_transport(tmp_path)
+    credential_homes: list[Path | None] = []
+
+    def _load_credential(*, home=None):
+        credential_homes.append(home)
+        return StoredCredential(scope=CREDENTIAL_SCOPE, token=TOKEN)
+
+    result = sync_free_builder_install(
+        home=project_home,
+        transport=transport,
+        load_credential_fn=_load_credential,
+    )
+
+    assert result == "skipped_unsafe_runtime_home"
+    assert credential_homes == []
+    assert len(transport.calls) == 0
+    global_install_after = (
+        install_state_path(global_home).read_text(encoding="utf-8")
+        if install_state_path(global_home).is_file()
+        else None
+    )
+    assert global_install_after == global_install_before
+
+
+@pytest.mark.parametrize("runtime_name", [".avp", ".agentveil"])
+def test_sync_two_home_real_discovery_global_active_does_not_block_project(
+    tmp_path,
+    monkeypatch,
+    runtime_name,
+):
+    from agentveil_mcp_proxy.console_credentials import credential_path
+
+    resolved_project_home = tmp_path / "project" / runtime_name
+    global_home, global_install_before = _configure_two_home_global_legacy(
+        tmp_path,
+        monkeypatch,
+        project_home=resolved_project_home,
+    )
+    global_vendor_dir = global_home / "paid" / "vendor"
+    global_vendor_before = sorted(global_vendor_dir.rglob("*")) if global_vendor_dir.exists() else []
+    transport = _two_home_v2_transport(tmp_path)
+
+    result = sync_free_builder_install(home=resolved_project_home, transport=transport)
+
+    assert result == "installed"
+    project_state = json.loads(
+        install_state_path(resolved_project_home).read_text(encoding="utf-8")
+    )
+    assert project_state["install_composition_version"] == COMPOSED_INSTALL_COMPOSITION_VERSION
+    assert project_state["install_safety_state"] == "verified"
+    assert install_state_path(global_home).read_text(encoding="utf-8") == global_install_before
+    global_vendor_after = sorted(global_vendor_dir.rglob("*")) if global_vendor_dir.exists() else []
+    assert global_vendor_after == global_vendor_before
+    assert not credential_path(resolved_project_home).exists()
+    assert len(transport.calls) == 3
+
+    repeat = sync_free_builder_install(home=resolved_project_home, transport=transport)
+    assert repeat == "skipped_already_active"
+    assert len(transport.calls) == 3
+
+
+def test_sync_two_home_project_a_does_not_inherit_project_b(tmp_path, monkeypatch):
+    project_a = tmp_path / "a" / ".avp"
+    project_b = tmp_path / "b" / ".avp"
+    global_home, global_install_before = _configure_two_home_global_legacy(
+        tmp_path, monkeypatch, project_home=project_a
+    )
+    transport_a = _two_home_v2_transport(tmp_path / "a-transport")
+    assert sync_free_builder_install(home=project_a, transport=transport_a) == "installed"
+    state_a = install_state_path(project_a).read_text(encoding="utf-8")
+
+    transport_b = _two_home_v2_transport(tmp_path / "b-transport")
+    assert sync_free_builder_install(home=project_b, transport=transport_b) == "installed"
+    assert install_state_path(project_b).is_file()
+    assert install_state_path(project_a).read_text(encoding="utf-8") == state_a
+    assert install_state_path(global_home).read_text(encoding="utf-8") == global_install_before
+
+
+@pytest.mark.parametrize(
+    ("credential_home", "expected"),
+    [
+        (None, "skipped_no_credential"),
+        ("unsafe", "skipped_unsafe_credential"),
+    ],
+)
+def test_sync_two_home_fail_closed_credential(tmp_path, monkeypatch, credential_home, expected):
+    project_home = tmp_path / "project" / ".avp"
+    global_home, _ = _configure_two_home_global_legacy(
+        tmp_path, monkeypatch, project_home=project_home
+    )
+    if credential_home == "unsafe":
+        save_credential(TOKEN, home=global_home)
+        from agentveil_mcp_proxy.console_credentials import credential_path as cred_path
+
+        raw = json.loads(cred_path(global_home).read_text(encoding="utf-8"))
+        raw["scope"] = "wrong-scope"
+        cred_path(global_home).write_text(json.dumps(raw), encoding="utf-8")
+    else:
+        from agentveil_mcp_proxy.console_credentials import delete_credential
+
+        delete_credential(home=global_home)
+    transport = _two_home_v2_transport(tmp_path)
+    assert sync_free_builder_install(home=project_home, transport=transport) == expected
+    assert len(transport.calls) == 0
+
+
+def test_sync_two_home_fail_closed_ineligible(tmp_path, monkeypatch):
+    project_home = tmp_path / "project" / ".avp"
+    _configure_two_home_global_legacy(tmp_path, monkeypatch, project_home=project_home)
+    transport = BackendEchoTransport(
+        responses=[_json_response(200, {"eligible": False, "error_code": "capability_inactive"})]
+    )
+    assert sync_free_builder_install(home=project_home, transport=transport) == "skipped_ineligible"
+    assert len(transport.calls) == 1
+
+
 def test_sync_v2_ineligible_does_not_fallback_to_v1(tmp_path):
     save_credential(TOKEN, home=tmp_path)
     transport = BackendEchoTransport(
@@ -1256,6 +1437,29 @@ def _seed_legacy_active_thin_install(tmp_path, monkeypatch) -> Path:
     )
     assert skip == "skipped_already_active"
     return home
+
+
+def test_upgrade_explicit_project_home_does_not_use_global_credential(
+    tmp_path,
+    monkeypatch,
+):
+    from test_mcp_proxy_paid_provider import _build_wheel, _install_active_state
+
+    global_home = tmp_path / "global.avp"
+    global_home.mkdir()
+    project_home = tmp_path / "project" / ".avp"
+    project_home.mkdir(parents=True)
+    monkeypatch.setenv("AVP_HOME", str(project_home))
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_credentials._global_console_credential_home",
+        lambda: global_home,
+    )
+    save_credential(TOKEN, home=global_home)
+    wheel_bytes, _artifact_hash = _build_wheel(tmp_path / "legacy-wheel")
+    _install_active_state(project_home, wheel_bytes=wheel_bytes)
+
+    payload = upgrade_free_builder_to_paired(home=project_home, apply=False)
+    assert payload["result_code"] == "skipped_no_credential"
 
 
 def test_upgrade_preview_without_apply_does_not_mutate_or_download(tmp_path, monkeypatch):

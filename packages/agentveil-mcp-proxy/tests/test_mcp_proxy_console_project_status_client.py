@@ -14,6 +14,7 @@ from agentveil_mcp_proxy.console_credentials import (
     CREDENTIAL_SCOPE,
     CredentialError,
     StoredCredential,
+    save_credential,
 )
 from agentveil_mcp_proxy.console_project_status_client import (
     CONSOLE_ORIGIN,
@@ -836,3 +837,140 @@ def test_privacy_canaries_absent_from_request_json():
         "private_guardrails_status",
     }
     assert payload["private_guardrails_status"] == "unavailable"
+
+
+@pytest.mark.parametrize("runtime_name", [".avp", ".agentveil"])
+def test_sync_symlink_project_runtime_home_skips_before_credential_and_network(
+    tmp_path,
+    monkeypatch,
+    runtime_name,
+):
+    global_home = tmp_path / "global.avp"
+    global_home.mkdir()
+    project_home = tmp_path / "project" / runtime_name
+    project_home.parent.mkdir(parents=True)
+    project_home.symlink_to(global_home)
+    project = tmp_path / "project"
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_credentials._global_console_credential_home",
+        lambda: global_home,
+    )
+    save_credential(TOKEN, home=global_home)
+    credential_homes: list[Path | None] = []
+    provider_homes: list[Path | None] = []
+
+    def _load_credential(*, home=None):
+        credential_homes.append(home)
+        return StoredCredential(scope=CREDENTIAL_SCOPE, token=TOKEN)
+
+    def _discover(*, home=None):
+        provider_homes.append(home)
+        return absent_provider_snapshot()
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_project_status_client.discover_paid_provider",
+        _discover,
+    )
+    transport = BackendEchoTransport()
+
+    result = sync_project_status(
+        connector="codex" if runtime_name == ".avp" else "cursor",
+        connector_status=_advisory_status(),
+        project_dir=project,
+        runtime_home=project_home,
+        load_credential_fn=_load_credential,
+        transport=transport,
+    )
+
+    assert result == "skipped_unsafe_runtime_home"
+    assert credential_homes == []
+    assert provider_homes == []
+    assert len(transport.calls) == 0
+
+
+def test_sync_project_status_separates_credential_and_provider_homes(
+    tmp_path,
+    monkeypatch,
+):
+    global_home = tmp_path / "global.avp"
+    global_home.mkdir()
+    project_home = tmp_path / "project" / ".avp"
+    project_home.mkdir(parents=True)
+    project = tmp_path / "project"
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_credentials._global_console_credential_home",
+        lambda: global_home,
+    )
+    save_credential(TOKEN, home=global_home)
+
+    credential_homes: list[Path | None] = []
+    provider_homes: list[Path | None] = []
+
+    def _load_credential(*, home=None):
+        credential_homes.append(home)
+        return StoredCredential(scope=CREDENTIAL_SCOPE, token=TOKEN)
+
+    def _discover(*, home=None):
+        provider_homes.append(home)
+        return absent_provider_snapshot()
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_project_status_client.discover_paid_provider",
+        _discover,
+    )
+    transport = BackendEchoTransport()
+
+    result = sync_project_status(
+        connector="codex",
+        connector_status=_advisory_status(),
+        project_dir=project,
+        runtime_home=project_home,
+        load_credential_fn=_load_credential,
+        transport=transport,
+    )
+
+    assert result == "accepted"
+    assert credential_homes == [global_home]
+    assert provider_homes == [project_home]
+    payload = json.loads(transport.calls[0]["body"].decode("utf-8"))
+    assert payload["private_guardrails_status"] == "unavailable"
+
+
+def test_sync_project_status_cursor_home_uses_global_credential(
+    tmp_path,
+    monkeypatch,
+):
+    global_home = tmp_path / "global.avp"
+    global_home.mkdir()
+    project_home = tmp_path / "project" / ".agentveil"
+    project_home.mkdir(parents=True)
+    project = tmp_path / "project"
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_credentials._global_console_credential_home",
+        lambda: global_home,
+    )
+    save_credential(TOKEN, home=global_home)
+
+    credential_homes: list[Path | None] = []
+
+    def _load_credential(*, home=None):
+        credential_homes.append(home)
+        return StoredCredential(scope=CREDENTIAL_SCOPE, token=TOKEN)
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_project_status_client.discover_paid_provider",
+        lambda *, home=None: absent_provider_snapshot(),
+    )
+    transport = BackendEchoTransport()
+
+    result = sync_project_status(
+        connector="cursor",
+        connector_status=_advisory_status(),
+        project_dir=project,
+        runtime_home=project_home,
+        load_credential_fn=_load_credential,
+        transport=transport,
+    )
+
+    assert result == "accepted"
+    assert credential_homes == [global_home]

@@ -148,6 +148,27 @@ def _global_console_credential_home() -> Path | None:
         return None
 
 
+def is_canonical_global_runtime_home(runtime_home: Path) -> bool:
+    """True only for the default global AVP home path, not symlink aliases."""
+
+    expanded = _expanduser_or_self(Path(runtime_home))
+    if expanded.is_symlink():
+        return False
+    effective_global = credential_home(None).expanduser()
+    if expanded == effective_global:
+        return True
+    global_home = _global_console_credential_home()
+    if global_home is not None and expanded == global_home.expanduser():
+        return True
+    return False
+
+
+def requires_scoped_paid_provider_discovery(runtime_home: Path) -> bool:
+    """Explicit non-global homes must not inherit global loader/entrypoint providers."""
+
+    return not is_canonical_global_runtime_home(runtime_home)
+
+
 def console_credential_home_for_runtime(runtime_home: Path | None) -> Path | None:
     """Keep one user Console credential outside a project-scoped runtime home."""
 
@@ -155,17 +176,60 @@ def console_credential_home_for_runtime(runtime_home: Path | None) -> Path | Non
         return None
     expanded_runtime_home = _expanduser_or_self(Path(runtime_home))
     global_home = _global_console_credential_home()
+    global_expanded = global_home.expanduser() if global_home is not None else None
     if (
         global_home is not None
-        and expanded_runtime_home.name == ".avp"
-        and expanded_runtime_home != global_home
+        and global_expanded is not None
+        and expanded_runtime_home.name
+        in (
+            ".avp",
+            ".agentveil",
+        )
     ):
-        return global_home
+        if expanded_runtime_home.is_symlink():
+            try:
+                if expanded_runtime_home.resolve() == global_expanded.resolve():
+                    return expanded_runtime_home
+            except OSError:
+                return expanded_runtime_home
+            if expanded_runtime_home != global_expanded:
+                return global_home
+        else:
+            try:
+                if expanded_runtime_home.resolve() != global_expanded.resolve():
+                    return global_home
+            except OSError:
+                if expanded_runtime_home != global_expanded:
+                    return global_home
     configured_home = os.environ.get("AVP_HOME")
     if configured_home is not None and global_home is not None:
         if _expanduser_or_self(Path(configured_home)) == expanded_runtime_home:
             return global_home
     return expanded_runtime_home
+
+
+def is_distinct_project_runtime_home(runtime_home: Path) -> bool:
+    """True when *runtime_home* is a project-local runtime dir, not global/default."""
+
+    expanded = _expanduser_or_self(Path(runtime_home))
+    if expanded.name not in (".avp", ".agentveil"):
+        return False
+    return not is_canonical_global_runtime_home(expanded)
+
+
+def project_runtime_home_automatic_sync_preflight_skip(
+    runtime_home: Path | None,
+) -> str | None:
+    """Reject symlinked project connector homes before credential or network I/O."""
+
+    if runtime_home is None:
+        return None
+    expanded = _expanduser_or_self(Path(runtime_home))
+    if not is_distinct_project_runtime_home(expanded):
+        return None
+    if expanded.is_symlink():
+        return "skipped_unsafe_runtime_home"
+    return None
 
 
 def credential_path(home: Path | None = None) -> Path:

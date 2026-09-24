@@ -32,6 +32,7 @@ from agentveil_mcp_proxy.console_credentials import (
     CREDENTIAL_SCOPE,
     CredentialError,
     StoredCredential,
+    console_credential_home_for_runtime,
     load_credential,
 )
 from agentveil_mcp_proxy.paid_provider import (
@@ -537,6 +538,7 @@ def sync_project_status(
     connector_status: Mapping[str, Any],
     project_dir: Path,
     home: Path | None = None,
+    runtime_home: Path | None = None,
     package_version: str | None = None,
     load_credential_fn: LoadCredential = load_credential,
     discover_paid_provider_fn: DiscoverPaidProvider | None = None,
@@ -545,14 +547,35 @@ def sync_project_status(
 ) -> str:
     """Best-effort sync returning a short non-secret result code."""
 
+    from agentveil_mcp_proxy.console_credentials import (
+        project_runtime_home_automatic_sync_preflight_skip,
+    )
+
+    preflight = project_runtime_home_automatic_sync_preflight_skip(runtime_home)
+    if preflight is not None:
+        return preflight
+
+    credential_home = home
+    if runtime_home is not None:
+        credential_home = console_credential_home_for_runtime(runtime_home)
+
     credential, skip = _resolve_credential(
-        home=home,
+        home=credential_home,
         load_credential_fn=load_credential_fn,
     )
     if skip is not None:
         return skip
 
-    discover = discover_paid_provider_fn or discover_paid_provider
+    if discover_paid_provider_fn is not None:
+        discover = discover_paid_provider_fn
+    elif runtime_home is not None:
+        provider_home = runtime_home.expanduser()
+
+        def discover() -> PaidProviderSnapshot:
+            return discover_paid_provider(home=provider_home)
+
+    else:
+        discover = discover_paid_provider
     try:
         provider_snapshot = discover()
         private_guardrails_status = resolve_private_guardrails_status(

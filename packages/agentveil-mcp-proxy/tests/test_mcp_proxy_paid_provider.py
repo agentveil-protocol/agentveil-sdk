@@ -468,3 +468,174 @@ def test_environment_entry_point_discovery_still_works():
     snapshot = discover_paid_provider()
     assert snapshot.status == STATUS_ACTIVE
     assert snapshot.summary == "loader provider"
+
+
+def test_discover_paid_provider_home_scopes_vendored_install(tmp_path, monkeypatch):
+    global_home = tmp_path / "global.avp"
+    project_home = tmp_path / "project" / ".avp"
+    project_home.mkdir(parents=True)
+    wheel_bytes, _digest = _build_wheel(tmp_path / "wheel")
+    _install_active_state(global_home, wheel_bytes=wheel_bytes)
+    monkeypatch.setenv("AVP_HOME", str(global_home))
+
+    assert discover_paid_provider(home=global_home).status == STATUS_ACTIVE
+    assert discover_paid_provider(home=project_home).status == STATUS_MISSING
+    assert discover_paid_provider().status == STATUS_ACTIVE
+
+
+def test_discover_paid_provider_home_ignores_entry_points(tmp_path, monkeypatch):
+    global_home = tmp_path / "global.avp"
+    project_home = tmp_path / "project" / ".agentveil"
+    project_home.mkdir(parents=True)
+    wheel_bytes, _digest = _build_wheel(tmp_path / "wheel")
+    _install_active_state(global_home, wheel_bytes=wheel_bytes)
+    monkeypatch.setenv("AVP_HOME", str(global_home))
+
+    class _Provider:
+        provider_id = "private_v1"
+        provider_contract_version = PUBLIC_PAID_PROVIDER_CONTRACT_VERSION
+
+        def activate(self, *, license_key: str):
+            del license_key
+            return self.status()
+
+        def status(self):
+            return {
+                "provider_present": True,
+                "provider_id": self.provider_id,
+                "provider_contract_version": self.provider_contract_version,
+                "status": STATUS_ACTIVE,
+                "private_provider_enabled": True,
+                "public_fallback_available": True,
+                "summary": "entry point provider",
+                "error_code": None,
+            }
+
+        def deactivate(self):
+            return self.status()
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.paid_provider._load_provider_from_entry_points",
+        lambda: _Provider(),
+    )
+
+    assert discover_paid_provider(home=project_home).status == STATUS_MISSING
+    assert discover_paid_provider().status == STATUS_ACTIVE
+
+
+def test_sync_free_builder_install_home_none_uses_global_provider_loader(
+    tmp_path, monkeypatch,
+):
+    from agentveil_mcp_proxy.console_credentials import save_credential
+    from agentveil_mcp_proxy.console_free_builder_client import sync_free_builder_install
+
+    class _Provider:
+        provider_id = "private_v1"
+        provider_contract_version = PUBLIC_PAID_PROVIDER_CONTRACT_VERSION
+
+        def activate(self, *, license_key: str):
+            del license_key
+            return self.status()
+
+        def status(self):
+            return {
+                "provider_present": True,
+                "provider_id": self.provider_id,
+                "provider_contract_version": self.provider_contract_version,
+                "status": STATUS_ACTIVE,
+                "private_provider_enabled": True,
+                "public_fallback_available": True,
+                "summary": "loader provider",
+                "error_code": None,
+            }
+
+        def deactivate(self):
+            return self.status()
+
+    set_paid_provider_loader(lambda: _Provider())
+    monkeypatch.setenv("AVP_HOME", str(tmp_path))
+    save_credential(TOKEN, home=tmp_path)
+    assert sync_free_builder_install(home=None) == "skipped_already_active"
+
+
+def test_discover_paid_provider_symlink_project_home_does_not_inherit_global_loader(
+    tmp_path, monkeypatch,
+):
+    global_home = tmp_path / "global.avp"
+    global_home.mkdir()
+    project_home = tmp_path / "project" / ".avp"
+    project_home.parent.mkdir(parents=True)
+    project_home.symlink_to(global_home)
+    wheel_bytes, _digest = _build_wheel(tmp_path / "wheel")
+    _install_active_state(global_home, wheel_bytes=wheel_bytes)
+    monkeypatch.setenv("AVP_HOME", str(global_home))
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_credentials._global_console_credential_home",
+        lambda: global_home,
+    )
+
+    class _Provider:
+        provider_id = "private_v1"
+        provider_contract_version = PUBLIC_PAID_PROVIDER_CONTRACT_VERSION
+
+        def activate(self, *, license_key: str):
+            del license_key
+            return self.status()
+
+        def status(self):
+            return {
+                "provider_present": True,
+                "provider_id": self.provider_id,
+                "provider_contract_version": self.provider_contract_version,
+                "status": STATUS_ACTIVE,
+                "private_provider_enabled": True,
+                "public_fallback_available": True,
+                "summary": "entry point provider",
+                "error_code": None,
+            }
+
+        def deactivate(self):
+            return self.status()
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.paid_provider._load_provider_from_entry_points",
+        lambda: _Provider(),
+    )
+
+    assert discover_paid_provider(home=project_home).status == STATUS_MISSING
+    assert discover_paid_provider().status == STATUS_ACTIVE
+
+
+def test_discover_paid_provider_arbitrary_explicit_home_ignores_entry_points(
+    tmp_path, monkeypatch,
+):
+    arbitrary_home = tmp_path / "custom-runtime"
+    arbitrary_home.mkdir()
+    monkeypatch.setenv("AVP_HOME", str(tmp_path / "global.avp"))
+
+    class _Provider:
+        provider_id = "private_v1"
+        provider_contract_version = PUBLIC_PAID_PROVIDER_CONTRACT_VERSION
+
+        def activate(self, *, license_key: str):
+            del license_key
+            return self.status()
+
+        def status(self):
+            return {
+                "provider_present": True,
+                "provider_id": self.provider_id,
+                "provider_contract_version": self.provider_contract_version,
+                "status": STATUS_ACTIVE,
+                "private_provider_enabled": True,
+                "public_fallback_available": True,
+                "summary": "entry point provider",
+                "error_code": None,
+            }
+
+        def deactivate(self):
+            return self.status()
+
+    set_paid_provider_loader(lambda: _Provider())
+    assert discover_paid_provider(home=arbitrary_home).status == STATUS_MISSING
+    assert discover_paid_provider().status == STATUS_ACTIVE

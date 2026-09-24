@@ -644,6 +644,44 @@ def _resolve_credential(
     return credential, None
 
 
+def resolve_free_builder_install_home(home: Path | None) -> Path:
+    """Return the AVP home that receives paid install state."""
+
+    return credential_home(home)
+
+
+def resolve_free_builder_credential_home(home: Path | None) -> Path:
+    """Return the AVP home that stores the Console credential for *home*."""
+
+    from agentveil_mcp_proxy.console_credentials import (
+        console_credential_home_for_runtime,
+    )
+
+    install_home = resolve_free_builder_install_home(home).expanduser()
+    if install_home.name not in (".avp", ".agentveil"):
+        return install_home
+    credential_home = console_credential_home_for_runtime(install_home)
+    if credential_home is None:
+        return install_home
+    return credential_home.expanduser()
+
+
+def _resolve_credential_for_setup_sync(
+    *,
+    home: Path | None,
+    load_credential_fn: LoadCredential,
+) -> tuple[StoredCredential | None, str | None]:
+    try:
+        credential = load_credential_fn(home=resolve_free_builder_credential_home(home))
+    except CredentialError:
+        return None, "skipped_unsafe_credential"
+    if credential is None:
+        return None, "skipped_no_credential"
+    if credential.scope != CREDENTIAL_SCOPE:
+        return None, "skipped_unsafe_credential"
+    return credential, None
+
+
 def _resolve_provider_guard(snapshot: object) -> str | None:
     """Return a skip code when an existing paid provider state blocks free install."""
 
@@ -1076,11 +1114,23 @@ def sync_free_builder_install(
 ) -> str:
     """Best-effort free Builder install returning a short non-secret result code."""
 
-    credential, skip = _resolve_credential(home=home, load_credential_fn=load_credential_fn)
+    install_home = resolve_free_builder_install_home(home)
+    from agentveil_mcp_proxy.console_credentials import (
+        project_runtime_home_automatic_sync_preflight_skip,
+    )
+
+    preflight = project_runtime_home_automatic_sync_preflight_skip(install_home)
+    if preflight is not None:
+        return preflight
+
+    credential, skip = _resolve_credential_for_setup_sync(
+        home=home,
+        load_credential_fn=load_credential_fn,
+    )
     if skip is not None:
         return skip
 
-    discover = discover_paid_provider_fn or discover_paid_provider
+    discover = discover_paid_provider_fn or (lambda: discover_paid_provider(home=home))
     try:
         guard = _resolve_provider_guard(discover())
     except Exception:
@@ -1088,12 +1138,13 @@ def sync_free_builder_install(
     if guard is not None:
         return guard
 
+    from agentveil_mcp_proxy.paid_activation import bound_avp_home
     from agentveil_mcp_proxy.paid_install import (
         current_platform_name,
         current_python_version,
     )
 
-    resolved_home = credential_home(home)
+    resolved_home = install_home
     resolved_platform = _validate_platform(platform or current_platform_name())
     resolved_python = _validate_python_version(python_version or current_python_version())
     client = ConsoleFreeBuilderClient(transport=transport)
@@ -1151,15 +1202,16 @@ def sync_free_builder_install(
 
     paired_install = _default_paired_install_flow
     try:
-        paired_install(
-            base_wheel_bytes=base_wheel_bytes,
-            thin_wheel_bytes=thin_wheel_bytes,
-            home=resolved_home,
-            activation_credential=credential.token,
-            base_expectations=base_expectations,
-            thin_expectations=thin_expectations,
-            discover_paid_provider_fn=discover,
-        )
+        with bound_avp_home(resolved_home):
+            paired_install(
+                base_wheel_bytes=base_wheel_bytes,
+                thin_wheel_bytes=thin_wheel_bytes,
+                home=resolved_home,
+                activation_credential=credential.token,
+                base_expectations=base_expectations,
+                thin_expectations=thin_expectations,
+                discover_paid_provider_fn=discover,
+            )
     except FreeBuilderInstallError:
         return "skipped_install_failed"
     except Exception:

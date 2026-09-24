@@ -452,7 +452,7 @@ def build_paid_activate_payload(*, license_key: str, home: Path | None) -> dict[
 def build_paid_status_payload(*, home: Path | None) -> dict[str, Any]:
     resolved_home = (home or default_home()).expanduser()
     install_state = load_install_state(install_state_path(resolved_home))
-    provider = discover_paid_provider()
+    provider = discover_paid_provider(home=home)
     path = activation_path(resolved_home)
     activation = load_activation_state(path)
     checked_at = utc_now_iso()

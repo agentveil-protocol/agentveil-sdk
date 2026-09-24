@@ -18,6 +18,7 @@ from agentveil_mcp_proxy.console_credentials import (
     CREDENTIAL_SCHEMA_VERSION,
     CREDENTIAL_SCOPE,
     CredentialError,
+    console_credential_home_for_runtime,
     console_login_lock,
     credential_path,
     delete_credential,
@@ -549,6 +550,69 @@ def test_windows_login_lock_is_named_and_fails_closed_on_contention(
         creds._windows_mutex_name(tmp_path, purpose="login")
     ]
     assert str(tmp_path) not in windows_backend.lock_names[0]
+
+
+def test_cursor_project_runtime_uses_global_console_credential_home(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.delenv("AVP_HOME", raising=False)
+    runtime_home = tmp_path / "project" / ".agentveil"
+    assert console_credential_home_for_runtime(runtime_home) == (
+        tmp_path.home() / ".avp"
+    )
+
+
+def test_project_runtime_symlink_to_global_is_distinct_and_fails_closed_on_alias(
+    tmp_path,
+    monkeypatch,
+):
+    from agentveil_mcp_proxy.console_credentials import (
+        is_distinct_project_runtime_home,
+        requires_scoped_paid_provider_discovery,
+    )
+
+    global_home = tmp_path / "global.avp"
+    global_home.mkdir()
+    project_home = tmp_path / "project" / ".avp"
+    project_home.parent.mkdir(parents=True)
+    project_home.symlink_to(global_home)
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_credentials._global_console_credential_home",
+        lambda: global_home,
+    )
+
+    assert is_distinct_project_runtime_home(project_home) is True
+    assert requires_scoped_paid_provider_discovery(project_home) is True
+    assert console_credential_home_for_runtime(project_home) == project_home
+
+
+@pytest.mark.parametrize("runtime_name", [".avp", ".agentveil"])
+def test_project_runtime_symlink_preflight_skips_automatic_sync(
+    tmp_path,
+    monkeypatch,
+    runtime_name,
+):
+    from agentveil_mcp_proxy.console_credentials import (
+        project_runtime_home_automatic_sync_preflight_skip,
+    )
+
+    global_home = tmp_path / "global.avp"
+    global_home.mkdir()
+    project_home = tmp_path / "project" / runtime_name
+    project_home.parent.mkdir(parents=True)
+    project_home.symlink_to(global_home)
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_credentials._global_console_credential_home",
+        lambda: global_home,
+    )
+
+    assert project_runtime_home_automatic_sync_preflight_skip(project_home) == (
+        "skipped_unsafe_runtime_home"
+    )
+    real_project_home = tmp_path / "project-real" / runtime_name
+    real_project_home.mkdir(parents=True)
+    assert project_runtime_home_automatic_sync_preflight_skip(real_project_home) is None
 
 
 def test_windows_native_backend_errors_do_not_expose_token_or_path(

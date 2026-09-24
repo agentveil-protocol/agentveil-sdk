@@ -1680,6 +1680,7 @@ def _best_effort_console_project_status_sync(
     connector: str,
     connector_status: Mapping[str, Any],
     project_dir: Path,
+    runtime_home: Path | None = None,
 ) -> None:
     """Upload status, repairing one rejected Console credential via attach."""
 
@@ -1697,6 +1698,7 @@ def _best_effort_console_project_status_sync(
             connector=connector,
             connector_status=connector_status,
             project_dir=project_dir,
+            runtime_home=runtime_home,
             package_version=package_version,
             load_credential_fn=load_credential,
         )
@@ -1717,6 +1719,7 @@ def _best_effort_console_project_status_sync(
             connector=connector,
             connector_status=connector_status,
             project_dir=project_dir,
+            runtime_home=runtime_home,
             package_version=package_version,
             load_credential_fn=load_credential,
         )
@@ -3070,7 +3073,7 @@ def run_proxy(
         controlled_runtime = bind_controlled_alternative_runtime(
             home=paths.home,
             downstream=dict(config.downstream),
-            paid_snapshot=discover_paid_provider(),
+            paid_snapshot=discover_paid_provider(home=paths.home),
             runtime_context=controlled_runtime_context,
         )
         controlled_status_dispatcher = ControlledAlternativesStatusDispatcher(
@@ -5662,8 +5665,9 @@ def run_setup_cursor_cli(
         connector="cursor",
         connector_status=status,
         project_dir=target,
+        runtime_home=home,
     )
-    _best_effort_console_free_builder_sync()
+    _best_effort_console_free_builder_sync(home=home)
     return 0
 
 
@@ -5694,8 +5698,9 @@ def run_setup_cursor_status_cli(*, workspace: Path | None, output_json: bool) ->
         connector="cursor",
         connector_status=status,
         project_dir=target,
+        runtime_home=home,
     )
-    _best_effort_console_free_builder_sync()
+    _best_effort_console_free_builder_sync(home=home)
     return 0
 
 
@@ -6409,8 +6414,9 @@ def run_setup_claude_code_cli(
         connector="claude-code",
         connector_status=status,
         project_dir=target,
+        runtime_home=home,
     )
-    _best_effort_console_free_builder_sync()
+    _best_effort_console_free_builder_sync(home=home)
     return 0
 
 
@@ -6612,8 +6618,9 @@ def run_setup_codex_cli(
         connector="codex",
         connector_status=status,
         project_dir=target,
+        runtime_home=home,
     )
-    _best_effort_console_free_builder_sync()
+    _best_effort_console_free_builder_sync(home=home)
     return 0
 
 
@@ -6656,8 +6663,9 @@ def run_setup_codex_status_cli(
         connector="codex",
         connector_status=status,
         project_dir=target,
+        runtime_home=home,
     )
-    _best_effort_console_free_builder_sync()
+    _best_effort_console_free_builder_sync(home=home)
     return 0
 
 
@@ -6917,8 +6925,9 @@ def run_setup_gemini_cli(
         connector="gemini-cli",
         connector_status=status,
         project_dir=target,
+        runtime_home=home,
     )
-    _best_effort_console_free_builder_sync()
+    _best_effort_console_free_builder_sync(home=home)
     return 0
 
 
@@ -6958,8 +6967,9 @@ def run_setup_gemini_status_cli(
         connector="gemini-cli",
         connector_status=status,
         project_dir=target,
+        runtime_home=home,
     )
-    _best_effort_console_free_builder_sync()
+    _best_effort_console_free_builder_sync(home=home)
     return 0
 
 
@@ -7056,8 +7066,9 @@ def run_setup_connector_status_cli(*, project_dir: Path | None, output_json: boo
         connector="claude-code",
         connector_status=status,
         project_dir=target,
+        runtime_home=home,
     )
-    _best_effort_console_free_builder_sync()
+    _best_effort_console_free_builder_sync(home=home)
     return 0
 
 
