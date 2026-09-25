@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -26,10 +27,28 @@ from agentveil_mcp_proxy.console_project_status_client import (
     build_project_status_summary,
     normalize_connector_status,
     normalize_package_version,
+    resolve_controlled_alternatives_installed_readiness,
     resolve_private_guardrails_status,
     summary_to_request_payload,
     sync_project_status,
     validate_project_display_label,
+)
+from test_mcp_proxy_paid_install import (
+    _build_composed_base_wheel,
+    _build_composed_thin_wheel,
+)
+from agentveil_mcp_proxy.paid_install import (
+    COMPOSED_BASE_PACKAGE_NAME,
+    COMPOSED_BASE_PACKAGE_VERSION,
+    COMPOSED_INSTALL_COMPOSITION_VERSION,
+    COMPOSED_THIN_PACKAGE_VERSION,
+    COMPONENT_ROLE_BASE,
+    COMPONENT_ROLE_THIN,
+    DEFAULT_PACKAGE_NAME,
+    install_wheel_to_vendor,
+    install_state_path,
+    vendor_root,
+    write_install_state,
 )
 from agentveil_mcp_proxy.paid_provider import (
     ERROR_CONTRACT_INCOMPATIBLE,
@@ -46,6 +65,8 @@ from agentveil_mcp_proxy.paid_provider import (
     PaidProviderSnapshot,
     absent_provider_snapshot,
 )
+
+THIN_PACKAGE_NAME = "agentveil-private-policy-thin"
 
 TOKEN = "console-device-token-secret"
 SECRET = "SECRET_PROJECT_STATUS_CANARY"
@@ -835,6 +856,8 @@ def test_privacy_canaries_absent_from_request_json():
         "observed_at",
         "package_version",
         "private_guardrails_status",
+        "controlled_alternatives_status",
+        "controlled_alternatives_package_version",
     }
     assert payload["private_guardrails_status"] == "unavailable"
 
@@ -974,3 +997,374 @@ def test_sync_project_status_cursor_home_uses_global_credential(
 
     assert result == "accepted"
     assert credential_homes == [global_home]
+
+
+def _install_verified_composed_ca_home(home: Path, tmp_path: Path) -> None:
+    base_wheel, _ = _build_composed_base_wheel(tmp_path / "wheel-base")
+    thin_wheel, _ = _build_composed_thin_wheel(tmp_path / "wheel-thin")
+    install_wheel_to_vendor(
+        home=home,
+        wheel_path=base_wheel,
+        target_dir=vendor_root(home)
+        / f"{COMPOSED_BASE_PACKAGE_NAME}-{COMPOSED_BASE_PACKAGE_VERSION}",
+        expected_package_name=COMPOSED_BASE_PACKAGE_NAME,
+        expected_package_version=COMPOSED_BASE_PACKAGE_VERSION,
+        require_empty_target=True,
+    )
+    install_wheel_to_vendor(
+        home=home,
+        wheel_path=thin_wheel,
+        target_dir=vendor_root(home)
+        / f"{THIN_PACKAGE_NAME}-{COMPOSED_THIN_PACKAGE_VERSION}",
+        expected_package_name=THIN_PACKAGE_NAME,
+        expected_package_version=COMPOSED_THIN_PACKAGE_VERSION,
+        require_empty_target=True,
+    )
+    write_install_state(
+        install_state_path(home),
+        {
+            "status": STATUS_ACTIVE,
+            "provider_id": "private_v1",
+            "package_name": COMPOSED_BASE_PACKAGE_NAME,
+            "package_version": COMPOSED_BASE_PACKAGE_VERSION,
+            "public_fallback_available": True,
+            "error_code": None,
+            "last_installed_at": "2026-08-08T12:00:00+00:00",
+            "install_safety_state": "verified",
+            "install_safety_reason": None,
+            "install_composition_version": COMPOSED_INSTALL_COMPOSITION_VERSION,
+            "install_components": [
+                {
+                    "role": COMPONENT_ROLE_BASE,
+                    "package_name": COMPOSED_BASE_PACKAGE_NAME,
+                    "package_version": COMPOSED_BASE_PACKAGE_VERSION,
+                },
+                {
+                    "role": COMPONENT_ROLE_THIN,
+                    "package_name": THIN_PACKAGE_NAME,
+                    "package_version": COMPOSED_THIN_PACKAGE_VERSION,
+                },
+            ],
+        },
+    )
+
+
+@pytest.mark.parametrize("connector", ["codex", "claude-code", "cursor", "gemini-cli"])
+def test_verified_paired_install_reports_controlled_alternatives_installed_ready(
+    connector,
+    tmp_path,
+    monkeypatch,
+):
+    home = tmp_path / "avp-home"
+    home.mkdir()
+    project = tmp_path / "checkout-service"
+    project.mkdir()
+    _install_verified_composed_ca_home(home, tmp_path)
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_project_status_client.discover_paid_provider",
+        lambda *, home=None: absent_provider_snapshot(),
+    )
+    transport = BackendEchoTransport()
+
+    result = sync_project_status(
+        connector=connector,
+        connector_status=_advisory_status(),
+        project_dir=project,
+        runtime_home=home,
+        load_credential_fn=_load_credential_ok,
+        transport=transport,
+        clock=lambda: 1_785_844_800.0,
+    )
+
+    assert result == "accepted"
+    payload = json.loads(transport.calls[0]["body"].decode("utf-8"))
+    assert payload["connector"] == connector
+    assert payload["controlled_alternatives_status"] == "installed_ready"
+    assert payload["controlled_alternatives_package_version"] == COMPOSED_THIN_PACKAGE_VERSION
+    assert set(payload.keys()) == {
+        "schema_version",
+        "connector",
+        "connection_state",
+        "route_state",
+        "project_display_label",
+        "observed_at",
+        "private_guardrails_status",
+        "controlled_alternatives_status",
+        "controlled_alternatives_package_version",
+    }
+
+
+def test_installed_ready_payload_carries_only_bounded_readiness_metadata(
+    tmp_path,
+    monkeypatch,
+):
+    home = tmp_path / "avp-home"
+    home.mkdir()
+    project = tmp_path / "checkout-service"
+    project.mkdir()
+    _install_verified_composed_ca_home(home, tmp_path)
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_project_status_client.discover_paid_provider",
+        lambda *, home=None: absent_provider_snapshot(),
+    )
+    transport = BackendEchoTransport()
+    sync_project_status(
+        connector="codex",
+        connector_status=_advisory_status(),
+        project_dir=project,
+        runtime_home=home,
+        load_credential_fn=lambda home=None: StoredCredential(
+            scope=CREDENTIAL_SCOPE,
+            token=SECRET,
+        ),
+        transport=transport,
+        clock=lambda: 1_785_844_800.0,
+    )
+    encoded = transport.calls[0]["body"].decode("utf-8")
+    payload = json.loads(encoded)
+    assert payload["controlled_alternatives_status"] == "installed_ready"
+    assert (
+        payload["controlled_alternatives_package_version"]
+        == COMPOSED_THIN_PACKAGE_VERSION
+    )
+    assert set(payload.keys()) == {
+        "schema_version",
+        "connector",
+        "connection_state",
+        "route_state",
+        "project_display_label",
+        "observed_at",
+        "private_guardrails_status",
+        "controlled_alternatives_status",
+        "controlled_alternatives_package_version",
+    }
+    assert all(isinstance(value, str) for value in payload.values())
+    for forbidden in (
+        SECRET,
+        TOKEN,
+        str(home),
+        str(project.resolve()),
+        "private_v1",
+        PROVIDER_ID,
+        "controlled_provider",
+        "authority",
+        "provider_id",
+        "install_components",
+        "sha256",
+        "hash",
+        '"controlled_alternatives_status": "active"',
+        '"controlled_alternatives_status":"active"',
+    ):
+        assert forbidden not in encoded
+
+
+def test_project_status_summary_preserves_active_only_heartbeat_contract():
+    with pytest.raises(
+        ProjectStatusClientError,
+        match="invalid_controlled_alternatives_status",
+    ):
+        build_project_status_summary(
+            connector="codex",
+            connector_status=_advisory_status(),
+            project_dir=Path("/tmp/project"),
+            private_guardrails_status="unavailable",
+            controlled_alternatives_status="active",
+            controlled_alternatives_package_version="0.1.4",
+        )
+    summary = build_project_status_summary(
+        connector="codex",
+        connector_status=_advisory_status(),
+        project_dir=Path("/tmp/project"),
+        private_guardrails_status="active",
+        controlled_alternatives_status="installed_ready",
+        controlled_alternatives_package_version="0.1.4",
+    )
+    assert summary is not None
+    payload = summary_to_request_payload(summary)
+    assert payload["private_guardrails_status"] == "active"
+    assert payload["controlled_alternatives_status"] == "installed_ready"
+    assert payload["controlled_alternatives_status"] != "active"
+
+
+@pytest.mark.parametrize(
+    "patch_target",
+    [
+        "agentveil_mcp_proxy.paid_install.resolve_vendored_controlled_alternative_provider",
+        "agentveil_mcp_proxy.paid_install.resolve_vendored_controlled_alternative_authority",
+    ],
+)
+def test_incomplete_or_untrusted_ca_install_omits_readiness_fields(
+    tmp_path,
+    monkeypatch,
+    patch_target,
+):
+    home = tmp_path / "avp-home"
+    home.mkdir()
+    project = tmp_path / "checkout-service"
+    project.mkdir()
+    _install_verified_composed_ca_home(home, tmp_path)
+
+    def _fail(*args, **kwargs):
+        return None, "vendored_provider_missing"
+
+    monkeypatch.setattr(patch_target, _fail)
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_project_status_client.discover_paid_provider",
+        lambda *, home=None: absent_provider_snapshot(),
+    )
+    transport = BackendEchoTransport()
+    result = sync_project_status(
+        connector="codex",
+        connector_status=_advisory_status(),
+        project_dir=project,
+        runtime_home=home,
+        load_credential_fn=_load_credential_ok,
+        transport=transport,
+    )
+    assert result == "accepted"
+    payload = json.loads(transport.calls[0]["body"].decode("utf-8"))
+    assert "controlled_alternatives_status" not in payload
+    assert "controlled_alternatives_package_version" not in payload
+
+
+def test_missing_base_vendor_omits_ca_readiness_when_thin_and_metadata_intact(
+    tmp_path,
+    monkeypatch,
+):
+    home = tmp_path / "avp-home"
+    home.mkdir()
+    project = tmp_path / "checkout-service"
+    project.mkdir()
+    _install_verified_composed_ca_home(home, tmp_path)
+    base_vendor = (
+        vendor_root(home) / f"{COMPOSED_BASE_PACKAGE_NAME}-{COMPOSED_BASE_PACKAGE_VERSION}"
+    )
+    shutil.rmtree(base_vendor)
+    assert base_vendor.exists() is False
+    assert resolve_controlled_alternatives_installed_readiness(home=home) is None
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_project_status_client.discover_paid_provider",
+        lambda *, home=None: absent_provider_snapshot(),
+    )
+    transport = BackendEchoTransport()
+    result = sync_project_status(
+        connector="codex",
+        connector_status=_advisory_status(),
+        project_dir=project,
+        runtime_home=home,
+        load_credential_fn=_load_credential_ok,
+        transport=transport,
+    )
+    assert result == "accepted"
+    payload = json.loads(transport.calls[0]["body"].decode("utf-8"))
+    assert "controlled_alternatives_status" not in payload
+    assert "controlled_alternatives_package_version" not in payload
+
+
+def test_legacy_install_state_omits_ca_fields_when_resolvers_succeed(
+    tmp_path,
+    monkeypatch,
+):
+    home = tmp_path / "avp-home"
+    home.mkdir()
+    project = tmp_path / "checkout-service"
+    project.mkdir()
+    _install_verified_composed_ca_home(home, tmp_path)
+    assert resolve_controlled_alternatives_installed_readiness(home=home) is not None
+    write_install_state(
+        install_state_path(home),
+        {
+            "status": STATUS_ACTIVE,
+            "provider_id": "private_v1",
+            "package_name": DEFAULT_PACKAGE_NAME,
+            "package_version": COMPOSED_THIN_PACKAGE_VERSION,
+            "public_fallback_available": True,
+            "error_code": None,
+            "last_installed_at": "2026-08-08T12:00:00+00:00",
+            "install_safety_state": "verified",
+            "install_safety_reason": None,
+        },
+    )
+    assert resolve_controlled_alternatives_installed_readiness(home=home) is None
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_project_status_client.discover_paid_provider",
+        lambda *, home=None: absent_provider_snapshot(),
+    )
+    transport = BackendEchoTransport()
+    result = sync_project_status(
+        connector="codex",
+        connector_status=_advisory_status(),
+        project_dir=project,
+        runtime_home=home,
+        load_credential_fn=_load_credential_ok,
+        transport=transport,
+    )
+    assert result == "accepted"
+    payload = json.loads(transport.calls[0]["body"].decode("utf-8"))
+    assert "controlled_alternatives_status" not in payload
+    assert "controlled_alternatives_package_version" not in payload
+
+
+def test_incomplete_or_untrusted_ca_install_omits_readiness_on_resolver_exception(
+    tmp_path,
+    monkeypatch,
+):
+    home = tmp_path / "avp-home"
+    home.mkdir()
+    project = tmp_path / "checkout-service"
+    project.mkdir()
+
+    def _explode(*args, **kwargs):
+        raise RuntimeError("resolver must not leak")
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.paid_install.resolve_vendored_controlled_alternative_provider",
+        _explode,
+    )
+    transport = BackendEchoTransport()
+    result = sync_project_status(
+        connector="codex",
+        connector_status=_advisory_status(),
+        project_dir=project,
+        runtime_home=home,
+        load_credential_fn=_load_credential_ok,
+        transport=transport,
+    )
+    assert result == "accepted"
+    payload = json.loads(transport.calls[0]["body"].decode("utf-8"))
+    assert "controlled_alternatives_status" not in payload
+
+
+def test_installed_ready_report_does_not_serialize_provider_authority_or_paths(
+    tmp_path,
+    monkeypatch,
+):
+    home = tmp_path / "avp-home"
+    home.mkdir()
+    project = tmp_path / "checkout-service"
+    project.mkdir()
+    _install_verified_composed_ca_home(home, tmp_path)
+    assert resolve_controlled_alternatives_installed_readiness(home=home) is not None
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_project_status_client.discover_paid_provider",
+        lambda *, home=None: absent_provider_snapshot(),
+    )
+    transport = BackendEchoTransport()
+    sync_project_status(
+        connector="codex",
+        connector_status=_advisory_status(),
+        project_dir=project,
+        runtime_home=home,
+        load_credential_fn=_load_credential_ok,
+        transport=transport,
+    )
+    encoded = transport.calls[0]["body"].decode("utf-8")
+    assert str(home) not in encoded
+    assert "controlled_provider" not in encoded
+    assert "private_v1" not in encoded
+    assert "agentveil-private-policy" not in encoded
+    assert "vendored" not in encoded
+    assert "authority" not in encoded.lower()
+    payload = json.loads(encoded)
+    assert payload["controlled_alternatives_status"] == "installed_ready"
+    assert payload["controlled_alternatives_package_version"] == COMPOSED_THIN_PACKAGE_VERSION

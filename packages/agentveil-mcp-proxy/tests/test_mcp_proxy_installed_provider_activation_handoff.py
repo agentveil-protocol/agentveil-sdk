@@ -31,6 +31,8 @@ from agentveil_mcp_proxy.paid_activation import (
 from agentveil_mcp_proxy.paid_install import (
     BOUNDED_INSTALL_KEYS,
     COMPOSED_INSTALL_COMPOSITION_VERSION,
+    COMPOSED_THIN_ARTIFACT_ID,
+    COMPOSED_THIN_PACKAGE_VERSION,
     COMPONENT_ROLE_BASE,
     COMPONENT_ROLE_THIN,
     ERROR_HANDOFF_HOOK_EXCEPTION,
@@ -107,9 +109,7 @@ LEGACY_PACKAGE_VERSION = "0.1.0"
 PACKAGE_NAME = "agentveil-private-guardrails-base"
 PACKAGE_VERSION = "0.1.0"
 THIN_PACKAGE_NAME = "agentveil-private-policy-thin"
-THIN_PACKAGE_VERSION = "0.1.3"
 COMPOSED_BASE_ARTIFACT_ID = "art_pkg_private_guardrails_base_001"
-COMPOSED_THIN_ARTIFACT_ID = "art_pkg_ca_basic_004"
 MODULE_NAME = PACKAGE_NAME.replace("-", "_")
 THIN_MODULE_NAME = THIN_PACKAGE_NAME.replace("-", "_")
 
@@ -119,8 +119,8 @@ def _default_thin_wheel_bytes() -> tuple[bytes, str]:
     with zipfile.ZipFile(buffer, "w") as archive:
         archive.writestr(f"{THIN_MODULE_NAME}/__init__.py", "\n")
         archive.writestr(
-            f"{THIN_MODULE_NAME}-{THIN_PACKAGE_VERSION}.dist-info/METADATA",
-            f"Name: {THIN_PACKAGE_NAME}\nVersion: {THIN_PACKAGE_VERSION}\n",
+            f"{THIN_MODULE_NAME}-{COMPOSED_THIN_PACKAGE_VERSION}.dist-info/METADATA",
+            f"Name: {THIN_PACKAGE_NAME}\nVersion: {COMPOSED_THIN_PACKAGE_VERSION}\n",
         )
     data = buffer.getvalue()
     return data, sha256_hex(data)
@@ -692,7 +692,7 @@ class _FakeBackend:
                 download_authorized=True,
                 artifact_id=COMPOSED_THIN_ARTIFACT_ID,
                 package_name=THIN_PACKAGE_NAME,
-                package_version=THIN_PACKAGE_VERSION,
+                package_version=COMPOSED_THIN_PACKAGE_VERSION,
                 artifact_hash=self.thin_artifact_hash,
                 artifact_size_bytes=self.thin_artifact_size,
                 download_authorization_id="dlauth_handoff_thin_001",

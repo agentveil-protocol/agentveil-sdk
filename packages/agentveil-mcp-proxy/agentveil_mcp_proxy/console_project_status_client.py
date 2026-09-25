@@ -65,6 +65,9 @@ _LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _PACKAGE_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
 _MAX_PACKAGE_VERSION_LENGTH = 64
 
+_CA_STATUS_INSTALLED_READY = "installed_ready"
+_CA_RUNTIME_REPORT_VALUES = frozenset({_CA_STATUS_INSTALLED_READY})
+
 _REQUEST_KEYS = frozenset({
     "schema_version",
     "connector",
@@ -74,8 +77,14 @@ _REQUEST_KEYS = frozenset({
     "observed_at",
     "package_version",
     "private_guardrails_status",
+    "controlled_alternatives_status",
+    "controlled_alternatives_package_version",
 })
-_REQUIRED_REQUEST_KEYS = _REQUEST_KEYS - {"package_version"}
+_REQUIRED_REQUEST_KEYS = _REQUEST_KEYS - {
+    "package_version",
+    "controlled_alternatives_status",
+    "controlled_alternatives_package_version",
+}
 _RESPONSE_KEYS = frozenset({
     "workspace_id",
     "connector",
@@ -130,6 +139,8 @@ class ProjectStatusSummary:
     observed_at: str
     private_guardrails_status: str
     package_version: str | None = None
+    controlled_alternatives_status: str | None = None
+    controlled_alternatives_package_version: str | None = None
 
 
 Transport = Callable[..., RawResponse]
@@ -298,6 +309,100 @@ def _validate_private_guardrails_status(value: str) -> str:
     return value
 
 
+def _validate_controlled_alternatives_status(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if value not in _CA_RUNTIME_REPORT_VALUES:
+        raise ProjectStatusClientError("invalid_controlled_alternatives_status")
+    return value
+
+
+def resolve_controlled_alternatives_installed_readiness(
+    *,
+    home: Path | None,
+) -> tuple[str, str] | None:
+    """Return installed_ready and bounded thin version when both resolvers succeed."""
+
+    if home is None:
+        return None
+    try:
+        from agentveil_mcp_proxy.paid_install import (
+            COMPOSED_BASE_PACKAGE_NAME,
+            COMPOSED_BASE_PACKAGE_VERSION,
+            COMPOSED_INSTALL_COMPOSITION_VERSION,
+            COMPOSED_THIN_PACKAGE_VERSION,
+            COMPONENT_ROLE_BASE,
+            COMPONENT_ROLE_THIN,
+            FREE_BUILDER_PACKAGE_NAME,
+            install_state_path,
+            load_install_state,
+            resolve_vendored_controlled_alternative_authority,
+            resolve_vendored_controlled_alternative_provider,
+            resolve_vendored_paid_provider,
+        )
+
+        resolved_home = home.expanduser()
+        provider, provider_error = resolve_vendored_controlled_alternative_provider(
+            home=resolved_home
+        )
+        if provider is None or provider_error is not None:
+            return None
+        authority, authority_error = resolve_vendored_controlled_alternative_authority(
+            home=resolved_home
+        )
+        if authority is None or authority_error is not None:
+            return None
+        if resolve_vendored_paid_provider(home=resolved_home) is None:
+            return None
+
+        install_state = load_install_state(install_state_path(resolved_home))
+        if install_state is None:
+            return None
+        if install_state.get("install_composition_version") != (
+            COMPOSED_INSTALL_COMPOSITION_VERSION
+        ):
+            return None
+        components = install_state.get("install_components")
+        if not isinstance(components, list):
+            return None
+        by_role: dict[str, dict[str, Any]] = {}
+        for entry in components:
+            if not isinstance(entry, dict):
+                return None
+            role = entry.get("role")
+            if not isinstance(role, str) or role in by_role:
+                return None
+            by_role[role] = entry
+        expected_roles = {COMPONENT_ROLE_BASE, COMPONENT_ROLE_THIN}
+        if set(by_role) != expected_roles:
+            return None
+        base_entry = by_role[COMPONENT_ROLE_BASE]
+        thin_entry = by_role[COMPONENT_ROLE_THIN]
+        if (
+            base_entry.get("package_name") != COMPOSED_BASE_PACKAGE_NAME
+            or base_entry.get("package_version") != COMPOSED_BASE_PACKAGE_VERSION
+            or thin_entry.get("package_name") != FREE_BUILDER_PACKAGE_NAME
+            or thin_entry.get("package_version") != COMPOSED_THIN_PACKAGE_VERSION
+        ):
+            return None
+        top_name = install_state.get("package_name")
+        top_version = install_state.get("package_version")
+        if (
+            top_name != COMPOSED_BASE_PACKAGE_NAME
+            or top_version != COMPOSED_BASE_PACKAGE_VERSION
+        ):
+            return None
+        thin_version = thin_entry.get("package_version")
+        if not isinstance(thin_version, str):
+            return None
+        normalized = normalize_package_version(thin_version)
+        if normalized is None:
+            return None
+        return _CA_STATUS_INSTALLED_READY, normalized
+    except Exception:
+        return None
+
+
 def resolve_private_guardrails_status(snapshot: object) -> str:
     """Map a bounded paid-provider snapshot to a local Console report."""
 
@@ -358,6 +463,8 @@ def build_project_status_summary(
     project_dir: Path,
     private_guardrails_status: str,
     package_version: str | None = None,
+    controlled_alternatives_status: str | None = None,
+    controlled_alternatives_package_version: str | None = None,
     observed_at: str | None = None,
     clock: Clock | None = None,
 ) -> ProjectStatusSummary | None:
@@ -369,6 +476,12 @@ def build_project_status_summary(
     if label is None:
         return None
     version = normalize_package_version(package_version)
+    ca_status = _validate_controlled_alternatives_status(controlled_alternatives_status)
+    ca_version = normalize_package_version(controlled_alternatives_package_version)
+    if ca_status is None:
+        ca_version = None
+    elif ca_version is None:
+        ca_status = None
     if observed_at is not None:
         canonical_observed = _canonical_observed_at(_parse_rfc3339_utc(observed_at))
     else:
@@ -384,6 +497,8 @@ def build_project_status_summary(
             private_guardrails_status
         ),
         package_version=version,
+        controlled_alternatives_status=ca_status,
+        controlled_alternatives_package_version=ca_version,
     )
 
 
@@ -401,6 +516,16 @@ def summary_to_request_payload(summary: ProjectStatusSummary) -> dict[str, str]:
     }
     if summary.package_version is not None:
         payload["package_version"] = summary.package_version
+    if summary.controlled_alternatives_status is not None:
+        payload["controlled_alternatives_status"] = _validate_controlled_alternatives_status(
+            summary.controlled_alternatives_status
+        )
+        ca_version = normalize_package_version(
+            summary.controlled_alternatives_package_version
+        )
+        if ca_version is None:
+            raise ProjectStatusClientError("invalid_request")
+        payload["controlled_alternatives_package_version"] = ca_version
     if set(payload) - _REQUEST_KEYS:
         raise ProjectStatusClientError("invalid_request")
     if not _REQUIRED_REQUEST_KEYS.issubset(payload):
@@ -584,6 +709,15 @@ def sync_project_status(
     except Exception:
         private_guardrails_status = _LOCAL_REPORT_UNAVAILABLE
 
+    ca_readiness: tuple[str, str] | None = None
+    if runtime_home is not None:
+        try:
+            ca_readiness = resolve_controlled_alternatives_installed_readiness(
+                home=runtime_home
+            )
+        except Exception:
+            ca_readiness = None
+
     try:
         summary = build_project_status_summary(
             connector=connector,
@@ -591,6 +725,12 @@ def sync_project_status(
             project_dir=project_dir,
             package_version=package_version,
             private_guardrails_status=private_guardrails_status,
+            controlled_alternatives_status=(
+                None if ca_readiness is None else ca_readiness[0]
+            ),
+            controlled_alternatives_package_version=(
+                None if ca_readiness is None else ca_readiness[1]
+            ),
             clock=clock,
         )
     except ProjectStatusClientError:
@@ -707,6 +847,7 @@ __all__ = [
     "build_project_status_summary",
     "normalize_connector_status",
     "normalize_package_version",
+    "resolve_controlled_alternatives_installed_readiness",
     "resolve_private_guardrails_status",
     "summary_to_request_payload",
     "sync_project_status",

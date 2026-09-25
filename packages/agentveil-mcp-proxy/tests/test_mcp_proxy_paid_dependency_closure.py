@@ -15,6 +15,11 @@ from pathlib import Path
 import pytest
 from packaging.version import Version
 
+from agentveil_mcp_proxy.paid_install import (
+    COMPOSED_THIN_ARTIFACT_ID,
+    COMPOSED_THIN_PACKAGE_VERSION,
+)
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 MCP_PROXY_ROOT = Path(__file__).resolve().parents[1]
 CANONICAL_CONTRACT_PATH = (
@@ -28,11 +33,10 @@ PROXY_VERSION = "0.7.49"
 BASE_PACKAGE_NAME = "agentveil-private-guardrails-base"
 BASE_PACKAGE_VERSION = "0.1.0"
 THIN_PACKAGE_NAME = "agentveil-private-policy-thin"
-THIN_PACKAGE_VERSION = "0.1.3"
+THIN_PACKAGE_VERSION = COMPOSED_THIN_PACKAGE_VERSION
 BASE_MODULE_NAME = BASE_PACKAGE_NAME.replace("-", "_")
 THIN_MODULE_NAME = THIN_PACKAGE_NAME.replace("-", "_")
 COMPOSED_BASE_ARTIFACT_ID = "art_pkg_private_guardrails_base_001"
-COMPOSED_THIN_ARTIFACT_ID = "art_pkg_ca_basic_004"
 RAW_LICENSE_KEY = "avp_live_closure_secret_key_do_not_leak_xyz789"
 CANONICAL_WHEEL_CONTRACT_MEMBER = (
     "agentveil_mcp_proxy/contracts/installed_provider_activation_handoff_v1.json"
