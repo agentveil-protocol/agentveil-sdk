@@ -19,6 +19,7 @@ from agentveil_mcp_proxy.console_credentials import (
 )
 from agentveil_mcp_proxy.console_project_status_client import (
     CONSOLE_ORIGIN,
+    ConsoleProjectStatusClient,
     ProjectStatusClientError,
     ProjectStatusSummary,
     RawResponse,
@@ -1368,3 +1369,204 @@ def test_installed_ready_report_does_not_serialize_provider_authority_or_paths(
     payload = json.loads(encoded)
     assert payload["controlled_alternatives_status"] == "installed_ready"
     assert payload["controlled_alternatives_package_version"] == COMPOSED_THIN_PACKAGE_VERSION
+
+
+def _installed_ready_summary(*, private_guardrails_status="unavailable", package_version=None):
+    return build_project_status_summary(
+        connector="codex",
+        connector_status=_advisory_status(),
+        project_dir=Path("/tmp/checkout-service"),
+        package_version=package_version,
+        private_guardrails_status=private_guardrails_status,
+        controlled_alternatives_status="installed_ready",
+        controlled_alternatives_package_version=COMPOSED_THIN_PACKAGE_VERSION,
+        observed_at="2026-08-04T12:00:00Z",
+    )
+
+
+def test_readiness_unsupported_retries_once_without_ca_fields():
+    summary = _installed_ready_summary()
+    assert summary is not None
+    transport = FakeTransport([
+        RawResponse(status=400, content_types=("application/json",), body=b"{}"),
+        lambda body: _json_response(200, _backend_ingest_response_for_request(body)),
+    ])
+    client = ConsoleProjectStatusClient(transport=transport)
+    client.upload(summary, bearer_token=TOKEN)
+    assert len(transport.calls) == 2
+    first = json.loads(transport.calls[0]["body"].decode("utf-8"))
+    second = json.loads(transport.calls[1]["body"].decode("utf-8"))
+    assert first["controlled_alternatives_status"] == "installed_ready"
+    assert "controlled_alternatives_status" not in second
+    assert "controlled_alternatives_package_version" not in second
+
+
+def test_new_server_accepts_readiness_without_fallback_retry(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    home.mkdir()
+    project = tmp_path / "checkout-service"
+    project.mkdir()
+    _install_verified_composed_ca_home(home, tmp_path)
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_project_status_client.discover_paid_provider",
+        lambda *, home=None: absent_provider_snapshot(),
+    )
+    transport = BackendEchoTransport()
+    result = sync_project_status(
+        connector="codex",
+        connector_status=_advisory_status(),
+        project_dir=project,
+        runtime_home=home,
+        load_credential_fn=_load_credential_ok,
+        transport=transport,
+        clock=lambda: 1_785_844_800.0,
+    )
+    assert result == "accepted"
+    assert len(transport.calls) == 1
+    payload = json.loads(transport.calls[0]["body"].decode("utf-8"))
+    assert payload["controlled_alternatives_status"] == "installed_ready"
+
+
+def test_old_server_fallback_preserves_ordinary_project_status_payload():
+    summary = _installed_ready_summary(
+        private_guardrails_status="active",
+        package_version="1.2.3",
+    )
+    assert summary is not None
+    transport = FakeTransport([
+        RawResponse(status=400, content_types=("application/json",), body=b"{}"),
+        lambda body: _json_response(200, _backend_ingest_response_for_request(body)),
+    ])
+    client = ConsoleProjectStatusClient(transport=transport)
+    client.upload(summary, bearer_token=TOKEN)
+    first = json.loads(transport.calls[0]["body"].decode("utf-8"))
+    second = json.loads(transport.calls[1]["body"].decode("utf-8"))
+    ordinary_keys = {
+        "schema_version",
+        "connector",
+        "connection_state",
+        "route_state",
+        "project_display_label",
+        "observed_at",
+        "private_guardrails_status",
+        "package_version",
+    }
+    assert ordinary_keys.issubset(first)
+    assert ordinary_keys.issubset(second)
+    for key in ordinary_keys:
+        assert second[key] == first[key]
+    assert second["observed_at"] == "2026-08-04T12:00:00Z"
+
+
+@pytest.mark.parametrize(
+    "response_item",
+    [
+        RawResponse(status=401, content_types=("application/json",), body=b"{}"),
+        RawResponse(status=403, content_types=("application/json",), body=b"{}"),
+        RawResponse(status=409, content_types=("application/json",), body=b"{}"),
+        RawResponse(status=413, content_types=("application/json",), body=b"{}"),
+        RawResponse(status=415, content_types=("application/json",), body=b"{}"),
+        RawResponse(status=500, content_types=("application/json",), body=b"{}"),
+        RawResponse(status=301, content_types=("application/json",), body=b"{}"),
+        TransportError(),
+        _json_response(200, {}, content_type="text/plain"),
+    ],
+)
+def test_readiness_fallback_does_not_retry_auth_conflict_or_server_failures(
+    response_item,
+):
+    summary = _installed_ready_summary()
+    assert summary is not None
+    transport = FakeTransport([
+        response_item,
+        lambda body: _json_response(200, _backend_ingest_response_for_request(body)),
+    ])
+    client = ConsoleProjectStatusClient(transport=transport)
+    with pytest.raises(ProjectStatusClientError):
+        client.upload(summary, bearer_token=TOKEN)
+    assert len(transport.calls) == 1
+
+
+def test_readiness_fallback_never_serializes_private_or_credential_fields(
+    tmp_path,
+    monkeypatch,
+):
+    home = tmp_path / "avp-home"
+    home.mkdir()
+    project = tmp_path / "checkout-service"
+    project.mkdir()
+    _install_verified_composed_ca_home(home, tmp_path)
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_project_status_client.discover_paid_provider",
+        lambda *, home=None: _active_provider_snapshot(
+            summary="policy prompt command /Users/me/secret",
+            error_code=PROVIDER_ERROR,
+        ),
+    )
+    transport = FakeTransport([
+        RawResponse(status=400, content_types=("application/json",), body=b"{}"),
+        lambda body: _json_response(200, _backend_ingest_response_for_request(body)),
+    ])
+    result = sync_project_status(
+        connector="codex",
+        connector_status=_advisory_status(),
+        project_dir=project,
+        runtime_home=home,
+        load_credential_fn=lambda home=None: StoredCredential(
+            scope=CREDENTIAL_SCOPE,
+            token=SECRET,
+        ),
+        transport=transport,
+        clock=lambda: 1_785_844_800.0,
+    )
+    assert result == "accepted"
+    assert len(transport.calls) == 2
+    for call in transport.calls:
+        encoded = call["body"].decode("utf-8")
+        for forbidden in (
+            SECRET,
+            WORKSPACE_ID,
+            PROVIDER_ID,
+            PROVIDER_SUMMARY,
+            PROVIDER_ERROR,
+            "/Users/",
+            "approval",
+            "policy",
+            "prompt",
+            "command",
+            str(home),
+            "private_v1",
+            "authority",
+            "provider_id",
+        ):
+            assert forbidden not in encoded
+        payload = json.loads(encoded)
+        assert payload.get("controlled_alternatives_status") != "active"
+        assert set(payload.keys()) <= {
+            "schema_version",
+            "connector",
+            "connection_state",
+            "route_state",
+            "project_display_label",
+            "observed_at",
+            "package_version",
+            "private_guardrails_status",
+            "controlled_alternatives_status",
+            "controlled_alternatives_package_version",
+        }
+    fallback = json.loads(transport.calls[1]["body"].decode("utf-8"))
+    assert "controlled_alternatives_status" not in fallback
+    assert "controlled_alternatives_package_version" not in fallback
+
+
+def test_readiness_fallback_does_not_retry_twice_on_repeated_400():
+    summary = _installed_ready_summary()
+    assert summary is not None
+    transport = FakeTransport([
+        RawResponse(status=400, content_types=("application/json",), body=b"{}"),
+        RawResponse(status=400, content_types=("application/json",), body=b"{}"),
+    ])
+    client = ConsoleProjectStatusClient(transport=transport)
+    with pytest.raises(ProjectStatusClientError, match="unexpected_status"):
+        client.upload(summary, bearer_token=TOKEN)
+    assert len(transport.calls) == 2

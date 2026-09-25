@@ -549,6 +549,33 @@ def _validate_workspace_id(value: object) -> None:
         raise ProjectStatusClientError("malformed_body") from exc
 
 
+def _summary_without_controlled_alternatives_readiness(
+    summary: ProjectStatusSummary,
+) -> ProjectStatusSummary:
+    return ProjectStatusSummary(
+        schema_version=summary.schema_version,
+        connector=summary.connector,
+        connection_state=summary.connection_state,
+        route_state=summary.route_state,
+        project_display_label=summary.project_display_label,
+        observed_at=summary.observed_at,
+        private_guardrails_status=summary.private_guardrails_status,
+        package_version=summary.package_version,
+        controlled_alternatives_status=None,
+        controlled_alternatives_package_version=None,
+    )
+
+
+def _is_readiness_unsupported_response(
+    response: RawResponse,
+    *,
+    summary: ProjectStatusSummary,
+) -> bool:
+    if response.status != 400:
+        return False
+    return summary.controlled_alternatives_status == _CA_STATUS_INSTALLED_READY
+
+
 def _decode_response_object(
     response: RawResponse,
     *,
@@ -609,12 +636,12 @@ class ConsoleProjectStatusClient:
         self._transport = transport or _urllib_transport
         self._clock = clock
 
-    def upload(
+    def _post_ingest(
         self,
         summary: ProjectStatusSummary,
         *,
         bearer_token: str,
-    ) -> None:
+    ) -> RawResponse:
         payload = summary_to_request_payload(summary)
         body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
             "utf-8"
@@ -629,7 +656,7 @@ class ConsoleProjectStatusClient:
         if split.scheme != "https" or split.netloc != _ORIGIN_HOST:
             raise ProjectStatusClientError("invalid_origin")
         try:
-            response = self._transport(
+            return self._transport(
                 "POST",
                 url,
                 headers=headers,
@@ -638,6 +665,19 @@ class ConsoleProjectStatusClient:
             )
         except TransportError as exc:
             raise ProjectStatusClientError("transport_failed") from exc
+
+    def upload(
+        self,
+        summary: ProjectStatusSummary,
+        *,
+        bearer_token: str,
+    ) -> None:
+        response = self._post_ingest(summary, bearer_token=bearer_token)
+        if _is_readiness_unsupported_response(response, summary=summary):
+            fallback = _summary_without_controlled_alternatives_readiness(summary)
+            response = self._post_ingest(fallback, bearer_token=bearer_token)
+            _decode_response_object(response, request=fallback)
+            return
         _decode_response_object(response, request=summary)
 
 
