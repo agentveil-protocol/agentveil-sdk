@@ -3351,6 +3351,7 @@ def test_demo_human_output_omits_role_presets_hint(tmp_path, capsys):
 CONSOLE_DEVICE_CODE = "device-code-secret-cli"
 CONSOLE_USER_CODE = "ABCD-2468"
 CONSOLE_TOKEN = "confirmed-device-token-secret-cli"
+CONSOLE_BINDING_TOKEN = "runtime-binding-token-secret-cli"
 CONSOLE_URL = "https://agentveil.dev/console/pairing"
 CONSOLE_ATTACH_DEVICE_CODE = "attach-device-code-secret-cli"
 CONSOLE_ATTACH_TOKEN = "attach-confirmed-token-secret-cli"
@@ -3628,6 +3629,120 @@ def test_console_login_store_failure_revokes_orphan_token(tmp_path, monkeypatch,
     assert exit_code == 1
     assert client.revoke_calls == [CONSOLE_TOKEN]
     assert "ERROR:" in err
+
+
+def test_console_pairing_dual_storage_failure_revokes_source_and_cleans_both_credentials(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from agentveil_mcp_proxy.console_credentials import (
+        RUNTIME_BINDING_SCOPE,
+        load_runtime_binding_credential,
+    )
+
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    client = _FakeConsoleClient(
+        start=_console_start(),
+        token=PairingToken(
+            token=CONSOLE_TOKEN,
+            scope=CREDENTIAL_SCOPE,
+            runtime_binding_token=CONSOLE_BINDING_TOKEN,
+            runtime_binding_scope=RUNTIME_BINDING_SCOPE,
+        ),
+        revoke_result=RevokeOutcome.REVOKED,
+    )
+    _install_console_client(monkeypatch, client)
+
+    def _binding_write_failed(*_args, **_kwargs):
+        raise console_creds.CredentialError("credential_write_failed")
+
+    monkeypatch.setattr(
+        proxy_cli,
+        "save_runtime_binding_credential",
+        _binding_write_failed,
+    )
+
+    exit_code = main(["login", "--no-open"])
+    _out, err = capsys.readouterr()
+
+    assert exit_code == 1
+    assert client.revoke_calls == [CONSOLE_TOKEN, CONSOLE_BINDING_TOKEN]
+    assert load_credential(home=home) is None
+    assert load_runtime_binding_credential(home=home) is None
+    assert CONSOLE_TOKEN not in err
+    assert CONSOLE_BINDING_TOKEN not in err
+    assert "ERROR:" in err
+
+
+def test_console_pairing_dual_bundle_never_leaks_credentials(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from agentveil_mcp_proxy.console_credentials import (
+        RUNTIME_BINDING_SCOPE,
+        load_runtime_binding_credential,
+    )
+    from agentveil_mcp_proxy.console_pairing_client import (
+        ConsolePairingClient,
+        RawResponse,
+    )
+
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+
+    class _PairingTransport:
+        def __call__(self, method, url, *, headers, body, timeout):
+            del method, headers, body, timeout
+            if url.endswith("/console/pairing/start"):
+                payload = {
+                    "device_code": CONSOLE_DEVICE_CODE,
+                    "user_code": CONSOLE_USER_CODE,
+                    "verification_uri": "/console/pairing",
+                    "expires_in": 600,
+                    "interval": 5,
+                }
+            else:
+                payload = {
+                    "status": "consumed",
+                    "token": CONSOLE_TOKEN,
+                    "scope": CREDENTIAL_SCOPE,
+                    "runtime_binding_token": CONSOLE_BINDING_TOKEN,
+                    "runtime_binding_scope": RUNTIME_BINDING_SCOPE,
+                }
+            return RawResponse(
+                status=200,
+                content_types=("application/json",),
+                body=json.dumps(payload).encode("utf-8"),
+            )
+
+    class _FailingAttach:
+        def start(self):
+            raise AttachClientError("unexpected_status")
+
+    monkeypatch.setattr(proxy_cli, "_console_attach_client", lambda: _FailingAttach())
+    monkeypatch.setattr(
+        proxy_cli,
+        "_console_pairing_client",
+        lambda: ConsolePairingClient(transport=_PairingTransport()),
+    )
+
+    exit_code = main(["login", "--no-open"])
+    out, err = capsys.readouterr()
+
+    assert exit_code == 0
+    assert load_credential(home=home).token == CONSOLE_TOKEN
+    assert load_runtime_binding_credential(home=home).token == CONSOLE_BINDING_TOKEN
+    for secret in (
+        CONSOLE_DEVICE_CODE,
+        CONSOLE_TOKEN,
+        CONSOLE_BINDING_TOKEN,
+        RUNTIME_BINDING_SCOPE,
+    ):
+        assert secret not in out
+        assert secret not in err
 
 
 def test_console_login_recheck_revokes_token_when_credential_appears(tmp_path, monkeypatch, capsys):
@@ -4417,7 +4532,7 @@ def test_console_login_attach_path_without_user_code(tmp_path, monkeypatch, caps
     assert (
         proxy_cli.run_console_login_cli(
             open_browser=True,
-            browser_open=lambda url: opened.append(url),
+            browser_open=lambda url: opened.append(url) or True,
         )
         == 0
     )

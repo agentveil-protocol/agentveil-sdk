@@ -228,6 +228,7 @@ from agentveil_mcp_proxy.console_attach_client import (
 from agentveil_mcp_proxy.console_pairing_client import (
     ConsolePairingClient,
     PairingClientError,
+    PairingToken,
     RevokeOutcome,
 )
 from agentveil_mcp_proxy.console_decision_summary_client import (
@@ -3962,16 +3963,28 @@ def _acquire_console_credential_via_explicit_pairing(
     try:
         existing = load_credential()
     except CredentialError:
-        _revoke_orphan_console_token(pairing, token.token)
+        _revoke_orphan_console_token(
+            pairing,
+            token.token,
+            runtime_binding_token=token.runtime_binding_token,
+        )
         return False
     if existing is not None:
-        _revoke_orphan_console_token(pairing, token.token)
+        _revoke_orphan_console_token(
+            pairing,
+            token.token,
+            runtime_binding_token=token.runtime_binding_token,
+        )
         return True
 
     try:
-        save_credential(token.token, scope=token.scope)
+        _store_console_pairing_credentials(token)
     except CredentialError:
-        _revoke_orphan_console_token(pairing, token.token)
+        _revoke_orphan_console_token(
+            pairing,
+            token.token,
+            runtime_binding_token=token.runtime_binding_token,
+        )
         _delete_local_console_credentials()
         return False
     return True
@@ -4087,6 +4100,20 @@ def _store_console_attach_credentials(
     save_runtime_binding_credential(binding_token, home=home)
 
 
+def _store_console_pairing_credentials(
+    token: PairingToken,
+    *,
+    home: Path | None = None,
+) -> None:
+    """Persist summary and optional runtime binding credentials from pairing."""
+
+    save_credential(token.token, scope=token.scope, home=home)
+    binding_token = token.runtime_binding_token
+    if binding_token is None:
+        return
+    save_runtime_binding_credential(binding_token, home=home)
+
+
 def _delete_local_console_credentials(*, home: Path | None = None) -> None:
     delete_credential(home=home)
     delete_runtime_binding_credential(home=home)
@@ -4154,14 +4181,22 @@ def run_console_login_cli(
                 try:
                     existing = load_credential()
                 except CredentialError as exc:
-                    _revoke_orphan_console_token(pairing, token.token)
+                    _revoke_orphan_console_token(
+                        pairing,
+                        token.token,
+                        runtime_binding_token=token.runtime_binding_token,
+                    )
                     raise ProxyCliError(
                         f"Existing Console credential is unreadable ({exc.code}). "
                         "Run logout or remove it, then retry.",
                         exit_code=1,
                     ) from exc
                 if existing is not None:
-                    _revoke_orphan_console_token(pairing, token.token)
+                    _revoke_orphan_console_token(
+                        pairing,
+                        token.token,
+                        runtime_binding_token=token.runtime_binding_token,
+                    )
                     print(
                         "Already connected to AgentVeil Console. Run logout first.",
                         file=stream,
@@ -4169,9 +4204,14 @@ def run_console_login_cli(
                     return 0
 
                 try:
-                    save_credential(token.token, scope=token.scope)
+                    _store_console_pairing_credentials(token)
                 except CredentialError as exc:
-                    _revoke_orphan_console_token(pairing, token.token)
+                    _revoke_orphan_console_token(
+                        pairing,
+                        token.token,
+                        runtime_binding_token=token.runtime_binding_token,
+                    )
+                    _delete_local_console_credentials()
                     raise ProxyCliError(
                         f"Login could not store the credential ({exc.code}); not connected.",
                         exit_code=1,

@@ -9,10 +9,17 @@ import json
 
 import pytest
 
+from agentveil_mcp_proxy.console_credentials import (
+    CREDENTIAL_SCOPE,
+    RUNTIME_BINDING_SCOPE,
+)
 from agentveil_mcp_proxy.console_pairing_client import (
     CONSOLE_ORIGIN,
     ConsolePairingClient,
+    PAIRING_BUNDLE_VERSION_DUAL,
+    PAIRING_BUNDLE_VERSION_HEADER,
     PairingClientError,
+    PairingStart,
     RawResponse,
     RevokeOutcome,
     TransportError,
@@ -22,6 +29,25 @@ from agentveil_mcp_proxy.console_pairing_client import (
 DEVICE_CODE = "device-code-secret-xyz"
 USER_CODE = "WXYZ-1234"
 TOKEN = "confirmed-device-token-secret"
+BINDING_TOKEN = "runtime-binding-token-secret-xyz"
+
+
+def test_pairing_start_repr_redacts_pairing_secrets() -> None:
+    start = PairingStart(
+        device_code=DEVICE_CODE,
+        user_code=USER_CODE,
+        verification_url="https://agentveil.dev/console/pairing?state=secret-state",
+        expires_in=600,
+        interval=5,
+    )
+
+    rendered = repr(start)
+
+    assert DEVICE_CODE not in rendered
+    assert USER_CODE not in rendered
+    assert "secret-state" not in rendered
+    assert "agentveil.dev" not in rendered
+    assert rendered == "PairingStart(expires_in=600, interval=5)"
 
 
 def _json_response(status, obj, *, content_type="application/json"):
@@ -278,6 +304,10 @@ def test_poll_pending_then_consumed_returns_token():
     consume_call = transport.calls[0]
     assert consume_call["url"] == f"{CONSOLE_ORIGIN}/console/pairing/consume"
     assert json.loads(consume_call["body"]) == {"device_code": DEVICE_CODE}
+    assert (
+        consume_call["headers"][PAIRING_BUNDLE_VERSION_HEADER]
+        == PAIRING_BUNDLE_VERSION_DUAL
+    )
     assert clock.now > 0  # a bounded sleep occurred between pending and consume
 
 
@@ -524,6 +554,119 @@ def test_start_accepts_json_with_utf8_charset():
         ]
     )
     assert client.start().user_code == USER_CODE
+
+
+# --- pairing bundle v2 -----------------------------------------------------
+
+
+def test_pairing_client_requests_v2_and_parses_exact_dual_bundle():
+    transport = FakeTransport(
+        [
+            _json_response(
+                200,
+                {
+                    "status": "consumed",
+                    "token": TOKEN,
+                    "scope": CREDENTIAL_SCOPE,
+                    "runtime_binding_token": BINDING_TOKEN,
+                    "runtime_binding_scope": RUNTIME_BINDING_SCOPE,
+                },
+            )
+        ]
+    )
+    client = ConsolePairingClient(transport=transport)
+
+    result = client.poll_for_token(_start(_start_payload()))
+
+    assert result.token == TOKEN
+    assert result.scope == CREDENTIAL_SCOPE
+    assert result.runtime_binding_token == BINDING_TOKEN
+    assert result.runtime_binding_scope == RUNTIME_BINDING_SCOPE
+    consume_call = transport.calls[0]
+    assert (
+        consume_call["headers"][PAIRING_BUNDLE_VERSION_HEADER]
+        == PAIRING_BUNDLE_VERSION_DUAL
+    )
+
+
+def test_pairing_client_accepts_exact_legacy_summary_only_response():
+    transport = FakeTransport(
+        [
+            _json_response(
+                200,
+                {
+                    "status": "consumed",
+                    "token": TOKEN,
+                    "scope": CREDENTIAL_SCOPE,
+                },
+            )
+        ]
+    )
+    client = ConsolePairingClient(transport=transport)
+
+    result = client.poll_for_token(_start(_start_payload()))
+
+    assert result.token == TOKEN
+    assert result.scope == CREDENTIAL_SCOPE
+    assert result.runtime_binding_token is None
+    assert result.runtime_binding_scope is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "status": "consumed",
+            "token": TOKEN,
+            "scope": CREDENTIAL_SCOPE,
+            "runtime_binding_scope": RUNTIME_BINDING_SCOPE,
+        },
+        {
+            "status": "consumed",
+            "token": TOKEN,
+            "scope": CREDENTIAL_SCOPE,
+            "runtime_binding_token": BINDING_TOKEN,
+            "runtime_binding_scope": "other_scope",
+        },
+        {
+            "status": "consumed",
+            "token": TOKEN,
+            "scope": CREDENTIAL_SCOPE,
+            "runtime_binding_token": BINDING_TOKEN,
+            "runtime_binding_scope": RUNTIME_BINDING_SCOPE,
+            "extra": "field",
+        },
+        {
+            "status": "consumed",
+            "token": TOKEN,
+            "scope": CREDENTIAL_SCOPE,
+            "runtime_binding_token": TOKEN,
+            "runtime_binding_scope": RUNTIME_BINDING_SCOPE,
+        },
+        {
+            "status": "consumed",
+            "token": "bad\x00token",
+            "scope": CREDENTIAL_SCOPE,
+            "runtime_binding_token": BINDING_TOKEN,
+            "runtime_binding_scope": RUNTIME_BINDING_SCOPE,
+        },
+        {
+            "status": "consumed",
+            "token": "x" * 4097,
+            "scope": CREDENTIAL_SCOPE,
+            "runtime_binding_token": BINDING_TOKEN,
+            "runtime_binding_scope": RUNTIME_BINDING_SCOPE,
+        },
+    ],
+)
+def test_pairing_client_rejects_partial_or_invalid_dual_bundle(payload):
+    client = _client([_json_response(200, payload)])
+    with pytest.raises(PairingClientError) as exc:
+        client.poll_for_token(_start(_start_payload()))
+    assert exc.value.code in {
+        "malformed_consume",
+        "unexpected_binding_scope",
+    }
 
 
 # --- helpers ---------------------------------------------------------------

@@ -23,9 +23,14 @@ from dataclasses import dataclass
 from typing import Callable, Mapping
 from urllib.parse import urlsplit
 
-from agentveil_mcp_proxy.console_credentials import CREDENTIAL_SCOPE
+from agentveil_mcp_proxy.console_credentials import (
+    CREDENTIAL_SCOPE,
+    RUNTIME_BINDING_SCOPE,
+)
 
 CONSOLE_ORIGIN = "https://agentveil.dev"
+PAIRING_BUNDLE_VERSION_HEADER = "X-AVP-Console-Pairing-Bundle-Version"
+PAIRING_BUNDLE_VERSION_DUAL = "2"
 _ORIGIN_HOST = "agentveil.dev"
 
 _START_PATH = "/console/pairing/start"
@@ -47,6 +52,13 @@ _START_KEYS = frozenset(
 )
 _PENDING_KEYS = frozenset({"status"})
 _CONSUMED_KEYS = frozenset({"status", "token", "scope"})
+_CONSUMED_DUAL_KEYS = frozenset({
+    "status",
+    "token",
+    "scope",
+    "runtime_binding_token",
+    "runtime_binding_scope",
+})
 _REVOKED_KEYS = frozenset({"status"})
 
 _USER_CODE_RE = re.compile(r"^[A-Z0-9]+(?:-[A-Z0-9]+)*$")
@@ -83,6 +95,12 @@ class PairingStart:
     expires_in: int
     interval: int
 
+    def __repr__(self) -> str:
+        return (
+            "PairingStart("
+            f"expires_in={self.expires_in!r}, interval={self.interval!r})"
+        )
+
 
 @dataclass(frozen=True)
 class PairingToken:
@@ -90,6 +108,15 @@ class PairingToken:
 
     token: str
     scope: str
+    runtime_binding_token: str | None = None
+    runtime_binding_scope: str | None = None
+
+    def __repr__(self) -> str:
+        return (
+            "PairingToken("
+            f"scope={self.scope!r}, "
+            f"has_runtime_binding={self.runtime_binding_token is not None})"
+        )
 
 
 class RevokeOutcome:
@@ -183,8 +210,11 @@ class ConsolePairingClient:
         *,
         json_body: dict | None = None,
         bearer_token: str | None = None,
+        extra_headers: Mapping[str, str] | None = None,
     ) -> RawResponse:
         headers = {"Accept": "application/json"}
+        if extra_headers:
+            headers.update(extra_headers)
         body: bytes | None = None
         if json_body is not None:
             body = json.dumps(json_body).encode("utf-8")
@@ -232,7 +262,11 @@ class ConsolePairingClient:
             if self._clock() >= deadline:
                 raise PairingClientError("expired")
             response = self._post(
-                _CONSUME_PATH, json_body={"device_code": start.device_code}
+                _CONSUME_PATH,
+                json_body={"device_code": start.device_code},
+                extra_headers={
+                    PAIRING_BUNDLE_VERSION_HEADER: PAIRING_BUNDLE_VERSION_DUAL,
+                },
             )
             payload = _decode_json_object(response, expected_status=200)
             status = payload.get("status")
@@ -245,14 +279,36 @@ class ConsolePairingClient:
                 self._sleep(min(interval, remaining))
                 continue
             if status == "consumed":
-                if set(payload) != _CONSUMED_KEYS:
-                    raise PairingClientError("malformed_consume")
-                token = _require_secret_str(
-                    payload["token"], _MAX_TOKEN_LENGTH, "malformed_consume"
-                )
-                if payload["scope"] != CREDENTIAL_SCOPE:
-                    raise PairingClientError("unexpected_scope")
-                return PairingToken(token=token, scope=CREDENTIAL_SCOPE)
+                keys = set(payload)
+                if keys == _CONSUMED_KEYS:
+                    token = _require_secret_str(
+                        payload["token"], _MAX_TOKEN_LENGTH, "malformed_consume"
+                    )
+                    if payload["scope"] != CREDENTIAL_SCOPE:
+                        raise PairingClientError("unexpected_scope")
+                    return PairingToken(token=token, scope=CREDENTIAL_SCOPE)
+                if keys == _CONSUMED_DUAL_KEYS:
+                    token = _require_secret_str(
+                        payload["token"], _MAX_TOKEN_LENGTH, "malformed_consume"
+                    )
+                    if payload["scope"] != CREDENTIAL_SCOPE:
+                        raise PairingClientError("unexpected_scope")
+                    binding_token = _require_secret_str(
+                        payload["runtime_binding_token"],
+                        _MAX_TOKEN_LENGTH,
+                        "malformed_consume",
+                    )
+                    if payload["runtime_binding_scope"] != RUNTIME_BINDING_SCOPE:
+                        raise PairingClientError("unexpected_binding_scope")
+                    if token == binding_token:
+                        raise PairingClientError("malformed_consume")
+                    return PairingToken(
+                        token=token,
+                        scope=CREDENTIAL_SCOPE,
+                        runtime_binding_token=binding_token,
+                        runtime_binding_scope=RUNTIME_BINDING_SCOPE,
+                    )
+                raise PairingClientError("malformed_consume")
             raise PairingClientError("unexpected_status")
 
     def revoke(self, token: str) -> str:
@@ -361,6 +417,8 @@ def _resolve_verification_url(value: object) -> str:
 __all__ = [
     "CONSOLE_ORIGIN",
     "ConsolePairingClient",
+    "PAIRING_BUNDLE_VERSION_DUAL",
+    "PAIRING_BUNDLE_VERSION_HEADER",
     "PairingClientError",
     "PairingStart",
     "PairingToken",
