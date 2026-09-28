@@ -15,8 +15,10 @@ from agentveil_mcp_proxy.controlled_alternatives import (
     APPLY_PREPARED_PATCH_ALTERNATIVE_ID,
     CONSOLE_BOUNDED_SUMMARY_UPLOAD_SCOPE,
     CONTROLLED_ALTERNATIVE_AUTHORITY_CONTRACT_VERSION,
+    CONTROLLED_ALTERNATIVE_AUTHORITY_ENTRYPOINT_GROUP,
     CONTROLLED_ALTERNATIVE_AUTHORITY_ID,
     CONTROLLED_ALTERNATIVE_AUTHORITY_SCOPE,
+    CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP,
     CONTROLLED_ALTERNATIVE_IDS,
     CONTROLLED_ALTERNATIVE_PROVIDER_CONTRACT_VERSION,
     CONTROLLED_ALTERNATIVE_PROVIDER_ID,
@@ -205,6 +207,18 @@ class _FakeProvider:
         if request.alternative_id == STAGE:
             return self._base(request, status="success", target=True, rollback=True, qid=QUARANTINE_ID)
         return self._base(request, status="success", target=True, rollback=False)
+
+
+def _install_scoped_vendor(tmp_path: Path, home: Path) -> None:
+    from test_mcp_proxy_controlled_alternatives import (
+        _build_controlled_alternative_wheel,
+        _install_active_controlled_alternative_vendor,
+    )
+
+    _install_active_controlled_alternative_vendor(
+        home,
+        wheel_bytes=_build_controlled_alternative_wheel(tmp_path / "scoped-vendor"),
+    )
 
 
 def _binding(tmp_path: Path) -> ControlledAlternativeRuntimeBinding:
@@ -434,6 +448,215 @@ def test_bind_rejects_global_state_root(tmp_path: Path) -> None:
     assert bound is None
 
 
+def test_bind_outside_workspace_home_skips_global_loaders(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from test_mcp_proxy_controlled_alternatives import (
+        _build_controlled_alternative_wheel,
+        _install_active_controlled_alternative_vendor,
+    )
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside-home"
+    outside.mkdir()
+    _install_active_controlled_alternative_vendor(
+        outside,
+        wheel_bytes=_build_controlled_alternative_wheel(tmp_path / "outside-wheel"),
+    )
+    calls = {"provider": 0, "authority": 0}
+
+    def _count_provider() -> _FakeProvider:
+        calls["provider"] += 1
+        return _FakeProvider(workspace)
+
+    def _count_authority() -> object:
+        calls["authority"] += 1
+        return _active_runtime_authority()
+
+    set_controlled_alternative_provider_loader(_count_provider)
+    set_controlled_alternative_authority_loader(_count_authority)
+    try:
+        bound = bind_controlled_alternative_runtime(
+            home=outside,
+            downstream={"name": "fs", "command": "python", "args": [], "cwd": str(workspace)},
+        )
+        assert bound is None
+        assert calls == {"provider": 0, "authority": 0}
+    finally:
+        set_controlled_alternative_provider_loader(None)
+        set_controlled_alternative_authority_loader(None)
+
+
+def test_bind_uses_explicit_project_home_not_global_avp_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from test_mcp_proxy_controlled_alternatives import (
+        _build_controlled_alternative_wheel,
+        _install_active_controlled_alternative_vendor,
+        _no_global_controlled_entries,
+    )
+
+    import agentveil_mcp_proxy.controlled_alternatives as ca_mod
+
+    global_home = tmp_path / "global-home"
+    monkeypatch.setenv("AVP_HOME", str(global_home))
+    monkeypatch.setattr(ca_mod, "entry_points", _no_global_controlled_entries)
+    _install_active_controlled_alternative_vendor(
+        global_home,
+        wheel_bytes=_build_controlled_alternative_wheel(tmp_path / "global-wheel"),
+    )
+
+    workspace = tmp_path / "workspace"
+    project_home = workspace / ".avp"
+    workspace.mkdir()
+    project_home.mkdir()
+
+    set_controlled_alternative_provider_loader(None)
+    set_controlled_alternative_authority_loader(None)
+    try:
+        missing = bind_controlled_alternative_runtime(
+            home=project_home,
+            downstream={"name": "fs", "command": "python", "args": [], "cwd": str(workspace)},
+            authority=_active_runtime_authority(),
+        )
+        assert missing is None
+
+        _install_active_controlled_alternative_vendor(
+            project_home,
+            wheel_bytes=_build_controlled_alternative_wheel(tmp_path / "project-wheel"),
+        )
+        bound = bind_controlled_alternative_runtime(
+            home=project_home,
+            downstream={"name": "fs", "command": "python", "args": [], "cwd": str(workspace)},
+            authority=_active_runtime_authority(),
+        )
+        assert bound is not None
+        listed = inject_controlled_alternative_tool(
+            {"result": {"tools": [{"name": "read_file"}]}},
+            bound,
+        )
+        assert GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME in {
+            tool["name"] for tool in listed["result"]["tools"]
+        }
+    finally:
+        set_controlled_alternative_provider_loader(None)
+        set_controlled_alternative_authority_loader(None)
+
+
+def test_bind_scoped_home_passes_runtime_context_to_vendored_adapters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agentveil_mcp_proxy.controlled_alternatives_transport import ControlledAlternativeRuntimeContext
+    from test_mcp_proxy_controlled_alternatives import (
+        VENDORED_CA_MODULE_NAME,
+        _build_controlled_alternative_wheel,
+        _install_active_controlled_alternative_vendor,
+        _no_global_controlled_entries,
+    )
+
+    import agentveil_mcp_proxy.controlled_alternatives as ca_mod
+
+    global_home = tmp_path / "global-home"
+    monkeypatch.setenv("AVP_HOME", str(global_home))
+    monkeypatch.setattr(ca_mod, "entry_points", _no_global_controlled_entries)
+    _install_active_controlled_alternative_vendor(
+        global_home,
+        wheel_bytes=_build_controlled_alternative_wheel(tmp_path / "global-wheel"),
+    )
+
+    workspace = tmp_path / "workspace"
+    project_home = workspace / ".avp"
+    workspace.mkdir()
+    project_home.mkdir()
+    snapshot = _active_runtime_authority().to_dict()
+    authority_source = f'''
+class Authority:
+    def __init__(self, context=None):
+        self.context = context
+    def bind_runtime_context(self, context):
+        return Authority(context)
+    def authority(self):
+        from agentveil_mcp_proxy.controlled_alternatives import validate_controlled_alternative_authority
+        if self.context is None:
+            from agentveil_mcp_proxy.controlled_alternatives import ControlledAlternativeAuthoritySnapshot
+            return ControlledAlternativeAuthoritySnapshot().to_dict()
+        status, payload = self.context.request("preflight", {{}})
+        if status != 200 or payload.get("ok") is not True:
+            from agentveil_mcp_proxy.controlled_alternatives import ControlledAlternativeAuthoritySnapshot
+            return ControlledAlternativeAuthoritySnapshot().to_dict()
+        return validate_controlled_alternative_authority({snapshot!r})
+class Provider:
+    def __init__(self, context=None):
+        self.context = context
+    def bind_runtime_context(self, context):
+        return Provider(context)
+    def descriptor(self):
+        return {{
+            "provider_id": "{CONTROLLED_ALTERNATIVE_PROVIDER_ID}",
+            "contract_version": "{CONTROLLED_ALTERNATIVE_PROVIDER_CONTRACT_VERSION}",
+            "profile_id": "{CONTROLLED_ALTERNATIVES_PROFILE_ID}",
+            "alternative_ids": list({list(CONTROLLED_ALTERNATIVE_IDS)!r}),
+        }}
+    def propose(self, request):
+        raise RuntimeError("unused")
+    def execute(self, request):
+        raise RuntimeError("unused")
+    def verify(self, request):
+        raise RuntimeError("unused")
+def build_provider():
+    return Authority()
+def build_controlled_provider():
+    return Provider()
+'''
+    entries = (
+        f"[{CONTROLLED_ALTERNATIVE_AUTHORITY_ENTRYPOINT_GROUP}]\n"
+        f"{CONTROLLED_ALTERNATIVE_AUTHORITY_ID} = {VENDORED_CA_MODULE_NAME}.controlled_provider:build_provider\n"
+        f"[{CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP}]\n"
+        f"{CONTROLLED_ALTERNATIVE_PROVIDER_ID} = {VENDORED_CA_MODULE_NAME}.controlled_provider:build_controlled_provider\n"
+    )
+    wheel = _build_controlled_alternative_wheel(
+        tmp_path / "project-wheel",
+        source=authority_source,
+        entry_points=entries,
+    )
+    _install_active_controlled_alternative_vendor(project_home, wheel_bytes=wheel)
+
+    calls: list[tuple[str, object]] = []
+
+    def preflight(operation, payload):
+        calls.append((operation, payload))
+        return 200, {"ok": True}
+
+    context = ControlledAlternativeRuntimeContext(request=preflight, state_root=str(project_home))
+    set_controlled_alternative_provider_loader(None)
+    set_controlled_alternative_authority_loader(None)
+    try:
+        denied = bind_controlled_alternative_runtime(
+            home=project_home,
+            downstream={"name": "fs", "command": "python", "args": [], "cwd": str(workspace)},
+            runtime_context=ControlledAlternativeRuntimeContext(
+                request=lambda *args: (401, {}),
+                state_root=str(project_home),
+            ),
+        )
+        assert denied is None
+
+        bound = bind_controlled_alternative_runtime(
+            home=project_home,
+            downstream={"name": "fs", "command": "python", "args": [], "cwd": str(workspace)},
+            runtime_context=context,
+        )
+        assert bound is not None
+        assert calls == [("preflight", {})]
+    finally:
+        set_controlled_alternative_provider_loader(None)
+        set_controlled_alternative_authority_loader(None)
+
+
 def _active_runtime_authority():
     return validate_controlled_alternative_authority({
         "authority_present": True,
@@ -484,7 +707,9 @@ def test_bind_active_authority_exposes_ca_tools(tmp_path: Path) -> None:
     home = workspace / ".avp"
     workspace.mkdir()
     home.mkdir()
-    set_controlled_alternative_provider_loader(lambda: _FakeProvider(workspace))
+    _install_scoped_vendor(tmp_path, home)
+    set_controlled_alternative_provider_loader(None)
+    set_controlled_alternative_authority_loader(None)
     try:
         bound = bind_controlled_alternative_runtime(
             home=home,
@@ -516,7 +741,9 @@ def test_bind_accepts_authority_snapshot_to_dict(tmp_path: Path) -> None:
     home = workspace / ".avp"
     workspace.mkdir()
     home.mkdir()
-    set_controlled_alternative_provider_loader(lambda: _FakeProvider(workspace))
+    _install_scoped_vendor(tmp_path, home)
+    set_controlled_alternative_provider_loader(None)
+    set_controlled_alternative_authority_loader(None)
     try:
         bound = bind_controlled_alternative_runtime(
             home=home,
@@ -545,7 +772,8 @@ def test_bind_rejects_forged_route_ready_and_upload_scope(tmp_path: Path) -> Non
     home = workspace / ".avp"
     workspace.mkdir()
     home.mkdir()
-    set_controlled_alternative_provider_loader(lambda: _FakeProvider(workspace))
+    set_controlled_alternative_provider_loader(None)
+    set_controlled_alternative_authority_loader(None)
     try:
         forged = {
             "authority_present": True,
@@ -579,7 +807,8 @@ def test_bind_rejects_console_upload_scope_as_ca_authority(tmp_path: Path) -> No
     home = workspace / ".avp"
     workspace.mkdir()
     home.mkdir()
-    set_controlled_alternative_provider_loader(lambda: _FakeProvider(workspace))
+    set_controlled_alternative_provider_loader(None)
+    set_controlled_alternative_authority_loader(None)
     try:
         rejected = {
             "authority_present": True,

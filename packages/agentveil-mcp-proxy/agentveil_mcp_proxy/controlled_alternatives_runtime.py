@@ -98,10 +98,29 @@ def bind_controlled_alternative_runtime(
     """
 
     try:
+        state_root = _canonical_existing_dir(Path(home))
+        if state_root is None:
+            return None
+        scoped_home = Path(state_root)
+        workspace = trusted_project_workspace_root_from_downstream(dict(downstream))
+        if workspace is None:
+            return None
+        workspace_root = _canonical_existing_dir(workspace)
+        if workspace_root is None:
+            return None
+        if not _path_is_inside(state_root, workspace_root, strict=True):
+            return None
+        workspace_stat = os.stat(workspace_root)
+        state_stat = os.stat(state_root)
+        if workspace_stat.st_dev != state_stat.st_dev:
+            return None
         resolved_authority = (
             authority
             if authority is not None
-            else discover_controlled_alternative_authority(runtime_context=runtime_context)
+            else discover_controlled_alternative_authority(
+                home=scoped_home,
+                runtime_context=runtime_context,
+            )
         )
         if (
             isinstance(resolved_authority, ControlledAlternativeAuthoritySnapshot)
@@ -111,22 +130,10 @@ def bind_controlled_alternative_runtime(
         discovered = discover_controlled_alternative_provider(
             paid_snapshot,
             authority=resolved_authority,
+            home=scoped_home,
             runtime_context=runtime_context,
         )
         if not discovered.available or discovered.descriptor is None or discovered.provider is None:
-            return None
-        workspace = trusted_project_workspace_root_from_downstream(dict(downstream))
-        if workspace is None:
-            return None
-        workspace_root = _canonical_existing_dir(workspace)
-        state_root = _canonical_existing_dir(Path(home))
-        if workspace_root is None or state_root is None:
-            return None
-        if not _path_is_inside(state_root, workspace_root, strict=True):
-            return None
-        workspace_stat = os.stat(workspace_root)
-        state_stat = os.stat(state_root)
-        if workspace_stat.st_dev != state_stat.st_dev:
             return None
         startup = downstream_startup_fingerprint(dict(downstream))
         workspace_hash = canonical_project_workspace_root_hash(Path(workspace_root))

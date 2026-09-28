@@ -13,6 +13,8 @@ from __future__ import annotations
 import ntpath
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
+import stat
 from functools import wraps
 from importlib.metadata import entry_points
 from types import MappingProxyType
@@ -1802,6 +1804,26 @@ def _iter_controlled_alternative_authority_entry_points() -> Any:
         return entry_points().get(CONTROLLED_ALTERNATIVE_AUTHORITY_ENTRYPOINT_GROUP, ())
 
 
+def _canonical_trusted_project_home(home: Path) -> Path | None:
+    try:
+        if not home.exists() or not home.is_dir() or home.is_symlink():
+            return None
+        resolved = home.resolve()
+        if not resolved.is_dir() or resolved.is_symlink():
+            return None
+        if os.path.realpath(home) != str(resolved):
+            return None
+        mode = home.lstat().st_mode
+        if stat.S_ISLNK(mode):
+            return None
+        value = str(resolved)
+        if os.path.normpath(value) != value:
+            return None
+        return resolved
+    except OSError:
+        return None
+
+
 def _load_authority_object(loaded: Any, runtime_context: Any = None) -> ControlledAlternativeAuthoritySnapshot:
     from agentveil_mcp_proxy.controlled_alternatives_transport import bind_installed_runtime_context
 
@@ -1817,8 +1839,39 @@ def _load_authority_object(loaded: Any, runtime_context: Any = None) -> Controll
     raise ControlledAlternativeValidationError(ERROR_AUTHORITY_INVALID)
 
 
-def discover_controlled_alternative_authority(*, runtime_context: Any = None) -> ControlledAlternativeAuthoritySnapshot:
+def discover_controlled_alternative_authority(
+    *,
+    home: Path | None = None,
+    runtime_context: Any = None,
+) -> ControlledAlternativeAuthoritySnapshot:
     """Discover one bounded CA route-authority snapshot."""
+
+    scoped_home = _canonical_trusted_project_home(home) if home is not None else None
+    if home is not None and scoped_home is None:
+        return _fail_closed_authority_snapshot(ERROR_AUTHORITY_MISSING)
+
+    if scoped_home is not None:
+        from agentveil_mcp_proxy.paid_install import (
+            ERROR_VENDORED_PROVIDER_MISSING,
+            ERROR_VENDORED_PROVIDER_MULTIPLE,
+            resolve_vendored_controlled_alternative_authority,
+        )
+
+        loaded, error = resolve_vendored_controlled_alternative_authority(home=scoped_home)
+        if error is not None or loaded is None:
+            code = (
+                ERROR_AUTHORITY_MISSING if error == ERROR_VENDORED_PROVIDER_MISSING
+                else ERROR_AUTHORITY_DUPLICATE if error == ERROR_VENDORED_PROVIDER_MULTIPLE
+                else ERROR_AUTHORITY_INVALID
+            )
+            return _fail_closed_authority_snapshot(code)
+        try:
+            return _load_authority_object(loaded, runtime_context)
+        except ControlledAlternativeValidationError as exc:
+            code = str(exc.args[0]) if exc.args else ERROR_AUTHORITY_INVALID
+            return _fail_closed_authority_snapshot(code)
+        except Exception:
+            return _fail_closed_authority_snapshot(ERROR_AUTHORITY_INVALID)
 
     if _authority_loader is not None:
         try:
@@ -1914,7 +1967,10 @@ def _load_named_entry_point(entry: Any) -> tuple[ControlledAlternativeProvider |
     return _load_provider_object(loaded)
 
 
-def _resolve_provider() -> tuple[ControlledAlternativeProvider | None, str | None]:
+def _resolve_provider(*, home: Path | None = None) -> tuple[ControlledAlternativeProvider | None, str | None]:
+    if home is not None:
+        return _resolve_vendored_controlled_alternative_provider(home=home)
+
     if _provider_loader is not None:
         try:
             loaded = _provider_loader()
@@ -1946,7 +2002,10 @@ def _map_vendored_controlled_alternative_error(code: str) -> str:
     return ERROR_DISCOVERY_ENTRYPOINT_LOAD_FAILED
 
 
-def _resolve_vendored_controlled_alternative_provider() -> tuple[
+def _resolve_vendored_controlled_alternative_provider(
+    *,
+    home: Path | None = None,
+) -> tuple[
     ControlledAlternativeProvider | None,
     str | None,
 ]:
@@ -1955,7 +2014,7 @@ def _resolve_vendored_controlled_alternative_provider() -> tuple[
             resolve_vendored_controlled_alternative_provider,
         )
 
-        provider, error = resolve_vendored_controlled_alternative_provider()
+        provider, error = resolve_vendored_controlled_alternative_provider(home=home)
     except Exception:
         return None, ERROR_DISCOVERY_ENTRYPOINT_LOAD_FAILED
     if error is not None:
@@ -1969,6 +2028,7 @@ def discover_controlled_alternative_provider(
     paid_snapshot: PaidProviderSnapshot | None = None,
     *,
     authority: Mapping[str, Any] | ControlledAlternativeAuthoritySnapshot | None = None,
+    home: Path | None = None,
     runtime_context: Any = None,
 ) -> ControlledAlternativeDiscoveryResult:
     """Discover one compatible installed provider when CA route authority is ready.
@@ -2002,7 +2062,13 @@ def discover_controlled_alternative_provider(
             available=False,
             error_code=resolved.error_code or ERROR_DISCOVERY_INELIGIBLE,
         )
-    provider, resolve_error = _resolve_provider()
+    scoped_home = _canonical_trusted_project_home(home) if home is not None else None
+    if home is not None and scoped_home is None:
+        return ControlledAlternativeDiscoveryResult(
+            available=False,
+            error_code=ERROR_DISCOVERY_ENTRYPOINT_MISSING,
+        )
+    provider, resolve_error = _resolve_provider(home=scoped_home)
     if resolve_error is not None:
         return ControlledAlternativeDiscoveryResult(available=False, error_code=resolve_error)
     if provider is None:

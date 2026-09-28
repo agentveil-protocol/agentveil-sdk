@@ -2220,6 +2220,222 @@ def test_global_authority_failure_never_falls_back_to_vendor(monkeypatch, duplic
     assert result.error_code == ("authority_duplicate" if duplicate else "authority_invalid")
     assert calls == []
 
+
+def test_scoped_empty_project_home_ignores_global_loaders(
+    tmp_path: Path,
+) -> None:
+    project_home = tmp_path / "workspace" / ".avp"
+    project_home.mkdir(parents=True)
+    calls = {"provider": 0, "authority": 0}
+
+    def _count_provider() -> _FakeProvider:
+        calls["provider"] += 1
+        return _FakeProvider()
+
+    def _count_authority() -> object:
+        calls["authority"] += 1
+        return _active_ca_authority()
+
+    set_controlled_alternative_provider_loader(_count_provider)
+    set_controlled_alternative_authority_loader(_count_authority)
+    try:
+        authority = discover_controlled_alternative_authority(home=project_home)
+        assert authority.route_ready is False
+        assert authority.error_code == ERROR_AUTHORITY_MISSING
+        provider = discover_controlled_alternative_provider(
+            _active_paid_snapshot(),
+            authority=_active_ca_authority(),
+            home=project_home,
+        )
+        assert provider.available is False
+        assert provider.error_code == ERROR_DISCOVERY_ENTRYPOINT_MISSING
+        assert calls == {"provider": 0, "authority": 0}
+    finally:
+        set_controlled_alternative_provider_loader(None)
+        set_controlled_alternative_authority_loader(None)
+
+
+def test_scoped_home_uses_local_vendor_when_global_loaders_fail(
+    tmp_path: Path,
+) -> None:
+    project_home = tmp_path / "workspace" / ".avp"
+    project_home.mkdir(parents=True)
+    wheel = _build_controlled_alternative_wheel(tmp_path / "project-wheel")
+    _install_active_controlled_alternative_vendor(project_home, wheel_bytes=wheel)
+    calls = {"provider": 0, "authority": 0}
+
+    def _boom_provider() -> _FakeProvider:
+        calls["provider"] += 1
+        raise RuntimeError("global loader must not run for scoped home")
+
+    def _boom_authority() -> object:
+        calls["authority"] += 1
+        raise RuntimeError("global loader must not run for scoped home")
+
+    set_controlled_alternative_provider_loader(_boom_provider)
+    set_controlled_alternative_authority_loader(_boom_authority)
+    try:
+        provider = discover_controlled_alternative_provider(
+            _active_paid_snapshot(),
+            authority=_active_ca_authority(),
+            home=project_home,
+        )
+        assert provider.available is True
+        assert provider.descriptor is not None
+        assert provider.descriptor.provider_id == "private_v1"
+        assert calls == {"provider": 0, "authority": 0}
+    finally:
+        set_controlled_alternative_provider_loader(None)
+        set_controlled_alternative_authority_loader(None)
+
+
+def test_scoped_home_provider_discovery_ignores_global_avp_home_and_entry_points(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    global_home = tmp_path / "global-home"
+    project_home = tmp_path / "workspace" / ".avp"
+    project_home.mkdir(parents=True)
+    monkeypatch.setenv("AVP_HOME", str(global_home))
+    wheel_bytes = _build_controlled_alternative_wheel(tmp_path / "global-wheel")
+    _install_active_controlled_alternative_vendor(global_home, wheel_bytes=wheel_bytes)
+
+    compatible = _write_disposable_distribution(
+        tmp_path / "global-entry",
+        dist_name="ca-global-entry",
+        module_name="ca_global_entry_provider",
+        source=COMPATIBLE_PROVIDER_SOURCE,
+    )
+
+    def _global_entry(*, group: str | None = None, **_kwargs):
+        if group == CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP:
+            return _entry_points_from_dist(compatible)
+        return []
+
+    monkeypatch.setattr(ca_mod, "entry_points", _global_entry)
+
+    missing_project = discover_controlled_alternative_provider(
+        _active_paid_snapshot(),
+        authority=_active_ca_authority(),
+        home=project_home,
+    )
+    assert missing_project.available is False
+    assert missing_project.error_code == ERROR_DISCOVERY_ENTRYPOINT_MISSING
+
+    project_wheel = _build_controlled_alternative_wheel(tmp_path / "project-wheel")
+    _install_active_controlled_alternative_vendor(project_home, wheel_bytes=project_wheel)
+    scoped = discover_controlled_alternative_provider(
+        _active_paid_snapshot(),
+        authority=_active_ca_authority(),
+        home=project_home,
+    )
+    assert scoped.available is True
+    assert scoped.descriptor is not None
+    assert scoped.descriptor.provider_id == "private_v1"
+
+
+def test_scoped_home_authority_discovery_ignores_global_entry_points(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_home = tmp_path / "workspace" / ".avp"
+    project_home.mkdir(parents=True)
+    snapshot = _active_ca_authority().to_dict()
+    global_source = f'''
+class Authority:
+    def authority(self):
+        from agentveil_mcp_proxy.controlled_alternatives import validate_controlled_alternative_authority
+        return validate_controlled_alternative_authority({snapshot!r})
+def build_provider():
+    return Authority()
+'''
+    module_name = "ca_global_authority"
+    package = tmp_path / "global-authority" / module_name
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text(global_source, encoding="utf-8")
+    dist_info = tmp_path / "global-authority" / f"{module_name}-0.1.0.dist-info"
+    dist_info.mkdir()
+    (dist_info / "METADATA").write_text("Name: ca-global-authority\nVersion: 0.1.0\n", encoding="utf-8")
+    (dist_info / "entry_points.txt").write_text(
+        f"[{CONTROLLED_ALTERNATIVE_AUTHORITY_ENTRYPOINT_GROUP}]\n"
+        f"{CONTROLLED_ALTERNATIVE_AUTHORITY_ID} = {module_name}:build_provider\n",
+        encoding="utf-8",
+    )
+    global_authority_entries = [
+        entry
+        for entry in Distribution.at(dist_info).entry_points
+        if entry.group == CONTROLLED_ALTERNATIVE_AUTHORITY_ENTRYPOINT_GROUP
+    ]
+
+    def _global_authority(*, group: str | None = None, **_kwargs):
+        if group == CONTROLLED_ALTERNATIVE_AUTHORITY_ENTRYPOINT_GROUP:
+            return global_authority_entries
+        return []
+
+    monkeypatch.setattr(ca_mod, "entry_points", _global_authority)
+    monkeypatch.setenv("AVP_HOME", str(tmp_path / "unused-global"))
+
+    scoped_missing = discover_controlled_alternative_authority(home=project_home)
+    assert scoped_missing.route_ready is False
+    assert scoped_missing.error_code == ERROR_AUTHORITY_MISSING
+
+    authority_source = f'''
+class Authority:
+    def authority(self):
+        from agentveil_mcp_proxy.controlled_alternatives import validate_controlled_alternative_authority
+        return validate_controlled_alternative_authority({snapshot!r})
+def build_provider():
+    return Authority()
+'''
+    entries = (
+        f"[{CONTROLLED_ALTERNATIVE_AUTHORITY_ENTRYPOINT_GROUP}]\n"
+        f"{CONTROLLED_ALTERNATIVE_AUTHORITY_ID} = {VENDORED_CA_MODULE_NAME}.controlled_provider:build_provider\n"
+    )
+    wheel = _build_controlled_alternative_wheel(
+        tmp_path / "project-wheel",
+        source=authority_source,
+        entry_points=entries,
+    )
+    _install_active_controlled_alternative_vendor(project_home, wheel_bytes=wheel)
+    scoped_ready = discover_controlled_alternative_authority(home=project_home)
+    assert scoped_ready.route_ready is True
+
+
+def test_scoped_home_discovery_stays_hidden_when_project_vendor_invalid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    global_home = tmp_path / "global-home"
+    project_home = tmp_path / "workspace" / ".avp"
+    project_home.mkdir(parents=True)
+    monkeypatch.setenv("AVP_HOME", str(global_home))
+    monkeypatch.setattr(ca_mod, "entry_points", _no_global_controlled_entries)
+    _install_active_controlled_alternative_vendor(
+        global_home,
+        wheel_bytes=_build_controlled_alternative_wheel(tmp_path / "global-wheel"),
+    )
+
+    malformed_wheel = _build_controlled_alternative_wheel(
+        tmp_path / "malformed-project",
+        entry_points=(
+            f"[{CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP}]\n"
+            "private_v1 = not-a-valid-target\n"
+        ),
+    )
+    _install_active_controlled_alternative_vendor(project_home, wheel_bytes=malformed_wheel)
+
+    provider = discover_controlled_alternative_provider(
+        _active_paid_snapshot(),
+        authority=_active_ca_authority(),
+        home=project_home,
+    )
+    assert provider.available is False
+    assert provider.error_code == ERROR_DISCOVERY_ENTRYPOINT_LOAD_FAILED
+
+    authority = discover_controlled_alternative_authority(home=project_home)
+    assert authority.route_ready is False
+
+
 VENDORED_CA_PROVIDER_SOURCE = '''
 class _Provider:
     calls = []
