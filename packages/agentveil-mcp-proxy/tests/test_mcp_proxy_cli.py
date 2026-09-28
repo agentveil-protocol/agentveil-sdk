@@ -4505,6 +4505,7 @@ def test_console_setup_attach_acquires_credential_and_uploads_status(
         "agentveil_mcp_proxy.console_project_status_client.sync_project_status",
         lambda **kwargs: sync_calls.append(kwargs) or "accepted",
     )
+    monkeypatch.setattr(proxy_cli.webbrowser, "open", lambda _url: True)
 
     project = tmp_path / "project"
     project.mkdir()
@@ -4521,6 +4522,149 @@ def test_console_setup_attach_acquires_credential_and_uploads_status(
     assert CONSOLE_ATTACH_DEVICE_CODE not in out
     assert CONSOLE_ATTACH_TOKEN not in out
     assert CONSOLE_ATTACH_TOKEN not in err
+
+
+def _install_browser_failure_setup_fakes(
+    monkeypatch,
+    tmp_path,
+    *,
+    attach_client,
+    pairing_client,
+    browser_open,
+):
+    from test_mcp_proxy_codex_setup import (
+        _install_fast_codex_setup_fakes,
+        _isolate_cli_home,
+        _make_proxy_command,
+    )
+
+    avp_home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(avp_home))
+    real_attach_credential = proxy_cli._best_effort_console_attach_credential
+    isolated_home = tmp_path / "home"
+    _isolate_cli_home(monkeypatch, isolated_home)
+    proxy_command = _make_proxy_command(tmp_path)
+    _install_fast_codex_setup_fakes(monkeypatch, proxy_command=proxy_command)
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.cli._console_attach_client",
+        lambda: attach_client,
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.cli._console_pairing_client",
+        lambda: pairing_client,
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.cli.console_login_lock",
+        lambda home=None: _null_context(),
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.cli.load_credential",
+        lambda home=None: None,
+    )
+    monkeypatch.setattr(
+        proxy_cli,
+        "_best_effort_console_attach_credential",
+        real_attach_credential,
+    )
+    monkeypatch.setattr(
+        proxy_cli.webbrowser,
+        "open",
+        browser_open,
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_project_status_client.sync_project_status",
+        lambda **kwargs: "accepted",
+    )
+    return avp_home
+
+
+@pytest.mark.parametrize(
+    "browser_open",
+    [
+        lambda _url: False,
+        lambda _url: (_ for _ in ()).throw(OSError("browser delivery unavailable")),
+    ],
+)
+def test_console_setup_browser_delivery_failure_surfaces_pairing_without_attach_poll(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    browser_open,
+):
+    attach = _FakeAttachClient()
+    pairing = _FakeConsoleClient(
+        start=_console_start(),
+        token=PairingToken(
+            token=CONSOLE_TOKEN,
+            scope=CREDENTIAL_SCOPE,
+        ),
+    )
+    avp_home = _install_browser_failure_setup_fakes(
+        monkeypatch,
+        tmp_path,
+        attach_client=attach,
+        pairing_client=pairing,
+        browser_open=browser_open,
+    )
+
+    project = tmp_path / "project"
+    project.mkdir()
+    rc = main(["setup", "codex", "--project-dir", str(project), "--yes", "--json"])
+    out, err = capsys.readouterr()
+
+    assert rc == 0
+    assert attach.started is True
+    assert attach.polled is False
+    assert pairing.started is True
+    assert pairing.polled is True
+    assert CONSOLE_USER_CODE in err
+    assert CONSOLE_USER_CODE not in out
+    assert load_credential(home=avp_home).token == CONSOLE_TOKEN
+    assert CONSOLE_ATTACH_DEVICE_CODE not in out
+    assert CONSOLE_ATTACH_DEVICE_CODE not in err
+    assert CONSOLE_ATTACH_TOKEN not in out
+    assert CONSOLE_ATTACH_TOKEN not in err
+
+
+def test_console_setup_browser_delivery_failure_redacts_attach_secrets_and_preserves_json(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    attach = _FakeAttachClient()
+    pairing = _FakeConsoleClient(
+        start=_console_start(),
+        token=PairingToken(
+            token=CONSOLE_TOKEN,
+            scope=CREDENTIAL_SCOPE,
+        ),
+    )
+    _install_browser_failure_setup_fakes(
+        monkeypatch,
+        tmp_path,
+        attach_client=attach,
+        pairing_client=pairing,
+        browser_open=lambda _url: False,
+    )
+
+    project = tmp_path / "project"
+    project.mkdir()
+    rc = main(["setup", "codex", "--project-dir", str(project), "--yes", "--json"])
+    out, err = capsys.readouterr()
+    combined = out + err
+
+    assert rc == 0
+    payload = json.loads(out)
+    assert payload["ok"] is True
+    assert payload["action"] == "setup-codex"
+    assert CONSOLE_USER_CODE in err
+    assert CONSOLE_USER_CODE not in out
+    assert CONSOLE_ATTACH_STATE not in combined
+    assert CONSOLE_ATTACH_DEVICE_CODE not in combined
+    assert CONSOLE_ATTACH_TOKEN not in combined
+    assert CONSOLE_ATTACH_URL not in combined
+    assert CONSOLE_TOKEN not in combined
+    assert CONSOLE_DEVICE_CODE not in combined
 
 
 def test_console_setup_succeeds_when_attach_unavailable(
@@ -4708,6 +4852,7 @@ def test_console_attach_on_setup_for_connectors(
         "agentveil_mcp_proxy.console_project_status_client.sync_project_status",
         lambda **kwargs: sync_calls.append(kwargs) or "accepted",
     )
+    monkeypatch.setattr(proxy_cli.webbrowser, "open", lambda _url: True)
 
     if client == "cursor":
         def fake_init_proxy(**kwargs):

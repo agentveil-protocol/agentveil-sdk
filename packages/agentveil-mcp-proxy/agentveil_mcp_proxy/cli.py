@@ -1671,6 +1671,7 @@ def _best_effort_console_attach_credential(
                 open_browser=open_browser,
                 browser_open=browser_open,
                 interactive=False,
+                explicit_pairing_on_browser_failure=True,
             )
     except CredentialError as exc:
         if exc.code == "login_in_progress":
@@ -3926,6 +3927,56 @@ def _console_pairing_client() -> ConsolePairingClient:
     return ConsolePairingClient()
 
 
+def _acquire_console_credential_via_explicit_pairing(
+    *,
+    open_browser: bool,
+    pairing_client: ConsolePairingClient | None = None,
+    browser_open: Callable[[str], Any] | None = None,
+    out: TextIO | None = None,
+) -> bool:
+    """Return True when device pairing stored a new bounded Console credential."""
+
+    _ = out
+    pairing = pairing_client or _console_pairing_client()
+    try:
+        start = pairing.start()
+    except PairingClientError:
+        return False
+
+    print(
+        f"To connect, open {start.verification_url} and enter code {start.user_code}.",
+        file=sys.stderr,
+    )
+    if open_browser:
+        opener = browser_open or webbrowser.open
+        try:
+            opener(start.verification_url)
+        except Exception:
+            pass
+
+    try:
+        token = pairing.poll_for_token(start)
+    except PairingClientError:
+        return False
+
+    try:
+        existing = load_credential()
+    except CredentialError:
+        _revoke_orphan_console_token(pairing, token.token)
+        return False
+    if existing is not None:
+        _revoke_orphan_console_token(pairing, token.token)
+        return True
+
+    try:
+        save_credential(token.token, scope=token.scope)
+    except CredentialError:
+        _revoke_orphan_console_token(pairing, token.token)
+        _delete_local_console_credentials()
+        return False
+    return True
+
+
 def _acquire_console_credential_via_attach(
     *,
     open_browser: bool,
@@ -3933,6 +3984,7 @@ def _acquire_console_credential_via_attach(
     browser_open: Callable[[str], Any] | None = None,
     out: TextIO | None = None,
     interactive: bool = False,
+    explicit_pairing_on_browser_failure: bool = False,
 ) -> bool:
     """Return True when attach stored a new bounded Console credential."""
 
@@ -3949,12 +4001,22 @@ def _acquire_console_credential_via_attach(
             "this machine.",
             file=stream,
         )
+    browser_delivered = not open_browser
     if open_browser:
         opener = browser_open or webbrowser.open
         try:
-            opener(start.attach_url)
+            browser_delivered = bool(opener(start.attach_url))
         except Exception:
-            pass
+            browser_delivered = False
+
+    if open_browser and not browser_delivered:
+        if explicit_pairing_on_browser_failure:
+            return _acquire_console_credential_via_explicit_pairing(
+                open_browser=open_browser,
+                browser_open=browser_open,
+                out=stream,
+            )
+        return False
 
     try:
         token = attach.poll_for_token(start)
