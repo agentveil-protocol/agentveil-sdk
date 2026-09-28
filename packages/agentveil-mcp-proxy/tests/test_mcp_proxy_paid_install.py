@@ -791,11 +791,11 @@ def test_paid_activate_install_uses_composed_artifact_sequence(tmp_path, mock_pa
     assert code == 0, err
     assert _MockPaidBackendHandler.state.authorize_artifact_ids == [
         "art_pkg_private_guardrails_base_001",
-        "art_pkg_ca_basic_005",
+        "art_pkg_ca_basic_006",
     ]
     assert COMPOSED_BASE_ARTIFACT_ID == "art_pkg_private_guardrails_base_001"
-    assert COMPOSED_THIN_ARTIFACT_ID == "art_pkg_ca_basic_005"
-    assert COMPOSED_THIN_PACKAGE_VERSION == "0.1.4"
+    assert COMPOSED_THIN_ARTIFACT_ID == "art_pkg_ca_basic_006"
+    assert COMPOSED_THIN_PACKAGE_VERSION == "0.1.5"
     assert _MockPaidBackendHandler.state.entitlement_call_count == 1
     assert _MockPaidBackendHandler.state.safety_call_count == 1
     assert _MockPaidBackendHandler.state.authorize_call_count == 2
