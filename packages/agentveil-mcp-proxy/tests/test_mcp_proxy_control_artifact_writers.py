@@ -35,8 +35,10 @@ from agentveil_mcp_proxy.client_guidance import (
 from agentveil_mcp_proxy.control_artifacts import (
     ControlArtifactError,
     ensure_control_directory,
+    ensure_control_subdirectory_at,
     rewrite_locked_control_file,
     write_atomic_control_file,
+    write_atomic_control_file_at,
 )
 
 
@@ -81,6 +83,57 @@ def _secure_dir(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     os.chmod(path, 0o700)
     return path
+
+
+def test_write_atomic_control_file_at_publishes_relative_to_open_home(tmp_path):
+    home = _secure_dir(tmp_path / "home")
+    flags = os.O_RDONLY | os.O_DIRECTORY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    home_fd = os.open(home, flags)
+    try:
+        write_atomic_control_file_at(home_fd, "agents/proxy.json", b'{"ok":true}\n')
+    finally:
+        os.close(home_fd)
+    target = home / "agents" / "proxy.json"
+    assert target.read_bytes() == b'{"ok":true}\n'
+    assert _mode(target) == 0o600
+    assert _mode(home / "agents") == 0o700
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor-relative custody")
+def test_write_atomic_control_file_at_ignores_swapped_home_path(tmp_path):
+    home = _secure_dir(tmp_path / "home")
+    external = tmp_path / "external"
+    external.mkdir()
+    flags = os.O_RDONLY | os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    home_fd = os.open(home, flags)
+    home.rename(tmp_path / "home-backup")
+    os.symlink(external, home)
+    try:
+        write_atomic_control_file_at(home_fd, "secret.json", b"stay-local\n")
+    finally:
+        os.close(home_fd)
+    assert list(external.iterdir()) == []
+    assert (tmp_path / "home-backup" / "secret.json").read_bytes() == b"stay-local\n"
+
+
+def test_ensure_control_subdirectory_at_matches_path_based_custody(tmp_path):
+    home = _secure_dir(tmp_path / "home")
+    flags = os.O_RDONLY | os.O_DIRECTORY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    home_fd = os.open(home, flags)
+    try:
+        child_fd = ensure_control_subdirectory_at(home_fd, "control")
+        os.close(child_fd)
+    finally:
+        os.close(home_fd)
+    control = home / "control"
+    assert control.is_dir()
+    assert _mode(control) == 0o700
 
 
 def test_ensure_control_directory_creates_0700_under_permissive_umask(tmp_path):
@@ -378,6 +431,52 @@ def test_atomic_write_replace_failure_leaves_no_partial_publish(tmp_path, monkey
         write_atomic_control_file(target, b'{"ok":true}\n')
     assert not target.exists()
     assert list((tmp_path / "ctrl").glob("*.tmp")) == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX hardlink custody")
+def test_write_atomic_control_file_rejects_hardlink_and_preserves_bytes(tmp_path):
+    target = tmp_path / "ctrl" / "file.json"
+    ensure_control_directory(target.parent)
+    before = b'{"keep": true}\n'
+    target.write_bytes(before)
+    peer = target.parent / "file-peer.json"
+    try:
+        os.link(target, peer)
+    except OSError:
+        pytest.skip("hardlinks unavailable")
+    with pytest.raises(ControlArtifactError) as excinfo:
+        write_atomic_control_file(target, b'{"ok":true}\n')
+    assert str(excinfo.value) == "control_artifact_write_failed"
+    assert target.read_bytes() == before
+    assert peer.read_bytes() == before
+    assert str(target) not in str(excinfo.value)
+    assert str(peer) not in str(excinfo.value)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX hardlink custody")
+def test_write_atomic_control_file_at_rejects_hardlink_and_preserves_bytes(tmp_path):
+    home = _secure_dir(tmp_path / "home")
+    target = home / "config.json"
+    before = b'{"keep": true}\n'
+    target.write_bytes(before)
+    peer = home / "config-peer.json"
+    try:
+        os.link(target, peer)
+    except OSError:
+        pytest.skip("hardlinks unavailable")
+    flags = os.O_RDONLY | os.O_DIRECTORY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    home_fd = os.open(home, flags)
+    try:
+        with pytest.raises(ControlArtifactError) as excinfo:
+            write_atomic_control_file_at(home_fd, "config.json", b'{"ok":true}\n')
+    finally:
+        os.close(home_fd)
+    assert str(excinfo.value) == "control_artifact_write_failed"
+    assert target.read_bytes() == before
+    assert peer.read_bytes() == before
+    assert str(target) not in str(excinfo.value)
 
 
 def test_publish_owner_claim_rejects_symlink_and_preserves_victim(tmp_path):

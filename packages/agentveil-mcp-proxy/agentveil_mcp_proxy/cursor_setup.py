@@ -13,6 +13,7 @@ Approval Center lifecycle, and reports bounded ``Protected`` / ``Advisory`` /
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import shlex
 import stat
@@ -24,8 +25,13 @@ from typing import Any
 from agentveil_mcp_proxy.client_connect import resolve_cursor_global_mcp_json_path
 from agentveil_mcp_proxy.client_guidance import (
     add_agentveil_owned_git_excludes,
+    prepare_project_local_secret_git_custody,
     remove_agentveil_owned_git_exclude_if_target_missing,
     remove_agentveil_owned_git_excludes,
+)
+from agentveil_mcp_proxy.control_artifacts import (
+    ControlArtifactError,
+    write_atomic_control_file_at,
 )
 from agentveil_mcp_proxy.cursor_hooks import AGENTVEIL_MCP_SERVER_KEY
 from agentveil_mcp_proxy.cursor_user_mcp import (
@@ -238,15 +244,237 @@ def _is_agentveil_hook_command(command: str) -> bool:
     return is_managed_hook_command(command)
 
 
-def _ensure_passphrase(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.is_file():
-        return
-    path.write_text(secrets.token_urlsafe(32) + "\n", encoding="utf-8")
+# Boundary: bounded CLI error strings for rejected project-local paths; not product-wide safety claims.
+_PROJECT_LOCAL_RUNTIME_HOME_NOT_ACCEPTABLE = (
+    "project-local secret runtime home is not a safe directory"
+)
+_IDENTITY_PASSPHRASE_PATH_NOT_ACCEPTABLE = (  # Boundary: bounded CLI error text only.
+    "identity passphrase path is not a safe file"
+)
+
+
+def _path_inode(path: Path) -> tuple[int, int]:
     try:
-        path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        info = os.lstat(path)
+    except FileNotFoundError as exc:
+        raise CursorSetupError(
+            _PROJECT_LOCAL_RUNTIME_HOME_NOT_ACCEPTABLE,
+        ) from exc
+    return (info.st_dev, info.st_ino)
+
+
+def _assert_path_inode_matches(path: Path, info: os.stat_result) -> None:
+    current = _path_inode(path)
+    pinned = (info.st_dev, info.st_ino)
+    if current != pinned:
+        raise CursorSetupError(_PROJECT_LOCAL_RUNTIME_HOME_NOT_ACCEPTABLE)
+
+
+def _open_owner_controlled_directory_fd(path: Path) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        dir_fd = os.open(str(path), flags)
+    except OSError as exc:
+        raise CursorSetupError(
+            "project-local secret runtime home is unavailable",
+        ) from exc
+    try:
+        info = os.fstat(dir_fd)
+    except OSError as exc:
+        try:
+            os.close(dir_fd)
+        except OSError:
+            pass
+        raise CursorSetupError(
+            "project-local secret runtime home is unavailable",
+        ) from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        try:
+            os.close(dir_fd)
+        except OSError:
+            pass
+        raise CursorSetupError(_PROJECT_LOCAL_RUNTIME_HOME_NOT_ACCEPTABLE)
+    if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+        try:
+            os.close(dir_fd)
+        except OSError:
+            pass
+        raise CursorSetupError("selected project root is not owner-controlled")
+    if os.name != "nt":
+        mode = stat.S_IMODE(info.st_mode)
+        if mode & 0o022:
+            try:
+                os.close(dir_fd)
+            except OSError:
+                pass
+            raise CursorSetupError(
+                "selected project root is writable by other users",
+            )
+    try:
+        _assert_path_inode_matches(path, info)
+    except CursorSetupError:
+        try:
+            os.close(dir_fd)
+        except OSError:
+            pass
+        raise
+    return dir_fd
+
+
+def _require_project_local_secret_custody_platform() -> None:
+    if os.name == "nt":
+        raise CursorSetupError(
+            "project-local identity passphrase custody on Windows is not verified; "
+            "use a POSIX environment",
+        )
+
+
+def _open_project_local_runtime_home_at(
+    project_root_fd: int,
+    home_name: str,
+    home: Path,
+) -> int:
+    if home_name in {".", ".."} or "/" in home_name:
+        raise CursorSetupError(_PROJECT_LOCAL_RUNTIME_HOME_NOT_ACCEPTABLE)
+
+    target = Path(home).expanduser()
+    try:
+        entry_info = os.lstat(home_name, dir_fd=project_root_fd)
+    except FileNotFoundError:
+        try:
+            os.mkdir(home_name, 0o700, dir_fd=project_root_fd)
+        except OSError as exc:
+            raise CursorSetupError(
+                "project-local secret runtime home is unavailable",
+            ) from exc
+    except OSError as exc:
+        raise CursorSetupError(
+            "project-local secret runtime home is unavailable",
+        ) from exc
+    else:
+        if stat.S_ISLNK(entry_info.st_mode):
+            raise CursorSetupError(_PROJECT_LOCAL_RUNTIME_HOME_NOT_ACCEPTABLE)
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        dir_fd = os.open(home_name, flags, dir_fd=project_root_fd)
+    except OSError as exc:
+        raise CursorSetupError(
+            "project-local secret runtime home is unavailable",
+        ) from exc
+
+    try:
+        info = os.fstat(dir_fd)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise CursorSetupError(_PROJECT_LOCAL_RUNTIME_HOME_NOT_ACCEPTABLE)
+        if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+            raise CursorSetupError("project-local secret runtime home is not owner-controlled")
+        _assert_path_inode_matches(target, info)
+        if os.name != "nt" and home_name == ".agentveil":
+            mode = stat.S_IMODE(info.st_mode)
+            if mode != 0o700:
+                pinned = _path_inode(target)
+                try:
+                    if not hasattr(os, "fchmod"):
+                        raise CursorSetupError(
+                            "project-local secret runtime home permissions could not be secured",
+                        )
+                    os.fchmod(dir_fd, 0o700)
+                except OSError as exc:
+                    raise CursorSetupError(
+                        "project-local secret runtime home permissions could not be secured",
+                    ) from exc
+                _assert_path_inode_matches(target, os.fstat(dir_fd))
+                if _path_inode(target) != pinned:
+                    raise CursorSetupError(
+                        _PROJECT_LOCAL_RUNTIME_HOME_NOT_ACCEPTABLE,
+                    )
+                if stat.S_IMODE(os.fstat(dir_fd).st_mode) != 0o700:
+                    raise CursorSetupError(
+                        "project-local secret runtime home permissions could not be secured",
+                    )
+    except Exception:
+        try:
+            os.close(dir_fd)
+        except OSError:
+            pass
+        raise
+    return dir_fd
+
+
+def _open_project_local_runtime_home(home: Path) -> int:
+    _require_project_local_secret_custody_platform()
+    target = Path(home).expanduser()
+    project_root = target.parent
+    project_root_fd = _open_owner_controlled_directory_fd(project_root)
+    try:
+        return _open_project_local_runtime_home_at(project_root_fd, target.name, target)
+    finally:
+        try:
+            os.close(project_root_fd)
+        except OSError:
+            pass
+
+
+def _ensure_project_local_runtime_home(home: Path) -> None:
+    dir_fd = _open_project_local_runtime_home(home)
+    try:
+        os.close(dir_fd)
     except OSError:
         pass
+
+
+def _ensure_passphrase_at(home_fd: int, passphrase_name: str) -> None:
+    try:
+        info = os.lstat(passphrase_name, dir_fd=home_fd)
+    except FileNotFoundError:
+        info = None
+    except OSError as exc:
+        raise CursorSetupError("identity passphrase path is unavailable") from exc
+    if info is not None:
+        if stat.S_ISLNK(info.st_mode):
+            raise CursorSetupError(_IDENTITY_PASSPHRASE_PATH_NOT_ACCEPTABLE)
+        if not stat.S_ISREG(info.st_mode):
+            raise CursorSetupError(_IDENTITY_PASSPHRASE_PATH_NOT_ACCEPTABLE)
+        if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+            raise CursorSetupError("identity passphrase path is not owner-controlled")
+        if info.st_nlink > 1:
+            raise CursorSetupError(_IDENTITY_PASSPHRASE_PATH_NOT_ACCEPTABLE)
+        if stat.S_IMODE(info.st_mode) & 0o077:
+            raise CursorSetupError("identity passphrase permissions must be owner-only")
+        return
+    body = (secrets.token_urlsafe(32) + "\n").encode("utf-8")
+    try:
+        write_atomic_control_file_at(home_fd, passphrase_name, body)
+    except ControlArtifactError as exc:
+        raise CursorSetupError("identity passphrase could not be created safely") from exc
+
+
+def _ensure_passphrase(path: Path) -> None:
+    _require_project_local_secret_custody_platform()
+    target = Path(path)
+    home = target.parent
+    project_root = home.parent
+    home_fd = _open_project_local_runtime_home(home)
+    try:
+        try:
+            prepare_project_local_secret_git_custody(project_root, home)
+        except Exception as exc:
+            from agentveil_mcp_proxy.client_guidance import ProjectSecretGitCustodyError
+
+            if isinstance(exc, ProjectSecretGitCustodyError):
+                raise CursorSetupError(exc.message) from exc
+            raise
+        _ensure_passphrase_at(home_fd, target.name)
+    finally:
+        try:
+            os.close(home_fd)
+        except OSError:
+            pass
 
 
 def _ensure_workspace_sandbox(profile: Path, workspace: Path, *, force: bool = False) -> None:
@@ -767,12 +995,20 @@ def _hook_observation_state(workspace: Path, hooks_path: Path) -> tuple[bool, bo
     return hook_observed, mcp_route_observed
 
 
-def prepare_proxy_home(workspace: Path, *, force: bool = False) -> Path:
+def prepare_proxy_home(
+    workspace: Path,
+    *,
+    force: bool = False,
+    initialize_product_route: bool = False,
+) -> Path:
     workspace = workspace.resolve()
     home = setup_home(workspace)
-    home.mkdir(parents=True, exist_ok=True)
-    _ensure_workspace_sandbox(profile_root(home), workspace, force=force)
     _ensure_passphrase(passphrase_path(home))
+    _ensure_workspace_sandbox(profile_root(home), workspace, force=force)
+    if initialize_product_route:
+        from agentveil_mcp_proxy.product_route import initialize_product_route_profile
+
+        initialize_product_route_profile(profile_root(home))
     return home
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 import sys
 import time
@@ -1096,3 +1097,243 @@ def test_cursor_uninstall_drops_evidence_exclude_only_when_file_missing(tmp_path
     remove_hooks(kept)
     assert evidence.is_file()
     assert ".cursor/agentveil/evidence.jsonl" in _exclude_lines(kept)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX owner-only custody")
+def test_cursor_passphrase_creation_is_owner_only_and_rejects_links(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+    home = setup_home(workspace)
+    victim = tmp_path / "victim-passphrase.txt"
+    victim.write_text("do-not-overwrite\n", encoding="utf-8")
+    home.mkdir(parents=True)
+    os.chmod(home, 0o755)
+    link = cursor_setup.passphrase_path(home)
+    link.symlink_to(victim)
+    # Negative test: expects bounded passphrase path rejection substring in setup error.
+    with pytest.raises(CursorSetupError, match="safe"):
+        cursor_setup._ensure_passphrase(link)
+    assert victim.read_text(encoding="utf-8") == "do-not-overwrite\n"
+
+    workspace2 = tmp_path / "project2"
+    workspace2.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=workspace2, check=True)
+    home2 = setup_home(workspace2)
+    path = cursor_setup.passphrase_path(home2)
+    modes_at_write: list[int] = []
+    real_write = os.write
+
+    def tracked_write(fd, data):
+        modes_at_write.append(stat.S_IMODE(os.fstat(fd).st_mode))
+        return real_write(fd, data)
+
+    monkeypatch.setattr(os, "write", tracked_write)
+    cursor_setup._ensure_passphrase(path)
+    assert path.is_file()
+    assert modes_at_write
+    assert modes_at_write[0] == 0o600
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX hardlink custody")
+def test_cursor_passphrase_rejects_existing_owner_hardlink(tmp_path: Path) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+    home = setup_home(workspace)
+    cursor_setup._ensure_project_local_runtime_home(home)
+    from agentveil_mcp_proxy.control_artifacts import ensure_control_directory
+
+    ensure_control_directory(home)
+    canonical = cursor_setup.passphrase_path(home)
+    canonical.write_text("canonical-secret\n", encoding="utf-8")
+    os.chmod(canonical, 0o600)
+    alias = home / "passphrase-hardlink"
+    os.link(canonical, alias)
+    try:
+        # Negative test: expects bounded passphrase path rejection substring in setup error.
+        with pytest.raises(CursorSetupError, match="safe"):
+            cursor_setup._ensure_passphrase(canonical)
+        assert canonical.read_bytes() == b"canonical-secret\n"
+    finally:
+        alias.unlink()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows project-local custody branch")
+def test_cursor_passphrase_windows_fail_closed_before_create(tmp_path: Path) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    home = setup_home(workspace)
+    path = cursor_setup.passphrase_path(home)
+    with pytest.raises(CursorSetupError, match="Windows"):
+        cursor_setup._ensure_passphrase(path)
+
+
+def test_cursor_runtime_home_windows_gate_before_directory_open(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    directory_opens: list[str] = []
+    real_open = os.open
+
+    def _tracking_open(path, flags, mode=0o777, *, dir_fd=None, **kwargs):
+        if dir_fd is None and flags & getattr(os, "O_DIRECTORY", 0):
+            directory_opens.append(str(path))
+        return real_open(path, flags, mode, dir_fd=dir_fd, **kwargs)
+
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(os, "open", _tracking_open)
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    home = workspace / ".agentveil"
+    with pytest.raises(CursorSetupError, match="Windows"):
+        cursor_setup._ensure_project_local_runtime_home(home)
+    assert directory_opens == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX runtime-home parent swap")
+def test_cursor_runtime_home_rejects_parent_directory_swap(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    home = setup_home(workspace)
+    home.mkdir(parents=True, exist_ok=True)
+    os.chmod(home, 0o755)
+    external = tmp_path / "external-agentveil"
+    external.mkdir(mode=0o755)
+    backup = tmp_path / "workspace-pinned-backup"
+    original_open = os.open
+    swapped = {"done": False}
+
+    def _opening(path, flags, mode=0o777, *, dir_fd=None, **kwargs):
+        fd = original_open(path, flags, mode, dir_fd=dir_fd, **kwargs)
+        if (
+            dir_fd is None
+            and not swapped["done"]
+            and str(path) == str(workspace)
+            and flags & os.O_DIRECTORY
+        ):
+            swapped["done"] = True
+            workspace.rename(backup)
+            os.symlink(external, workspace)
+        return fd
+
+    monkeypatch.setattr(os, "open", _opening)
+    # Negative test: expects bounded runtime-home path rejection substring in setup error.
+    with pytest.raises(CursorSetupError, match="safe directory|unavailable"):
+        cursor_setup._ensure_project_local_runtime_home(home)
+    assert stat.S_IMODE(external.stat().st_mode) == 0o755
+    assert backup.is_dir()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX runtime-home parent swap")
+def test_prepare_proxy_home_rejects_home_swap_without_external_profile_mutation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+    home = setup_home(workspace)
+    home.mkdir(parents=True, exist_ok=True)
+    os.chmod(home, 0o755)
+    external = tmp_path / "external-agentveil"
+    external.mkdir(mode=0o755)
+    external_marker = external / "must-stay-empty.txt"
+    external_marker.write_bytes(b"keep\n")
+    backup = tmp_path / "workspace-pinned-backup"
+    real_open_root = cursor_setup._open_owner_controlled_directory_fd
+    swapped = {"done": False}
+
+    def _open_root_with_swap(path: Path) -> int:
+        fd = real_open_root(path)
+        if not swapped["done"]:
+            swapped["done"] = True
+            workspace.rename(backup)
+            os.symlink(external, workspace)
+        return fd
+
+    monkeypatch.setattr(cursor_setup, "_open_owner_controlled_directory_fd", _open_root_with_swap)
+    # Negative test: expects bounded runtime-home path rejection substring in setup error.
+    with pytest.raises(CursorSetupError, match="safe directory"):
+        cursor_setup.prepare_proxy_home(workspace)
+    assert external_marker.read_bytes() == b"keep\n"
+    assert not (external / "product-profile").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX product-route profile initialization")
+def test_prepare_proxy_home_runs_unmocked_product_route_initialization(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+    home = cursor_setup.prepare_proxy_home(
+        workspace,
+        initialize_product_route=True,
+    )
+    profile_root = home / "product-profile"
+    assert profile_root.is_dir()
+    package_venv = profile_root / "package" / "venv"
+    assert package_venv.is_dir()
+    git_repo = profile_root / "workspace"
+    assert (git_repo / ".git").is_dir()
+    assert (home / "passphrase").is_file()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX project-root permissions")
+def test_cursor_passphrase_rejects_group_writable_project_root(tmp_path: Path) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    os.chmod(workspace, 0o775)
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+    home = setup_home(workspace)
+    path = cursor_setup.passphrase_path(home)
+    with pytest.raises(CursorSetupError, match="writable by other users"):
+        cursor_setup._ensure_passphrase(path)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX project-root permissions")
+def test_cursor_passphrase_allows_owner_controlled_0755_project_root(tmp_path: Path) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir(mode=0o755)
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+    home = setup_home(workspace)
+    path = cursor_setup.passphrase_path(home)
+    cursor_setup._ensure_passphrase(path)
+    assert path.is_file()
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink custody")
+def test_cursor_passphrase_rejects_symlinked_home_without_git_exclude_mutation(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+    exclude_path = workspace / ".git" / "info" / "exclude"
+    before_exclude = exclude_path.read_bytes() if exclude_path.is_file() else b""
+
+    external = tmp_path / "external-agentveil"
+    external.mkdir(mode=0o700)
+    external_passphrase = external / "passphrase"
+    external_passphrase.write_text("external-secret\n", encoding="utf-8")
+    os.chmod(external_passphrase, 0o600)
+
+    home = setup_home(workspace)
+    os.symlink(external, home, target_is_directory=True)
+    path = cursor_setup.passphrase_path(home)
+
+    # Negative test: expects bounded symlinked .agentveil runtime-home path rejection substring in setup error.
+    with pytest.raises(CursorSetupError, match="safe"):
+        cursor_setup._ensure_passphrase(path)
+
+    assert exclude_path.read_bytes() == before_exclude
+    assert external_passphrase.read_bytes() == b"external-secret\n"

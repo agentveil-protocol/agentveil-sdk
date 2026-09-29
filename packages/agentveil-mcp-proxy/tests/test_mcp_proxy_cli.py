@@ -7,13 +7,20 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
+import subprocess
 import sys
 from types import SimpleNamespace
 
 import pytest
 
 import agentveil_mcp_proxy.cli as proxy_cli
+import agentveil_mcp_proxy.control_artifacts as control_artifacts
+from agentveil_mcp_proxy.client_guidance import (
+    ProjectSecretGitCustodyError,
+    prepare_project_local_secret_git_custody,
+)
 import agentveil_mcp_proxy.console_credentials as console_creds
 from agentveil.delegation import verify_delegation
 from agentveil.exceptions import AVPNotFoundError, AVPServerError, AVPValidationError
@@ -62,6 +69,16 @@ from agentveil_mcp_proxy.quickstart_filesystem import _tools as quickstart_files
 
 TEST_PASSPHRASE = "correct horse battery staple"
 WRONG_PASSPHRASE = "wrong horse battery staple"
+_INIT_PROJECT_LOCAL = {"project_local_secret_custody": True}
+
+
+def _stub_project_proxy_home(home: Path) -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    os.chmod(home, 0o700)
+    proxy_dir = home / "mcp-proxy"
+    proxy_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(proxy_dir, 0o700)
+    (proxy_dir / "config.json").write_text("{}", encoding="utf-8")
 
 
 def _quickstart_filesystem_tool_count() -> int:
@@ -137,6 +154,7 @@ def _replace_grant(
     return grant
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX project-local secret custody")
 def test_secure_write_json_fsyncs_before_close(tmp_path, monkeypatch):
     calls: list[int] = []
 
@@ -151,9 +169,8 @@ def test_secure_write_json_fsyncs_before_close(tmp_path, monkeypatch):
     assert calls
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX project-local secret custody")
 def test_secure_write_json_force_fsyncs_parent_directory_on_posix(tmp_path, monkeypatch):
-    if os.name == "nt":
-        pytest.skip("directory fsync is POSIX-specific")
     calls: list[bool] = []
 
     def fake_fsync(fd: int) -> None:
@@ -176,6 +193,7 @@ def test_init_creates_identity_config_and_control_grant_with_0600(tmp_path):
         agent_name="proxy",
         policy_pack="github",
         passphrase=TEST_PASSPHRASE,
+        **_INIT_PROJECT_LOCAL,
     )
 
     assert result.identity_path == home / "agents" / "proxy.json"
@@ -221,6 +239,7 @@ def test_init_scaffold_fallback_is_not_fail_open(tmp_path):
         agent_name="proxy",
         policy_pack="github",
         passphrase=TEST_PASSPHRASE,
+        **_INIT_PROJECT_LOCAL,
     )
 
     fallback = _load(result.config_path)["fallback"]
@@ -242,6 +261,7 @@ def test_init_scaffold_tool_surface_defaults_off(tmp_path):
         agent_name="proxy",
         policy_pack="github",
         passphrase=TEST_PASSPHRASE,
+        **_INIT_PROJECT_LOCAL,
     )
 
     tool_surface = _load(result.config_path)["tool_surface"]
@@ -2240,8 +2260,7 @@ def test_cli_setup_claude_code_starts_center_with_passphrase_without_url_leak(
 
     def fake_init_proxy(**kwargs):
         home = kwargs["home"]
-        (home / "mcp-proxy").mkdir(parents=True, exist_ok=True)
-        (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+        _stub_project_proxy_home(home)
         seen["init_plaintext"] = kwargs["plaintext"]
         seen["init_passphrase_file"] = kwargs["passphrase_file"]
         seen["policy_pack"] = kwargs.get("policy_pack")
@@ -2310,8 +2329,7 @@ def test_cli_setup_claude_code_choose_folder_uses_selected_project(
 
     def fake_init_proxy(**kwargs):
         home = kwargs["home"]
-        (home / "mcp-proxy").mkdir(parents=True, exist_ok=True)
-        (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+        _stub_project_proxy_home(home)
         seen["home"] = home
         seen["downstream_root"] = kwargs["downstream_config"]["args"][-1]
 
@@ -2374,8 +2392,7 @@ def test_cli_setup_gemini_cli_enables_approval_wait_mode(tmp_path, monkeypatch, 
 
     def fake_init_proxy(**kwargs):
         home = kwargs["home"]
-        (home / "mcp-proxy").mkdir(parents=True, exist_ok=True)
-        (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+        _stub_project_proxy_home(home)
 
     monkeypatch.setattr(proxy_cli, "init_proxy", fake_init_proxy)
     monkeypatch.setattr(proxy_cli, "run_connect_cli", lambda **_kwargs: 0)
@@ -2410,8 +2427,7 @@ def test_cli_setup_codex_enables_approval_wait_mode(tmp_path, monkeypatch, capsy
 
     def fake_init_proxy(**kwargs):
         home = kwargs["home"]
-        (home / "mcp-proxy").mkdir(parents=True, exist_ok=True)
-        (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+        _stub_project_proxy_home(home)
 
     monkeypatch.setattr(proxy_cli, "init_proxy", fake_init_proxy)
     monkeypatch.setattr(proxy_cli, "run_connect_cli", lambda **_kwargs: 0)
@@ -2446,8 +2462,7 @@ def test_cli_setup_cursor_enables_approval_wait_mode(tmp_path, monkeypatch, caps
 
     def fake_init_proxy(**kwargs):
         home = kwargs["home"]
-        (home / "mcp-proxy").mkdir(parents=True, exist_ok=True)
-        (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+        _stub_project_proxy_home(home)
 
     monkeypatch.setattr(proxy_cli, "init_proxy", fake_init_proxy)
     monkeypatch.setattr(proxy_cli, "initialize_product_route_profile", lambda _prof: None)
@@ -2493,8 +2508,7 @@ def test_cli_setup_claude_code_fails_when_center_not_running(
 ):
     def fake_init_proxy(**kwargs):
         home = kwargs["home"]
-        (home / "mcp-proxy").mkdir(parents=True, exist_ok=True)
-        (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+        _stub_project_proxy_home(home)
 
     def fake_connect(**kwargs):
         project = kwargs["project_root"]
@@ -4037,8 +4051,7 @@ def test_console_project_status_sync_on_setup_status_for_connectors(
     if client == "cursor":
         def fake_init_proxy(**kwargs):
             home = kwargs["home"]
-            (home / "mcp-proxy").mkdir(parents=True, exist_ok=True)
-            (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+            _stub_project_proxy_home(home)
 
         def fake_prepare(_workspace, *, force=False):
             home = cursor_setup.setup_home(_workspace)
@@ -4382,8 +4395,7 @@ def test_console_free_builder_sync_on_setup_status_for_connectors(
     if client == "cursor":
         def fake_init_proxy(**kwargs):
             home = kwargs["home"]
-            (home / "mcp-proxy").mkdir(parents=True, exist_ok=True)
-            (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+            _stub_project_proxy_home(home)
 
         def fake_prepare(_workspace, *, force=False):
             home = cursor_setup.setup_home(_workspace)
@@ -4973,8 +4985,7 @@ def test_console_attach_on_setup_for_connectors(
     if client == "cursor":
         def fake_init_proxy(**kwargs):
             home = kwargs["home"]
-            (home / "mcp-proxy").mkdir(parents=True, exist_ok=True)
-            (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
+            _stub_project_proxy_home(home)
 
         def fake_prepare(_workspace, *, force=False):
             home = cursor_setup.setup_home(_workspace)
@@ -5213,9 +5224,10 @@ def _seed_project_proxy_identity(project: Path, connector: str, *, registered: b
             agent_name="proxy",
             plaintext=False,
             passphrase_file=passphrase_file,
+            **_INIT_PROJECT_LOCAL,
         )
     else:
-        init_proxy(home=home, agent_name="proxy", plaintext=True)
+        init_proxy(home=home, agent_name="proxy", plaintext=True, **_INIT_PROJECT_LOCAL)
     if registered:
         paths = proxy_paths(home)
         identity_path = paths.identity_path("proxy")
@@ -5262,6 +5274,7 @@ def _init_proxy_for_connector_setup(**kwargs):
         passphrase_file=kwargs.get("passphrase_file"),
         force=kwargs.get("force", False),
         err=kwargs.get("err") or io.StringIO(),
+        **_INIT_PROJECT_LOCAL,
     )
 
 
@@ -5696,3 +5709,907 @@ def test_setup_common_registration_guidance_human_output_shows_quoted_paths_with
     identity = _load(proxy_paths(home).identity_path("proxy"))
     assert identity["did"] not in captured
     assert _secret_material(identity) not in captured
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink custody")
+def test_identity_force_rewrite_rejects_preplanted_temp_symlink(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    home = project / ".avp"
+    result = init_proxy(
+        home=home,
+        agent_name="proxy",
+        policy_pack="github",
+        passphrase=TEST_PASSPHRASE,
+        **_INIT_PROJECT_LOCAL,
+    )
+    outside = tmp_path / "outside-target.txt"
+    outside.write_text("preserve-me", encoding="utf-8")
+    predictable_tmp = result.identity_path.with_name(".proxy.json.tmp")
+    predictable_tmp.symlink_to(outside)
+    proxy_cli._secure_write_json(
+        result.identity_path,
+        {"tampered": True},
+        force=True,
+    )
+    assert outside.read_text(encoding="utf-8") == "preserve-me"
+    assert _load(result.identity_path)["tampered"] is True
+
+
+def test_project_secret_home_git_excluded_before_identity_creation(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    home = project / ".avp"
+    result = init_proxy(
+        home=home,
+        agent_name="proxy",
+        policy_pack="github",
+        passphrase=TEST_PASSPHRASE,
+        **_INIT_PROJECT_LOCAL,
+    )
+    dry_run = subprocess.run(
+        ["git", "-C", str(project), "add", "-n", "--", ".avp"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    staged = dry_run.stdout.strip()
+    assert str(result.identity_path.relative_to(project)) not in staged
+    assert str(result.control_grant_path.relative_to(project)) not in staged
+    ignore = subprocess.run(
+        ["git", "-C", str(project), "check-ignore", "-q", "--", ".avp/agents/probe.json"],
+        check=False,
+    )
+    assert ignore.returncode == 0
+
+
+def test_setup_rejects_pretracked_identity_without_modifying_it(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    identity_path = project / ".avp" / "agents" / "proxy.json"
+    identity_path.parent.mkdir(parents=True)
+    original = {"name": "proxy", "did": "did:example:tracked", "encrypted": False}
+    identity_path.write_text(json.dumps(original), encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(project), "add", "--", ".avp/agents/proxy.json"],
+        check=True,
+    )
+    before = identity_path.read_bytes()
+    with pytest.raises(ProxyCliError, match="tracked"):
+        init_proxy(
+            home=project / ".avp",
+            agent_name="proxy",
+            policy_pack="github",
+            passphrase=TEST_PASSPHRASE,
+            **_INIT_PROJECT_LOCAL,
+        )
+    assert identity_path.read_bytes() == before
+
+
+def test_existing_project_secret_custody_is_preserved_on_repeat_setup(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    home = project / ".avp"
+    result = init_proxy(
+        home=home,
+        agent_name="proxy",
+        policy_pack="github",
+        passphrase=TEST_PASSPHRASE,
+        **_INIT_PROJECT_LOCAL,
+    )
+    before_identity = result.identity_path.read_bytes()
+    before_grant = result.control_grant_path.read_bytes()
+    project_root = proxy_cli._selected_project_root_for_home(home)
+    project_root_fd = proxy_cli._open_owner_controlled_directory_fd(project_root)
+    home_fd = proxy_cli._open_project_local_runtime_home(home)
+    try:
+        proxy_cli._prepare_project_local_secret_custody(
+            home=home,
+            home_fd=home_fd,
+            project_root=project_root,
+            project_root_fd=project_root_fd,
+        )
+    finally:
+        os.close(home_fd)
+        os.close(project_root_fd)
+    proxy_cli._ensure_project_local_runtime_home(home)
+    assert result.identity_path.read_bytes() == before_identity
+    assert result.control_grant_path.read_bytes() == before_grant
+    if os.name != "nt":
+        assert _mode(result.identity_path) == 0o600
+        assert _mode(home) == 0o700
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX project-local secret custody")
+def test_secure_write_json_force_preserves_bytes_when_write_all_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "secret.json"
+    proxy_cli._secure_write_json(path, {"keep": True})
+    before = path.read_bytes()
+
+    def failing_write_all(fd: int, data: bytes) -> None:
+        raise control_artifacts.ControlArtifactError("control_artifact_write_failed")
+
+    monkeypatch.setattr(control_artifacts, "_write_all", failing_write_all)
+    with pytest.raises(proxy_cli.ProxyCliError):
+        proxy_cli._secure_write_json(path, {"lost": True}, force=True)
+    assert path.read_bytes() == before
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX project-local secret custody")
+def test_secure_write_json_force_serializes_concurrent_rewrites(tmp_path: Path) -> None:
+    import threading
+
+    path = tmp_path / "secret.json"
+    proxy_cli._secure_write_json(path, {"start": 0})
+    errors: list[Exception] = []
+    lock = threading.Lock()
+
+    def rewrite(value: int) -> None:
+        try:
+            proxy_cli._secure_write_json(path, {"value": value}, force=True)
+        except Exception as exc:
+            with lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=rewrite, args=(index,)) for index in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert not errors
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert isinstance(payload["value"], int)
+
+
+def test_prepare_project_local_secret_git_custody_fails_closed_on_ls_files_error(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "repo"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    home = project / ".avp"
+
+    real_run = subprocess.run
+
+    def guarded_run(args, **kwargs):
+        if "ls-files" in args:
+            return SimpleNamespace(returncode=2, stdout="", stderr="ls-files failed")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.client_guidance.subprocess.run",
+        guarded_run,
+    )
+    with pytest.raises(ProjectSecretGitCustodyError, match="tracked-path query"):
+        prepare_project_local_secret_git_custody(project, home)
+
+
+def test_prepare_project_local_secret_git_custody_fails_closed_on_git_detection_error(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "repo"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    home = project / ".avp"
+    calls = {"rev_parse": 0}
+
+    real_run = subprocess.run
+
+    def guarded_run(args, **kwargs):
+        if args[:4] == ["git", "-C", str(project.resolve()), "rev-parse"]:
+            calls["rev_parse"] += 1
+            return SimpleNamespace(returncode=1, stdout="", stderr="fatal: git unavailable")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.client_guidance.subprocess.run",
+        guarded_run,
+    )
+    with pytest.raises(ProjectSecretGitCustodyError, match="unavailable"):
+        prepare_project_local_secret_git_custody(project, home)
+    assert calls["rev_parse"] == 1
+
+
+def test_prepare_project_local_secret_git_custody_rejects_tracked_proxy_json(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "repo"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    tracked = project / ".avp" / "agents" / "proxy.json"
+    tracked.parent.mkdir(parents=True)
+    tracked.write_text('{"tracked": true}\n', encoding="utf-8")
+    subprocess.run(["git", "-C", str(project), "add", "--", ".avp/agents/proxy.json"], check=True)
+    before = tracked.read_bytes()
+    with pytest.raises(ProjectSecretGitCustodyError, match="tracked"):
+        prepare_project_local_secret_git_custody(project, project / ".avp")
+    assert tracked.read_bytes() == before
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows global init path")
+def test_init_proxy_global_home_skips_project_local_windows_gate(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    calls = {"n": 0}
+    real_require = proxy_cli._require_project_local_secret_custody_platform
+
+    def tracked_require() -> None:
+        calls["n"] += 1
+        real_require()
+
+    monkeypatch.setattr(
+        proxy_cli,
+        "_require_project_local_secret_custody_platform",
+        tracked_require,
+    )
+    home = tmp_path / "global-avp-home"
+    init_proxy(home=home, agent_name="proxy", plaintext=True)
+    assert calls["n"] == 0
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows project-local custody branch")
+def test_init_proxy_project_local_windows_gate_fails_closed(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    home = project / ".avp"
+    with pytest.raises(ProxyCliError, match="Windows"):
+        init_proxy(
+            home=home,
+            agent_name="proxy",
+            plaintext=True,
+            **_INIT_PROJECT_LOCAL,
+        )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows project-local custody branch")
+def test_secure_write_json_windows_fail_closed_before_rewrite(tmp_path: Path) -> None:
+    path = tmp_path / "secret.json"
+    with pytest.raises(ProxyCliError, match="Windows"):
+        # Negative test: synthetic payload key only; not an execution-blocking claim.
+        proxy_cli._secure_write_json(
+            path,
+            {"rewrite_guard": True},
+            project_local_secret_custody=True,
+        )
+
+
+def test_secure_write_json_project_local_gate_is_caller_controlled(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    calls = {"n": 0}
+    real_require = proxy_cli._require_project_local_secret_custody_platform
+
+    def tracked_require() -> None:
+        calls["n"] += 1
+        real_require()
+
+    monkeypatch.setattr(
+        proxy_cli,
+        "_require_project_local_secret_custody_platform",
+        tracked_require,
+    )
+    proxy_cli._secure_write_json(tmp_path / "global-config.json", {"global": True})
+    assert calls["n"] == 0
+    proxy_cli._secure_write_json(
+        tmp_path / "project-config.json",
+        {"project": True},
+        project_local_secret_custody=True,
+    )
+    assert calls["n"] == 1
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX runtime-home parent swap")
+def test_init_proxy_anchors_writes_when_home_path_is_swapped(tmp_path: Path, monkeypatch) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    home = project / ".avp"
+    external = tmp_path / "external-home"
+    external.mkdir()
+    external_marker = external / "must-stay-empty.txt"
+    external_marker.write_bytes(b"keep\n")
+    backup = project / ".avp-pinned-backup"
+    real_open = proxy_cli._open_project_local_runtime_home
+    swapped = {"done": False}
+
+    def _open_with_swap(path: Path, **kwargs) -> int:
+        fd = real_open(path, **kwargs)
+        if not swapped["done"]:
+            swapped["done"] = True
+            home.rename(backup)
+            os.symlink(external, home)
+        return fd
+
+    monkeypatch.setattr(proxy_cli, "_open_project_local_runtime_home", _open_with_swap)
+    # Negative test: expects bounded runtime-home path rejection substring in CLI error.
+    with pytest.raises(ProxyCliError, match="safe directory"):
+        init_proxy(
+            home=home,
+            agent_name="proxy",
+            policy_pack="github",
+            passphrase=TEST_PASSPHRASE,
+            **_INIT_PROJECT_LOCAL,
+        )
+    assert external_marker.read_bytes() == b"keep\n"
+    assert not (backup / "agents" / "proxy.json").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX in-home identity symlink custody")
+def test_init_proxy_force_rewrite_rejects_in_home_identity_symlink(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    home = project / ".avp"
+    init_proxy(
+        home=home,
+        agent_name="proxy",
+        policy_pack="github",
+        passphrase=TEST_PASSPHRASE,
+        **_INIT_PROJECT_LOCAL,
+    )
+    identity_path = home / "agents" / "proxy.json"
+    victim = home / "agents" / "victim.json"
+    victim.write_text('{"keep": true}\n', encoding="utf-8")
+    before = victim.read_bytes()
+    identity_path.unlink()
+    identity_path.symlink_to(victim)
+    with pytest.raises(ProxyCliError, match="could not be written safely"):
+        init_proxy(
+            home=home,
+            agent_name="proxy",
+            policy_pack="github",
+            passphrase=TEST_PASSPHRASE,
+            force=True,
+            **_INIT_PROJECT_LOCAL,
+        )
+    assert victim.read_bytes() == before
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinked intermediate directory custody")
+def test_init_proxy_rejects_symlinked_agents_directory(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    home = project / ".avp"
+    outside_agents = tmp_path / "outside-agents"
+    outside_agents.mkdir()
+    marker = outside_agents / "marker.txt"
+    marker.write_bytes(b"untouched\n")
+    init_proxy(
+        home=home,
+        agent_name="proxy",
+        policy_pack="github",
+        passphrase=TEST_PASSPHRASE,
+        **_INIT_PROJECT_LOCAL,
+    )
+    agents_dir = home / "agents"
+    backup = home / "agents-real"
+    agents_dir.rename(backup)
+    agents_dir.symlink_to(outside_agents)
+    with pytest.raises(ProxyCliError):
+        init_proxy(
+            home=home,
+            agent_name="other",
+            policy_pack="github",
+            passphrase=TEST_PASSPHRASE,
+            force=True,
+            **_INIT_PROJECT_LOCAL,
+        )
+    assert marker.read_bytes() == b"untouched\n"
+
+
+def test_init_proxy_project_local_windows_gate_before_directory_open(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    directory_opens: list[str] = []
+    real_open = os.open
+
+    def _tracking_open(path, flags, mode=0o777, *, dir_fd=None, **kwargs):
+        if dir_fd is None and flags & getattr(os, "O_DIRECTORY", 0):
+            directory_opens.append(str(path))
+        return real_open(path, flags, mode, dir_fd=dir_fd, **kwargs)
+
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(os, "open", _tracking_open)
+    project = tmp_path / "project"
+    project.mkdir()
+    home = project / ".avp"
+    with pytest.raises(ProxyCliError, match="Windows"):
+        init_proxy(
+            home=home,
+            agent_name="proxy",
+            plaintext=True,
+            **_INIT_PROJECT_LOCAL,
+        )
+    assert directory_opens == []
+
+
+def test_init_proxy_closes_custody_home_fd_on_trusted_signer_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    home = project / ".avp"
+    tracked_fd = {"value": None}
+    real_open_home = proxy_cli._open_project_local_runtime_home
+    closed: list[int] = []
+    real_close = os.close
+
+    def _open_and_track(path: Path, **kwargs) -> int:
+        fd = real_open_home(path, **kwargs)
+        tracked_fd["value"] = fd
+        return fd
+
+    def _track_close(fd: int) -> None:
+        if tracked_fd["value"] is not None and fd == tracked_fd["value"]:
+            closed.append(fd)
+        real_close(fd)
+
+    monkeypatch.setattr(proxy_cli, "_open_project_local_runtime_home", _open_and_track)
+    monkeypatch.setattr(os, "close", _track_close)
+    monkeypatch.setattr(proxy_cli, "trusted_signers_for_base_url", lambda _url: ())
+    with pytest.raises(ProxyCliError, match="trusted signer"):
+        init_proxy(
+            home=home,
+            agent_name="proxy",
+            plaintext=True,
+            **_INIT_PROJECT_LOCAL,
+        )
+    assert tracked_fd["value"] is not None
+    assert closed == [tracked_fd["value"]]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX runtime-home parent swap")
+def test_ensure_project_local_runtime_home_rejects_parent_directory_swap(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    home = project / ".avp"
+    home.mkdir(mode=0o755)
+    external = tmp_path / "external-home"
+    external.mkdir(mode=0o755)
+    backup = tmp_path / "project-pinned-backup"
+    original_open = os.open
+    swapped = {"done": False}
+
+    def _opening(path, flags, mode=0o777, *, dir_fd=None, **kwargs):
+        fd = original_open(path, flags, mode, dir_fd=dir_fd, **kwargs)
+        if (
+            dir_fd is None
+            and not swapped["done"]
+            and str(path) == str(project)
+            and flags & os.O_DIRECTORY
+        ):
+            swapped["done"] = True
+            project.rename(backup)
+            os.symlink(external, project)
+        return fd
+
+    monkeypatch.setattr(os, "open", _opening)
+    # Negative test: expects bounded runtime-home path rejection substring in CLI error.
+    with pytest.raises(ProxyCliError, match="safe directory|unavailable"):
+        proxy_cli._ensure_project_local_runtime_home(home)
+    assert stat.S_IMODE(external.stat().st_mode) == 0o755
+    assert backup.is_dir()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX lock custody")
+def test_local_secret_write_lock_rejects_symlink_and_hardlink(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    home = project / ".avp"
+    result = init_proxy(
+        home=home,
+        agent_name="proxy",
+        policy_pack="github",
+        passphrase=TEST_PASSPHRASE,
+        **_INIT_PROJECT_LOCAL,
+    )
+    target = result.identity_path
+    lock_path = target.with_name(f".{target.name}.write-lock")
+    victim = tmp_path / "victim-lock.txt"
+    victim.write_text("keep\n", encoding="utf-8")
+
+    if lock_path.exists():
+        lock_path.unlink()
+    lock_path.symlink_to(victim)
+    with pytest.raises(ProxyCliError):
+        proxy_cli._secure_write_json(target, {"x": 1}, force=True)
+    assert victim.read_text(encoding="utf-8") == "keep\n"
+
+    lock_path.unlink()
+    real_lock = tmp_path / "real-lock"
+    real_lock.write_text("lock\n", encoding="utf-8")
+    os.link(real_lock, lock_path)
+    with pytest.raises(ProxyCliError):
+        proxy_cli._secure_write_json(target, {"x": 2}, force=True)
+    assert real_lock.read_text(encoding="utf-8") == "lock\n"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX hardlink custody")
+def test_secure_write_json_rejects_hardlinked_identity_target(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    home = project / ".avp"
+    result = init_proxy(
+        home=home,
+        agent_name="proxy",
+        policy_pack="github",
+        passphrase=TEST_PASSPHRASE,
+        **_INIT_PROJECT_LOCAL,
+    )
+    target = result.identity_path
+    before = target.read_bytes()
+    peer = home / "identity-hardlink"
+    os.link(target, peer)
+    try:
+        # Negative test: expects bounded local secret file path rejection substring.
+        with pytest.raises(ProxyCliError, match="safe file"):
+            proxy_cli._secure_write_json(target, {"tampered": True}, force=True)
+        assert target.read_bytes() == before
+        assert peer.read_bytes() == before
+    finally:
+        peer.unlink()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink custody")
+def test_init_proxy_rejects_symlinked_avp_without_external_git_mutation(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    external = tmp_path / "external-git"
+    external.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=external, check=True)
+    external_exclude = external / ".git" / "info" / "exclude"
+    before_exclude = (
+        external_exclude.read_bytes() if external_exclude.is_file() else b""
+    )
+    external_avp = external / ".avp"
+    external_avp.mkdir(mode=0o700)
+    home = project / ".avp"
+    os.symlink(external_avp, home, target_is_directory=True)
+    with pytest.raises(ProxyCliError):
+        init_proxy(
+            home=home,
+            agent_name="proxy",
+            policy_pack="github",
+            passphrase=TEST_PASSPHRASE,
+            **_INIT_PROJECT_LOCAL,
+        )
+    assert external_exclude.read_bytes() == before_exclude
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX runtime-home parent swap")
+def test_init_proxy_home_swap_before_git_custody_skips_git_mutation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    exclude_path = project / ".git" / "info" / "exclude"
+    before_exclude = exclude_path.read_bytes() if exclude_path.is_file() else b""
+    home = project / ".avp"
+    external = tmp_path / "external-home"
+    external.mkdir(mode=0o700)
+    backup = project / ".avp-pinned-backup"
+    real_prepare = proxy_cli._prepare_project_local_secret_custody
+    swapped = {"done": False}
+
+    def _prepare_with_swap(**kwargs):
+        if not swapped["done"]:
+            swapped["done"] = True
+            home_path = Path(kwargs["home"])
+            home_path.rename(backup)
+            os.symlink(external, home_path)
+        return real_prepare(**kwargs)
+
+    monkeypatch.setattr(proxy_cli, "_prepare_project_local_secret_custody", _prepare_with_swap)
+    # Negative test: expects bounded runtime-home path rejection substring in CLI error.
+    with pytest.raises(ProxyCliError, match="safe directory"):
+        init_proxy(
+            home=home,
+            agent_name="proxy",
+            policy_pack="github",
+            passphrase=TEST_PASSPHRASE,
+            **_INIT_PROJECT_LOCAL,
+        )
+    assert exclude_path.read_bytes() == before_exclude
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX project-root parent swap")
+def test_init_proxy_rejects_project_root_swap_without_external_avp_creation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    external = tmp_path / "external-project"
+    external.mkdir(mode=0o755)
+    external_marker = external / "must-stay-empty.txt"
+    external_marker.write_bytes(b"keep\n")
+    home = project / ".avp"
+    backup = tmp_path / "project-pinned-backup"
+    real_open_root = proxy_cli._open_owner_controlled_directory_fd
+    swapped = {"done": False}
+
+    def _open_root_with_swap(path: Path) -> int:
+        fd = real_open_root(path)
+        if not swapped["done"]:
+            swapped["done"] = True
+            project.rename(backup)
+            os.symlink(external, project)
+        return fd
+
+    monkeypatch.setattr(proxy_cli, "_open_owner_controlled_directory_fd", _open_root_with_swap)
+    # Negative test: expects bounded runtime-home path rejection substring in CLI error.
+    with pytest.raises(ProxyCliError, match="safe directory"):
+        init_proxy(
+            home=home,
+            agent_name="proxy",
+            policy_pack="github",
+            passphrase=TEST_PASSPHRASE,
+            **_INIT_PROJECT_LOCAL,
+        )
+    assert external_marker.read_bytes() == b"keep\n"
+    assert not (external / ".avp").exists()
+    assert backup.is_dir()
+    assert not (backup / "agents").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX project-root permissions")
+def test_init_proxy_rejects_group_writable_project_root(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    os.chmod(project, 0o775)
+    home = project / ".avp"
+    with pytest.raises(ProxyCliError, match="writable by other users"):
+        init_proxy(
+            home=home,
+            agent_name="proxy",
+            policy_pack="github",
+            passphrase=TEST_PASSPHRASE,
+            **_INIT_PROJECT_LOCAL,
+        )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX project-root permissions")
+def test_init_proxy_rejects_world_writable_project_root(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    os.chmod(project, 0o777)
+    home = project / ".avp"
+    with pytest.raises(ProxyCliError, match="writable by other users"):
+        init_proxy(
+            home=home,
+            agent_name="proxy",
+            policy_pack="github",
+            passphrase=TEST_PASSPHRASE,
+            **_INIT_PROJECT_LOCAL,
+        )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX project-root permissions")
+def test_init_proxy_allows_owner_controlled_0755_project_root(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir(mode=0o755)
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    home = project / ".avp"
+    result = init_proxy(
+        home=home,
+        agent_name="proxy",
+        policy_pack="github",
+        passphrase=TEST_PASSPHRASE,
+        **_INIT_PROJECT_LOCAL,
+    )
+    assert result.identity_path.is_file()
+    assert stat.S_IMODE(home.stat().st_mode) == 0o700
+
+
+def _seed_populated_external_proxy_home(external: Path) -> bytes:
+    config_dir = external / "mcp-proxy"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config_path = config_dir / "config.json"
+    body = json.dumps({"approval": {"wait_for_decision": False}, "marker": "keep-bytes"}) + "\n"
+    config_path.write_text(body, encoding="utf-8")
+    if os.name != "nt":
+        os.chmod(config_path, 0o600)
+    return body.encode("utf-8")
+
+
+_CONNECTOR_SYMLINK_HOME_CASES = [
+    ("claude-code", ["setup", "claude-code", "--project-dir"]),
+    ("codex", ["setup", "codex", "--project-dir"]),
+    ("gemini-cli", ["setup", "gemini-cli", "--project-dir"]),
+    ("cursor", ["setup", "cursor", "--workspace"]),
+]
+
+
+@pytest.mark.parametrize(("connector", "setup_prefix"), _CONNECTOR_SYMLINK_HOME_CASES)
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink custody")
+def test_connector_setup_rejects_populated_symlinked_runtime_home(
+    tmp_path: Path,
+    monkeypatch,
+    connector: str,
+    setup_prefix: list[str],
+) -> None:
+    from agentveil_mcp_proxy import agent_launcher
+
+    project = tmp_path / "project"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    exclude_path = project / ".git" / "info" / "exclude"
+    before_exclude = exclude_path.read_bytes() if exclude_path.is_file() else b""
+
+    external = tmp_path / "external-home"
+    external.mkdir(mode=0o700)
+    before_config = _seed_populated_external_proxy_home(external)
+
+    home = _connector_runtime_home(project, connector)
+    os.symlink(external, home, target_is_directory=True)
+
+    init_calls: list[dict] = []
+
+    def track_init_proxy(**kwargs):
+        init_calls.append(kwargs)
+        return _init_proxy_for_connector_setup(**kwargs)
+
+    monkeypatch.setattr(proxy_cli, "init_proxy", track_init_proxy)
+    defaults_calls: list[Path] = []
+    real_defaults = agent_launcher.ensure_interactive_connector_defaults
+
+    def track_defaults(config_path: Path) -> None:
+        defaults_calls.append(config_path)
+        return real_defaults(config_path)
+
+    monkeypatch.setattr(agent_launcher, "ensure_interactive_connector_defaults", track_defaults)
+
+    assert main([*setup_prefix, str(project), "--yes"]) != 0
+    assert not init_calls
+    assert not defaults_calls
+    assert (external / "mcp-proxy" / "config.json").read_bytes() == before_config
+    assert exclude_path.read_bytes() == before_exclude
+
+
+@pytest.mark.parametrize("wait_for_decision", [False, True])
+@pytest.mark.skipif(os.name == "nt", reason="POSIX hardlink custody")
+def test_connector_setup_rejects_hardlinked_populated_proxy_config(
+    tmp_path: Path,
+    monkeypatch,
+    wait_for_decision: bool,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    home = project / ".avp"
+    _init_proxy_for_connector_setup(home=home)
+    config_path = home / "mcp-proxy" / "config.json"
+    before = json.dumps(
+        {"approval": {"wait_for_decision": wait_for_decision}, "marker": "keep-bytes"}
+    ) + "\n"
+    config_path.write_text(before, encoding="utf-8")
+    if os.name != "nt":
+        os.chmod(config_path, 0o600)
+    peer = config_path.parent / "config-peer.json"
+    try:
+        os.link(config_path, peer)
+    except OSError:
+        pytest.skip("hardlinks unavailable")
+
+    _install_connector_setup_success_mocks(monkeypatch, "claude-code")
+
+    assert main(["setup", "claude-code", "--project-dir", str(project), "--yes"]) != 0
+    assert config_path.read_text(encoding="utf-8") == before
+    assert peer.read_text(encoding="utf-8") == before
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX legacy mcp-proxy custody")
+def test_configure_downstream_tightens_owner_controlled_0755_mcp_proxy(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "avp-home"
+    result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    config_dir = home / "mcp-proxy"
+    os.chmod(config_dir, 0o755)
+    before_config = _load(result.config_path)
+    before_config.setdefault("approval", {})["wait_for_decision"] = False
+    result.config_path.write_text(json.dumps(before_config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    sandbox = tmp_path / "sandbox"
+
+    configure_downstream(
+        home=home,
+        name="filesystem",
+        command=sys.executable,
+        args=("-m", "agentveil_mcp_proxy.quickstart_filesystem", str(sandbox)),
+        response_timeout_seconds=5.0,
+    )
+
+    assert stat.S_IMODE(config_dir.stat().st_mode) == 0o700
+    payload = json.loads(result.config_path.read_text(encoding="utf-8"))
+    assert payload["downstream"]["name"] == "filesystem"
+    assert payload["approval"]["wait_for_decision"] is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX legacy mcp-proxy custody")
+def test_configure_downstream_rejects_symlinked_mcp_proxy_without_chmod(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "avp-home"
+    init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    config_dir = home / "mcp-proxy"
+    valid_config = (config_dir / "config.json").read_text(encoding="utf-8")
+    external = tmp_path / "external-mcp-proxy"
+    external.mkdir(mode=0o755)
+    before_mode = stat.S_IMODE(external.stat().st_mode)
+    (external / "config.json").write_text(valid_config, encoding="utf-8")
+    shutil.rmtree(config_dir)
+    os.symlink(external, config_dir, target_is_directory=True)
+    sandbox = tmp_path / "sandbox"
+
+    # Negative test: expects bounded storage-directory preparation failure substring.
+    with pytest.raises(ProxyCliError, match="cannot secure local secret storage directory"):
+        configure_downstream(
+            home=home,
+            name="filesystem",
+            command=sys.executable,
+            args=("-m", "agentveil_mcp_proxy.quickstart_filesystem", str(sandbox)),
+        )
+
+    assert stat.S_IMODE(external.stat().st_mode) == before_mode
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX legacy mcp-proxy custody")
+def test_configure_claude_setup_approval_ui_tightens_owner_controlled_0755_mcp_proxy(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "avp-home"
+    init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    config_dir = home / "mcp-proxy"
+    os.chmod(config_dir, 0o755)
+    config_path = config_dir / "config.json"
+    before = json.dumps({"approval": {"wait_for_decision": False}, "marker": "keep-bytes"}) + "\n"
+    config_path.write_text(before, encoding="utf-8")
+
+    proxy_cli._configure_claude_setup_approval_ui(config_path, home=home)
+
+    assert stat.S_IMODE(config_dir.stat().st_mode) == 0o700
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    assert payload["approval"]["ui_open_mode"] == "terminal"
+    assert payload["marker"] == "keep-bytes"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX legacy mcp-proxy custody")
+def test_configure_claude_setup_approval_ui_rejects_symlinked_mcp_proxy_without_chmod(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "avp-home"
+    init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    external = tmp_path / "external-mcp-proxy"
+    external.mkdir(mode=0o755)
+    before_mode = stat.S_IMODE(external.stat().st_mode)
+    victim = json.dumps({"approval": {"wait_for_decision": False}, "marker": "keep-bytes"}) + "\n"
+    config_path = external / "config.json"
+    config_path.write_text(victim, encoding="utf-8")
+    config_dir = home / "mcp-proxy"
+    shutil.rmtree(config_dir)
+    os.symlink(external, config_dir, target_is_directory=True)
+
+    # Negative test: expects bounded storage-directory preparation failure substring.
+    with pytest.raises(ProxyCliError, match="cannot secure local secret storage directory"):
+        proxy_cli._configure_claude_setup_approval_ui(config_dir / "config.json", home=home)
+
+    assert stat.S_IMODE(external.stat().st_mode) == before_mode
+    assert config_path.read_text(encoding="utf-8") == victim

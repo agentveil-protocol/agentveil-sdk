@@ -28,6 +28,7 @@ import secrets
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -70,7 +71,6 @@ from agentveil_mcp_proxy.evidence import (
     parse_utc_timestamp,
     verify_evidence_bundle_file,
 )
-from agentveil_mcp_proxy.evidence.proof import _fsync_parent_directory
 from agentveil_mcp_proxy.evidence.events_show import DEFAULT_SHOW_LAST
 from agentveil_mcp_proxy.identity import (
     IdentityDecryptError,
@@ -117,9 +117,18 @@ from agentveil_mcp_proxy.client_doctor import (
     format_client_doctor_report,
 )
 from agentveil_mcp_proxy.client_guidance import (
+    ProjectSecretGitCustodyError,
     build_client_guidance_payload,
     build_client_guidance_set_payload,
     format_client_guidance_text,
+    prepare_project_local_secret_git_custody,
+)
+from agentveil_mcp_proxy.control_artifacts import (
+    ControlArtifactError,
+    ensure_control_directory,
+    ensure_control_subdirectory_at,
+    write_atomic_control_file,
+    write_atomic_control_file_at,
 )
 from agentveil_mcp_proxy.client_packs import (
     CLIENT_PACK_IDS,
@@ -506,49 +515,688 @@ def proxy_paths(home: Path | None = None, config_path: Path | None = None) -> Pr
     )
 
 
-def _mkdir_private(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
+# Boundary: bounded CLI error strings for rejected project-local paths; not product-wide safety claims.
+_PROJECT_LOCAL_RUNTIME_HOME_NOT_ACCEPTABLE = (
+    "project-local secret runtime home is not a safe directory"
+)
+_CANNOT_SECURE_LOCAL_SECRET_STORAGE_DIRECTORY = (  # Boundary: bounded CLI error text only.
+    "cannot secure local secret storage directory"
+)
+_CANNOT_SECURE_LOCAL_SECRET_DIRECTORY_PERMISSIONS = (  # Boundary: bounded CLI error text only.
+    "cannot secure directory permissions for local secret storage"
+)
+_LOCAL_SECRET_FILE_PATH_NOT_ACCEPTABLE = (  # Boundary: bounded CLI error text only.
+    "local secret file path is not a safe file"
+)
+
+
+def _prepare_selected_proxy_config_directory_for_publication(
+    *,
+    home: Path | None,
+    config_path: Path,
+) -> None:
+    """Tighten legacy owner-controlled ``mcp-proxy`` before selected proxy config writes."""
+
+    from agentveil_mcp_proxy.agent_launcher import (
+        _prepare_project_local_mcp_proxy_directory_for_publication,
+    )
+
+    paths = proxy_paths(home, config_path)
+    if paths.config_path.parent != paths.proxy_dir:
+        return
     try:
-        os.chmod(path, 0o700)
-    except PermissionError:
-        raise ProxyCliError(f"cannot secure directory permissions for {path}")
+        _prepare_project_local_mcp_proxy_directory_for_publication(paths.proxy_dir)
+    except ControlArtifactError as exc:
+        raise ProxyCliError(_CANNOT_SECURE_LOCAL_SECRET_STORAGE_DIRECTORY) from exc
 
 
-def _secure_write_json(path: Path, data: dict[str, Any], *, force: bool = False) -> None:
-    """Write JSON with owner-only file permissions and no accidental overwrite."""
+def _mkdir_private(path: Path) -> None:
+    try:
+        ensure_control_directory(Path(path))
+    except ControlArtifactError as exc:
+        raise ProxyCliError(_CANNOT_SECURE_LOCAL_SECRET_DIRECTORY_PERMISSIONS) from exc
 
-    _mkdir_private(path.parent)
-    if path.exists() and not force:
-        raise ProxyCliError(f"{path} already exists; pass --force to overwrite")
 
-    if force:
-        tmp_path = path.with_name(f".{path.name}.tmp")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+def _path_inode(path: Path) -> tuple[int, int]:
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError as exc:
+        raise ProxyCliError(
+            _PROJECT_LOCAL_RUNTIME_HOME_NOT_ACCEPTABLE,
+        ) from exc
+    return (info.st_dev, info.st_ino)
+
+
+def _assert_path_inode_matches(path: Path, info: os.stat_result) -> None:
+    current = _path_inode(path)
+    pinned = (info.st_dev, info.st_ino)
+    if current != pinned:
+        raise ProxyCliError(_PROJECT_LOCAL_RUNTIME_HOME_NOT_ACCEPTABLE)
+
+
+def _open_owner_controlled_directory_fd(path: Path) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        dir_fd = os.open(str(path), flags)
+    except OSError as exc:
+        raise ProxyCliError(
+            "project-local secret runtime home is unavailable",
+        ) from exc
+    try:
+        info = os.fstat(dir_fd)
+    except OSError as exc:
         try:
-            with os.fdopen(os.open(tmp_path, flags, 0o600), "w", encoding="utf-8") as fh:
-                json.dump(data, fh, indent=2, sort_keys=True)
-                fh.write("\n")
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp_path, path)
-            os.chmod(path, 0o600)
-            _fsync_parent_directory(path)
+            os.close(dir_fd)
+        except OSError:
+            pass
+        raise ProxyCliError(
+            "project-local secret runtime home is unavailable",
+        ) from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        try:
+            os.close(dir_fd)
+        except OSError:
+            pass
+        raise ProxyCliError(_PROJECT_LOCAL_RUNTIME_HOME_NOT_ACCEPTABLE)
+    if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+        try:
+            os.close(dir_fd)
+        except OSError:
+            pass
+        raise ProxyCliError("selected project root is not owner-controlled")
+    if os.name != "nt":
+        mode = stat.S_IMODE(info.st_mode)
+        if mode & 0o022:
+            try:
+                os.close(dir_fd)
+            except OSError:
+                pass
+            raise ProxyCliError(
+                "selected project root is writable by other users",
+            )
+    try:
+        _assert_path_inode_matches(path, info)
+    except ProxyCliError:
+        try:
+            os.close(dir_fd)
+        except OSError:
+            pass
+        raise
+    return dir_fd
+
+
+def _open_project_local_runtime_home_at(
+    project_root_fd: int,
+    home_name: str,
+    home: Path,
+) -> int:
+    """Create or open a direct-child runtime home relative to a pinned project-root fd."""
+
+    if home_name in {".", ".."} or "/" in home_name:
+        raise ProxyCliError(_PROJECT_LOCAL_RUNTIME_HOME_NOT_ACCEPTABLE)
+
+    target = Path(home).expanduser()
+    try:
+        entry_info = os.lstat(home_name, dir_fd=project_root_fd)
+    except FileNotFoundError:
+        try:
+            os.mkdir(home_name, 0o700, dir_fd=project_root_fd)
+        except OSError as exc:
+            raise ProxyCliError(
+                "cannot create project-local secret runtime home",
+            ) from exc
+    except OSError as exc:
+        raise ProxyCliError(
+            "project-local secret runtime home is unavailable",
+        ) from exc
+    else:
+        if stat.S_ISLNK(entry_info.st_mode):
+            raise ProxyCliError(_PROJECT_LOCAL_RUNTIME_HOME_NOT_ACCEPTABLE)
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        dir_fd = os.open(home_name, flags, dir_fd=project_root_fd)
+    except OSError as exc:
+        raise ProxyCliError(
+            "project-local secret runtime home is unavailable",
+        ) from exc
+
+    try:
+        info = os.fstat(dir_fd)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise ProxyCliError(_PROJECT_LOCAL_RUNTIME_HOME_NOT_ACCEPTABLE)
+        if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+            raise ProxyCliError("project-local secret runtime home is not owner-controlled")
+        _assert_path_inode_matches(target, info)
+        if os.name != "nt" and home_name in {".avp", ".agentveil"}:
+            mode = stat.S_IMODE(info.st_mode)
+            if mode != 0o700:
+                pinned = _path_inode(target)
+                try:
+                    if not hasattr(os, "fchmod"):
+                        raise ProxyCliError(
+                            "project-local secret runtime home permissions could not be secured",
+                        )
+                    os.fchmod(dir_fd, 0o700)
+                except OSError as exc:
+                    raise ProxyCliError(
+                        "project-local secret runtime home permissions could not be secured",
+                    ) from exc
+                _assert_path_inode_matches(target, os.fstat(dir_fd))
+                if _path_inode(target) != pinned:
+                    raise ProxyCliError(
+                        _PROJECT_LOCAL_RUNTIME_HOME_NOT_ACCEPTABLE,
+                    )
+                if stat.S_IMODE(os.fstat(dir_fd).st_mode) != 0o700:
+                    raise ProxyCliError(
+                        "project-local secret runtime home permissions could not be secured",
+                    )
+    except Exception:
+        try:
+            os.close(dir_fd)
+        except OSError:
+            pass
+        raise
+    return dir_fd
+
+
+def _open_project_local_runtime_home(
+    home: Path,
+    *,
+    project_root_fd: int | None = None,
+) -> int:
+    """Validate or create a project-local runtime home and return its directory fd."""
+
+    _require_project_local_secret_custody_platform()
+    target = Path(home).expanduser()
+    project_root = target.parent
+    close_project_root = False
+    root_fd = project_root_fd
+    if root_fd is None:
+        root_fd = _open_owner_controlled_directory_fd(project_root)
+        close_project_root = True
+    try:
+        return _open_project_local_runtime_home_at(root_fd, target.name, target)
+    finally:
+        if close_project_root:
+            try:
+                os.close(root_fd)
+            except OSError:
+                pass
+
+
+def _ensure_project_local_runtime_home(home: Path) -> None:
+    dir_fd = _open_project_local_runtime_home(home)
+    try:
+        os.close(dir_fd)
+    except OSError:
+        pass
+
+
+def _reject_unsafe_project_local_connector_paths(*, project_root: Path, home: Path) -> None:
+    """Reject unsafe project roots or runtime homes before existing-install detection."""
+
+    _require_project_local_secret_custody_platform()
+    target_root = Path(project_root).expanduser()
+    target_home = Path(home).expanduser()
+    root_fd = _open_owner_controlled_directory_fd(target_root)
+    try:
+        home_fd = _open_project_local_runtime_home_at(
+            root_fd,
+            target_home.name,
+            target_home,
+        )
+        try:
+            os.close(home_fd)
+        except OSError:
+            pass
+    finally:
+        try:
+            os.close(root_fd)
+        except OSError:
+            pass
+
+
+def _mkdir_private_at(home_fd: int, name: str) -> None:
+    try:
+        child_fd = ensure_control_subdirectory_at(home_fd, name)
+    except ControlArtifactError as exc:
+        raise ProxyCliError(_CANNOT_SECURE_LOCAL_SECRET_DIRECTORY_PERMISSIONS) from exc
+    try:
+        os.close(child_fd)
+    except OSError:
+        pass
+
+
+def _project_local_relative_path(home: Path, target: Path) -> str:
+    """Lexical descriptor-relative name; does not follow symlinks in path choice."""
+
+    home_lex = Path(os.path.normpath(str(Path(home).expanduser())))
+    target_lex = Path(os.path.normpath(str(Path(target).expanduser())))
+    relative = os.path.relpath(str(target_lex), str(home_lex))
+    normalized = Path(relative)
+    if normalized.is_absolute() or ".." in normalized.parts:
+        raise ProxyCliError("local secret file path is outside project runtime home")
+    return normalized.as_posix()
+
+
+def _assert_project_local_runtime_home_path_matches_fd(home: Path, dir_fd: int) -> None:
+    """Ensure the caller path still refers to the pinned runtime-home directory."""
+
+    target = Path(home).expanduser()
+    try:
+        path_info = os.lstat(target)
+    except OSError as exc:
+        raise ProxyCliError(
+            _PROJECT_LOCAL_RUNTIME_HOME_NOT_ACCEPTABLE,
+        ) from exc
+    if stat.S_ISLNK(path_info.st_mode) or not stat.S_ISDIR(path_info.st_mode):
+        raise ProxyCliError(_PROJECT_LOCAL_RUNTIME_HOME_NOT_ACCEPTABLE)
+    try:
+        fd_info = os.fstat(dir_fd)
+    except OSError as exc:
+        raise ProxyCliError(
+            _PROJECT_LOCAL_RUNTIME_HOME_NOT_ACCEPTABLE,
+        ) from exc
+    if not stat.S_ISDIR(fd_info.st_mode):
+        raise ProxyCliError(_PROJECT_LOCAL_RUNTIME_HOME_NOT_ACCEPTABLE)
+    if (path_info.st_dev, path_info.st_ino) != (fd_info.st_dev, fd_info.st_ino):
+        raise ProxyCliError(_PROJECT_LOCAL_RUNTIME_HOME_NOT_ACCEPTABLE)
+
+
+def _local_secret_lock_relative(relative_path: str) -> str:
+    dir_name, _, file_name = relative_path.rpartition("/")
+    lock_name = f".{file_name}.write-lock"
+    if dir_name:
+        return f"{dir_name}/{lock_name}"
+    return lock_name
+
+
+def _prepare_project_local_secret_custody(
+    *,
+    home: Path,
+    home_fd: int,
+    project_root: Path,
+    project_root_fd: int,
+) -> None:
+    _assert_project_local_runtime_home_path_matches_fd(home, home_fd)
+    _assert_project_local_runtime_home_path_matches_fd(project_root, project_root_fd)
+    try:
+        prepare_project_local_secret_git_custody(project_root, home)
+    except ProjectSecretGitCustodyError as exc:
+        raise ProxyCliError(exc.message, exit_code=1) from exc
+
+
+def _project_local_secret_custody_platform_supported() -> bool:
+    return os.name != "nt"
+
+
+def _require_project_local_secret_custody_platform() -> None:
+    if not _project_local_secret_custody_platform_supported():
+        raise ProxyCliError(
+            "project-local secret file custody on Windows is not verified; use a POSIX environment",
+            exit_code=1,
+        )
+
+
+def _assert_safe_local_secret_lock_stat(info: os.stat_result) -> None:
+    if stat.S_ISLNK(info.st_mode):
+        raise ControlArtifactError("control_artifact_write_failed")
+    if not stat.S_ISREG(info.st_mode):
+        raise ControlArtifactError("control_artifact_write_failed")
+    if info.st_nlink > 1:
+        raise ControlArtifactError("control_artifact_write_failed")
+    if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+        raise ControlArtifactError("control_artifact_write_failed")
+
+
+def _open_local_secret_write_lock_fd(lock_path: Path) -> int:
+    create_flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    if hasattr(os, "O_NOFOLLOW"):
+        create_flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(str(lock_path), create_flags, 0o600)
+    except FileExistsError:
+        fd = None
+    except OSError as exc:
+        raise ControlArtifactError("control_artifact_write_failed") from exc
+    if fd is not None:
+        try:
+            info = os.fstat(fd)
+            _assert_safe_local_secret_lock_stat(info)
+            _assert_path_inode_matches(lock_path, info)
         except Exception:
             try:
-                tmp_path.unlink()
+                os.close(fd)
             except OSError:
                 pass
             raise
+        if os.name != "nt" and hasattr(os, "fchmod"):
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError as exc:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise ControlArtifactError("control_artifact_write_failed") from exc
+        return fd
+
+    try:
+        listed = os.lstat(lock_path)
+    except OSError as exc:
+        raise ControlArtifactError("control_artifact_write_failed") from exc
+    _assert_safe_local_secret_lock_stat(listed)
+
+    open_flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        open_flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(str(lock_path), open_flags)
+    except OSError as exc:
+        raise ControlArtifactError("control_artifact_write_failed") from exc
+    try:
+        info = os.fstat(fd)
+        _assert_safe_local_secret_lock_stat(info)
+        _assert_path_inode_matches(lock_path, info)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    return fd
+
+
+def _open_local_secret_write_lock_at(home_fd: int, lock_relative: str) -> int:
+    from agentveil_mcp_proxy.control_artifacts import _resolve_control_directory_at
+
+    dir_name, _, lock_name = lock_relative.rpartition("/")
+    dir_fd, extra_fds = _resolve_control_directory_at(home_fd, dir_name)
+    try:
+        create_flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        if hasattr(os, "O_NOFOLLOW"):
+            create_flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(lock_name, create_flags, 0o600, dir_fd=dir_fd)
+        except FileExistsError:
+            fd = None
+        except OSError as exc:
+            raise ControlArtifactError("control_artifact_write_failed") from exc
+        if fd is not None:
+            try:
+                info = os.fstat(fd)
+                _assert_safe_local_secret_lock_stat(info)
+            except Exception:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
+            if os.name != "nt" and hasattr(os, "fchmod"):
+                try:
+                    os.fchmod(fd, 0o600)
+                except OSError as exc:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    raise ControlArtifactError("control_artifact_write_failed") from exc
+            return fd
+
+        try:
+            listed = os.lstat(lock_name, dir_fd=dir_fd)
+        except OSError as exc:
+            raise ControlArtifactError("control_artifact_write_failed") from exc
+        _assert_safe_local_secret_lock_stat(listed)
+
+        open_flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            open_flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(lock_name, open_flags, dir_fd=dir_fd)
+        except OSError as exc:
+            raise ControlArtifactError("control_artifact_write_failed") from exc
+        try:
+            info = os.fstat(fd)
+            _assert_safe_local_secret_lock_stat(info)
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        return fd
+    finally:
+        for extra_fd in extra_fds:
+            try:
+                os.close(extra_fd)
+            except OSError:
+                pass
+        if dir_fd != home_fd:
+            try:
+                os.close(dir_fd)
+            except OSError:
+                pass
+
+
+def _acquire_local_secret_write_lock_at(home_fd: int, lock_relative: str) -> Any:
+    try:
+        fd = _open_local_secret_write_lock_at(home_fd, lock_relative)
+    except OSError as exc:
+        raise ControlArtifactError("control_artifact_write_failed") from exc
+    fh = os.fdopen(fd, "r+", encoding="utf-8")
+    if os.name == "nt":
+        import msvcrt
+
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+    return fh
+
+
+@contextlib.contextmanager
+def _exclusive_local_secret_write_lock_at(home_fd: int, lock_relative: str):
+    fh = _acquire_local_secret_write_lock_at(home_fd, lock_relative)
+    try:
+        yield
+    finally:
+        _release_local_secret_write_lock(fh)
+
+
+def _acquire_local_secret_write_lock(target: Path) -> Any:
+    lock_path = target.with_name(f".{target.name}.write-lock")
+    try:
+        fd = _open_local_secret_write_lock_fd(lock_path)
+    except ProxyCliError as exc:
+        raise ControlArtifactError("control_artifact_write_failed") from exc
+    except OSError as exc:
+        raise ControlArtifactError("control_artifact_write_failed") from exc
+    fh = os.fdopen(fd, "r+", encoding="utf-8")
+    if os.name == "nt":
+        import msvcrt
+
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+    return fh
+
+
+def _release_local_secret_write_lock(fh: Any) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        try:
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+    else:
+        import fcntl
+
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+    try:
+        fh.close()
+    except OSError:
+        pass
+
+
+@contextlib.contextmanager
+def _exclusive_local_secret_write_lock(target: Path):
+    fh = _acquire_local_secret_write_lock(target)
+    try:
+        yield
+    finally:
+        _release_local_secret_write_lock(fh)
+
+
+def _reject_hardlinked_local_secret_target(target: Path) -> None:
+    try:
+        info = os.lstat(target)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ProxyCliError("local secret file path is unavailable") from exc
+    if info.st_nlink > 1:
+        raise ProxyCliError(_LOCAL_SECRET_FILE_PATH_NOT_ACCEPTABLE)
+
+
+def _reject_hardlinked_local_secret_target_at(home_fd: int, relative_path: str) -> None:
+    from agentveil_mcp_proxy.control_artifacts import _resolve_control_directory_at
+
+    dir_name, _, file_name = relative_path.rpartition("/")
+    dir_fd, extra_fds = _resolve_control_directory_at(home_fd, dir_name)
+    try:
+        try:
+            info = os.lstat(file_name if dir_name else relative_path, dir_fd=dir_fd)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise ProxyCliError("local secret file path is unavailable") from exc
+        if info.st_nlink > 1:
+            raise ProxyCliError(_LOCAL_SECRET_FILE_PATH_NOT_ACCEPTABLE)
+    finally:
+        for extra_fd in extra_fds:
+            try:
+                os.close(extra_fd)
+            except OSError:
+                pass
+        if dir_fd != home_fd:
+            try:
+                os.close(dir_fd)
+            except OSError:
+                pass
+
+
+def _secure_write_json(
+    path: Path,
+    data: dict[str, Any],
+    *,
+    force: bool = False,
+    project_local_secret_custody: bool = False,
+    custody_home_fd: int | None = None,
+    custody_home: Path | None = None,
+) -> None:
+    """Write JSON with owner-only file permissions and no accidental overwrite."""
+
+    if project_local_secret_custody:
+        _require_project_local_secret_custody_platform()
+    target = Path(path)
+    payload = (json.dumps(data, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    anchored = (
+        project_local_secret_custody
+        and custody_home_fd is not None
+        and custody_home is not None
+    )
+    if not anchored:
+        try:
+            ensure_control_directory(target.parent)
+        except ControlArtifactError as exc:
+            raise ProxyCliError(_CANNOT_SECURE_LOCAL_SECRET_STORAGE_DIRECTORY) from exc
+
+    exists = False
+    if anchored:
+        _assert_project_local_runtime_home_path_matches_fd(custody_home, custody_home_fd)
+        relative = _project_local_relative_path(custody_home, target)
+        from agentveil_mcp_proxy.control_artifacts import _resolve_control_directory_at
+
+        dir_name, _, file_name = relative.rpartition("/")
+        dir_fd, extra_fds = _resolve_control_directory_at(custody_home_fd, dir_name)
+        try:
+            try:
+                os.lstat(file_name if dir_name else relative, dir_fd=dir_fd)
+                exists = True
+            except FileNotFoundError:
+                exists = False
+            except OSError as exc:
+                raise ProxyCliError("local secret file path is unavailable") from exc
+        finally:
+            for extra_fd in extra_fds:
+                try:
+                    os.close(extra_fd)
+                except OSError:
+                    pass
+            if dir_fd != custody_home_fd:
+                try:
+                    os.close(dir_fd)
+                except OSError:
+                    pass
+    else:
+        try:
+            os.lstat(target)
+            exists = True
+        except FileNotFoundError:
+            exists = False
+        except OSError as exc:
+            raise ProxyCliError("local secret file path is unavailable") from exc
+
+    if exists and not force:
+        raise ProxyCliError(f"{path} already exists; pass --force to overwrite")
+
+    if anchored:
+        _assert_project_local_runtime_home_path_matches_fd(custody_home, custody_home_fd)
+        relative = _project_local_relative_path(custody_home, target)
+        _reject_hardlinked_local_secret_target_at(custody_home_fd, relative)
+        lock_relative = _local_secret_lock_relative(relative)
+        try:
+            with _exclusive_local_secret_write_lock_at(custody_home_fd, lock_relative):
+                _reject_hardlinked_local_secret_target_at(custody_home_fd, relative)
+                write_atomic_control_file_at(custody_home_fd, relative, payload)
+        except ControlArtifactError as exc:
+            raise ProxyCliError("local secret file could not be written safely") from exc
         return
 
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    with os.fdopen(os.open(path, flags, 0o600), "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2, sort_keys=True)
-        fh.write("\n")
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.chmod(path, 0o600)
-    _fsync_parent_directory(path)
+    _reject_hardlinked_local_secret_target(target)
+
+    try:
+        with _exclusive_local_secret_write_lock(target):
+            _reject_hardlinked_local_secret_target(target)
+            write_atomic_control_file(target, payload)
+    except ControlArtifactError as exc:
+        raise ProxyCliError("local secret file could not be written safely") from exc
 
 
 def _read_json(path: Path, label: str) -> dict[str, Any]:
@@ -828,6 +1476,7 @@ def init_proxy(
     plaintext: bool = False,
     err: TextIO | None = None,
     force: bool = False,
+    project_local_secret_custody: bool = False,
 ) -> InitResult:
     """Create a local proxy identity, config, and control grant."""
 
@@ -845,67 +1494,121 @@ def init_proxy(
             if path.exists():
                 raise ProxyCliError(f"{path} already exists; pass --force to overwrite")
 
-    signers = tuple(trusted_signer_dids or trusted_signers_for_base_url(base_url))
-    if not signers:
-        raise ProxyCliError(
-            "no trusted signer DID configured; pass --trusted-signer-did for this AVP base URL",
+    custody_home_fd: int | None = None
+    custody_project_root_fd: int | None = None
+    try:
+        if project_local_secret_custody:
+            _require_project_local_secret_custody_platform()
+            project_root = _selected_project_root_for_home(paths.home)
+            custody_project_root_fd = _open_owner_controlled_directory_fd(project_root)
+            try:
+                custody_home_fd = _open_project_local_runtime_home(
+                    paths.home,
+                    project_root_fd=custody_project_root_fd,
+                )
+            except Exception:
+                if custody_project_root_fd is not None:
+                    try:
+                        os.close(custody_project_root_fd)
+                    except OSError:
+                        pass
+                    custody_project_root_fd = None
+                raise
+            _prepare_project_local_secret_custody(
+                home=paths.home,
+                home_fd=custody_home_fd,
+                project_root=project_root,
+                project_root_fd=custody_project_root_fd,
+            )
+
+        signers = tuple(trusted_signer_dids or trusted_signers_for_base_url(base_url))
+        if not signers:
+            raise ProxyCliError(
+                "no trusted signer DID configured; pass --trusted-signer-did for this AVP base URL",
+            )
+
+        identity_passphrase = _resolve_new_identity_passphrase(
+            passphrase=passphrase,
+            passphrase_file=passphrase_file,
+            plaintext=plaintext,
+        )
+        if plaintext:
+            warning_out = err or sys.stderr
+            print(PLAINTEXT_WARNING, file=warning_out)
+
+        if custody_home_fd is not None:
+            _assert_project_local_runtime_home_path_matches_fd(paths.home, custody_home_fd)
+
+        if custody_home_fd is not None:
+            _mkdir_private_at(custody_home_fd, "agents")
+            _mkdir_private_at(custody_home_fd, "mcp-proxy")
+        else:
+            _mkdir_private(paths.agents_dir)
+            _mkdir_private(paths.proxy_dir)
+
+        if custody_home_fd is not None:
+            _assert_project_local_runtime_home_path_matches_fd(paths.home, custody_home_fd)
+
+        identity_payload, agent = _create_identity_payload(
+            base_url=base_url,
+            agent_name=agent_name,
+            passphrase=identity_passphrase,
+            plaintext=plaintext,
+        )
+        control_grant = agent.issue_delegation_receipt(
+            agent_did=agent.did,
+            allowed_categories=list(categories),
+            valid_for=timedelta(days=ttl_days),
+            purpose="Local MCP proxy control grant",
+        )
+        verified_grant = verify_delegation(control_grant)
+        expires_at = str(verified_grant["valid_until"])
+
+        try:
+            preset = resolve_role_preset(role_preset)
+        except RolePresetError as exc:
+            raise ProxyCliError(str(exc), exit_code=2) from exc
+
+        config_payload = _build_config_payload(
+            base_url=base_url,
+            agent_name=agent_name,
+            trusted_signer_dids=signers,
+            policy_pack=policy_pack,
+            role_preset=preset.name,
+            setup_profile=setup_profile,
+            downstream_config=downstream_config,
+            identity_passphrase_file=passphrase_file if not plaintext else None,
         )
 
-    identity_passphrase = _resolve_new_identity_passphrase(
-        passphrase=passphrase,
-        passphrase_file=passphrase_file,
-        plaintext=plaintext,
-    )
-    if plaintext:
-        warning_out = err or sys.stderr
-        print(PLAINTEXT_WARNING, file=warning_out)
+        write_kwargs: dict[str, Any] = {}
+        if project_local_secret_custody:
+            write_kwargs = {
+                "project_local_secret_custody": True,
+                "custody_home_fd": custody_home_fd,
+                "custody_home": paths.home,
+            }
+        _secure_write_json(identity_path, identity_payload, force=force, **write_kwargs)
+        _secure_write_json(grant_path, control_grant, force=force, **write_kwargs)
+        _secure_write_json(paths.config_path, config_payload, force=force, **write_kwargs)
 
-    _mkdir_private(paths.agents_dir)
-    _mkdir_private(paths.proxy_dir)
+        if custody_home_fd is not None:
+            _assert_project_local_runtime_home_path_matches_fd(paths.home, custody_home_fd)
 
-    identity_payload, agent = _create_identity_payload(
-        base_url=base_url,
-        agent_name=agent_name,
-        passphrase=identity_passphrase,
-        plaintext=plaintext,
-    )
-    control_grant = agent.issue_delegation_receipt(
-        agent_did=agent.did,
-        allowed_categories=list(categories),
-        valid_for=timedelta(days=ttl_days),
-        purpose="Local MCP proxy control grant",
-    )
-    verified_grant = verify_delegation(control_grant)
-    expires_at = str(verified_grant["valid_until"])
-
-    try:
-        preset = resolve_role_preset(role_preset)
-    except RolePresetError as exc:
-        raise ProxyCliError(str(exc), exit_code=2) from exc
-
-    config_payload = _build_config_payload(
-        base_url=base_url,
-        agent_name=agent_name,
-        trusted_signer_dids=signers,
-        policy_pack=policy_pack,
-        role_preset=preset.name,
-        setup_profile=setup_profile,
-        downstream_config=downstream_config,
-        identity_passphrase_file=passphrase_file if not plaintext else None,
-    )
-
-    _secure_write_json(identity_path, identity_payload, force=force)
-    _secure_write_json(grant_path, control_grant, force=force)
-    _secure_write_json(paths.config_path, config_payload, force=force)
-
-    return InitResult(
-        agent_name=agent_name,
-        agent_did=agent.did,
-        identity_path=identity_path,
-        config_path=paths.config_path,
-        control_grant_path=grant_path,
-        control_grant_expires_at=expires_at,
-    )
+        return InitResult(
+            agent_name=agent_name,
+            agent_did=agent.did,
+            identity_path=identity_path,
+            config_path=paths.config_path,
+            control_grant_path=grant_path,
+            control_grant_expires_at=expires_at,
+        )
+    finally:
+        for pinned_fd in (custody_home_fd, custody_project_root_fd):
+            if pinned_fd is not None:
+                try:
+                    os.close(pinned_fd)
+                except OSError:
+                    pass
 
 
 def _parse_env_assignment(value: str) -> tuple[str, str]:
@@ -991,6 +1694,10 @@ def configure_downstream(
     )
     config_payload["downstream"] = downstream_payload
     downstream = _validate_downstream_payload(config_payload)
+    _prepare_selected_proxy_config_directory_for_publication(
+        home=home,
+        config_path=paths.config_path,
+    )
     _secure_write_json(paths.config_path, config_payload, force=True)
     downstream_info = _downstream_info(ProxyConfig.from_dict(config_payload))
     if output_json:
@@ -1713,10 +2420,10 @@ def _register_guidance_passphrase_file(home: Path) -> Path | None:
 
 
 def _selected_project_root_for_home(home: Path) -> Path:
-    home_resolved = home.expanduser().resolve()
-    if home_resolved.name in {".agentveil", ".avp"}:
-        return home_resolved.parent
-    return home_resolved
+    home_lex = Path(home).expanduser()
+    if home_lex.name in {".agentveil", ".avp"}:
+        return home_lex.parent
+    return home_lex.resolve()
 
 
 def _register_command_home_token(home: Path, *, json_safe: bool) -> str:
@@ -5887,13 +6594,19 @@ def run_setup_cursor_cli(
     config_path = cursor_setup.proxy_config_path(home)
     resolved_passphrase = passphrase_file or cursor_setup.passphrase_path(home)
 
+    _reject_unsafe_project_local_connector_paths(project_root=target, home=home)
+
     quiet = io.StringIO()
     proxy_initialized = False
     try:
-        cursor_setup.prepare_proxy_home(target, force=force)
-        if force or not config_path.exists():
+        needs_proxy_init = force or not config_path.exists()
+        cursor_setup.prepare_proxy_home(
+            target,
+            force=force,
+            initialize_product_route=needs_proxy_init,
+        )
+        if needs_proxy_init:
             prof = cursor_setup.profile_root(home)
-            initialize_product_route_profile(prof)
             downstream = build_product_route_downstream_config(prof)
             init_proxy(
                 home=home,
@@ -5905,6 +6618,7 @@ def run_setup_cursor_cli(
                 passphrase_file=resolved_passphrase,
                 force=force,
                 err=quiet,
+                project_local_secret_custody=True,
             )
             proxy_initialized = True
     except ProxyCliError:
@@ -6290,6 +7004,7 @@ def _launch_init_proxy(
         plaintext=(passphrase_file is None),
         passphrase_file=passphrase_file,
         err=quiet,
+        project_local_secret_custody=True,
     )
 
 
@@ -6545,7 +7260,7 @@ def _resolve_setup_proxy_command() -> str | None:
     return None
 
 
-def _configure_claude_setup_approval_ui(config_path: Path) -> None:
+def _configure_claude_setup_approval_ui(config_path: Path, *, home: Path) -> None:
     """Disable browser auto-open for Claude setup-managed approvals.
 
     Claude Code already displays the exact pending approval URL in chat. Opening
@@ -6558,15 +7273,22 @@ def _configure_claude_setup_approval_ui(config_path: Path) -> None:
         approval = {}
         config_payload["approval"] = approval
     approval["ui_open_mode"] = ApprovalUiOpenMode.TERMINAL.value
+    _prepare_selected_proxy_config_directory_for_publication(
+        home=home,
+        config_path=config_path,
+    )
     _secure_write_json(config_path, config_payload, force=True)
 
 
 def _configure_interactive_connector_defaults(config_path: Path) -> None:
     """Enable bounded approval wait-mode for interactive MCP client setups."""
 
-    from agentveil_mcp_proxy.agent_launcher import ensure_interactive_connector_defaults
+    from agentveil_mcp_proxy.agent_launcher import AgentLauncherError, ensure_interactive_connector_defaults
 
-    ensure_interactive_connector_defaults(config_path)
+    try:
+        ensure_interactive_connector_defaults(config_path)
+    except AgentLauncherError as exc:
+        raise ProxyCliError(str(exc), exit_code=exc.exit_code) from exc
 
 
 def run_setup_claude_code_cli(
@@ -6611,6 +7333,8 @@ def run_setup_claude_code_cli(
             print(message)
         return 0
 
+    _reject_unsafe_project_local_connector_paths(project_root=target, home=home)
+
     quiet = io.StringIO()
     # 1. Proxy quickstart route (idempotent unless --force).
     proxy_present = config_path.exists()
@@ -6627,12 +7351,13 @@ def run_setup_claude_code_cli(
                 passphrase_file=passphrase_file,
                 force=force,
                 err=quiet,
+                project_local_secret_custody=True,
             )
         except ProxyCliError:
             raise
         proxy_initialized = True
     if config_path.exists():
-        _configure_claude_setup_approval_ui(config_path)
+        _configure_claude_setup_approval_ui(config_path, home=home)
         _configure_interactive_connector_defaults(config_path)
 
     # 2. Claude Code MCP route (.mcp.json) — reuse the connect command. Resolve
@@ -6806,6 +7531,8 @@ def run_setup_codex_cli(
     except codex_setup.CodexSetupError as exc:
         raise ProxyCliError(str(exc), exit_code=2) from exc
 
+    _reject_unsafe_project_local_connector_paths(project_root=target, home=home)
+
     quiet = io.StringIO()
     proxy_present = config_path.exists()
     proxy_initialized = False
@@ -6821,6 +7548,7 @@ def run_setup_codex_cli(
                 passphrase_file=passphrase_file,
                 force=force,
                 err=quiet,
+                project_local_secret_custody=True,
             )
         except ProxyCliError:
             raise
@@ -7113,6 +7841,8 @@ def run_setup_gemini_cli(
     except gemini_setup.GeminiSetupError as exc:
         raise ProxyCliError(str(exc), exit_code=2) from exc
 
+    _reject_unsafe_project_local_connector_paths(project_root=target, home=home)
+
     quiet = io.StringIO()
     proxy_present = config_path.exists()
     proxy_initialized = False
@@ -7128,6 +7858,7 @@ def run_setup_gemini_cli(
                 passphrase_file=passphrase_file,
                 force=force,
                 err=quiet,
+                project_local_secret_custody=True,
             )
         except ProxyCliError:
             raise

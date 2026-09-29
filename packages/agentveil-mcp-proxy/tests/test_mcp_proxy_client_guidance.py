@@ -1129,6 +1129,22 @@ def test_owned_git_exclude_fail_closed_on_unsafe_exclude_file(tmp_path: Path) ->
     assert outside.read_text(encoding="utf-8") == "outside\n"
 
 
+def test_owned_git_exclude_covers_project_local_secret_runtime_paths(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    added = add_agentveil_owned_git_excludes(
+        project,
+        (".avp/agents", ".avp/mcp-proxy", ".agentveil/passphrase"),
+    )
+    assert added == (".agentveil/passphrase", ".avp/agents", ".avp/mcp-proxy")
+    ignore = subprocess.run(
+        ["git", "-C", str(project), "check-ignore", "-q", "--", ".avp/agents/proxy.json"],
+        check=False,
+    )
+    assert ignore.returncode == 0
+
+
 def test_owned_git_exclude_non_git_project_is_noop(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()

@@ -11,6 +11,7 @@ import os
 import secrets
 import shlex
 import stat
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -1396,7 +1397,13 @@ _OWNED_GIT_EXCLUDE_EXACT: frozenset[str] = frozenset({
     ".cursor/agentveil/evidence.jsonl",
     ".gemini/settings.json",
     ".gemini/agentveil/evidence.jsonl",
+    ".avp/agents",
+    ".avp/mcp-proxy",
+    ".agentveil/agents",
+    ".agentveil/mcp-proxy",
+    ".agentveil/passphrase",
 })
+_AGENTVEIL_PROJECT_RUNTIME_DIRNAMES = frozenset({".avp", ".agentveil"})
 _BROAD_GIT_EXCLUDE_FORBIDDEN: frozenset[str] = frozenset({
     "*",
     ".codex/",
@@ -1448,17 +1455,171 @@ def _is_safe_directory(info: os.stat_result) -> bool:
     return not stat.S_ISLNK(info.st_mode) and stat.S_ISDIR(info.st_mode)
 
 
+def _git_not_a_repository_output(proc: subprocess.CompletedProcess[str]) -> bool:
+    combined = f"{proc.stdout or ''}\n{proc.stderr or ''}".lower()
+    return "not a git repository" in combined
+
+
+def _git_common_directory(project_root: Path) -> Path | None:
+    root = Path(project_root).resolve()
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ProjectSecretGitCustodyError(
+            "Git project checkout is unavailable for secret-path verification",
+            code="project_secret_git_unavailable",
+        ) from exc
+    if proc.returncode != 0:
+        if _git_not_a_repository_output(proc):
+            return None
+        raise ProjectSecretGitCustodyError(
+            "Git project checkout is unavailable for secret-path verification",
+            code="project_secret_git_unavailable",
+        )
+    raw = proc.stdout.strip()
+    if not raw:
+        raise ProjectSecretGitCustodyError(
+            "Git project checkout is unavailable for secret-path verification",
+            code="project_secret_git_unavailable",
+        )
+    common = Path(raw)
+    if not common.is_absolute():
+        common = (root / common).resolve()
+    info = _lstat_or_none(common)
+    if info is None or not _is_safe_directory(info):
+        raise ProjectSecretGitCustodyError(
+            # Boundary: bounded Git metadata path rejection; not a product-wide safety guarantee.
+            "Git metadata directory is not safe for secret-path verification",
+            code="project_secret_git_unavailable",
+        )
+    return common
+
+
 def _exclude_path_for_project(project_root: Path) -> Path | None:
     root = Path(project_root)
-    git_dir = root / ".git"
-    git_info = _lstat_or_none(git_dir)
-    if git_info is None or not _is_safe_directory(git_info):
-        return None
-    info_dir = git_dir / "info"
+    git_common = _git_common_directory(root)
+    if git_common is None:
+        git_dir = root / ".git"
+        git_info = _lstat_or_none(git_dir)
+        if git_info is None or not _is_safe_directory(git_info):
+            return None
+        git_common = git_dir
+    info_dir = git_common / "info"
     info_stat = _lstat_or_none(info_dir)
     if info_stat is not None and not _is_safe_directory(info_stat):
         return None
     return info_dir / "exclude"
+
+
+class ProjectSecretGitCustodyError(RuntimeError):
+    """Bounded failure when project-local secret paths cannot be Git-excluded safely."""
+
+    def __init__(self, message: str, *, code: str = "project_secret_git_custody_failed"):
+        self.code = str(code)
+        self.message = str(message)
+        super().__init__(self.message)
+
+
+def agentveil_runtime_secret_exclude_relpaths(runtime_home_name: str) -> tuple[str, ...]:
+    if runtime_home_name not in _AGENTVEIL_PROJECT_RUNTIME_DIRNAMES:
+        return ()
+    paths = [f"{runtime_home_name}/agents", f"{runtime_home_name}/mcp-proxy"]
+    if runtime_home_name == ".agentveil":
+        paths.append(f"{runtime_home_name}/passphrase")
+    return tuple(paths)
+
+
+def _git_tracked_secret_relpaths(project_root: Path, relpaths: tuple[str, ...]) -> tuple[str, ...]:
+    if not relpaths:
+        return ()
+    root = Path(project_root).resolve()
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "--", *relpaths],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise ProjectSecretGitCustodyError(
+            "Git project checkout is unavailable for secret-path verification",
+            code="project_secret_git_unavailable",
+        )
+    if proc.returncode != 0:
+        raise ProjectSecretGitCustodyError(
+            "Git tracked-path query failed for AgentVeil secret runtime paths",
+            code="project_secret_git_tracked_query_failed",
+        )
+    return tuple(line.strip() for line in proc.stdout.splitlines() if line.strip())
+
+
+def _git_ignores_relpath(project_root: Path, relpath: str) -> bool:
+    root = Path(project_root).resolve()
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "check-ignore", "-q", "--", relpath],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ProjectSecretGitCustodyError(
+            "Git exclusion verification is unavailable for AgentVeil secret runtime paths",
+            code="project_secret_git_unavailable",
+        ) from exc
+    if proc.returncode not in {0, 1}:
+        raise ProjectSecretGitCustodyError(
+            "Git exclusion verification failed for AgentVeil secret runtime paths",
+            code="project_secret_git_exclude_unverified",
+        )
+    return proc.returncode == 0
+
+
+def prepare_project_local_secret_git_custody(
+    project_root: Path,
+    runtime_home: Path,
+) -> None:
+    """Ensure AgentVeil secret runtime paths are Git-excluded before first secret write."""
+
+    runtime_lex = Path(runtime_home).expanduser()
+    if runtime_lex.name not in _AGENTVEIL_PROJECT_RUNTIME_DIRNAMES:
+        return
+    project_lex = Path(project_root).expanduser()
+    try:
+        runtime_lex.relative_to(project_lex)
+    except ValueError:
+        return
+    project = project_lex.resolve()
+    if _git_common_directory(project) is None:
+        return
+    relpaths = agentveil_runtime_secret_exclude_relpaths(runtime_lex.name)
+    tracked = _git_tracked_secret_relpaths(project, relpaths)
+    if tracked:
+        raise ProjectSecretGitCustodyError(
+            "AgentVeil secret paths are already tracked by Git; remove them from the "
+            "index manually before setup",
+            code="project_secret_git_tracked",
+        )
+    added = add_agentveil_owned_git_excludes(project, relpaths)
+    if added != relpaths:
+        raise ProjectSecretGitCustodyError(
+            "Could not establish Git exclusion for AgentVeil secret runtime paths",
+            code="project_secret_git_exclude_failed",
+        )
+    probe = f"{runtime_lex.name}/agents/.agentveil-git-exclude-probe"
+    if not _git_ignores_relpath(project, probe):
+        raise ProjectSecretGitCustodyError(
+            "Git exclusion for AgentVeil secret runtime paths could not be verified",
+            code="project_secret_git_exclude_unverified",
+        )
 
 
 def _parse_owned_git_exclude(text: str) -> tuple[list[str], frozenset[str]] | None:
@@ -2033,7 +2194,10 @@ __all__ = [
     "NativeActionIntent",
     "NativeControlledGuidanceEnvelope",
     "NativeRedirectOrigin",
+    "ProjectSecretGitCustodyError",
     "add_agentveil_owned_git_excludes",
+    "agentveil_runtime_secret_exclude_relpaths",
+    "prepare_project_local_secret_git_custody",
     "assert_client_guidance_payload_is_privacy_safe",
     "build_native_controlled_guidance_envelope",
     "build_client_guidance_payload",

@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1008,7 +1011,8 @@ def test_launch_hermes_cli_patches_existing_config_wait_for_decision(tmp_path, m
 
     home = project_avp_home(project)
     config_path = home / "mcp-proxy" / "config.json"
-    config_path.parent.mkdir(parents=True)
+    home.mkdir(mode=0o700)
+    config_path.parent.mkdir(mode=0o700)
     config_path.write_text(
         json.dumps(
             {
@@ -1504,3 +1508,330 @@ def test_classify_approval_wait_mode_read_only(tmp_path):
     assert classify_approval_wait_mode(home, HERMES_CLI_PROFILE) == "enabled"
     ensure_interactive_connector_defaults(config_path)
     assert config_path.read_text(encoding="utf-8") != before
+
+
+def _hermes_launch_stubs(monkeypatch, tmp_path, *, operator_home_name: str = "host-home"):
+    host_home = tmp_path / operator_home_name
+    host_home.mkdir()
+    operator_hermes = tmp_path / "bin" / "hermes"
+    operator_hermes.parent.mkdir(parents=True)
+    operator_hermes.write_text("#!/bin/sh\n", encoding="utf-8")
+    operator_hermes.chmod(0o755)
+    monkeypatch.setenv("HOME", str(host_home))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-hermes-legacy-proxy")
+
+    def fake_which(name):
+        if name == "hermes":
+            return str(operator_hermes)
+        if name == "agentveil-mcp-proxy":
+            return "/usr/local/bin/agentveil-mcp-proxy"
+        return None
+
+    monkeypatch.setattr("agentveil_mcp_proxy.agent_launcher.shutil.which", fake_which)
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.agent_launcher.ensure_approval_center_running",
+        lambda **_kwargs: (
+            SimpleNamespace(state="running", pid=111, port=8765),
+            True,
+            "approval center started",
+        ),
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.agent_launcher.subprocess.Popen",
+        lambda *_args, **_kwargs: SimpleNamespace(pid=7777, wait=lambda: 0),
+    )
+    return host_home
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX legacy mcp-proxy custody")
+def test_launch_managed_process_tightens_owner_controlled_0755_mcp_proxy_for_hermes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    _hermes_launch_stubs(monkeypatch, tmp_path)
+    home = project_avp_home(project)
+    config_dir = home / "mcp-proxy"
+    config_dir.mkdir(parents=True)
+    os.chmod(config_dir, 0o755)
+    before = json.dumps({"approval": {"wait_for_decision": False}, "marker": "keep-bytes"}) + "\n"
+    config_path = config_dir / "config.json"
+    config_path.write_text(before, encoding="utf-8")
+
+    launch_managed_process(
+        project_dir=project,
+        profile_id="hermes-cli",
+        child_command=["hermes", "chat", "-q", "hello"],
+        proxy_command="agentveil-mcp-proxy",
+    )
+
+    assert stat.S_IMODE(config_dir.stat().st_mode) == 0o700
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    assert payload["approval"]["wait_for_decision"] is True
+    assert payload["marker"] == "keep-bytes"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX legacy mcp-proxy custody")
+def test_launch_managed_process_rejects_symlinked_mcp_proxy_without_chmod(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    _hermes_launch_stubs(monkeypatch, tmp_path)
+    home = project_avp_home(project)
+    home.mkdir(parents=True, exist_ok=True)
+    external = tmp_path / "external-mcp-proxy"
+    external.mkdir(mode=0o755)
+    before_mode = stat.S_IMODE(external.stat().st_mode)
+    (external / "config.json").write_text("{}\n", encoding="utf-8")
+    os.symlink(external, home / "mcp-proxy", target_is_directory=True)
+
+    with pytest.raises(AgentLauncherError, match="safely"):
+        launch_managed_process(
+            project_dir=project,
+            profile_id="hermes-cli",
+            child_command=["hermes", "chat", "-q", "hello"],
+            proxy_command="agentveil-mcp-proxy",
+        )
+
+    assert stat.S_IMODE(external.stat().st_mode) == before_mode
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX legacy mcp-proxy custody")
+def test_launch_managed_process_rejects_group_writable_legacy_mcp_proxy_without_chmod(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    _hermes_launch_stubs(monkeypatch, tmp_path)
+    home = project_avp_home(project)
+    config_dir = home / "mcp-proxy"
+    config_dir.mkdir(parents=True)
+    os.chmod(config_dir, 0o775)
+    before_mode = stat.S_IMODE(config_dir.stat().st_mode)
+    (config_dir / "config.json").write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(AgentLauncherError, match="safely"):
+        launch_managed_process(
+            project_dir=project,
+            profile_id="hermes-cli",
+            child_command=["hermes", "chat", "-q", "hello"],
+            proxy_command="agentveil-mcp-proxy",
+        )
+
+    assert stat.S_IMODE(config_dir.stat().st_mode) == before_mode
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX legacy mcp-proxy custody")
+def test_write_proxy_config_json_leaves_0700_mcp_proxy_unchanged(tmp_path: Path) -> None:
+    from agentveil_mcp_proxy import agent_launcher as launcher_module
+
+    config_dir = tmp_path / "mcp-proxy"
+    config_dir.mkdir(mode=0o700)
+    config_path = config_dir / "config.json"
+    launcher_module._write_proxy_config_json(
+        config_path,
+        {"approval": {"wait_for_decision": True}},
+    )
+    assert stat.S_IMODE(config_dir.stat().st_mode) == 0o700
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX owner-only custody")
+def test_write_proxy_config_json_is_owner_only_from_first_byte_at_umask_022(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from agentveil_mcp_proxy import agent_launcher as launcher_module
+
+    config_path = tmp_path / "mcp-proxy" / "config.json"
+    modes_at_write: list[int] = []
+    real_write = os.write
+
+    def tracked_write(fd, data):
+        modes_at_write.append(stat.S_IMODE(os.fstat(fd).st_mode))
+        return real_write(fd, data)
+
+    previous_umask = os.umask(0o022)
+    try:
+        monkeypatch.setattr(os, "write", tracked_write)
+        launcher_module._write_proxy_config_json(config_path, {"approval": {}})
+    finally:
+        os.umask(previous_umask)
+
+    assert config_path.is_file()
+    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+    assert modes_at_write
+    assert modes_at_write[0] == 0o600
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink custody")
+def test_write_proxy_config_json_legacy_predictable_temp_symlink_does_not_clobber_victim(
+    tmp_path: Path,
+) -> None:
+    from agentveil_mcp_proxy import agent_launcher as launcher_module
+
+    config_path = tmp_path / "config.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_tmp = config_path.with_name(".config.json.tmp")
+    victim = tmp_path / "victim-config.json"
+    victim.write_text('{"victim": true}\n', encoding="utf-8")
+    legacy_tmp.symlink_to(victim)
+
+    launcher_module._write_proxy_config_json(config_path, {"approval": {"wait_for_decision": True}})
+
+    assert victim.read_text(encoding="utf-8") == '{"victim": true}\n'
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    assert payload["approval"]["wait_for_decision"] is True
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink custody")
+def test_write_proxy_config_json_failure_preserves_existing_bytes(tmp_path: Path) -> None:
+    from agentveil_mcp_proxy import agent_launcher as launcher_module
+
+    config_path = tmp_path / "config.json"
+    victim = tmp_path / "victim-config.json"
+    before = b'{"before": true}\n'
+    victim.write_bytes(before)
+    config_path.symlink_to(victim)
+
+    with pytest.raises(AgentLauncherError, match="safely"):
+        launcher_module._write_proxy_config_json(
+            config_path,
+            {"approval": {"wait_for_decision": True}},
+        )
+
+    assert victim.read_bytes() == before
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX hardlink custody")
+def test_write_proxy_config_json_rejects_hardlinked_target_at_umask_022(
+    tmp_path: Path,
+) -> None:
+    from agentveil_mcp_proxy import agent_launcher as launcher_module
+
+    config_path = tmp_path / "mcp-proxy" / "config.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    before = b'{"approval": {"wait_for_decision": false}, "marker": "keep"}\n'
+    config_path.write_bytes(before)
+    peer = config_path.parent / "config-peer.json"
+    try:
+        os.link(config_path, peer)
+    except OSError:
+        pytest.skip("hardlinks unavailable")
+
+    previous_umask = os.umask(0o022)
+    try:
+        with pytest.raises(AgentLauncherError, match="safely"):
+            launcher_module._write_proxy_config_json(
+                config_path,
+                {"approval": {"wait_for_decision": True}},
+            )
+    finally:
+        os.umask(previous_umask)
+
+    assert config_path.read_bytes() == before
+    assert peer.read_bytes() == before
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX hardlink custody")
+def test_ensure_interactive_connector_defaults_rejects_hardlinked_wait_enabled_config(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "mcp-proxy" / "config.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    before = json.dumps({"approval": {"wait_for_decision": True}, "marker": "keep"}) + "\n"
+    config_path.write_text(before, encoding="utf-8")
+    peer = config_path.parent / "config-peer.json"
+    try:
+        os.link(config_path, peer)
+    except OSError:
+        pytest.skip("hardlinks unavailable")
+
+    with pytest.raises(AgentLauncherError, match="safely"):
+        ensure_interactive_connector_defaults(config_path)
+
+    assert config_path.read_text(encoding="utf-8") == before
+    assert peer.read_text(encoding="utf-8") == before
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX hardlink custody")
+def test_launch_managed_process_rejects_hardlinked_populated_config_wait_enabled(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    home = project_avp_home(project)
+    config_dir = home / "mcp-proxy"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(config_dir, 0o700)
+    config_path = config_dir / "config.json"
+    before = json.dumps({"approval": {"wait_for_decision": True}}) + "\n"
+    config_path.write_text(before, encoding="utf-8")
+    os.chmod(config_path, 0o600)
+    peer = config_dir / "config-peer.json"
+    try:
+        os.link(config_path, peer)
+    except OSError:
+        pytest.skip("hardlinks unavailable")
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.agent_launcher.ensure_approval_center_running",
+        lambda **_kwargs: (
+            SimpleNamespace(state="running", pid=1, port=8765),
+            True,
+            "ok",
+        ),
+    )
+
+    with pytest.raises(AgentLauncherError, match="safely"):
+        launch_managed_process(
+            project_dir=project,
+            profile_id="generic-process",
+            child_command=["sleep", "1"],
+            proxy_command="agentveil-mcp-proxy",
+        )
+
+    assert config_path.read_text(encoding="utf-8") == before
+    assert peer.read_text(encoding="utf-8") == before
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink custody")
+def test_launch_managed_process_rejects_symlinked_populated_runtime_home(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    external = tmp_path / "external-home"
+    external.mkdir(mode=0o700)
+    config_dir = external / "mcp-proxy"
+    config_dir.mkdir()
+    (config_dir / "config.json").write_text("{}\n", encoding="utf-8")
+    os.symlink(external, project / ".avp", target_is_directory=True)
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.agent_launcher.ensure_approval_center_running",
+        lambda **_kwargs: (
+            SimpleNamespace(state="running", pid=1, port=8765),
+            True,
+            "ok",
+        ),
+    )
+
+    # Negative test: expects bounded connector path rejection substring in launcher error.
+    with pytest.raises(AgentLauncherError, match="safe"):
+        launch_managed_process(
+            project_dir=project,
+            profile_id="generic-process",
+            child_command=["sleep", "1"],
+            proxy_command="agentveil-mcp-proxy",
+        )

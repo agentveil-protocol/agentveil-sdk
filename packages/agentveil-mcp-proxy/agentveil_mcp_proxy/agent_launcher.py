@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import signal
 import subprocess
 import sys
@@ -855,14 +856,138 @@ def write_runtime_route_config(
     os.replace(tmp_path, path)
 
 
+def _validate_proxy_config_publication_target(path: Path) -> None:
+    from agentveil_mcp_proxy.control_artifacts import (
+        ControlArtifactError,
+        _reject_unsafe_regular_target,
+    )
+
+    try:
+        _reject_unsafe_regular_target(path, allow_missing=False)
+    except ControlArtifactError as exc:
+        raise AgentLauncherError("proxy config could not be written safely") from exc
+
+
+def _proxy_config_path_inode(path: Path) -> tuple[int, int]:
+    try:
+        info = os.lstat(path)
+    except OSError as exc:
+        from agentveil_mcp_proxy.control_artifacts import ControlArtifactError
+
+        raise ControlArtifactError("control_directory_invalid") from exc
+    return (info.st_dev, info.st_ino)
+
+
+def _assert_proxy_config_path_inode_matches(path: Path, info: os.stat_result) -> None:
+    from agentveil_mcp_proxy.control_artifacts import ControlArtifactError
+
+    if _proxy_config_path_inode(path) != (info.st_dev, info.st_ino):
+        raise ControlArtifactError("control_directory_invalid")
+
+
+def _prepare_project_local_mcp_proxy_directory_for_publication(proxy_dir: Path) -> None:
+    """Tighten owner-controlled legacy ``mcp-proxy`` (0755) before config publication.
+
+    Project-local connector launches may inherit a pre-hardening ``mcp-proxy`` directory.
+    This path is separate from ``ensure_control_directory`` and does not chmod arbitrary
+    parents, symlinks, wrong-owner paths, or group/world-writable directories.
+    """
+
+    from agentveil_mcp_proxy.control_artifacts import ControlArtifactError
+
+    if os.name == "nt":
+        return
+
+    target = Path(proxy_dir).expanduser()
+    if target.name != "mcp-proxy":
+        return
+
+    try:
+        entry = os.lstat(target)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ControlArtifactError("control_directory_invalid") from exc
+
+    if stat.S_ISLNK(entry.st_mode) or not stat.S_ISDIR(entry.st_mode):
+        raise ControlArtifactError("control_directory_invalid")
+    if hasattr(os, "geteuid") and entry.st_uid != os.geteuid():
+        raise ControlArtifactError("control_directory_invalid")
+
+    mode = stat.S_IMODE(entry.st_mode)
+    if mode == 0o700:
+        return
+    if (mode & (stat.S_IWGRP | stat.S_IWOTH)) != 0:
+        raise ControlArtifactError("control_directory_invalid")
+    if mode != 0o755:
+        raise ControlArtifactError("control_directory_invalid")
+
+    pinned = (entry.st_dev, entry.st_ino)
+    home = target.parent
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+
+    home_fd: int | None = None
+    proxy_fd: int | None = None
+    try:
+        try:
+            home_fd = os.open(str(home), flags)
+        except OSError as exc:
+            raise ControlArtifactError("control_directory_invalid") from exc
+
+        home_info = os.fstat(home_fd)
+        if stat.S_ISLNK(home_info.st_mode) or not stat.S_ISDIR(home_info.st_mode):
+            raise ControlArtifactError("control_directory_invalid")
+        if hasattr(os, "geteuid") and home_info.st_uid != os.geteuid():
+            raise ControlArtifactError("control_directory_invalid")
+        _assert_proxy_config_path_inode_matches(home, home_info)
+
+        try:
+            proxy_fd = os.open("mcp-proxy", flags, dir_fd=home_fd)
+        except OSError as exc:
+            raise ControlArtifactError("control_directory_invalid") from exc
+
+        proxy_info = os.fstat(proxy_fd)
+        if stat.S_ISLNK(proxy_info.st_mode) or not stat.S_ISDIR(proxy_info.st_mode):
+            raise ControlArtifactError("control_directory_invalid")
+        if hasattr(os, "geteuid") and proxy_info.st_uid != os.geteuid():
+            raise ControlArtifactError("control_directory_invalid")
+        if (proxy_info.st_dev, proxy_info.st_ino) != pinned:
+            raise ControlArtifactError("control_directory_invalid")
+
+        if not hasattr(os, "fchmod"):
+            raise ControlArtifactError("control_directory_invalid")
+        try:
+            os.fchmod(proxy_fd, 0o700)
+        except OSError as exc:
+            raise ControlArtifactError("control_directory_invalid") from exc
+        proxy_info = os.fstat(proxy_fd)
+        if stat.S_IMODE(proxy_info.st_mode) != 0o700:
+            raise ControlArtifactError("control_directory_invalid")
+        _assert_proxy_config_path_inode_matches(target, proxy_info)
+    finally:
+        if proxy_fd is not None:
+            try:
+                os.close(proxy_fd)
+            except OSError:
+                pass
+        if home_fd is not None:
+            try:
+                os.close(home_fd)
+            except OSError:
+                pass
+
+
 def _write_proxy_config_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.tmp")
-    with open(tmp_path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    os.chmod(tmp_path, 0o600)
-    os.replace(tmp_path, path)
+    from agentveil_mcp_proxy.control_artifacts import ControlArtifactError, write_atomic_control_file
+
+    body = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    try:
+        _prepare_project_local_mcp_proxy_directory_for_publication(path.parent)
+        write_atomic_control_file(path, body)
+    except ControlArtifactError as exc:
+        raise AgentLauncherError("proxy config could not be written safely") from exc
 
 
 def ensure_interactive_connector_defaults(config_path: Path) -> None:
@@ -870,6 +995,7 @@ def ensure_interactive_connector_defaults(config_path: Path) -> None:
 
     if not config_path.is_file():
         return
+    _validate_proxy_config_publication_target(config_path)
     try:
         config_payload = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
@@ -951,6 +1077,13 @@ def launch_managed_process(
     config_path = proxy_dir(home) / "config.json"
     proxy_initialized = False
 
+    from agentveil_mcp_proxy.cli import ProxyCliError, _reject_unsafe_project_local_connector_paths
+
+    try:
+        _reject_unsafe_project_local_connector_paths(project_root=target, home=home)
+    except ProxyCliError as exc:
+        raise AgentLauncherError(str(exc), exit_code=1) from exc
+
     resolved_proxy_command = resolve_proxy_command(proxy_command)
     proxy_command_display = _proxy_command_display(resolved_proxy_command)
     run_args = build_run_args(home=home, config_path=config_path, passphrase_file=passphrase_file)
@@ -971,6 +1104,8 @@ def launch_managed_process(
         proxy_initialized = True
         if not config_path.exists():
             raise AgentLauncherError("proxy route initialization did not create config", exit_code=1)
+
+    _validate_proxy_config_publication_target(config_path)
 
     if profile.profile_id == "hermes-cli":
         ensure_interactive_connector_defaults(config_path)
