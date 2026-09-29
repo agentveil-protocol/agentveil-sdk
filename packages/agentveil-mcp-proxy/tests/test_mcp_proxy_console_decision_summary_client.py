@@ -142,6 +142,12 @@ def _load_credential_ok(home=None):
     return StoredCredential(scope=CREDENTIAL_SCOPE, token=TOKEN)
 
 
+def _terminal_summary_event_id(**overrides) -> str:
+    payload = build_decision_summary_payload(_record(**overrides))
+    assert payload is not None
+    return payload.event_id
+
+
 def _record(**overrides) -> PendingApproval:
     base = PendingApproval(
         request_id=EVENT_ID,
@@ -325,7 +331,9 @@ def test_build_payload_for_uploadable_terminal_states(
     assert payload is not None
     assert payload.decision == decision
     assert payload.target_reached is target_reached
-    assert payload.event_id == EVENT_ID
+    assert payload.event_id == _terminal_summary_event_id(status=status, **extra)
+    assert payload.idempotency_key == payload.event_id
+    assert payload.event_id.startswith("ds.ev.")
     body = payload_to_request_body(payload)
     assert body["decision"] == decision
     if payload.proof_status == "unavailable":
@@ -350,6 +358,134 @@ def test_build_payload_skips_non_uploadable_states(status):
 
 def test_build_payload_skips_secretish_event_id():
     assert build_decision_summary_payload(_record(request_id="token-leak-001")) is None
+
+
+def test_summary_event_identity_distinguishes_reused_request_ids_across_sessions():
+    shared_request_id = "x"
+    record_a = _record(session_id="proxy-session-alpha", request_id=shared_request_id)
+    record_b = _record(session_id="proxy-session-bravo", request_id=shared_request_id)
+    payload_a = build_decision_summary_payload(record_a)
+    payload_b = build_decision_summary_payload(record_b)
+    assert payload_a is not None
+    assert payload_b is not None
+    assert payload_a.event_id != payload_b.event_id
+    assert payload_a.idempotency_key == payload_a.event_id
+    assert payload_b.idempotency_key == payload_b.event_id
+    assert shared_request_id not in payload_a.event_id
+    assert shared_request_id not in payload_b.event_id
+    assert "proxy-session" not in payload_a.event_id
+    assert "proxy-session" not in payload_b.event_id
+
+    seen: list[str] = []
+
+    class _DistinctSessionTransport:
+        def __call__(self, method, url, *, headers, body, timeout):
+            payload = json.loads(body.decode("utf-8"))
+            seen.append(payload["event_id"])
+            return _json_response(
+                200,
+                _backend_ack_for_request(body),
+            )
+
+    transport = _DistinctSessionTransport()
+    assert (
+        sync_decision_summary(
+            payload_a,
+            load_credential_fn=_load_credential_ok,
+            transport=transport,
+        )
+        == "accepted"
+    )
+    assert (
+        sync_decision_summary(
+            payload_b,
+            load_credential_fn=_load_credential_ok,
+            transport=transport,
+        )
+        == "accepted"
+    )
+    assert len(seen) == 2
+    assert seen[0] != seen[1]
+
+
+def test_summary_event_identity_stable_for_same_record_and_ack_replay():
+    record = _record(request_id="replay-stable-001", session_id="replay-session-001")
+    first = build_decision_summary_payload(record)
+    second = build_decision_summary_payload(record)
+    assert first is not None and second is not None
+    assert first.event_id == second.event_id
+    assert first.idempotency_key == second.idempotency_key
+
+    transport = BackendEchoTransport(status="duplicate")
+    assert (
+        sync_decision_summary(
+            first,
+            load_credential_fn=_load_credential_ok,
+            transport=transport,
+        )
+        == "duplicate"
+    )
+    assert len(transport.calls) == 1
+    replay_body = json.loads(transport.calls[0]["body"].decode("utf-8"))
+    assert replay_body["event_id"] == first.event_id
+    assert replay_body["idempotency_key"] == first.event_id
+
+
+def test_summary_event_identity_rejects_secretish_source_id_before_derivation():
+    assert build_decision_summary_payload(_record(request_id="token-leak-001")) is None
+    assert (
+        build_decision_summary_payload(
+            _record(session_id="bearer-session-leak", request_id="ordinary-req-001")
+        )
+        is None
+    )
+    assert build_decision_summary_payload(_record(session_id="", request_id="ordinary-req-002")) is None
+
+
+def test_summary_event_identity_accepts_colon_bearing_producer_session():
+    record = _record(session_id="claude:session", request_id="producer-req-001")
+    payload = build_decision_summary_payload(record)
+    assert payload is not None
+    assert payload.event_id.startswith("ds.ev.")
+    assert payload.idempotency_key == payload.event_id
+    assert "claude:session" not in payload.event_id
+    assert "producer-req-001" not in payload.event_id
+
+    transport = BackendEchoTransport()
+    assert (
+        sync_decision_summary(
+            payload,
+            load_credential_fn=_load_credential_ok,
+            transport=transport,
+        )
+        == "accepted"
+    )
+    wire = json.loads(transport.calls[0]["body"].decode("utf-8"))
+    assert wire["event_id"] == payload.event_id
+    assert wire["idempotency_key"] == payload.event_id
+
+
+def test_summary_event_identity_preserves_controlled_v2_payload():
+    record = _record(
+        action_gate_metadata_jcs=_controlled_metadata(
+            "filesystem.stage_delete.v1",
+            target_reached=True,
+            rollback_available=True,
+        ),
+        result_hash=RESULT_HASH,
+    )
+    payload = build_decision_summary_payload(record)
+    assert payload is not None
+    assert payload.schema_version == "2"
+    assert payload.controlled_outcome == "completed_safely"
+    assert payload.event_id.startswith("ds.ev.")
+    body = payload_to_request_body(payload)
+    assert body["schema_version"] == "2"
+    assert body["controlled_alternative_id"] == "filesystem.stage_delete.v1"
+    assert body["controlled_outcome"] == "completed_safely"
+    assert body["event_id"] == payload.event_id
+    assert body["idempotency_key"] == payload.event_id
+    assert EVENT_ID not in json.dumps(body)
 
 
 def test_build_payload_uses_unavailable_without_verified_receipt():
@@ -401,16 +537,17 @@ def test_build_payload_emits_bounded_v2_controlled_alternative_summary(
     )
     assert payload is not None
     body = payload_to_request_body(payload)
+    expected_event_id = payload.event_id
     assert body == {
         "schema_version": "2",
-        "event_id": EVENT_ID,
+        "event_id": expected_event_id,
         "action_family": "filesystem_write",
         "decision": "allowed",
         "occurred_at": "2023-11-14T22:13:30Z",
         "target_reached": target_reached,
         "proof_status": "intact",
         "proof_hash": PROOF_HASH,
-        "idempotency_key": EVENT_ID,
+        "idempotency_key": expected_event_id,
         "controlled_alternative_id": alternative_id,
         "controlled_outcome": outcome,
         "rollback_available": rollback_available,
@@ -878,14 +1015,19 @@ def test_dispatcher_stop_drains_queue_within_budget(tmp_path):
         queue_capacity=4,
     )
     dispatcher.start()
-    dispatcher.notify_terminal_record(_record(request_id="event-a"))
-    dispatcher.notify_terminal_record(_record(request_id="event-b"))
+    record_a = _record(request_id="event-a")
+    record_b = _record(request_id="event-b")
+    dispatcher.notify_terminal_record(record_a)
+    dispatcher.notify_terminal_record(record_b)
     assert done.wait(timeout=1.0)
     dispatcher.stop()
     worker = dispatcher._worker
     assert worker is not None
     assert not worker.is_alive()
-    assert processed == ["event-a", "event-b"]
+    assert processed == [
+        _terminal_summary_event_id(request_id="event-a"),
+        _terminal_summary_event_id(request_id="event-b"),
+    ]
     assert _alive_threads_created_since(baseline) == []
 
 
@@ -923,9 +1065,11 @@ def test_dispatcher_stop_drops_queued_events_when_shutdown_requested(tmp_path):
     gate = threading.Event()
     uploads: list[str] = []
 
+    slow_event_id = _terminal_summary_event_id(request_id="slow-1")
+
     def _slow_first_upload(payload, *, home=None, load_credential_fn=None, transport=None):
         uploads.append(payload.event_id)
-        if payload.event_id == "slow-1":
+        if payload.event_id == slow_event_id:
             gate.wait(timeout=_REQUEST_TIMEOUT_SECONDS)
         return "accepted"
 
@@ -939,7 +1083,7 @@ def test_dispatcher_stop_drops_queued_events_when_shutdown_requested(tmp_path):
     dispatcher.start()
     gate.clear()
     dispatcher.notify_terminal_record(_record(request_id="slow-1"))
-    while "slow-1" not in uploads:
+    while slow_event_id not in uploads:
         time.sleep(0.001)
     dispatcher.notify_terminal_record(_record(request_id="queued-2"))
 
@@ -947,7 +1091,7 @@ def test_dispatcher_stop_drops_queued_events_when_shutdown_requested(tmp_path):
     dispatcher.stop()
     elapsed = time.monotonic() - began
     assert elapsed <= _SHUTDOWN_JOIN_TIMEOUT_SECONDS + 0.25
-    assert uploads == ["slow-1"]
+    assert uploads == [slow_event_id]
     assert dispatcher._worker is not None
     assert not dispatcher._worker.is_alive()
     assert _alive_threads_created_since(baseline) == []
@@ -1002,7 +1146,7 @@ def test_dispatcher_deduplicates_duplicate_notifications(tmp_path):
         deadline = time.monotonic() + 2.0
         while len(uploads) < 1 and time.monotonic() < deadline:
             time.sleep(0.01)
-        assert uploads == [EVENT_ID]
+        assert uploads == [_terminal_summary_event_id()]
     finally:
         dispatcher.stop()
 
@@ -1025,6 +1169,9 @@ def test_dispatcher_retries_same_event_after_unacked_upload(tmp_path, first_outc
     dispatcher.start()
     try:
         record = _record(request_id=f"retry-after-{first_outcome}")
+        expected_event_id = _terminal_summary_event_id(
+            request_id=f"retry-after-{first_outcome}"
+        )
         dispatcher.notify_terminal_record(record)
         deadline = time.monotonic() + 2.0
         while len(uploads) < 1 and time.monotonic() < deadline:
@@ -1035,7 +1182,7 @@ def test_dispatcher_retries_same_event_after_unacked_upload(tmp_path, first_outc
             time.sleep(0.01)
         dispatcher.notify_terminal_record(record)
         time.sleep(0.1)
-        assert uploads == [record.request_id, record.request_id]
+        assert uploads == [expected_event_id, expected_event_id]
     finally:
         dispatcher.stop()
 
@@ -1058,6 +1205,7 @@ def test_dispatcher_retries_same_event_after_upload_exception(tmp_path):
     dispatcher.start()
     try:
         record = _record(request_id="retry-after-exception")
+        expected_event_id = _terminal_summary_event_id(request_id="retry-after-exception")
         dispatcher.notify_terminal_record(record)
         deadline = time.monotonic() + 2.0
         while len(uploads) < 1 and time.monotonic() < deadline:
@@ -1068,7 +1216,7 @@ def test_dispatcher_retries_same_event_after_upload_exception(tmp_path):
             time.sleep(0.01)
         dispatcher.notify_terminal_record(record)
         time.sleep(0.1)
-        assert uploads == [record.request_id, record.request_id]
+        assert uploads == [expected_event_id, expected_event_id]
     finally:
         dispatcher.stop()
 
@@ -1409,7 +1557,7 @@ def test_attach_terminal_evidence_observer_wires_dispatcher(tmp_path):
         deadline = time.monotonic() + 2.0
         while uploads.empty() and time.monotonic() < deadline:
             time.sleep(0.01)
-        assert uploads.get_nowait() == EVENT_ID
+        assert uploads.get_nowait() == _terminal_summary_event_id()
     finally:
         dispatcher.stop()
         server.stop()

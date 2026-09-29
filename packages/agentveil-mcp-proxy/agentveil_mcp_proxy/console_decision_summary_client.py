@@ -129,7 +129,11 @@ _RESPONSE_KEYS = frozenset({
 _ACK_STATUSES = frozenset({"accepted", "duplicate"})
 _HOOK_DENIED_UPLOAD_ACK_STATUSES = frozenset({"accepted", "duplicate"})
 
+_TERMINAL_SUMMARY_EVENT_DOMAIN = b"avp.console.decision_summary.terminal_event.v1"
+_TERMINAL_SUMMARY_EVENT_PREFIX = "ds.ev."
+
 _EVENT_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+_SOURCE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _PROOF_HASH_RE = re.compile(r"^[a-f0-9]{64}$")
 _RESULT_HASH_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
@@ -345,6 +349,55 @@ def _validate_idempotency_key(value: str) -> str | None:
     return value
 
 
+def _summary_source_id_privacy_ok(value: str) -> bool:
+    lowered = value.lower()
+    for fragment in _FORBIDDEN_EVENT_ID_FRAGMENTS:
+        if fragment.lower() in lowered:
+            return False
+    for forbidden in _FORBIDDEN_EVENT_ID_SUBSTRINGS:
+        if forbidden in lowered:
+            return False
+    return True
+
+
+def _validate_summary_source_request_id(value: object) -> str | None:
+    """Validate one persisted request id before bounded summary identity derivation."""
+
+    if not isinstance(value, str):
+        return None
+    return _validate_event_id(value)
+
+
+def _validate_summary_source_session_id(value: object) -> str | None:
+    """Validate one persisted session id compatible with local approval producers."""
+
+    if not isinstance(value, str):
+        return None
+    if not _SOURCE_SESSION_ID_RE.fullmatch(value):
+        return None
+    if not _summary_source_id_privacy_ok(value):
+        return None
+    return value
+
+
+def _derive_terminal_summary_event_identity(
+    *,
+    session_id: str,
+    request_id: str,
+) -> str | None:
+    """Return a stable opaque hosted event/idempotency id for one terminal record."""
+
+    material = json.dumps(
+        {"request_id": request_id, "session_id": session_id},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(
+        _TERMINAL_SUMMARY_EVENT_DOMAIN + material.encode("utf-8")
+    ).hexdigest()
+    return _validate_event_id(f"{_TERMINAL_SUMMARY_EVENT_PREFIX}{digest[:32]}")
+
+
 def _resolve_action_family(record: PendingApproval) -> str | None:
     metadata = parse_action_gate_metadata(record)
     if metadata is not None:
@@ -511,7 +564,16 @@ def build_decision_summary_payload(
     if record.status not in _UPLOADABLE_STATUSES:
         return None
 
-    event_id = _validate_event_id(record.request_id)
+    request_id = _validate_summary_source_request_id(record.request_id)
+    if request_id is None:
+        return None
+    session_id = _validate_summary_source_session_id(record.session_id)
+    if session_id is None:
+        return None
+    event_id = _derive_terminal_summary_event_identity(
+        session_id=session_id,
+        request_id=request_id,
+    )
     if event_id is None:
         return None
 
