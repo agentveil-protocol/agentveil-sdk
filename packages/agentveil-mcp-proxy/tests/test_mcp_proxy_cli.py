@@ -55,6 +55,7 @@ from agentveil_mcp_proxy.console_pairing_client import (
 from agentveil_mcp_proxy.controlled_alternatives import inject_agentveil_write_file_tool
 from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore, PendingApproval
 from agentveil_mcp_proxy.identity import encrypted_identity_payload, load_agent_from_identity
+from agentveil_mcp_proxy.client_config import assert_proxy_cli_json_is_privacy_safe
 from agentveil_mcp_proxy.policy import ProxyConfig
 from agentveil_mcp_proxy.quickstart_filesystem import _tools as quickstart_filesystem_tools
 
@@ -5181,3 +5182,517 @@ def test_run_proxy_starts_ca_status_only_after_runtime_binding(tmp_path, monkeyp
     assert captured["home"] == tmp_path.home() / ".avp"
     assert captured["started"] == 1
     assert captured["stopped"] == 1
+
+
+# ----- W-08 common backend registration guidance -----------------------------
+
+
+def _connector_runtime_home(project: Path, connector: str) -> Path:
+    if connector == "cursor":
+        return project / ".agentveil"
+    return project / ".avp"
+
+
+def _write_owner_only_passphrase_file(path: Path, *, value: str = TEST_PASSPHRASE) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(value + "\n", encoding="utf-8")
+    if os.name != "nt":
+        path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+
+
+def _seed_project_proxy_identity(project: Path, connector: str, *, registered: bool) -> Path:
+    home = _connector_runtime_home(project, connector)
+    if connector == "cursor":
+        from agentveil_mcp_proxy import cursor_setup
+
+        home.mkdir(parents=True, exist_ok=True)
+        passphrase_file = cursor_setup.passphrase_path(home)
+        _write_owner_only_passphrase_file(passphrase_file)
+        init_proxy(
+            home=home,
+            agent_name="proxy",
+            plaintext=False,
+            passphrase_file=passphrase_file,
+        )
+    else:
+        init_proxy(home=home, agent_name="proxy", plaintext=True)
+    if registered:
+        paths = proxy_paths(home)
+        identity_path = paths.identity_path("proxy")
+        identity = _load(identity_path)
+        identity["registered"] = True
+        identity["verified"] = True
+        identity_path.write_text(json.dumps(identity), encoding="utf-8")
+    return home
+
+
+def _assert_backend_registration_guidance(payload: dict, *, home: Path) -> None:
+    guidance = payload["backend_registration"]
+    assert guidance["required"] is True
+    assert guidance["register_working_directory"] == "selected_project_root"
+    expected_cmd, expected_manual = proxy_cli._register_command_for_project_home(
+        home,
+        json_safe=True,
+    )
+    assert guidance["register_command"] == expected_cmd
+    if expected_manual:
+        assert guidance.get("manual_passphrase_file_required") is True
+    else:
+        assert guidance.get("manual_passphrase_file_required") is not True
+    assert "register" in guidance["message"].lower()
+    serialized = json.dumps(payload)
+    identity = _load(proxy_paths(home).identity_path("proxy"))
+    assert identity["did"] not in serialized
+    assert _secret_material(identity) not in serialized
+    assert str(home.resolve()) not in serialized
+    project_root = proxy_cli._selected_project_root_for_home(home)
+    assert str(project_root.resolve()) not in serialized
+    assert_proxy_cli_json_is_privacy_safe(payload)
+
+
+def _init_proxy_for_connector_setup(**kwargs):
+    home = kwargs["home"]
+    project = home.parent if home.name == ".avp" else home
+    init_proxy(
+        home=home,
+        downstream_config=kwargs.get("downstream_config")
+        or quickstart_filesystem_downstream(project),
+        policy_pack=kwargs.get("policy_pack", "filesystem"),
+        plaintext=kwargs.get("plaintext", True),
+        passphrase_file=kwargs.get("passphrase_file"),
+        force=kwargs.get("force", False),
+        err=kwargs.get("err") or io.StringIO(),
+    )
+
+
+def _install_connector_setup_success_mocks(monkeypatch, connector: str) -> None:
+    from agentveil_mcp_proxy import claude_hook_setup, codex_setup, cursor_setup, gemini_setup
+
+    def fake_connect(**kwargs):
+        project = kwargs["project_root"]
+        (project / ".mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "agentveil-mcp-proxy": {
+                            "command": "agentveil-mcp-proxy",
+                            "args": ["run"],
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        return 0
+
+    monkeypatch.setattr(proxy_cli, "init_proxy", _init_proxy_for_connector_setup)
+    monkeypatch.setattr(proxy_cli, "run_connect_cli", fake_connect)
+    monkeypatch.setattr("shutil.which", lambda _name: "agentveil-mcp-proxy")
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.approval.server.ensure_managed_approval_center_for_cli",
+        _fake_running_approval_center,
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.approval.server.inspect_managed_approval_center",
+        lambda _home: SimpleNamespace(state="running", pid=1, port=8765),
+    )
+    connector_status = {
+        "status": "advisory",
+        "hook": "installed",
+        "mcp_route": "present",
+        "proxy_route": "present",
+        "next_step": "reload client",
+    }
+    if connector == "cursor":
+        monkeypatch.setattr(proxy_cli, "initialize_product_route_profile", lambda _prof: None)
+        monkeypatch.setattr(
+            proxy_cli,
+            "build_product_route_downstream_config",
+            lambda _prof: {"command": sys.executable, "args": ["downstream.py"]},
+        )
+        monkeypatch.setattr(cursor_setup, "prepare_proxy_home", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(cursor_setup, "profile_root", lambda home: home / "profiles" / "product_route")
+        monkeypatch.setattr(cursor_setup, "proxy_config_path", lambda home: home / "mcp-proxy" / "config.json")
+        monkeypatch.setattr(cursor_setup, "passphrase_path", cursor_setup.passphrase_path)
+        monkeypatch.setattr(
+            cursor_setup,
+            "neutralize_competing_global_route",
+            lambda *_args, **_kwargs: SimpleNamespace(changed=False),
+        )
+        monkeypatch.setattr(cursor_setup, "install_mcp_route", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(
+            cursor_setup,
+            "install_hooks",
+            lambda *_args, **_kwargs: SimpleNamespace(created_hooks=["beforeSubmitPrompt"]),
+        )
+        monkeypatch.setattr(
+            cursor_setup,
+            "ensure_approval_center_running",
+            _fake_running_approval_center,
+        )
+        monkeypatch.setattr(cursor_setup, "connector_status", lambda *_args, **_kwargs: connector_status)
+    elif connector == "claude-code":
+        monkeypatch.setattr(
+            claude_hook_setup,
+            "install_hook",
+            lambda _target: SimpleNamespace(created_settings=True),
+        )
+        monkeypatch.setattr(
+            claude_hook_setup,
+            "connector_status",
+            lambda *_args, **_kwargs: connector_status,
+        )
+    elif connector == "codex":
+        monkeypatch.setattr(codex_setup, "validate_hook_config", lambda **_kwargs: None)
+        monkeypatch.setattr(
+            codex_setup,
+            "install_hook",
+            lambda **_kwargs: SimpleNamespace(applied=True),
+        )
+        monkeypatch.setattr(
+            codex_setup,
+            "connect_status",
+            lambda **_kwargs: {"config_ref": "codex"},
+        )
+        monkeypatch.setattr(codex_setup, "managed_route_present", lambda _status: True)
+        monkeypatch.setattr(codex_setup, "connector_status", lambda **_kwargs: connector_status)
+    elif connector == "gemini-cli":
+        monkeypatch.setattr(gemini_setup, "validate_hook_config", lambda **_kwargs: None)
+        monkeypatch.setattr(
+            gemini_setup,
+            "install_hook",
+            lambda **_kwargs: SimpleNamespace(applied=True),
+        )
+        monkeypatch.setattr(
+            gemini_setup,
+            "connect_status",
+            lambda **_kwargs: {"config_ref": "gemini"},
+        )
+        monkeypatch.setattr(gemini_setup, "managed_route_present", lambda _status: True)
+        monkeypatch.setattr(gemini_setup, "connector_status", lambda **_kwargs: connector_status)
+    else:
+        raise AssertionError(f"unsupported connector {connector!r}")
+
+
+def _install_connector_status_mocks(monkeypatch, connector: str) -> None:
+    from agentveil_mcp_proxy import claude_hook_setup, codex_setup, cursor_setup, gemini_setup
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.approval.server.inspect_managed_approval_center",
+        lambda _home: SimpleNamespace(state="running", pid=1, port=8765),
+    )
+    status = {
+        "status": "advisory",
+        "connector": connector,
+        "hook": "installed",
+        "hook_state": "installed",
+        "mcp_route": "present",
+        "proxy_route": "present",
+        "approval_center": "running",
+        "route_launch_proved": False,
+        "hook_trust_required": False,
+        "restart_required": True,
+        "next_step": "reload client",
+        "user_mcp_route": "absent",
+        "competing_global_route": "none",
+        "mcp_route_observed": False,
+    }
+    if connector == "cursor":
+        monkeypatch.setattr(cursor_setup, "connector_status", lambda *_args, **_kwargs: status)
+    elif connector == "claude-code":
+        monkeypatch.setattr(
+            claude_hook_setup,
+            "connector_status",
+            lambda *_args, **_kwargs: {k: v for k, v in status.items() if k != "connector"},
+        )
+    elif connector == "codex":
+        monkeypatch.setattr(codex_setup, "connector_status", lambda **_kwargs: status)
+    elif connector == "gemini-cli":
+        monkeypatch.setattr(gemini_setup, "connector_status", lambda **_kwargs: status)
+    else:
+        raise AssertionError(f"unsupported connector {connector!r}")
+
+
+_CONNECTOR_SETUP_STATUS_CASES = [
+    ("cursor", ["setup", "cursor", "--workspace"], ["setup", "status", "--workspace"]),
+    ("claude-code", ["setup", "claude-code", "--project-dir"], ["setup", "status", "--project-dir"]),
+    ("codex", ["setup", "codex", "--project-dir"], ["setup", "status", "--client", "codex", "--project-dir"]),
+    (
+        "gemini-cli",
+        ["setup", "gemini-cli", "--project-dir"],
+        ["setup", "status", "--client", "gemini-cli", "--project-dir"],
+    ),
+]
+
+
+@pytest.mark.parametrize(("connector", "setup_prefix", "status_prefix"), _CONNECTOR_SETUP_STATUS_CASES)
+def test_setup_common_registration_guidance_for_unregistered_project_identity(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    connector,
+    setup_prefix,
+    status_prefix,
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    home = _seed_project_proxy_identity(project, connector, registered=False)
+    _install_connector_setup_success_mocks(monkeypatch, connector)
+    _install_connector_status_mocks(monkeypatch, connector)
+
+    setup_argv = [*setup_prefix, str(project), "--yes", "--json"]
+    assert main(setup_argv) == 0
+    setup_payload = json.loads(capsys.readouterr().out)
+    _assert_backend_registration_guidance(setup_payload, home=home)
+
+    status_argv = [*status_prefix, str(project), "--json"]
+    assert main(status_argv) == 0
+    status_payload = json.loads(capsys.readouterr().out)
+    _assert_backend_registration_guidance(status_payload, home=home)
+
+
+@pytest.mark.parametrize(("connector", "setup_prefix", "status_prefix"), _CONNECTOR_SETUP_STATUS_CASES)
+def test_setup_common_registration_guidance_absent_when_registered(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    connector,
+    setup_prefix,
+    status_prefix,
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    _seed_project_proxy_identity(project, connector, registered=True)
+    _install_connector_setup_success_mocks(monkeypatch, connector)
+    _install_connector_status_mocks(monkeypatch, connector)
+
+    setup_argv = [*setup_prefix, str(project), "--yes", "--json"]
+    assert main(setup_argv) == 0
+    setup_payload = json.loads(capsys.readouterr().out)
+    assert "backend_registration" not in setup_payload
+
+    status_argv = [*status_prefix, str(project), "--json"]
+    assert main(status_argv) == 0
+    status_payload = json.loads(capsys.readouterr().out)
+    assert "backend_registration" not in status_payload
+
+
+@pytest.mark.parametrize(("connector", "setup_prefix", "status_prefix"), _CONNECTOR_SETUP_STATUS_CASES)
+def test_setup_common_registration_guidance_never_calls_register(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    connector,
+    setup_prefix,
+    status_prefix,
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    _seed_project_proxy_identity(project, connector, registered=False)
+    _install_connector_setup_success_mocks(monkeypatch, connector)
+    _install_connector_status_mocks(monkeypatch, connector)
+
+    def forbidden_register(**_kwargs):
+        raise AssertionError("register_proxy must not be invoked from setup/status guidance")
+
+    monkeypatch.setattr(proxy_cli, "register_proxy", forbidden_register)
+
+    assert main([*setup_prefix, str(project), "--yes", "--json"]) == 0
+    capsys.readouterr()
+    assert main([*status_prefix, str(project), "--json"]) == 0
+    capsys.readouterr()
+
+
+def test_setup_common_registration_guidance_json_has_no_identity_or_credential(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from agentveil_mcp_proxy import codex_setup
+
+    project = tmp_path / "project"
+    project.mkdir()
+    home = _seed_project_proxy_identity(project, "codex", registered=False)
+    identity = _load(proxy_paths(home).identity_path("proxy"))
+    _install_connector_status_mocks(monkeypatch, "codex")
+    monkeypatch.setattr(codex_setup, "connector_status", lambda **_kwargs: {
+        "status": "advisory",
+        "connector": "codex",
+        "hook": "installed",
+        "hook_state": "installed",
+        "mcp_route": "present",
+        "proxy_route": "present",
+        "approval_center": "running",
+        "route_launch_proved": False,
+        "hook_trust_required": False,
+        "restart_required": True,
+        "next_step": "reload client",
+    })
+
+    assert main(["setup", "status", "--client", "codex", "--project-dir", str(project), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    _assert_backend_registration_guidance(payload, home=home)
+    serialized = json.dumps(payload).lower()
+    assert identity["did"].lower() not in serialized
+    assert "private_key" not in serialized
+    assert "public_key_hex" not in serialized
+
+
+def test_setup_common_registration_guidance_cursor_encrypted_json_command_is_actionable(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    home = _seed_project_proxy_identity(project, "cursor", registered=False)
+    identity = _load(proxy_paths(home).identity_path("proxy"))
+    assert identity.get("encrypted") is True
+    _install_connector_status_mocks(monkeypatch, "cursor")
+
+    assert main(["setup", "status", "--workspace", str(project), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    _assert_backend_registration_guidance(payload, home=home)
+    cmd = payload["backend_registration"]["register_command"]
+    assert cmd == (
+        "agentveil-mcp-proxy register --home .agentveil --passphrase-file .agentveil/passphrase"
+    )
+
+
+def test_setup_common_registration_guidance_cursor_advertised_register_reaches_backend_stub(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    import shlex
+
+    project = tmp_path / "project"
+    project.mkdir()
+    home = _seed_project_proxy_identity(project, "cursor", registered=False)
+    _install_connector_status_mocks(monkeypatch, "cursor")
+    _install_fake_register(monkeypatch)
+    monkeypatch.delenv("AVP_PROXY_PASSPHRASE", raising=False)
+
+    assert main(["setup", "status", "--workspace", str(project), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    register_argv = shlex.split(payload["backend_registration"]["register_command"])
+    if register_argv and register_argv[0] == "agentveil-mcp-proxy":
+        register_argv = register_argv[1:]
+
+    assert payload["backend_registration"]["register_working_directory"] == "selected_project_root"
+    monkeypatch.chdir(project)
+    assert main(register_argv) == 0
+    out, _err = capsys.readouterr()
+    assert "OK: agent " in out
+    identity_after = _load(proxy_paths(home).identity_path("proxy"))
+    assert identity_after.get("registered") is True
+
+
+def test_setup_common_registration_guidance_json_actionable_from_nonproject_cwd(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    import shlex
+
+    project = tmp_path / "project"
+    project.mkdir()
+    home = _seed_project_proxy_identity(project, "cursor", registered=False)
+    _install_connector_status_mocks(monkeypatch, "cursor")
+    _install_fake_register(monkeypatch)
+    monkeypatch.delenv("AVP_PROXY_PASSPHRASE", raising=False)
+
+    other_cwd = tmp_path / "elsewhere"
+    other_cwd.mkdir()
+    monkeypatch.chdir(other_cwd)
+
+    assert main(["setup", "status", "--workspace", str(project), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    _assert_backend_registration_guidance(payload, home=home)
+    register_argv = shlex.split(payload["backend_registration"]["register_command"])
+    if register_argv and register_argv[0] == "agentveil-mcp-proxy":
+        register_argv = register_argv[1:]
+
+    assert main(register_argv) != 0
+    capsys.readouterr()
+
+    monkeypatch.chdir(project)
+    assert main(register_argv) == 0
+    out, _err = capsys.readouterr()
+    assert "OK: agent " in out
+
+
+def _seed_cursor_encrypted_with_external_passphrase_file(
+    project: Path,
+    passphrase_file: Path,
+    *,
+    registered: bool,
+) -> Path:
+    home = project / ".agentveil"
+    home.mkdir(parents=True, exist_ok=True)
+    _write_owner_only_passphrase_file(passphrase_file)
+    init_proxy(
+        home=home,
+        agent_name="proxy",
+        plaintext=False,
+        passphrase_file=passphrase_file,
+    )
+    if registered:
+        paths = proxy_paths(home)
+        identity_path = paths.identity_path("proxy")
+        identity = _load(identity_path)
+        identity["registered"] = True
+        identity["verified"] = True
+        identity_path.write_text(json.dumps(identity), encoding="utf-8")
+    return home
+
+
+def test_setup_common_registration_guidance_external_passphrase_file_json(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    external_passphrase = tmp_path / "stored-passphrase"
+    home = _seed_cursor_encrypted_with_external_passphrase_file(
+        project,
+        external_passphrase,
+        registered=False,
+    )
+    _install_connector_status_mocks(monkeypatch, "cursor")
+
+    assert main(["setup", "status", "--workspace", str(project), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    guidance = payload["backend_registration"]
+    assert guidance["manual_passphrase_file_required"] is True
+    assert guidance["register_command"] == "agentveil-mcp-proxy register --home .agentveil"
+    assert external_passphrase.name not in guidance["register_command"]
+    _assert_backend_registration_guidance(payload, home=home)
+
+
+def test_setup_common_registration_guidance_human_output_shows_quoted_paths_without_secrets(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    import shlex
+
+    project = tmp_path / "project"
+    project.mkdir()
+    home = _seed_project_proxy_identity(project, "cursor", registered=False)
+    from agentveil_mcp_proxy import cursor_setup
+
+    passphrase_file = cursor_setup.passphrase_path(home)
+    _install_connector_status_mocks(monkeypatch, "cursor")
+
+    assert main(["setup", "status", "--workspace", str(project)]) == 0
+    captured = capsys.readouterr().out
+    assert "Backend registration:" in captured
+    assert f"cwd: {shlex.quote(str(project.resolve()))}" in captured
+    assert f"--home {shlex.quote(str(home.resolve()))}" in captured
+    assert f"--passphrase-file {shlex.quote(str(passphrase_file.resolve()))}" in captured
+    assert TEST_PASSPHRASE not in captured
+    identity = _load(proxy_paths(home).identity_path("proxy"))
+    assert identity["did"] not in captured
+    assert _secret_material(identity) not in captured

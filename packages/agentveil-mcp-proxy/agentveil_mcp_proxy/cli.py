@@ -25,6 +25,7 @@ from pathlib import Path
 import queue
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import subprocess
@@ -1649,6 +1650,176 @@ def _attach_connector_trust_boundary(
         hook_coverage=derive_hook_coverage_from_connector_status(enriched),
     )
     return enriched
+
+
+def _project_needs_backend_registration(home: Path) -> bool:
+    """Return True when the selected project identity is locally unregistered."""
+
+    paths = proxy_paths(home)
+    if not paths.config_path.exists():
+        return False
+    try:
+        config = load_proxy_config(paths.config_path)
+    except ProxyCliError:
+        return False
+    identity_path = paths.identity_path(config.avp.agent_name)
+    if not identity_path.exists():
+        return False
+    try:
+        identity = _read_json(identity_path, "agent identity")
+    except ProxyCliError:
+        return False
+    if not isinstance(identity, Mapping):
+        return False
+    if identity.get("did") is None:
+        return False
+    return identity.get("registered") is not True
+
+
+def _register_guidance_passphrase_file(home: Path) -> Path | None:
+    """Return a passphrase file for register guidance when identity is encrypted.
+
+    Does not read passphrase contents; only checks that a configured or default
+    Cursor passphrase file exists on disk.
+    """
+
+    paths = proxy_paths(home)
+    if not paths.config_path.exists():
+        return None
+    try:
+        config = load_proxy_config(paths.config_path)
+    except ProxyCliError:
+        return None
+    identity_path = paths.identity_path(config.avp.agent_name)
+    if not identity_path.exists():
+        return None
+    try:
+        identity = _read_json(identity_path, "agent identity")
+    except ProxyCliError:
+        return None
+    if identity.get("encrypted") is not True:
+        return None
+    stored = _stored_passphrase_file(config)
+    if stored is not None:
+        expanded = stored.expanduser()
+        if expanded.is_file():
+            return expanded
+    from agentveil_mcp_proxy import cursor_setup
+
+    candidate = cursor_setup.passphrase_path(home)
+    if candidate.is_file():
+        return candidate
+    return None
+
+
+def _selected_project_root_for_home(home: Path) -> Path:
+    home_resolved = home.expanduser().resolve()
+    if home_resolved.name in {".agentveil", ".avp"}:
+        return home_resolved.parent
+    return home_resolved
+
+
+def _register_command_home_token(home: Path, *, json_safe: bool) -> str:
+    if json_safe:
+        return home.expanduser().resolve().name
+    return shlex.quote(str(home.expanduser().resolve()))
+
+
+def _passphrase_file_relative_to_project(home: Path, passphrase_file: Path) -> str | None:
+    project_root = _selected_project_root_for_home(home)
+    pp_resolved = passphrase_file.expanduser().resolve()
+    try:
+        return pp_resolved.relative_to(project_root).as_posix()
+    except ValueError:
+        return None
+
+
+def _register_command_for_project_home(home: Path, *, json_safe: bool) -> tuple[str, bool]:
+    """Build register guidance command and whether JSON must omit --passphrase-file."""
+
+    parts = [
+        "agentveil-mcp-proxy",
+        "register",
+        "--home",
+        _register_command_home_token(home, json_safe=json_safe),
+    ]
+    manual_passphrase_file_required = False
+    passphrase_file = _register_guidance_passphrase_file(home)
+    if passphrase_file is not None:
+        if json_safe:
+            relative_passphrase = _passphrase_file_relative_to_project(home, passphrase_file)
+            if relative_passphrase is None:
+                manual_passphrase_file_required = True
+            else:
+                parts.extend(["--passphrase-file", relative_passphrase])
+        else:
+            parts.extend([
+                "--passphrase-file",
+                shlex.quote(str(passphrase_file.expanduser().resolve())),
+            ])
+    return " ".join(parts), manual_passphrase_file_required
+
+
+def _backend_registration_guidance(home: Path) -> dict[str, Any] | None:
+    if not _project_needs_backend_registration(home):
+        return None
+    register_command, manual_passphrase_file_required = _register_command_for_project_home(
+        home,
+        json_safe=True,
+    )
+    message = (
+        "Backend registration is still required for this project identity. "
+        "Run register_command from the selected project root (register_working_directory)."
+    )
+    guidance: dict[str, Any] = {
+        "required": True,
+        "register_working_directory": "selected_project_root",
+        "register_command": register_command,
+        "message": message,
+    }
+    if manual_passphrase_file_required:
+        guidance["manual_passphrase_file_required"] = True
+        guidance["message"] = (
+            "Backend registration is still required for this project identity. "
+            "Run register_command from the selected project root and supply "
+            "--passphrase-file pointing to the configured identity passphrase file."
+        )
+    return guidance
+
+
+def _merge_backend_registration_guidance(
+    payload: Mapping[str, Any],
+    *,
+    home: Path,
+) -> dict[str, Any]:
+    guidance = _backend_registration_guidance(home)
+    if guidance is None:
+        return dict(payload)
+    merged = dict(payload)
+    merged["backend_registration"] = guidance
+    return merged
+
+
+def _print_backend_registration_guidance(*, home: Path, out: TextIO | None = None) -> None:
+    if not _project_needs_backend_registration(home):
+        return
+    sink = out or sys.stdout
+    project_root = _selected_project_root_for_home(home)
+    cmd, manual_passphrase_file_required = _register_command_for_project_home(
+        home,
+        json_safe=False,
+    )
+    print(
+        "Backend registration: still required for this project identity.",
+        file=sink,
+    )
+    print(f"  cwd: {shlex.quote(str(project_root))}", file=sink)
+    if manual_passphrase_file_required:
+        print(
+            "  note: use --passphrase-file with your configured identity passphrase file.",
+            file=sink,
+        )
+    print(f"  run: {cmd}", file=sink)
 
 
 def _best_effort_console_attach_credential(
@@ -5794,7 +5965,7 @@ def run_setup_cursor_cli(
         return 1
 
     if output_json:
-        _print_operator_json({
+        _print_operator_json(_merge_backend_registration_guidance({
             "ok": True,
             "action": "setup-cursor",
             "applied": True,
@@ -5812,7 +5983,7 @@ def run_setup_cursor_cli(
             "competing_global_route_neutralized": neutralize_result.changed,
             "status": status,
             "created_hooks": hook_result.created_hooks,
-        })
+        }, home=home))
     else:
         print(cursor_setup.format_setup_success_message(target, status=status))
         if open_after_setup and (choose_folder or not assume_yes):
@@ -5820,6 +5991,7 @@ def run_setup_cursor_cli(
             print(f"Cursor: {message}")
             if not opened:
                 print(f"Open manually: {target}")
+        _print_backend_registration_guidance(home=home)
     _best_effort_console_project_status_sync(
         connector="cursor",
         connector_status=status,
@@ -5840,6 +6012,7 @@ def run_setup_cursor_status_cli(*, workspace: Path | None, output_json: bool) ->
     if status["approval_center"] != "running" and status["status"] != "unsafe":
         status["status"] = "advisory"
     status = _attach_connector_trust_boundary(status, home=home, project_dir=target)
+    status = _merge_backend_registration_guidance(status, home=home)
     if output_json:
         _print_operator_json(status)
     else:
@@ -5853,6 +6026,7 @@ def run_setup_cursor_status_cli(*, workspace: Path | None, output_json: bool) ->
         print(f"  mcp observed:    {status['mcp_route_observed']}")
         print(f"  restart required:{status['restart_required']}")
         print(f"  next: {status['next_step']}")
+        _print_backend_registration_guidance(home=home)
     _best_effort_console_project_status_sync(
         connector="cursor",
         connector_status=status,
@@ -6539,7 +6713,7 @@ def run_setup_claude_code_cli(
         return 1
 
     if output_json:
-        _print_operator_json({
+        _print_operator_json(_merge_backend_registration_guidance({
             "ok": True,
             "action": "setup-claude-code",
             "applied": True,
@@ -6557,7 +6731,7 @@ def run_setup_claude_code_cli(
             },
             "reload_required": True,
             "status": status,
-        })
+        }, home=home))
     else:
         print("Claude Code connector set up for this project:")
         print(f"  proxy route: {'initialized' if proxy_initialized else 'already present'}")
@@ -6569,6 +6743,7 @@ def run_setup_claude_code_cli(
         print(f"  approval_center: running ({action})")
         print(f"  status:      {status['status']}")
         print("Restart Claude Code for this project, then run `agentveil-mcp-proxy setup status`.")
+        _print_backend_registration_guidance(home=home)
     _best_effort_console_project_status_sync(
         connector="claude-code",
         connector_status=status,
@@ -6736,7 +6911,7 @@ def run_setup_codex_cli(
         return 1
 
     if output_json:
-        _print_operator_json({
+        _print_operator_json(_merge_backend_registration_guidance({
             "ok": True,
             "action": "setup-codex",
             "applied": True,
@@ -6759,7 +6934,7 @@ def run_setup_codex_cli(
             "codex_hook_trust_required": status.get("hook_trust_required"),
             "codex_hook_trust_message": codex_setup.CODEX_HOOK_TRUST_MESSAGE,
             "status": status,
-        })
+        }, home=home))
     else:
         print("Codex connector set up for this project:")
         print(f"  proxy route: {'initialized' if proxy_initialized else 'already present'}")
@@ -6773,6 +6948,7 @@ def run_setup_codex_cli(
         print("  hook trust:  Codex will ask you to trust the AgentVeil project hook once.")
         print("               Until that hook fires, status remains advisory, not protected.")
         print("Open or restart Codex in this project, trust the AgentVeil hook if prompted, then run `agentveil-mcp-proxy setup status --client codex`.")
+        _print_backend_registration_guidance(home=home)
     _best_effort_console_project_status_sync(
         connector="codex",
         connector_status=status,
@@ -6805,6 +6981,7 @@ def run_setup_codex_status_cli(
         proxy_command=proxy_command or _resolve_setup_proxy_command(),
     )
     status = _attach_connector_trust_boundary(status, home=home, project_dir=target)
+    status = _merge_backend_registration_guidance(status, home=home)
     if output_json:
         _print_operator_json(status)
     else:
@@ -6818,6 +6995,7 @@ def run_setup_codex_status_cli(
         print(f"  hook trust req.: {status['hook_trust_required']}")
         print(f"  restart required:{status['restart_required']}")
         print(f"  next: {status['next_step']}")
+        _print_backend_registration_guidance(home=home)
     _best_effort_console_project_status_sync(
         connector="codex",
         connector_status=status,
@@ -7040,7 +7218,7 @@ def run_setup_gemini_cli(
         return 1
 
     if output_json:
-        _print_operator_json({
+        _print_operator_json(_merge_backend_registration_guidance({
             "ok": True,
             "action": "setup-gemini-cli",
             "applied": True,
@@ -7063,7 +7241,7 @@ def run_setup_gemini_cli(
             "gemini_folder_trust_required": status.get("hook_trust_required"),
             "gemini_folder_trust_message": gemini_setup.GEMINI_FOLDER_TRUST_MESSAGE,
             "status": status,
-        })
+        }, home=home))
     else:
         print("Gemini CLI connector set up for this project:")
         print(f"  proxy route: {'initialized' if proxy_initialized else 'already present'}")
@@ -7080,6 +7258,7 @@ def run_setup_gemini_cli(
             "Open or restart Gemini CLI in this project, trust the folder if prompted, "
             "then run `agentveil-mcp-proxy setup status --client gemini-cli`."
         )
+        _print_backend_registration_guidance(home=home)
     _best_effort_console_project_status_sync(
         connector="gemini-cli",
         connector_status=status,
@@ -7109,6 +7288,7 @@ def run_setup_gemini_status_cli(
         proxy_command=proxy_command or _resolve_setup_proxy_command(),
     )
     status = _attach_connector_trust_boundary(status, home=home, project_dir=target)
+    status = _merge_backend_registration_guidance(status, home=home)
     if output_json:
         _print_operator_json(status)
     else:
@@ -7122,6 +7302,7 @@ def run_setup_gemini_status_cli(
         print(f"  folder trust req:{status['hook_trust_required']}")
         print(f"  restart required:{status['restart_required']}")
         print(f"  next: {status['next_step']}")
+        _print_backend_registration_guidance(home=home)
     _best_effort_console_project_status_sync(
         connector="gemini-cli",
         connector_status=status,
@@ -7211,6 +7392,7 @@ def run_setup_connector_status_cli(*, project_dir: Path | None, output_json: boo
     if center.state != "running" and status["status"] != "unsafe":
         status["status"] = "unsafe" if status["mcp_route"] == "missing" else "advisory"
     status = _attach_connector_trust_boundary(status, home=home, project_dir=target)
+    status = _merge_backend_registration_guidance(status, home=home)
     if output_json:
         _print_operator_json(status)
     else:
@@ -7221,6 +7403,7 @@ def run_setup_connector_status_cli(*, project_dir: Path | None, output_json: boo
         print(f"  approval_center: {center.state}")
         print(f"  restart required: {status['restart_required']}")
         print(f"  next: {status['next_step']}")
+        _print_backend_registration_guidance(home=home)
     _best_effort_console_project_status_sync(
         connector="claude-code",
         connector_status=status,
