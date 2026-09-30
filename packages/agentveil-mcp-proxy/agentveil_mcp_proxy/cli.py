@@ -2467,39 +2467,95 @@ def _register_command_for_project_home(home: Path, *, json_safe: bool) -> tuple[
     return " ".join(parts), manual_passphrase_file_required
 
 
-def _backend_registration_guidance(home: Path) -> dict[str, Any] | None:
+_PROJECT_LOGIN_CONNECTORS = frozenset({"cursor", "claude_code", "codex", "gemini"})
+
+
+def _normalize_project_login_connector(connector: str) -> str:
+    normalized = connector.strip().replace("-", "_")
+    if normalized == "gemini_cli":
+        normalized = "gemini"
+    if normalized not in _PROJECT_LOGIN_CONNECTORS:
+        raise ProxyCliError(
+            "unsupported project login connector; expected "
+            "cursor, claude_code, codex, or gemini",
+            exit_code=2,
+        )
+    return normalized
+
+
+def _setup_connector_to_project_login_connector(setup_connector: str) -> str:
+    mapped = {
+        "cursor": "cursor",
+        "claude-code": "claude_code",
+        "codex": "codex",
+        "gemini-cli": "gemini",
+    }.get(setup_connector)
+    if mapped is not None:
+        return mapped
+    return _normalize_project_login_connector(setup_connector)
+
+
+def _project_login_connector_for_status_sync(connector: str) -> str:
+    normalized = _normalize_project_login_connector(connector)
+    return {
+        "cursor": "cursor",
+        "claude_code": "claude-code",
+        "codex": "codex",
+        "gemini": "gemini-cli",
+    }[normalized]
+
+
+def _project_runtime_home_for_login(project_dir: Path, connector: str) -> Path:
+    normalized = _normalize_project_login_connector(connector)
+    if normalized == "cursor":
+        return project_dir / ".agentveil"
+    return project_dir / ".avp"
+
+
+def _project_connect_command_for_project(
+    home: Path,
+    *,
+    connector: str,
+    json_safe: bool,
+) -> str:
+    login_connector = _setup_connector_to_project_login_connector(connector)
+    if json_safe:
+        project_token = "selected_project_root"
+    else:
+        project_token = shlex.quote(str(_selected_project_root_for_home(home).resolve()))
+    return (
+        f"agentveil-mcp-proxy login --project-dir {project_token} "
+        f"--connector {login_connector}"
+    )
+
+
+def _backend_registration_guidance(home: Path, *, connector: str) -> dict[str, Any] | None:
     if not _project_needs_backend_registration(home):
         return None
-    register_command, manual_passphrase_file_required = _register_command_for_project_home(
+    connect_command = _project_connect_command_for_project(
         home,
+        connector=connector,
         json_safe=True,
     )
     message = (
-        "Backend registration is still required for this project identity. "
+        "Project Console connection is still required for this identity. "
         "Run register_command from the selected project root (register_working_directory)."
     )
-    guidance: dict[str, Any] = {
+    return {
         "required": True,
         "register_working_directory": "selected_project_root",
-        "register_command": register_command,
+        "register_command": connect_command,
         "message": message,
     }
-    if manual_passphrase_file_required:
-        guidance["manual_passphrase_file_required"] = True
-        guidance["message"] = (
-            "Backend registration is still required for this project identity. "
-            "Run register_command from the selected project root and supply "
-            "--passphrase-file pointing to the configured identity passphrase file."
-        )
-    return guidance
 
 
 def _merge_backend_registration_guidance(
     payload: Mapping[str, Any],
     *,
     home: Path,
+    connector: str,
 ) -> dict[str, Any]:
-    guidance = _backend_registration_guidance(home)
+    guidance = _backend_registration_guidance(home, connector=connector)
     if guidance is None:
         return dict(payload)
     merged = dict(payload)
@@ -2507,25 +2563,26 @@ def _merge_backend_registration_guidance(
     return merged
 
 
-def _print_backend_registration_guidance(*, home: Path, out: TextIO | None = None) -> None:
+def _print_backend_registration_guidance(
+    *,
+    home: Path,
+    connector: str,
+    out: TextIO | None = None,
+) -> None:
     if not _project_needs_backend_registration(home):
         return
     sink = out or sys.stdout
     project_root = _selected_project_root_for_home(home)
-    cmd, manual_passphrase_file_required = _register_command_for_project_home(
+    cmd = _project_connect_command_for_project(
         home,
+        connector=connector,
         json_safe=False,
     )
     print(
-        "Backend registration: still required for this project identity.",
+        "Project connection: Console sign-in still required for this identity.",
         file=sink,
     )
     print(f"  cwd: {shlex.quote(str(project_root))}", file=sink)
-    if manual_passphrase_file_required:
-        print(
-            "  note: use --passphrase-file with your configured identity passphrase file.",
-            file=sink,
-        )
     print(f"  run: {cmd}", file=sink)
 
 
@@ -2941,6 +2998,101 @@ def _rewrite_proxy_identity_after_register(
     _secure_write_json(identity_path, payload, force=True)
 
 
+def _server_reports_agent_verified(
+    agent: Any,
+    *,
+    attempts: int = 3,
+    delay_s: float = 0.05,
+) -> bool:
+    """Return True only when a bounded backend lookup confirms verification."""
+
+    did = agent.did
+    for attempt in range(attempts):
+        try:
+            info = agent.get_agent_info(did)
+        except AVPError:
+            info = None
+        except Exception:
+            info = None
+        if (
+            isinstance(info, Mapping)
+            and info.get("did") == did
+            and info.get("is_verified") is True
+        ):
+            return True
+        if attempt + 1 < attempts:
+            time.sleep(delay_s)
+    return False
+
+
+def _mark_proxy_agent_registered_verified(agent: Any) -> None:
+    if hasattr(agent, "_is_registered"):
+        agent._is_registered = True
+    if hasattr(agent, "_is_verified"):
+        agent._is_verified = True
+
+
+def _observe_project_connector_status_for_login(
+    *,
+    project_dir: Path,
+    connector: str,
+    runtime_home: Path,
+) -> dict[str, Any] | None:
+    """Observed connector status for Console sync, or None when unavailable."""
+
+    normalized = _normalize_project_login_connector(connector)
+    target = project_dir.resolve()
+    try:
+        if normalized == "cursor":
+            from agentveil_mcp_proxy import cursor_setup
+            from agentveil_mcp_proxy.approval.server import inspect_managed_approval_center
+
+            status = cursor_setup.connector_status(target, home=runtime_home)
+            center = inspect_managed_approval_center(runtime_home)
+            if center.state != "running" and status.get("status") != "unsafe":
+                status["status"] = "advisory"
+        elif normalized == "codex":
+            from agentveil_mcp_proxy import codex_setup
+            from agentveil_mcp_proxy.approval.server import inspect_managed_approval_center
+
+            center = inspect_managed_approval_center(runtime_home)
+            status = codex_setup.connector_status(
+                project_dir=target,
+                center_state=center.state,
+                proxy_command=_resolve_setup_proxy_command(),
+            )
+        elif normalized == "gemini":
+            from agentveil_mcp_proxy import gemini_setup
+            from agentveil_mcp_proxy.approval.server import inspect_managed_approval_center
+
+            center = inspect_managed_approval_center(runtime_home)
+            status = gemini_setup.connector_status(
+                project_dir=target,
+                center_state=center.state,
+                proxy_command=_resolve_setup_proxy_command(),
+            )
+        elif normalized == "claude_code":
+            from agentveil_mcp_proxy import claude_hook_setup
+            from agentveil_mcp_proxy.approval.server import inspect_managed_approval_center
+
+            config_path = runtime_home / "mcp-proxy" / "config.json"
+            status = claude_hook_setup.connector_status(
+                target,
+                proxy_route_present=config_path.exists(),
+            )
+            center = inspect_managed_approval_center(runtime_home)
+            status["approval_center"] = center.state
+            if center.state != "running" and status.get("status") != "unsafe":
+                status["status"] = (
+                    "unsafe" if status.get("mcp_route") == "missing" else "advisory"
+                )
+        else:
+            return None
+        return dict(status)
+    except Exception:
+        return None
+
+
 def register_proxy(
     *,
     home: Path | None = None,
@@ -3005,34 +3157,34 @@ def register_proxy(
         agent.register()
     except AVPValidationError as exc:
         if getattr(exc, "status_code", 0) == 409:
-            # ``AVPAgent.register`` raises 409 before it gets to set its
-            # ``_is_registered`` / ``_is_verified`` flags, so the loaded
-            # agent's in-memory state still reads False. The backend has
-            # already accepted this DID, so reflect that locally before
-            # writing the identity file; otherwise the rewritten file
-            # would say ``registered: false`` while the CLI told the user
-            # the identity is already registered.
-            if hasattr(agent, "_is_registered"):
-                agent._is_registered = True
-            if hasattr(agent, "_is_verified"):
-                agent._is_verified = True
-            _rewrite_proxy_identity_after_register(
-                identity_path=identity_path,
-                agent=agent,
-                passphrase=identity_passphrase,
+            if _server_reports_agent_verified(agent):
+                _mark_proxy_agent_registered_verified(agent)
+                _rewrite_proxy_identity_after_register(
+                    identity_path=identity_path,
+                    agent=agent,
+                    passphrase=identity_passphrase,
+                )
+                if output_json:
+                    emit_json(
+                        ok=True,
+                        registered=True,
+                        warnings=("agent already registered",),
+                    )
+                else:
+                    print(
+                        f"OK: agent {agent.did} already registered at {base_url}",
+                        file=out,
+                    )
+                return 0
+            message = (
+                f"registration conflict at {base_url}: "
+                "agent not verified on server (status 409)"
             )
             if output_json:
-                emit_json(
-                    ok=True,
-                    registered=True,
-                    warnings=("agent already registered",),
-                )
+                emit_json(ok=False, registered=False, errors=(message,))
             else:
-                print(
-                    f"OK: agent {agent.did} already registered at {base_url}",
-                    file=out,
-                )
-            return 0
+                print(f"FAIL: {message}", file=out)
+            return 1
         message = f"registration rejected at {base_url}: status {exc.status_code}"
         if output_json:
             emit_json(ok=False, registered=False, errors=(message,))
@@ -4997,6 +5149,259 @@ def _delete_local_console_credentials(*, home: Path | None = None) -> None:
     delete_runtime_binding_credential(home=home)
 
 
+def _load_dual_console_credentials_or_raise() -> tuple[Any, Any]:
+    try:
+        summary = load_credential()
+    except CredentialError as exc:
+        raise ProxyCliError(
+            f"Existing Console credential is unreadable ({exc.code}). "
+            "Run logout or remove it, then retry.",
+            exit_code=1,
+        ) from exc
+    try:
+        binding = load_runtime_binding_credential()
+    except CredentialError as exc:
+        raise ProxyCliError(
+            f"Console runtime binding credential is unreadable ({exc.code}). "
+            "Run logout or remove it, then retry.",
+            exit_code=1,
+        ) from exc
+    return summary, binding
+
+
+def _pair_machine_console_credentials_for_project_connect(
+    *,
+    open_browser: bool,
+    client: ConsolePairingClient | None = None,
+    browser_open: Callable[[str], Any] | None = None,
+    out: TextIO | None = None,
+) -> None:
+    """Obtain machine Console credentials via attach or explicit pairing."""
+
+    stream = out or sys.stderr
+    with console_login_lock():
+        summary, binding = _load_dual_console_credentials_or_raise()
+        if summary is not None and binding is not None:
+            return
+        if summary is not None and binding is None:
+            raise ProxyCliError(
+                "Console connection is incomplete (missing runtime binding credential). "
+                "Run logout, then retry project login.",
+                exit_code=1,
+            )
+
+        if _acquire_console_credential_via_attach(
+            attach_client=None,
+            open_browser=open_browser,
+            browser_open=browser_open,
+            out=stream,
+            interactive=True,
+        ):
+            pass
+        else:
+            pairing = client or _console_pairing_client()
+            try:
+                start = pairing.start()
+                print(
+                    f"To connect, open {start.verification_url} "
+                    f"and enter code {start.user_code}.",
+                    file=stream,
+                )
+                if open_browser:
+                    opener = browser_open or webbrowser.open
+                    try:
+                        opener(start.verification_url)
+                    except Exception:
+                        pass
+                token = pairing.poll_for_token(start)
+            except PairingClientError as exc:
+                raise ProxyCliError(
+                    f"Login failed ({exc.code}); not connected to AgentVeil Console.",
+                    exit_code=1,
+                ) from exc
+
+            summary, binding = _load_dual_console_credentials_or_raise()
+            if summary is not None and binding is not None:
+                return
+            if summary is not None:
+                _revoke_orphan_console_token(
+                    pairing,
+                    token.token,
+                    runtime_binding_token=token.runtime_binding_token,
+                )
+                raise ProxyCliError(
+                    "Console login stored a summary credential but not the required "
+                    "runtime binding credential; not connected.",
+                    exit_code=1,
+                )
+
+            try:
+                _store_console_pairing_credentials(token)
+            except CredentialError as exc:
+                _revoke_orphan_console_token(
+                    pairing,
+                    token.token,
+                    runtime_binding_token=token.runtime_binding_token,
+                )
+                _delete_local_console_credentials()
+                raise ProxyCliError(
+                    f"Login could not store the credential ({exc.code}); not connected.",
+                    exit_code=1,
+                ) from exc
+
+        summary, binding = _load_dual_console_credentials_or_raise()
+        if summary is None or binding is None:
+            raise ProxyCliError(
+                "Console login incomplete; dual credentials are required before "
+                "project registration.",
+                exit_code=1,
+            )
+
+
+def _validate_project_connect_identity(home: Path) -> None:
+    paths = proxy_paths(home)
+    if not paths.config_path.exists():
+        raise ProxyCliError(
+            "Selected project has no proxy config; run connector setup first.",
+            exit_code=1,
+        )
+    try:
+        config = load_proxy_config(paths.config_path)
+    except ProxyCliError as exc:
+        raise ProxyCliError(
+            "Selected project proxy config is invalid; fix setup before project login.",
+            exit_code=1,
+        ) from exc
+    identity_path = paths.identity_path(config.avp.agent_name)
+    if not identity_path.exists():
+        raise ProxyCliError(
+            "Selected project has no local agent identity; run connector setup first.",
+            exit_code=1,
+        )
+    try:
+        identity = _read_json(identity_path, "agent identity")
+    except ProxyCliError as exc:
+        raise ProxyCliError(
+            "Selected project agent identity is unreadable.",
+            exit_code=1,
+        ) from exc
+    if not isinstance(identity, Mapping) or identity.get("did") is None:
+        raise ProxyCliError(
+            "Selected project agent identity is missing a DID.",
+            exit_code=1,
+        )
+
+
+def run_console_project_login_cli(
+    *,
+    project_dir: Path,
+    connector: str,
+    open_browser: bool = True,
+    client: ConsolePairingClient | None = None,
+    browser_open: Callable[[str], Any] | None = None,
+    out: TextIO | None = None,
+) -> int:
+    """Connect Console for a selected project and register its existing identity."""
+
+    stream = out or sys.stdout
+    normalized_connector = _normalize_project_login_connector(connector)
+    try:
+        target = project_dir.expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise ProxyCliError(
+            "Selected project directory is missing or not accessible.",
+            exit_code=1,
+        ) from exc
+    if not target.is_dir():
+        raise ProxyCliError(
+            "Selected project directory is missing or not accessible.",
+            exit_code=1,
+        )
+
+    home = _project_runtime_home_for_login(target, normalized_connector)
+    _reject_unsafe_project_local_connector_paths(project_root=target, home=home)
+    _validate_project_connect_identity(home)
+
+    try:
+        summary_before, binding_before = _load_dual_console_credentials_or_raise()
+        credential_reused = summary_before is not None and binding_before is not None
+        if not credential_reused:
+            _pair_machine_console_credentials_for_project_connect(
+                open_browser=open_browser,
+                client=client,
+                browser_open=browser_open,
+                out=stream,
+            )
+            print("Connected to AgentVeil Console.", file=stream)
+        else:
+            print(
+                "Reusing existing AgentVeil Console connection for this project.",
+                file=stream,
+            )
+    except CredentialError as exc:
+        if exc.code == "login_in_progress":
+            raise ProxyCliError(
+                "Another Console login is already in progress.",
+                exit_code=1,
+            ) from exc
+        raise ProxyCliError(
+            f"Console login custody check failed ({exc.code}).",
+            exit_code=1,
+        ) from exc
+
+    identity_before = _read_json(
+        proxy_paths(home).identity_path(
+            load_proxy_config(proxy_paths(home).config_path).avp.agent_name
+        ),
+        "agent identity",
+    )
+    did_before = identity_before.get("did")
+    passphrase_file = _register_guidance_passphrase_file(home)
+    reg_code = register_proxy(
+        home=home,
+        passphrase_file=passphrase_file,
+        out=io.StringIO(),
+    )
+    if reg_code != 0:
+        print(
+            "Project connection incomplete: backend agent registration failed.",
+            file=stream,
+        )
+        return reg_code
+
+    identity_after = _read_json(
+        proxy_paths(home).identity_path(
+            load_proxy_config(proxy_paths(home).config_path).avp.agent_name
+        ),
+        "agent identity",
+    )
+    if identity_after.get("did") != did_before:
+        raise ProxyCliError(
+            "Project login changed the local agent identity unexpectedly.",
+            exit_code=1,
+        )
+
+    print(
+        "Project connection: existing agent registered with the backend. "
+        "Runtime readiness is separate.",
+        file=stream,
+    )
+    observed_status = _observe_project_connector_status_for_login(
+        project_dir=target,
+        connector=normalized_connector,
+        runtime_home=home,
+    )
+    if observed_status is not None:
+        _best_effort_console_project_status_sync(
+            connector=_project_login_connector_for_status_sync(normalized_connector),
+            connector_status=observed_status,
+            project_dir=target,
+            runtime_home=home,
+        )
+    _best_effort_console_free_builder_sync(home=home)
+    return 0
+
+
 def run_console_login_cli(
     *,
     open_browser: bool = True,
@@ -5253,6 +5658,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-open",
         action="store_true",
         help="Do not attempt to open the verification URL in a browser",
+    )
+    login.add_argument(
+        "--project-dir",
+        type=Path,
+        default=None,
+        help="Selected project root for project-scoped Console connection",
+    )
+    login.add_argument(
+        "--connector",
+        choices=sorted(_PROJECT_LOGIN_CONNECTORS),
+        default=None,
+        help="Connector for the selected project (cursor, claude_code, codex, gemini)",
     )
 
     subparsers.add_parser(
@@ -6697,7 +7114,7 @@ def run_setup_cursor_cli(
             "competing_global_route_neutralized": neutralize_result.changed,
             "status": status,
             "created_hooks": hook_result.created_hooks,
-        }, home=home))
+        }, home=home, connector="cursor"))
     else:
         print(cursor_setup.format_setup_success_message(target, status=status))
         if open_after_setup and (choose_folder or not assume_yes):
@@ -6705,7 +7122,7 @@ def run_setup_cursor_cli(
             print(f"Cursor: {message}")
             if not opened:
                 print(f"Open manually: {target}")
-        _print_backend_registration_guidance(home=home)
+        _print_backend_registration_guidance(home=home, connector="cursor")
     _best_effort_console_project_status_sync(
         connector="cursor",
         connector_status=status,
@@ -6726,7 +7143,7 @@ def run_setup_cursor_status_cli(*, workspace: Path | None, output_json: bool) ->
     if status["approval_center"] != "running" and status["status"] != "unsafe":
         status["status"] = "advisory"
     status = _attach_connector_trust_boundary(status, home=home, project_dir=target)
-    status = _merge_backend_registration_guidance(status, home=home)
+    status = _merge_backend_registration_guidance(status, home=home, connector="cursor")
     if output_json:
         _print_operator_json(status)
     else:
@@ -6740,7 +7157,7 @@ def run_setup_cursor_status_cli(*, workspace: Path | None, output_json: bool) ->
         print(f"  mcp observed:    {status['mcp_route_observed']}")
         print(f"  restart required:{status['restart_required']}")
         print(f"  next: {status['next_step']}")
-        _print_backend_registration_guidance(home=home)
+        _print_backend_registration_guidance(home=home, connector="cursor")
     _best_effort_console_project_status_sync(
         connector="cursor",
         connector_status=status,
@@ -7456,7 +7873,7 @@ def run_setup_claude_code_cli(
             },
             "reload_required": True,
             "status": status,
-        }, home=home))
+        }, home=home, connector="claude-code"))
     else:
         print("Claude Code connector set up for this project:")
         print(f"  proxy route: {'initialized' if proxy_initialized else 'already present'}")
@@ -7468,7 +7885,7 @@ def run_setup_claude_code_cli(
         print(f"  approval_center: running ({action})")
         print(f"  status:      {status['status']}")
         print("Restart Claude Code for this project, then run `agentveil-mcp-proxy setup status`.")
-        _print_backend_registration_guidance(home=home)
+        _print_backend_registration_guidance(home=home, connector="claude-code")
     _best_effort_console_project_status_sync(
         connector="claude-code",
         connector_status=status,
@@ -7662,7 +8079,7 @@ def run_setup_codex_cli(
             "codex_hook_trust_required": status.get("hook_trust_required"),
             "codex_hook_trust_message": codex_setup.CODEX_HOOK_TRUST_MESSAGE,
             "status": status,
-        }, home=home))
+        }, home=home, connector="codex"))
     else:
         print("Codex connector set up for this project:")
         print(f"  proxy route: {'initialized' if proxy_initialized else 'already present'}")
@@ -7676,7 +8093,7 @@ def run_setup_codex_cli(
         print("  hook trust:  Codex will ask you to trust the AgentVeil project hook once.")
         print("               Until that hook fires, status remains advisory, not protected.")
         print("Open or restart Codex in this project, trust the AgentVeil hook if prompted, then run `agentveil-mcp-proxy setup status --client codex`.")
-        _print_backend_registration_guidance(home=home)
+        _print_backend_registration_guidance(home=home, connector="codex")
     _best_effort_console_project_status_sync(
         connector="codex",
         connector_status=status,
@@ -7709,7 +8126,7 @@ def run_setup_codex_status_cli(
         proxy_command=proxy_command or _resolve_setup_proxy_command(),
     )
     status = _attach_connector_trust_boundary(status, home=home, project_dir=target)
-    status = _merge_backend_registration_guidance(status, home=home)
+    status = _merge_backend_registration_guidance(status, home=home, connector="codex")
     if output_json:
         _print_operator_json(status)
     else:
@@ -7723,7 +8140,7 @@ def run_setup_codex_status_cli(
         print(f"  hook trust req.: {status['hook_trust_required']}")
         print(f"  restart required:{status['restart_required']}")
         print(f"  next: {status['next_step']}")
-        _print_backend_registration_guidance(home=home)
+        _print_backend_registration_guidance(home=home, connector="codex")
     _best_effort_console_project_status_sync(
         connector="codex",
         connector_status=status,
@@ -7972,7 +8389,7 @@ def run_setup_gemini_cli(
             "gemini_folder_trust_required": status.get("hook_trust_required"),
             "gemini_folder_trust_message": gemini_setup.GEMINI_FOLDER_TRUST_MESSAGE,
             "status": status,
-        }, home=home))
+        }, home=home, connector="gemini-cli"))
     else:
         print("Gemini CLI connector set up for this project:")
         print(f"  proxy route: {'initialized' if proxy_initialized else 'already present'}")
@@ -7989,7 +8406,7 @@ def run_setup_gemini_cli(
             "Open or restart Gemini CLI in this project, trust the folder if prompted, "
             "then run `agentveil-mcp-proxy setup status --client gemini-cli`."
         )
-        _print_backend_registration_guidance(home=home)
+        _print_backend_registration_guidance(home=home, connector="gemini-cli")
     _best_effort_console_project_status_sync(
         connector="gemini-cli",
         connector_status=status,
@@ -8019,7 +8436,7 @@ def run_setup_gemini_status_cli(
         proxy_command=proxy_command or _resolve_setup_proxy_command(),
     )
     status = _attach_connector_trust_boundary(status, home=home, project_dir=target)
-    status = _merge_backend_registration_guidance(status, home=home)
+    status = _merge_backend_registration_guidance(status, home=home, connector="gemini-cli")
     if output_json:
         _print_operator_json(status)
     else:
@@ -8033,7 +8450,7 @@ def run_setup_gemini_status_cli(
         print(f"  folder trust req:{status['hook_trust_required']}")
         print(f"  restart required:{status['restart_required']}")
         print(f"  next: {status['next_step']}")
-        _print_backend_registration_guidance(home=home)
+        _print_backend_registration_guidance(home=home, connector="gemini-cli")
     _best_effort_console_project_status_sync(
         connector="gemini-cli",
         connector_status=status,
@@ -8123,7 +8540,7 @@ def run_setup_connector_status_cli(*, project_dir: Path | None, output_json: boo
     if center.state != "running" and status["status"] != "unsafe":
         status["status"] = "unsafe" if status["mcp_route"] == "missing" else "advisory"
     status = _attach_connector_trust_boundary(status, home=home, project_dir=target)
-    status = _merge_backend_registration_guidance(status, home=home)
+    status = _merge_backend_registration_guidance(status, home=home, connector="claude-code")
     if output_json:
         _print_operator_json(status)
     else:
@@ -8134,7 +8551,7 @@ def run_setup_connector_status_cli(*, project_dir: Path | None, output_json: boo
         print(f"  approval_center: {center.state}")
         print(f"  restart required: {status['restart_required']}")
         print(f"  next: {status['next_step']}")
-        _print_backend_registration_guidance(home=home)
+        _print_backend_registration_guidance(home=home, connector="claude-code")
     _best_effort_console_project_status_sync(
         connector="claude-code",
         connector_status=status,
@@ -8227,6 +8644,18 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(result, sort_keys=True))
             return 0
         if args.command == "login":
+            if (args.project_dir is None) ^ (args.connector is None):
+                raise ProxyCliError(
+                    "login requires --project-dir and --connector together for "
+                    "project-scoped connection",
+                    exit_code=2,
+                )
+            if args.project_dir is not None and args.connector is not None:
+                return run_console_project_login_cli(
+                    project_dir=args.project_dir,
+                    connector=args.connector,
+                    open_browser=not args.no_open,
+                )
             return run_console_login_cli(open_browser=not args.no_open)
         if args.command == "logout":
             return run_console_logout_cli()

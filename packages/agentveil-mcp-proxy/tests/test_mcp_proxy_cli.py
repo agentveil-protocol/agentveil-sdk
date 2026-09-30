@@ -2,18 +2,28 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hashlib
 import io
 import json
 import os
 from pathlib import Path
+import secrets
 import shutil
 import stat
 import subprocess
 import sys
+import threading
+import urllib.error
+import urllib.request
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
+from nacl.signing import VerifyKey
 
 import agentveil_mcp_proxy.cli as proxy_cli
 import agentveil_mcp_proxy.control_artifacts as control_artifacts
@@ -44,9 +54,12 @@ from agentveil_mcp_proxy.cli import (
 )
 from agentveil_mcp_proxy.console_credentials import (
     CREDENTIAL_SCOPE,
+    RUNTIME_BINDING_SCOPE,
     credential_path,
     load_credential,
+    load_runtime_binding_credential,
     save_credential,
+    save_runtime_binding_credential,
 )
 from agentveil_mcp_proxy.console_attach_client import (
     AttachClientError,
@@ -1012,6 +1025,243 @@ def test_doctor_check_backend_skipped_when_local_checks_fail(tmp_path, monkeypat
     assert "trusted_signer_dids" in out.getvalue()
 
 
+_FAKE_REGISTRATION_POW_DIFFICULTY = 4
+
+
+def _fake_registration_pow_valid(challenge: str, nonce: str, difficulty: int) -> bool:
+    digest = hashlib.sha256((challenge + nonce).encode()).digest()
+    full_bytes = difficulty // 8
+    remaining_bits = difficulty % 8
+    mask = (0xFF >> remaining_bits) ^ 0xFF if remaining_bits else 0
+    for index in range(full_bytes):
+        if digest[index] != 0:
+            return False
+    if remaining_bits > 0 and (digest[full_bytes] & mask) != 0:
+        return False
+    return True
+
+
+def _fake_registration_verify_payload(
+    state: "_FakeAvpRegistrationState",
+    payload: dict[str, Any],
+) -> str | None:
+    did = payload.get("did", "")
+    agent = state.agents.get(did)
+    if agent is None:
+        return "unknown agent"
+    public_key_hex = agent.get("public_key_hex", "")
+    challenge_entry = state.challenges_by_pubkey.get(public_key_hex)
+    if not isinstance(challenge_entry, dict):
+        return "missing registration challenge"
+    challenge = payload.get("challenge", "")
+    if challenge != challenge_entry.get("challenge"):
+        return "challenge mismatch"
+    signature_hex = payload.get("signature_hex", "")
+    try:
+        VerifyKey(bytes.fromhex(public_key_hex)).verify(
+            challenge.encode(),
+            bytes.fromhex(signature_hex),
+        )
+    except Exception:
+        return "invalid signature"
+    pow_nonce = payload.get("pow_nonce", "")
+    pow_challenge = challenge_entry.get("pow_challenge", "")
+    if not _fake_registration_pow_valid(
+        str(pow_challenge),
+        str(pow_nonce),
+        _FAKE_REGISTRATION_POW_DIFFICULTY,
+    ):
+        return "invalid pow"
+    return None
+
+
+@dataclass
+class _FakeAvpRegistrationState:
+    register_status: int = 200
+    verify_status: int = 200
+    agents: dict[str, dict[str, Any]] = field(default_factory=dict)
+    challenges_by_pubkey: dict[str, dict[str, str]] = field(default_factory=dict)
+    lookup_is_verified: dict[str, Any] = field(default_factory=dict)
+    lookup_did: dict[str, str] = field(default_factory=dict)
+
+
+class _FakeAvpRegistrationHandler(BaseHTTPRequestHandler):
+    state: _FakeAvpRegistrationState
+
+    def log_message(self, _format, *_args) -> None:
+        return
+
+    def _read_json(self) -> dict:
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length) if length else b"{}"
+        payload = json.loads(raw.decode("utf-8"))
+        return payload if isinstance(payload, dict) else {}
+
+    def _send_json(self, status: int, payload: dict) -> None:
+        data = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self) -> None:
+        if self.path.startswith("/v1/health"):
+            self._send_json(200, {"status": "ok"})
+            return
+        prefix = "/v1/agents/"
+        if self.path.startswith(prefix):
+            did = self.path[len(prefix) :].split("?", 1)[0]
+            agent = self.state.agents.get(did)
+            if agent is None:
+                self._send_json(404, {"detail": "not found"})
+                return
+            reported_did = self.state.lookup_did.get(did, did)
+            if did in self.state.lookup_is_verified:
+                reported_verified = self.state.lookup_is_verified[did]
+            else:
+                reported_verified = agent.get("is_verified") is True
+            self._send_json(
+                200,
+                {
+                    "did": reported_did,
+                    "is_verified": reported_verified,
+                    "status": "active",
+                },
+            )
+            return
+        self._send_json(404, {"detail": "not found"})
+
+    def do_POST(self) -> None:
+        if self.path == "/v1/agents/register":
+            payload = self._read_json()
+            pubkey = payload.get("public_key_hex", "")
+            if self.state.register_status == 409:
+                self._send_json(409, {"detail": "conflict"})
+                return
+            if self.state.register_status >= 400:
+                self._send_json(
+                    self.state.register_status,
+                    {"detail": "registration rejected"},
+                )
+                return
+            challenge = secrets.token_hex(16)
+            self.state.challenges_by_pubkey[pubkey] = {
+                "challenge": challenge,
+                "pow_challenge": challenge,
+            }
+            self._send_json(
+                200,
+                {
+                    "challenge": challenge,
+                    "pow_challenge": challenge,
+                    "pow_difficulty": _FAKE_REGISTRATION_POW_DIFFICULTY,
+                },
+            )
+            return
+        if self.path == "/v1/agents/verify":
+            payload = self._read_json()
+            did = payload.get("did", "")
+            if self.state.verify_status == 409:
+                self._send_json(409, {"detail": "verify conflict"})
+                return
+            if self.state.verify_status >= 400:
+                self._send_json(
+                    self.state.verify_status,
+                    {"detail": "verify rejected"},
+                )
+                return
+            verify_error = _fake_registration_verify_payload(self.state, payload)
+            if verify_error is not None:
+                self._send_json(400, {"detail": verify_error})
+                return
+            entry = self.state.agents.setdefault(did, {})
+            entry["is_verified"] = True
+            self._send_json(
+                200,
+                {"onboarding_pending": False, "onboarding_started": False},
+            )
+            return
+        self._send_json(404, {"detail": "not found"})
+
+
+@contextmanager
+def _fake_avp_registration_backend(
+    *,
+    register_status: int = 200,
+    verify_status: int = 200,
+):
+    state = _FakeAvpRegistrationState(
+        register_status=register_status,
+        verify_status=verify_status,
+    )
+    _FakeAvpRegistrationHandler.state = state
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeAvpRegistrationHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        yield base_url, state
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def _set_proxy_home_base_url(home: Path, base_url: str) -> None:
+    paths = proxy_paths(home)
+    config = _load(paths.config_path)
+    config["avp"]["base_url"] = base_url
+    paths.config_path.write_text(json.dumps(config), encoding="utf-8")
+    identity_path = paths.identity_path(config["avp"]["agent_name"])
+    identity = _load(identity_path)
+    identity["base_url"] = base_url
+    identity_path.write_text(json.dumps(identity), encoding="utf-8")
+
+
+def _seed_identity_on_fake_backend(
+    state: _FakeAvpRegistrationState,
+    home: Path,
+    *,
+    passphrase: str | None = TEST_PASSPHRASE,
+    passphrase_file: Path | None = None,
+) -> str:
+    from agentveil_mcp_proxy.identity import load_agent_from_identity
+
+    paths = proxy_paths(home)
+    config = _load(paths.config_path)
+    identity_path = paths.identity_path(config["avp"]["agent_name"])
+    identity = _load(identity_path)
+    resolved_passphrase = passphrase
+    if identity.get("encrypted") and passphrase_file is not None:
+        resolved_passphrase = passphrase_file.read_text(encoding="utf-8").strip()
+    agent = load_agent_from_identity(
+        identity,
+        base_url=identity["base_url"],
+        agent_name=identity["name"],
+        passphrase=resolved_passphrase if identity.get("encrypted") else None,
+    )
+    state.agents[agent.did] = {
+        "public_key_hex": agent.public_key_hex,
+        "is_verified": False,
+    }
+    return agent.did
+
+
+def _assert_bounded_project_login_output(
+    combined: str,
+    identity: dict,
+    *,
+    home: Path,
+) -> None:
+    assert identity["did"] not in combined
+    assert str(home.resolve()) not in combined
+    assert TEST_PASSPHRASE not in combined
+    assert _secret_material(identity) not in combined
+    assert "OK: agent " not in combined
+    assert "already registered at" not in combined
+    assert "registered at http" not in combined.lower()
+
+
 def _install_fake_register(monkeypatch, *, raises=None, capture_dids=None):
     """Replace ``AVPAgent.register`` with a deterministic fake.
 
@@ -1141,59 +1391,227 @@ def test_register_backend_unreachable_prints_sanitized_fail(tmp_path, monkeypatc
     assert secret not in output
 
 
-def test_register_already_registered_returns_ok(tmp_path, monkeypatch):
+def test_register_already_registered_returns_ok(tmp_path):
     home = tmp_path / "avp-home"
     result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
     identity_before = _load(result.identity_path)
-    _install_fake_register(
-        monkeypatch,
-        raises=AVPValidationError("agent already exists", 409, "conflict"),
-    )
+    with _fake_avp_registration_backend(register_status=409) as (base_url, state):
+        did = _seed_identity_on_fake_backend(state, home)
+        state.agents[did]["is_verified"] = True
+        _set_proxy_home_base_url(home, base_url)
 
-    out = io.StringIO()
-    code = register_proxy(home=home, passphrase=TEST_PASSPHRASE, out=out)
+        out = io.StringIO()
+        code = register_proxy(home=home, passphrase=TEST_PASSPHRASE, out=out)
 
-    output = out.getvalue()
-    assert code == 0
-    assert "already registered" in output
+        output = out.getvalue()
+        assert code == 0
+        assert "already registered" in output
 
-    # The 409 path must keep the identity encrypted and update the
-    # local `registered` / `verified` flags to True so the file is not
-    # left in a stale state contradicting the CLI message.
-    identity_after = _load(result.identity_path)
-    assert identity_after["did"] == identity_before["did"]
-    assert identity_after["encrypted"] is True
-    assert "private_key_hex" not in identity_after
-    assert identity_after.get("registered") is True
-    assert identity_after.get("verified") is True
-    if os.name != "nt":
-        assert _mode(result.identity_path) == 0o600
+        identity_after = _load(result.identity_path)
+        assert identity_after["did"] == identity_before["did"]
+        assert identity_after["encrypted"] is True
+        assert "private_key_hex" not in identity_after
+        assert identity_after.get("registered") is True
+        assert identity_after.get("verified") is True
+        if os.name != "nt":
+            assert _mode(result.identity_path) == 0o600
 
 
-def test_register_already_registered_json_reports_warning(tmp_path, monkeypatch):
+def test_register_409_unverified_does_not_mark_registered(tmp_path):
+    home = tmp_path / "avp-home"
+    result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    with _fake_avp_registration_backend(register_status=409) as (base_url, state):
+        _seed_identity_on_fake_backend(state, home)
+        _set_proxy_home_base_url(home, base_url)
+        identity_before = _load(result.identity_path)
+
+        out = io.StringIO()
+        code = register_proxy(home=home, passphrase=TEST_PASSPHRASE, out=out)
+
+        assert code == 1
+        assert "not verified on server" in out.getvalue()
+        identity_after = _load(result.identity_path)
+        assert identity_after.get("registered") is not True
+        assert identity_after.get("verified") is not True
+        assert identity_after["did"] == identity_before["did"]
+
+
+def test_register_409_malformed_is_verified_false_preserves_identity(tmp_path):
+    home = tmp_path / "avp-home"
+    result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    with _fake_avp_registration_backend(register_status=409) as (base_url, state):
+        did = _seed_identity_on_fake_backend(state, home)
+        state.agents[did]["is_verified"] = True
+        state.lookup_is_verified[did] = "false"
+        _set_proxy_home_base_url(home, base_url)
+        identity_before = _load(result.identity_path)
+
+        out = io.StringIO()
+        code = register_proxy(home=home, passphrase=TEST_PASSPHRASE, out=out)
+
+        assert code == 1
+        assert "not verified on server" in out.getvalue()
+        identity_after = _load(result.identity_path)
+        assert identity_after.get("registered") is not True
+        assert identity_after.get("verified") is not True
+        assert identity_after == identity_before
+
+
+def test_register_409_mismatched_lookup_did_preserves_identity(tmp_path):
+    home = tmp_path / "avp-home"
+    result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    with _fake_avp_registration_backend(register_status=409) as (base_url, state):
+        did = _seed_identity_on_fake_backend(state, home)
+        state.agents[did]["is_verified"] = True
+        state.lookup_did[did] = "did:web:avp:agent:mismatch"
+        _set_proxy_home_base_url(home, base_url)
+        identity_before = _load(result.identity_path)
+
+        out = io.StringIO()
+        code = register_proxy(home=home, passphrase=TEST_PASSPHRASE, out=out)
+
+        assert code == 1
+        assert "not verified on server" in out.getvalue()
+        identity_after = _load(result.identity_path)
+        assert identity_after.get("registered") is not True
+        assert identity_after.get("verified") is not True
+        assert identity_after == identity_before
+
+
+def test_fake_avp_registration_backend_rejects_invalid_verify_signature(tmp_path):
+    home = tmp_path / "avp-home"
+    init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    with _fake_avp_registration_backend() as (base_url, state):
+        did = _seed_identity_on_fake_backend(state, home)
+        public_key_hex = state.agents[did]["public_key_hex"]
+        register_payload = json.dumps({"public_key_hex": public_key_hex}).encode("utf-8")
+        register_request = urllib.request.Request(  # noqa: S310
+            f"{base_url}/v1/agents/register",
+            data=register_payload,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(register_request) as response:  # noqa: S310
+            register_body = json.loads(response.read().decode("utf-8"))
+        challenge = register_body["challenge"]
+        verify_payload = json.dumps(
+            {
+                "did": did,
+                "challenge": challenge,
+                "signature_hex": "00" * 64,
+                "pow_nonce": "0",
+            }
+        ).encode("utf-8")
+        verify_request = urllib.request.Request(  # noqa: S310
+            f"{base_url}/v1/agents/verify",
+            data=verify_payload,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(verify_request)  # noqa: S310
+        assert exc_info.value.code == 400
+        assert state.agents[did]["is_verified"] is False
+
+
+def test_register_verify_409_unverified_does_not_mark_registered(tmp_path):
+    home = tmp_path / "avp-home"
+    result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    with _fake_avp_registration_backend(verify_status=409) as (base_url, state):
+        _seed_identity_on_fake_backend(state, home)
+        _set_proxy_home_base_url(home, base_url)
+        identity_before = _load(result.identity_path)
+
+        out = io.StringIO()
+        code = register_proxy(home=home, passphrase=TEST_PASSPHRASE, out=out)
+
+        assert code == 1
+        assert "not verified on server" in out.getvalue()
+        identity_after = _load(result.identity_path)
+        assert identity_after.get("registered") is not True
+        assert identity_after.get("verified") is not True
+        assert identity_after["did"] == identity_before["did"]
+
+
+def test_register_backend_auth_failure(tmp_path):
+    home = tmp_path / "avp-home"
+    result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    with _fake_avp_registration_backend(register_status=401) as (base_url, state):
+        _seed_identity_on_fake_backend(state, home)
+        _set_proxy_home_base_url(home, base_url)
+        identity_before = _load(result.identity_path)
+
+        out = io.StringIO()
+        code = register_proxy(home=home, passphrase=TEST_PASSPHRASE, out=out)
+
+        assert code == 1
+        assert "status 401" in out.getvalue()
+        identity_after = _load(result.identity_path)
+        assert identity_after.get("registered") is not True
+        assert identity_after["did"] == identity_before["did"]
+
+
+def test_register_backend_unavailable(tmp_path):
+    home = tmp_path / "avp-home"
+    result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    with _fake_avp_registration_backend(register_status=503) as (base_url, state):
+        _seed_identity_on_fake_backend(state, home)
+        _set_proxy_home_base_url(home, base_url)
+        identity_before = _load(result.identity_path)
+
+        out = io.StringIO()
+        code = register_proxy(home=home, passphrase=TEST_PASSPHRASE, out=out)
+
+        assert code == 1
+        assert "status 503" in out.getvalue()
+        identity_after = _load(result.identity_path)
+        assert identity_after.get("registered") is not True
+        assert identity_after["did"] == identity_before["did"]
+
+
+def test_register_already_registered_json_reports_warning(tmp_path):
     home = tmp_path / "avp-home"
     result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
     identity = _load(result.identity_path)
-    _install_fake_register(
-        monkeypatch,
-        raises=AVPValidationError("agent already exists", 409, "conflict"),
-    )
+    with _fake_avp_registration_backend(register_status=409) as (base_url, state):
+        did = _seed_identity_on_fake_backend(state, home)
+        state.agents[did]["is_verified"] = True
+        _set_proxy_home_base_url(home, base_url)
 
-    out = io.StringIO()
-    code = register_proxy(
-        home=home,
-        passphrase=TEST_PASSPHRASE,
-        output_json=True,
-        out=out,
-    )
+        out = io.StringIO()
+        code = register_proxy(
+            home=home,
+            passphrase=TEST_PASSPHRASE,
+            output_json=True,
+            out=out,
+        )
 
-    payload = json.loads(out.getvalue())
-    assert code == 0
-    assert payload["ok"] is True
-    assert payload["registered"] is True
-    assert payload["agent_did"] == identity["did"]
-    assert payload["errors"] == []
-    assert payload["warnings"] == ["agent already registered"]
+        payload = json.loads(out.getvalue())
+        assert code == 0
+        assert payload["ok"] is True
+        assert payload["registered"] is True
+        assert payload["agent_did"] == identity["did"]
+        assert payload["errors"] == []
+        assert payload["warnings"] == ["agent already registered"]
+
+
+def test_register_real_backend_round_trip_updates_identity(tmp_path):
+    home = tmp_path / "avp-home"
+    result = init_proxy(home=home, agent_name="proxy", passphrase=TEST_PASSPHRASE)
+    identity_before = _load(result.identity_path)
+    with _fake_avp_registration_backend() as (base_url, state):
+        did = _seed_identity_on_fake_backend(state, home)
+        _set_proxy_home_base_url(home, base_url)
+
+        out = io.StringIO()
+        code = register_proxy(home=home, passphrase=TEST_PASSPHRASE, out=out)
+
+        assert code == 0
+        assert state.agents[did]["is_verified"] is True
+        identity_after = _load(result.identity_path)
+        assert identity_after["did"] == identity_before["did"]
+        assert identity_after.get("registered") is True
+        assert identity_after.get("verified") is True
 
 
 def test_register_encrypted_identity_requires_passphrase(tmp_path, monkeypatch):
@@ -5238,20 +5656,24 @@ def _seed_project_proxy_identity(project: Path, connector: str, *, registered: b
     return home
 
 
-def _assert_backend_registration_guidance(payload: dict, *, home: Path) -> None:
+def _assert_backend_registration_guidance(
+    payload: dict,
+    *,
+    home: Path,
+    connector: str,
+) -> None:
     guidance = payload["backend_registration"]
     assert guidance["required"] is True
     assert guidance["register_working_directory"] == "selected_project_root"
-    expected_cmd, expected_manual = proxy_cli._register_command_for_project_home(
+    expected_cmd = proxy_cli._project_connect_command_for_project(
         home,
+        connector=connector,
         json_safe=True,
     )
     assert guidance["register_command"] == expected_cmd
-    if expected_manual:
-        assert guidance.get("manual_passphrase_file_required") is True
-    else:
-        assert guidance.get("manual_passphrase_file_required") is not True
-    assert "register" in guidance["message"].lower()
+    assert "login" in guidance["register_command"]
+    assert guidance.get("manual_passphrase_file_required") is not True
+    assert "register" in guidance["message"].lower() or "connection" in guidance["message"].lower()
     serialized = json.dumps(payload)
     identity = _load(proxy_paths(home).identity_path("proxy"))
     assert identity["did"] not in serialized
@@ -5456,12 +5878,12 @@ def test_setup_common_registration_guidance_for_unregistered_project_identity(
     setup_argv = [*setup_prefix, str(project), "--yes", "--json"]
     assert main(setup_argv) == 0
     setup_payload = json.loads(capsys.readouterr().out)
-    _assert_backend_registration_guidance(setup_payload, home=home)
+    _assert_backend_registration_guidance(setup_payload, home=home, connector=connector)
 
     status_argv = [*status_prefix, str(project), "--json"]
     assert main(status_argv) == 0
     status_payload = json.loads(capsys.readouterr().out)
-    _assert_backend_registration_guidance(status_payload, home=home)
+    _assert_backend_registration_guidance(status_payload, home=home, connector=connector)
 
 
 @pytest.mark.parametrize(("connector", "setup_prefix", "status_prefix"), _CONNECTOR_SETUP_STATUS_CASES)
@@ -5544,7 +5966,7 @@ def test_setup_common_registration_guidance_json_has_no_identity_or_credential(
 
     assert main(["setup", "status", "--client", "codex", "--project-dir", str(project), "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
-    _assert_backend_registration_guidance(payload, home=home)
+    _assert_backend_registration_guidance(payload, home=home, connector="codex")
     serialized = json.dumps(payload).lower()
     assert identity["did"].lower() not in serialized
     assert "private_key" not in serialized
@@ -5565,10 +5987,10 @@ def test_setup_common_registration_guidance_cursor_encrypted_json_command_is_act
 
     assert main(["setup", "status", "--workspace", str(project), "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
-    _assert_backend_registration_guidance(payload, home=home)
+    _assert_backend_registration_guidance(payload, home=home, connector="cursor")
     cmd = payload["backend_registration"]["register_command"]
     assert cmd == (
-        "agentveil-mcp-proxy register --home .agentveil --passphrase-file .agentveil/passphrase"
+        "agentveil-mcp-proxy login --project-dir selected_project_root --connector cursor"
     )
 
 
@@ -5577,26 +5999,28 @@ def test_setup_common_registration_guidance_cursor_advertised_register_reaches_b
     monkeypatch,
     capsys,
 ):
-    import shlex
+    from agentveil_mcp_proxy import cursor_setup
 
     project = tmp_path / "project"
     project.mkdir()
     home = _seed_project_proxy_identity(project, "cursor", registered=False)
     _install_connector_status_mocks(monkeypatch, "cursor")
-    _install_fake_register(monkeypatch)
+    _install_machine_dual_console_credentials(tmp_path, monkeypatch)
     monkeypatch.delenv("AVP_PROXY_PASSPHRASE", raising=False)
 
     assert main(["setup", "status", "--workspace", str(project), "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
-    register_argv = shlex.split(payload["backend_registration"]["register_command"])
-    if register_argv and register_argv[0] == "agentveil-mcp-proxy":
-        register_argv = register_argv[1:]
-
     assert payload["backend_registration"]["register_working_directory"] == "selected_project_root"
     monkeypatch.chdir(project)
-    assert main(register_argv) == 0
+    identity_before = _load(proxy_paths(home).identity_path("proxy"))
+    with _fake_avp_registration_backend() as (base_url, state):
+        _seed_identity_on_fake_backend(state, home, passphrase_file=cursor_setup.passphrase_path(home))
+        _set_proxy_home_base_url(home, base_url)
+        assert main(_project_login_argv(project, "cursor")) == 0
     out, _err = capsys.readouterr()
-    assert "OK: agent " in out
+    assert "existing agent registered with the backend" in out
+    assert "Runtime readiness is separate" in out
+    _assert_bounded_project_login_output(out + _err, identity_before, home=home)
     identity_after = _load(proxy_paths(home).identity_path("proxy"))
     assert identity_after.get("registered") is True
 
@@ -5606,13 +6030,11 @@ def test_setup_common_registration_guidance_json_actionable_from_nonproject_cwd(
     monkeypatch,
     capsys,
 ):
-    import shlex
-
     project = tmp_path / "project"
     project.mkdir()
     home = _seed_project_proxy_identity(project, "cursor", registered=False)
     _install_connector_status_mocks(monkeypatch, "cursor")
-    _install_fake_register(monkeypatch)
+    _install_machine_dual_console_credentials(tmp_path, monkeypatch)
     monkeypatch.delenv("AVP_PROXY_PASSPHRASE", raising=False)
 
     other_cwd = tmp_path / "elsewhere"
@@ -5621,18 +6043,22 @@ def test_setup_common_registration_guidance_json_actionable_from_nonproject_cwd(
 
     assert main(["setup", "status", "--workspace", str(project), "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
-    _assert_backend_registration_guidance(payload, home=home)
-    register_argv = shlex.split(payload["backend_registration"]["register_command"])
-    if register_argv and register_argv[0] == "agentveil-mcp-proxy":
-        register_argv = register_argv[1:]
+    _assert_backend_registration_guidance(payload, home=home, connector="cursor")
 
-    assert main(register_argv) != 0
+    assert main(_project_login_argv(Path("selected_project_root"), "cursor")) != 0
     capsys.readouterr()
 
-    monkeypatch.chdir(project)
-    assert main(register_argv) == 0
+    identity_before = _load(proxy_paths(home).identity_path("proxy"))
+    with _fake_avp_registration_backend() as (base_url, state):
+        from agentveil_mcp_proxy import cursor_setup
+
+        _seed_identity_on_fake_backend(state, home, passphrase_file=cursor_setup.passphrase_path(home))
+        _set_proxy_home_base_url(home, base_url)
+        assert main(_project_login_argv(project, "cursor")) == 0
     out, _err = capsys.readouterr()
-    assert "OK: agent " in out
+    assert "existing agent registered with the backend" in out
+    assert "Runtime readiness is separate" in out
+    _assert_bounded_project_login_output(out + _err, identity_before, home=home)
 
 
 def _seed_cursor_encrypted_with_external_passphrase_file(
@@ -5678,10 +6104,11 @@ def test_setup_common_registration_guidance_external_passphrase_file_json(
     assert main(["setup", "status", "--workspace", str(project), "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     guidance = payload["backend_registration"]
-    assert guidance["manual_passphrase_file_required"] is True
-    assert guidance["register_command"] == "agentveil-mcp-proxy register --home .agentveil"
+    assert guidance["register_command"] == (
+        "agentveil-mcp-proxy login --project-dir selected_project_root --connector cursor"
+    )
     assert external_passphrase.name not in guidance["register_command"]
-    _assert_backend_registration_guidance(payload, home=home)
+    _assert_backend_registration_guidance(payload, home=home, connector="cursor")
 
 
 def test_setup_common_registration_guidance_human_output_shows_quoted_paths_without_secrets(
@@ -5694,21 +6121,555 @@ def test_setup_common_registration_guidance_human_output_shows_quoted_paths_with
     project = tmp_path / "project"
     project.mkdir()
     home = _seed_project_proxy_identity(project, "cursor", registered=False)
-    from agentveil_mcp_proxy import cursor_setup
-
-    passphrase_file = cursor_setup.passphrase_path(home)
     _install_connector_status_mocks(monkeypatch, "cursor")
 
     assert main(["setup", "status", "--workspace", str(project)]) == 0
     captured = capsys.readouterr().out
-    assert "Backend registration:" in captured
+    assert "Project connection:" in captured
     assert f"cwd: {shlex.quote(str(project.resolve()))}" in captured
-    assert f"--home {shlex.quote(str(home.resolve()))}" in captured
-    assert f"--passphrase-file {shlex.quote(str(passphrase_file.resolve()))}" in captured
+    assert "--project-dir" in captured
+    assert "--connector cursor" in captured
     assert TEST_PASSPHRASE not in captured
     identity = _load(proxy_paths(home).identity_path("proxy"))
     assert identity["did"] not in captured
     assert _secret_material(identity) not in captured
+
+
+def _dual_console_pairing_token() -> PairingToken:
+    return PairingToken(
+        token=CONSOLE_TOKEN,
+        scope=CREDENTIAL_SCOPE,
+        runtime_binding_token=CONSOLE_BINDING_TOKEN,
+        runtime_binding_scope=RUNTIME_BINDING_SCOPE,
+    )
+
+
+def _install_machine_dual_console_credentials(tmp_path, monkeypatch) -> Path:
+    avp_home = tmp_path / "machine-avp"
+    avp_home.mkdir()
+    monkeypatch.setenv("AVP_HOME", str(avp_home))
+    save_credential(CONSOLE_TOKEN, home=avp_home)
+    save_runtime_binding_credential(CONSOLE_BINDING_TOKEN, home=avp_home)
+    return avp_home
+
+
+def _project_login_argv(project: Path, connector: str) -> list[str]:
+    login_connector = {
+        "cursor": "cursor",
+        "claude-code": "claude_code",
+        "codex": "codex",
+        "gemini-cli": "gemini",
+    }[connector]
+    return [
+        "login",
+        "--project-dir",
+        str(project),
+        "--connector",
+        login_connector,
+        "--no-open",
+    ]
+
+
+def test_project_login_registers_selected_existing_identity_after_pairing(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    home = _seed_project_proxy_identity(project, "codex", registered=False)
+    identity_before = _load(proxy_paths(home).identity_path("proxy"))
+    avp_home = tmp_path / "machine-avp"
+    avp_home.mkdir()
+    monkeypatch.setenv("AVP_HOME", str(avp_home))
+    client = _FakeConsoleClient(
+        start=_console_start(),
+        token=_dual_console_pairing_token(),
+    )
+    _install_console_client(monkeypatch, client)
+    _install_connector_status_mocks(monkeypatch, "codex")
+
+    with _fake_avp_registration_backend() as (base_url, state):
+        did = _seed_identity_on_fake_backend(state, home, passphrase=None)
+        _set_proxy_home_base_url(home, base_url)
+        assert main(_project_login_argv(project, "codex")) == 0
+        assert state.agents[did]["is_verified"] is True
+    out, err = capsys.readouterr()
+    combined = out + err
+
+    assert client.started is True
+    identity_after = _load(proxy_paths(home).identity_path("proxy"))
+    assert identity_after["did"] == identity_before["did"]
+    assert identity_after.get("registered") is True
+    assert load_credential(home=avp_home) is not None
+    assert load_runtime_binding_credential(home=avp_home) is not None
+    assert "existing agent registered with the backend" in combined
+    assert "Runtime readiness is separate" in combined
+    assert "Active" not in combined
+    assert CONSOLE_TOKEN not in combined
+    assert CONSOLE_BINDING_TOKEN not in combined
+    _assert_bounded_project_login_output(combined, identity_before, home=home)
+
+
+def test_project_login_uses_existing_console_credential_without_repairing(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    home = _seed_project_proxy_identity(project, "claude-code", registered=False)
+    _install_machine_dual_console_credentials(tmp_path, monkeypatch)
+    client = _FakeConsoleClient(fail_if_used=True)
+    _install_console_client(monkeypatch, client)
+    _install_connector_status_mocks(monkeypatch, "claude-code")
+    identity_before = _load(proxy_paths(home).identity_path("proxy"))
+
+    with _fake_avp_registration_backend() as (base_url, state):
+        _seed_identity_on_fake_backend(state, home, passphrase=None)
+        _set_proxy_home_base_url(home, base_url)
+        assert main(_project_login_argv(project, "claude-code")) == 0
+    out, _err = capsys.readouterr()
+
+    assert client.started is False
+    assert "Reusing existing AgentVeil Console connection" in out
+    assert _load(proxy_paths(home).identity_path("proxy")).get("registered") is True
+    _assert_bounded_project_login_output(out + _err, identity_before, home=home)
+
+
+def test_projectless_login_setup_and_status_never_register_agent(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    _seed_project_proxy_identity(project, "codex", registered=False)
+    _install_machine_dual_console_credentials(tmp_path, monkeypatch)
+    _install_connector_status_mocks(monkeypatch, "codex")
+
+    register_calls = {"count": 0}
+    original_register = proxy_cli.register_proxy
+
+    def counting_register(**kwargs):
+        register_calls["count"] += 1
+        return original_register(**kwargs)
+
+    monkeypatch.setattr(proxy_cli, "register_proxy", counting_register)
+
+    assert proxy_cli.run_console_login_cli(open_browser=False) == 0
+    capsys.readouterr()
+    assert main(["setup", "status", "--client", "codex", "--project-dir", str(project), "--json"]) == 0
+    capsys.readouterr()
+    assert register_calls["count"] == 0
+
+
+def test_project_login_encrypted_cursor_identity_preserves_custody_and_hides_secrets(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    home = _seed_project_proxy_identity(project, "cursor", registered=False)
+    identity_before = _load(proxy_paths(home).identity_path("proxy"))
+    assert identity_before.get("encrypted") is True
+    _install_machine_dual_console_credentials(tmp_path, monkeypatch)
+    _install_connector_status_mocks(monkeypatch, "cursor")
+
+    with _fake_avp_registration_backend() as (base_url, state):
+        from agentveil_mcp_proxy import cursor_setup
+
+        _seed_identity_on_fake_backend(state, home, passphrase_file=cursor_setup.passphrase_path(home))
+        _set_proxy_home_base_url(home, base_url)
+        assert main(_project_login_argv(project, "cursor")) == 0
+    out, err = capsys.readouterr()
+    combined = out + err
+
+    identity_after = _load(proxy_paths(home).identity_path("proxy"))
+    assert identity_after.get("encrypted") is True
+    assert identity_after["did"] == identity_before["did"]
+    _assert_bounded_project_login_output(combined, identity_before, home=home)
+
+
+def test_project_login_registration_failure_preserves_identity_credential_and_inactive_status(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    home = _seed_project_proxy_identity(project, "gemini-cli", registered=False)
+    identity_before = _load(proxy_paths(home).identity_path("proxy"))
+    avp_home = _install_machine_dual_console_credentials(tmp_path, monkeypatch)
+    _install_fake_register(
+        monkeypatch,
+        raises=AVPValidationError("rejected", status_code=403),
+    )
+
+    assert main(_project_login_argv(project, "gemini-cli")) == 1
+    out, err = capsys.readouterr()
+    combined = out + err
+
+    identity_after = _load(proxy_paths(home).identity_path("proxy"))
+    assert identity_after == identity_before
+    assert load_credential(home=avp_home).token == CONSOLE_TOKEN
+    assert load_runtime_binding_credential(home=avp_home).token == CONSOLE_BINDING_TOKEN
+    assert "Project connection incomplete" in combined
+    assert "Active" not in combined
+
+
+def test_project_login_repeat_is_idempotent_and_never_mints_new_identity(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    home = _seed_project_proxy_identity(project, "codex", registered=False)
+    identity_before = _load(proxy_paths(home).identity_path("proxy"))
+    _install_machine_dual_console_credentials(tmp_path, monkeypatch)
+    _install_connector_status_mocks(monkeypatch, "codex")
+
+    with _fake_avp_registration_backend() as (base_url, state):
+        did = _seed_identity_on_fake_backend(state, home, passphrase=None)
+        _set_proxy_home_base_url(home, base_url)
+        assert main(_project_login_argv(project, "codex")) == 0
+        capsys.readouterr()
+        state.register_status = 409
+        state.agents[did]["is_verified"] = True
+        assert main(_project_login_argv(project, "codex")) == 0
+        capsys.readouterr()
+
+    identity_after = _load(proxy_paths(home).identity_path("proxy"))
+    assert identity_after["did"] == identity_before["did"]
+
+
+def test_project_login_409_malformed_is_verified_false_preserves_identity_and_credentials(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    home = _seed_project_proxy_identity(project, "codex", registered=False)
+    identity_before = _load(proxy_paths(home).identity_path("proxy"))
+    avp_home = _install_machine_dual_console_credentials(tmp_path, monkeypatch)
+    _install_connector_status_mocks(monkeypatch, "codex")
+    credential_before = load_credential(home=avp_home)
+    binding_before = load_runtime_binding_credential(home=avp_home)
+
+    with _fake_avp_registration_backend() as (base_url, state):
+        did = _seed_identity_on_fake_backend(state, home, passphrase=None)
+        _set_proxy_home_base_url(home, base_url)
+        assert main(_project_login_argv(project, "codex")) == 0
+        capsys.readouterr()
+        identity_mid = _load(proxy_paths(home).identity_path("proxy"))
+        state.register_status = 409
+        state.agents[did]["is_verified"] = True
+        state.lookup_is_verified[did] = "false"
+        assert main(_project_login_argv(project, "codex")) == 1
+        capsys.readouterr()
+
+    identity_after = _load(proxy_paths(home).identity_path("proxy"))
+    assert identity_after["did"] == identity_before["did"]
+    assert identity_after.get("registered") is identity_mid.get("registered")
+    assert identity_after.get("verified") is identity_mid.get("verified")
+    assert load_credential(home=avp_home) == credential_before
+    assert load_runtime_binding_credential(home=avp_home) == binding_before
+
+
+def test_project_login_subprocess_cli_sequence(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    home = _seed_project_proxy_identity(project, "codex", registered=False)
+    identity_before = _load(proxy_paths(home).identity_path("proxy"))
+    avp_home = tmp_path / "machine-avp"
+    avp_home.mkdir()
+    save_credential(CONSOLE_TOKEN, home=avp_home)
+    save_runtime_binding_credential(CONSOLE_BINDING_TOKEN, home=avp_home)
+    repo_root = Path(__file__).resolve().parents[3]
+    script = tmp_path / "project_login_proof.py"
+    script.write_text(
+        f"""import hashlib
+import json
+import os
+import secrets
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+from nacl.signing import VerifyKey
+
+sys.path.insert(0, {str(repo_root)!r})
+sys.path.insert(0, {str(repo_root / "packages" / "agentveil-mcp-proxy")!r})
+os.environ["AVP_HOME"] = {str(avp_home)!r}
+
+from agentveil_mcp_proxy.cli import main, proxy_paths
+
+POW_DIFFICULTY = {_FAKE_REGISTRATION_POW_DIFFICULTY}
+
+class State:
+    agents = {{}}
+    challenges = {{}}
+
+def _pow_valid(challenge, nonce, difficulty):
+    digest = hashlib.sha256((challenge + nonce).encode()).digest()
+    full_bytes = difficulty // 8
+    remaining_bits = difficulty % 8
+    mask = (0xFF >> remaining_bits) ^ 0xFF if remaining_bits else 0
+    for index in range(full_bytes):
+        if digest[index] != 0:
+            return False
+    if remaining_bits > 0 and (digest[full_bytes] & mask) != 0:
+        return False
+    return True
+
+def _verify_payload(payload):
+    did = payload.get("did", "")
+    agent = State.agents.get(did)
+    if agent is None:
+        return "unknown agent"
+    public_key_hex = agent.get("public_key_hex", "")
+    challenge_entry = State.challenges.get(public_key_hex)
+    if not isinstance(challenge_entry, dict):
+        return "missing registration challenge"
+    challenge = payload.get("challenge", "")
+    if challenge != challenge_entry.get("challenge"):
+        return "challenge mismatch"
+    try:
+        VerifyKey(bytes.fromhex(public_key_hex)).verify(
+            challenge.encode(),
+            bytes.fromhex(payload.get("signature_hex", "")),
+        )
+    except Exception:
+        return "invalid signature"
+    if not _pow_valid(
+        str(challenge_entry.get("pow_challenge", "")),
+        str(payload.get("pow_nonce", "")),
+        POW_DIFFICULTY,
+    ):
+        return "invalid pow"
+    return None
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *_args):
+        return
+    def _send(self, status, payload):
+        data = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+    def do_GET(self):
+        if self.path.startswith("/v1/health"):
+            self._send(200, {{"status": "ok"}})
+            return
+        did = self.path.split("/v1/agents/", 1)[-1]
+        agent = State.agents.get(did)
+        if agent is None:
+            self._send(404, {{"detail": "missing"}})
+            return
+        self._send(
+            200,
+            {{
+                "did": did,
+                "is_verified": agent["is_verified"] is True,
+                "status": "active",
+            }},
+        )
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        if self.path == "/v1/agents/register":
+            challenge = secrets.token_hex(8)
+            State.challenges[payload["public_key_hex"]] = {{
+                "challenge": challenge,
+                "pow_challenge": challenge,
+            }}
+            self._send(
+                200,
+                {{
+                    "challenge": challenge,
+                    "pow_challenge": challenge,
+                    "pow_difficulty": POW_DIFFICULTY,
+                }},
+            )
+            return
+        if self.path == "/v1/agents/verify":
+            verify_error = _verify_payload(payload)
+            if verify_error is not None:
+                self._send(400, {{"detail": verify_error}})
+                return
+            did = payload["did"]
+            State.agents[did]["is_verified"] = True
+            self._send(200, {{"onboarding_pending": False}})
+            return
+        self._send(404, {{"detail": "missing"}})
+
+home = Path({str(home)!r})
+paths = proxy_paths(home)
+config = json.loads(paths.config_path.read_text(encoding="utf-8"))
+identity = json.loads(paths.identity_path(config["avp"]["agent_name"]).read_text(encoding="utf-8"))
+from agentveil_mcp_proxy.identity import load_agent_from_identity
+agent = load_agent_from_identity(
+    identity,
+    base_url=identity["base_url"],
+    agent_name=identity["name"],
+    passphrase=None,
+)
+State.agents[agent.did] = {{"public_key_hex": agent.public_key_hex, "is_verified": False}}
+
+server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+thread = threading.Thread(target=server.serve_forever, daemon=True)
+thread.start()
+base_url = f"http://127.0.0.1:{{server.server_address[1]}}"
+config["avp"]["base_url"] = base_url
+paths.config_path.write_text(json.dumps(config), encoding="utf-8")
+identity["base_url"] = base_url
+paths.identity_path(config["avp"]["agent_name"]).write_text(json.dumps(identity), encoding="utf-8")
+
+try:
+    code = main([
+        "login",
+        "--project-dir",
+        {str(project)!r},
+        "--connector",
+        "codex",
+        "--no-open",
+    ])
+finally:
+    server.shutdown()
+    thread.join(timeout=5)
+raise SystemExit(code)
+""",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTHONPATH"] = os.pathsep.join([
+        str(repo_root),
+        str(repo_root / "packages" / "agentveil-mcp-proxy"),
+    ])
+    result = subprocess.run(
+        [sys.executable, str(script)],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    identity = _load(proxy_paths(home).identity_path("proxy"))
+    assert identity.get("registered") is True
+    assert identity.get("verified") is True
+    assert identity["did"] == identity_before["did"]
+    combined = result.stdout + result.stderr
+    assert CONSOLE_TOKEN not in combined
+    _assert_bounded_project_login_output(combined, identity_before, home=home)
+
+
+def test_project_login_external_passphrase_file_registers_via_fake_backend(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    external_passphrase = tmp_path / "stored-passphrase"
+    home = _seed_cursor_encrypted_with_external_passphrase_file(
+        project,
+        external_passphrase,
+        registered=False,
+    )
+    identity_before = _load(proxy_paths(home).identity_path("proxy"))
+    _install_machine_dual_console_credentials(tmp_path, monkeypatch)
+    _install_connector_status_mocks(monkeypatch, "cursor")
+
+    with _fake_avp_registration_backend() as (base_url, state):
+        _seed_identity_on_fake_backend(state, home, passphrase_file=external_passphrase)
+        _set_proxy_home_base_url(home, base_url)
+        assert main(_project_login_argv(project, "cursor")) == 0
+    out, err = capsys.readouterr()
+    _assert_bounded_project_login_output(out + err, identity_before, home=home)
+    assert external_passphrase.read_text(encoding="utf-8").strip() not in out + err
+
+
+def test_project_login_two_home_selection_keeps_other_project_identity(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    project_a = tmp_path / "project-a"
+    project_b = tmp_path / "project-b"
+    project_a.mkdir()
+    project_b.mkdir()
+    home_a = _seed_project_proxy_identity(project_a, "codex", registered=False)
+    home_b = _seed_project_proxy_identity(project_b, "codex", registered=False)
+    identity_b_before = _load(proxy_paths(home_b).identity_path("proxy"))
+    _install_machine_dual_console_credentials(tmp_path, monkeypatch)
+    _install_connector_status_mocks(monkeypatch, "codex")
+
+    with _fake_avp_registration_backend() as (base_url, state):
+        _seed_identity_on_fake_backend(state, home_a, passphrase=None)
+        _set_proxy_home_base_url(home_a, base_url)
+        assert main(_project_login_argv(project_a, "codex")) == 0
+    capsys.readouterr()
+    identity_b_after = _load(proxy_paths(home_b).identity_path("proxy"))
+    assert identity_b_after == identity_b_before
+
+
+def test_project_login_partial_pairing_never_registers(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    home = _seed_project_proxy_identity(project, "codex", registered=False)
+    identity_before = _load(proxy_paths(home).identity_path("proxy"))
+    avp_home = tmp_path / "machine-avp"
+    avp_home.mkdir()
+    monkeypatch.setenv("AVP_HOME", str(avp_home))
+    client = _FakeConsoleClient(
+        start=_console_start(),
+        poll_error=PairingClientError("transport_failed"),
+    )
+    _install_console_client(monkeypatch, client)
+    register_calls = {"count": 0}
+    original_register = proxy_cli.register_proxy
+
+    def counting_register(**kwargs):
+        register_calls["count"] += 1
+        return original_register(**kwargs)
+
+    monkeypatch.setattr(proxy_cli, "register_proxy", counting_register)
+
+    assert main(_project_login_argv(project, "codex")) != 0
+    capsys.readouterr()
+    assert register_calls["count"] == 0
+    assert _load(proxy_paths(home).identity_path("proxy")) == identity_before
+
+
+def test_upgrade_ca_policy_preview_never_registers(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    _seed_project_proxy_identity(project, "codex", registered=False)
+    _install_machine_dual_console_credentials(tmp_path, monkeypatch)
+
+    def forbidden_register(**_kwargs):
+        raise AssertionError("register_proxy must not run during upgrade-ca-policy preview")
+
+    monkeypatch.setattr(proxy_cli, "register_proxy", forbidden_register)
+    home = project / ".avp"
+    assert main(["upgrade-ca-policy", "--home", str(home), "--json"]) in (0, 1)
+    capsys.readouterr()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink custody")
