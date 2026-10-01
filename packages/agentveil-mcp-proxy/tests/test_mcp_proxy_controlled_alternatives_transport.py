@@ -891,6 +891,242 @@ def _patch_heartbeat_exchange(monkeypatch):
     return exchanges
 
 
+def test_project_runtime_avp_home_resolves_global_scoped_binding_for_context(
+    identity, tmp_path, monkeypatch,
+):
+    from agentveil_mcp_proxy.console_credentials import (
+        console_credential_home_for_runtime,
+        save_scoped_runtime_binding_credential,
+    )
+
+    project_runtime = tmp_path / "project" / ".avp"
+    project_runtime.mkdir(parents=True)
+    user_global = tmp_path.home() / ".avp"
+    monkeypatch.delenv("AVP_HOME", raising=False)
+    save_credential(SUMMARY_TOKEN, home=user_global)
+    save_scoped_runtime_binding_credential(
+        BINDING_TOKEN,
+        agent_did=identity[1].did,
+        summary_token=SUMMARY_TOKEN,
+        home=project_runtime,
+    )
+    monkeypatch.setenv("AVP_HOME", str(project_runtime))
+    assert console_credential_home_for_runtime(project_runtime) == user_global
+    bound = transport.build_controlled_alternative_context(
+        agent=identity[1],
+        base_url="https://agentveil.dev",
+        state_root=project_runtime,
+        summary_token=SUMMARY_TOKEN,
+    )
+    assert bound is not None
+    assert bound.contract_version == transport.CONTEXT_VERSION_V2
+    assert bound.runtime_register is not None
+
+
+def _project_runtime_tool_list_setup(
+    identity,
+    tmp_path,
+    monkeypatch,
+    *,
+    failure_mode: str | None = None,
+):
+    import agentveil_mcp_proxy.controlled_alternatives as ca_mod
+    from agentveil_mcp_proxy.console_credentials import (
+        console_credential_home_for_runtime,
+        save_scoped_runtime_binding_credential,
+        scoped_runtime_binding_namespace_hash,
+    )
+    from agentveil_mcp_proxy.controlled_alternatives import (
+        CONTROLLED_ALTERNATIVE_AUTHORITY_ENTRYPOINT_GROUP,
+        CONTROLLED_ALTERNATIVE_AUTHORITY_ID,
+        CONTROLLED_ALTERNATIVE_IDS,
+        CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP,
+        CONTROLLED_ALTERNATIVE_PROVIDER_ID,
+        CONTROLLED_ALTERNATIVES_PROFILE_ID,
+        set_controlled_alternative_authority_loader,
+        set_controlled_alternative_provider_loader,
+    )
+    from agentveil_mcp_proxy.controlled_alternatives_runtime import (
+        bind_controlled_alternative_runtime,
+        inject_controlled_alternative_tool,
+    )
+    from test_mcp_proxy_controlled_alternatives import (
+        VENDORED_CA_MODULE_NAME,
+        _build_controlled_alternative_wheel,
+        _install_active_controlled_alternative_vendor,
+        _no_global_controlled_entries,
+    )
+    from test_mcp_proxy_controlled_alternatives_runtime import _active_runtime_authority
+
+    workspace = tmp_path / "workspace"
+    project_runtime = workspace / ".avp"
+    workspace.mkdir()
+    project_runtime.mkdir()
+    user_global = tmp_path.home() / ".avp"
+    downstream = {"name": "fs", "command": "python", "args": [], "cwd": str(workspace)}
+    list_response = {"result": {"tools": [{"name": "read_file"}]}}
+
+    monkeypatch.delenv("AVP_HOME", raising=False)
+    save_credential(SUMMARY_TOKEN, home=user_global)
+    save_scoped_runtime_binding_credential(
+        BINDING_TOKEN,
+        agent_did=identity[1].did,
+        summary_token=SUMMARY_TOKEN,
+        home=project_runtime,
+    )
+    if failure_mode == "missing_scoped":
+        namespace = scoped_runtime_binding_namespace_hash(
+            identity[1].did,
+            SUMMARY_TOKEN,
+        )
+        missing = user_global / "console" / f"runtime-binding-scoped-{namespace}.json"
+        if missing.exists():
+            missing.unlink()
+    if failure_mode == "malformed_scoped":
+        namespace = scoped_runtime_binding_namespace_hash(
+            identity[1].did,
+            SUMMARY_TOKEN,
+        )
+        bad = user_global / "console" / f"runtime-binding-scoped-{namespace}.json"
+        bad.parent.mkdir(parents=True, exist_ok=True)
+        bad.write_text("{", encoding="utf-8")
+        os.chmod(bad, 0o600)
+    if failure_mode == "summary_source_changed":
+        save_credential(SUMMARY_TOKEN_B, home=user_global)
+
+    monkeypatch.setenv("AVP_HOME", str(project_runtime))
+    assert console_credential_home_for_runtime(project_runtime) == user_global
+
+    snapshot = _active_runtime_authority().to_dict()
+    authority_source = f'''
+class Authority:
+    def __init__(self, context=None):
+        self.context = context
+    def bind_runtime_context(self, context):
+        return Authority(context)
+    def authority(self):
+        from agentveil_mcp_proxy.controlled_alternatives import validate_controlled_alternative_authority
+        if self.context is None:
+            from agentveil_mcp_proxy.controlled_alternatives import ControlledAlternativeAuthoritySnapshot
+            return ControlledAlternativeAuthoritySnapshot().to_dict()
+        status, payload = self.context.request("preflight", {{}})
+        if status != 200 or payload.get("ok") is not True:
+            from agentveil_mcp_proxy.controlled_alternatives import ControlledAlternativeAuthoritySnapshot
+            return ControlledAlternativeAuthoritySnapshot().to_dict()
+        return validate_controlled_alternative_authority({snapshot!r})
+class Provider:
+    def __init__(self, context=None):
+        self.context = context
+    def bind_runtime_context(self, context):
+        return Provider(context)
+    def descriptor(self):
+        return {{
+            "provider_id": "{CONTROLLED_ALTERNATIVE_PROVIDER_ID}",
+            "contract_version": "1",
+            "profile_id": "{CONTROLLED_ALTERNATIVES_PROFILE_ID}",
+            "alternative_ids": list({list(CONTROLLED_ALTERNATIVE_IDS)!r}),
+        }}
+    def propose(self, request):
+        raise RuntimeError("unused")
+    def execute(self, request):
+        raise RuntimeError("unused")
+    def verify(self, request):
+        raise RuntimeError("unused")
+def build_provider():
+    return Authority()
+def build_controlled_provider():
+    return Provider()
+'''
+    entries = (
+        f"[{CONTROLLED_ALTERNATIVE_AUTHORITY_ENTRYPOINT_GROUP}]\n"
+        f"{CONTROLLED_ALTERNATIVE_AUTHORITY_ID} = {VENDORED_CA_MODULE_NAME}.controlled_provider:build_provider\n"
+        f"[{CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP}]\n"
+        f"{CONTROLLED_ALTERNATIVE_PROVIDER_ID} = {VENDORED_CA_MODULE_NAME}.controlled_provider:build_controlled_provider\n"
+    )
+    wheel = _build_controlled_alternative_wheel(
+        tmp_path / "project-wheel",
+        source=authority_source,
+        entry_points=entries,
+    )
+    monkeypatch.setattr(ca_mod, "entry_points", _no_global_controlled_entries)
+    _install_active_controlled_alternative_vendor(project_runtime, wheel_bytes=wheel)
+
+    def hybrid_exchange(url, headers, body, method="POST"):
+        if transport._PATHS["preflight"] in url:
+            return 200, {"ok": True}
+        if transport._AV02_PATHS["register"] in url:
+            return 200, {
+                "schema_version": "runtime/register-response/1",
+                "runtime_installation_id": RUNTIME_ID,
+            }
+        return 200, {"ok": True}
+
+    monkeypatch.setattr(transport, "_run_bounded_exchange", hybrid_exchange)
+    runtime_context = transport.build_controlled_alternative_context(
+        agent=identity[1],
+        base_url="https://agentveil.dev",
+        state_root=project_runtime,
+        summary_token=SUMMARY_TOKEN,
+    )
+    set_controlled_alternative_authority_loader(None)
+    set_controlled_alternative_provider_loader(None)
+    try:
+        runtime_binding = bind_controlled_alternative_runtime(
+            home=project_runtime,
+            downstream=downstream,
+            runtime_context=runtime_context,
+        )
+        projected = inject_controlled_alternative_tool(list_response, runtime_binding)
+        return runtime_context, runtime_binding, projected
+    finally:
+        set_controlled_alternative_provider_loader(None)
+        set_controlled_alternative_authority_loader(None)
+
+
+def test_project_runtime_global_custody_projects_agentveil_stage_delete_in_tools_list(
+    identity,
+    tmp_path,
+    monkeypatch,
+):
+    from agentveil_mcp_proxy.controlled_alternatives import SEMANTIC_STAGE_DELETE_TOOL_NAME
+
+    runtime_context, runtime_binding, projected = _project_runtime_tool_list_setup(
+        identity,
+        tmp_path,
+        monkeypatch,
+    )
+    assert runtime_context.runtime_register is not None
+    assert runtime_binding is not None
+    tool_names = [tool["name"] for tool in projected["result"]["tools"]]
+    assert SEMANTIC_STAGE_DELETE_TOOL_NAME in tool_names
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    ["missing_scoped", "malformed_scoped", "summary_source_changed"],
+)
+def test_project_runtime_scoped_custody_failure_hides_agentveil_stage_delete(
+    identity,
+    tmp_path,
+    monkeypatch,
+    failure_mode,
+):
+    from agentveil_mcp_proxy.controlled_alternatives import SEMANTIC_STAGE_DELETE_TOOL_NAME
+
+    runtime_context, runtime_binding, projected = _project_runtime_tool_list_setup(
+        identity,
+        tmp_path,
+        monkeypatch,
+        failure_mode=failure_mode,
+    )
+    if failure_mode != "summary_source_changed":
+        assert runtime_context.runtime_register is None
+    assert runtime_binding is None
+    tool_names = [tool["name"] for tool in projected["result"]["tools"]]
+    assert tool_names == ["read_file"]
+    assert SEMANTIC_STAGE_DELETE_TOOL_NAME not in tool_names
+
+
 def test_opted_in_fresh_context_source_change_never_sends_schema1_heartbeat(
     identity, tmp_path, monkeypatch,
 ):

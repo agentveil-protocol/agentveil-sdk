@@ -149,13 +149,9 @@ def _expanduser_or_self(path: Path) -> Path:
         return path
 
 
-def _global_console_credential_home() -> Path | None:
-    configured = os.environ.get("AVP_HOME")
-    if configured:
-        try:
-            return Path(configured).expanduser()
-        except RuntimeError:
-            pass
+def _default_user_avp_home() -> Path | None:
+    """Default user-global AVP home used for Console custody outside project runtimes."""
+
     try:
         return Path("~/.avp").expanduser()
     except RuntimeError:
@@ -168,6 +164,27 @@ def _global_console_credential_home() -> Path | None:
         if home_drive and home_path:
             return Path(f"{home_drive}{home_path}") / ".avp"
         return None
+
+
+def _global_console_credential_home() -> Path | None:
+    default = _default_user_avp_home()
+    configured = os.environ.get("AVP_HOME")
+    if not configured:
+        return default
+    try:
+        expanded = Path(configured).expanduser()
+    except RuntimeError:
+        return default
+    if default is not None:
+        try:
+            if expanded == default.expanduser():
+                return default
+        except RuntimeError:
+            return default
+    # Connectors launch MCP with AVP_HOME=<project>/.avp; Console stays user-global.
+    if expanded.name in (".avp", ".agentveil"):
+        return default
+    return expanded
 
 
 def is_canonical_global_runtime_home(runtime_home: Path) -> bool:
@@ -224,9 +241,23 @@ def console_credential_home_for_runtime(runtime_home: Path | None) -> Path | Non
                 if expanded_runtime_home != global_expanded:
                     return global_home
     configured_home = os.environ.get("AVP_HOME")
-    if configured_home is not None and global_home is not None:
-        if _expanduser_or_self(Path(configured_home)) == expanded_runtime_home:
-            return global_home
+    if configured_home is not None:
+        try:
+            if _expanduser_or_self(Path(configured_home)) == expanded_runtime_home:
+                default_home = _default_user_avp_home()
+                if default_home is not None:
+                    try:
+                        resolved_default = default_home.expanduser()
+                    except RuntimeError:
+                        resolved_default = default_home
+                    if expanded_runtime_home.name in (".avp", ".agentveil"):
+                        return default_home
+                    if expanded_runtime_home != resolved_default:
+                        return default_home
+                if global_home is not None:
+                    return global_home
+        except RuntimeError:
+            pass
     return expanded_runtime_home
 
 

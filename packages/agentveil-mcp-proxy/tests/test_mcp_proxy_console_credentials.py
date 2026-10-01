@@ -891,6 +891,42 @@ def test_cursor_project_runtime_uses_global_console_credential_home(
     )
 
 
+def test_global_login_scoped_custody_resolves_under_project_runtime_avp_home(
+    tmp_path,
+    monkeypatch,
+):
+    """Login without AVP_HOME stores globally; MCP AVP_HOME=<project>/.avp must still resolve."""
+
+    agent_did = "did:key:z6MkhaWgW9R3mQ8p1k2v3N4m5L6n7O8p9Q0r1S2t3U4v5W6x7Y8z9"
+    summary = "summary-token-scoped-0123456789abcdef0123456789ab"
+    scoped_token = "scoped-runtime-binding-token-value-0123456789ab"
+    project_runtime = tmp_path / "project" / ".avp"
+    project_runtime.mkdir(parents=True)
+    user_global = tmp_path.home() / ".avp"
+
+    monkeypatch.delenv("AVP_HOME", raising=False)
+    save_credential(TOKEN, home=user_global)
+    save_scoped_runtime_binding_credential(
+        scoped_token,
+        agent_did=agent_did,
+        summary_token=summary,
+        home=project_runtime,
+    )
+    assert not (project_runtime / "console").exists()
+
+    monkeypatch.setenv("AVP_HOME", str(project_runtime))
+    assert console_credential_home_for_runtime(project_runtime) == user_global
+    resolved = resolve_runtime_binding_for_context(
+        agent_did,
+        summary,
+        project_runtime,
+    )
+    assert resolved is not None and resolved.token == scoped_token
+    custody = console_credential_home_for_runtime(project_runtime)
+    assert custody is not None
+    assert load_credential(home=custody).token == TOKEN
+
+
 def test_project_runtime_symlink_to_global_is_distinct_and_fails_closed_on_alias(
     tmp_path,
     monkeypatch,

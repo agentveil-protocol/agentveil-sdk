@@ -823,9 +823,9 @@ def test_duplicate_ack_is_preserved():
 def test_project_runtime_uses_global_console_credential_home(monkeypatch, tmp_path):
     runtime_home = tmp_path / "project-home"
     monkeypatch.setenv("AVP_HOME", str(runtime_home))
-    assert console_credential_home_for_runtime(runtime_home) == (
-        tmp_path.home() / ".avp"
-    )
+    custody = console_credential_home_for_runtime(runtime_home)
+    assert custody == (tmp_path.home() / ".avp")
+    assert custody != runtime_home
 
 
 def test_canonical_project_runtime_uses_global_credential_without_env(
