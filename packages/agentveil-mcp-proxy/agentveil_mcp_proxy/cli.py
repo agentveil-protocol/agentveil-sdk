@@ -219,6 +219,10 @@ from agentveil_mcp_proxy.cursor_setup import (
     CursorSetupError,
 )
 from agentveil_mcp_proxy.runtime_gate import RuntimeGateClient
+from agentveil_mcp_proxy.console_agent_binding_client import (
+    AgentBindingClientError,
+    ConsoleAgentBindingClient,
+)
 from agentveil_mcp_proxy.console_credentials import (
     CredentialError,
     console_login_lock,
@@ -229,6 +233,7 @@ from agentveil_mcp_proxy.console_credentials import (
     load_runtime_binding_credential,
     save_credential,
     save_runtime_binding_credential,
+    save_scoped_runtime_binding_credential,
 )
 from agentveil_mcp_proxy.console_attach_client import (
     AttachClientError,
@@ -4102,10 +4107,25 @@ def run_proxy(
             agent_cls=AVPAgent,
             passphrase=identity_passphrase,
         )
+        from agentveil_mcp_proxy.console_project_status_client import (
+            correlation_root_for_client_installation_ref,
+        )
+
+        runtime_home_path = paths.home
+        project_dir_for_ref = (
+            runtime_home_path.parent
+            if runtime_home_path.name in (".avp", ".agentveil")
+            else runtime_home_path
+        )
+        canonical_project_root = correlation_root_for_client_installation_ref(
+            project_dir=project_dir_for_ref,
+            runtime_home=runtime_home_path,
+        )
         controlled_runtime_context = build_controlled_alternative_context(
             agent=proxy_agent,
             base_url=config.avp.base_url,
             state_root=paths.home,
+            canonical_project_root=canonical_project_root,
         )
         controlled_runtime = bind_controlled_alternative_runtime(
             home=paths.home,
@@ -5127,6 +5147,12 @@ def _store_console_attach_credentials(
     binding_token = token.runtime_binding_token
     if binding_token is None:
         return
+    try:
+        existing = load_runtime_binding_credential(home=home)
+    except CredentialError:
+        existing = None
+    if existing is not None:
+        return
     save_runtime_binding_credential(binding_token, home=home)
 
 
@@ -5140,6 +5166,12 @@ def _store_console_pairing_credentials(
     save_credential(token.token, scope=token.scope, home=home)
     binding_token = token.runtime_binding_token
     if binding_token is None:
+        return
+    try:
+        existing = load_runtime_binding_credential(home=home)
+    except CredentialError:
+        existing = None
+    if existing is not None:
         return
     save_runtime_binding_credential(binding_token, home=home)
 
@@ -5169,6 +5201,98 @@ def _load_dual_console_credentials_or_raise() -> tuple[Any, Any]:
     return summary, binding
 
 
+def issue_and_store_scoped_runtime_binding(
+    *,
+    agent: Any,
+    summary_token: str,
+    home: Path | None = None,
+    client: ConsoleAgentBindingClient | None = None,
+) -> None:
+    """Issue and persist one agent-scoped runtime binding for the current source."""
+
+    binding_client = client or ConsoleAgentBindingClient()
+    issuance = binding_client.issue(agent=agent, summary_token=summary_token)
+    save_scoped_runtime_binding_credential(
+        issuance.token,
+        agent_did=str(agent.did),
+        summary_token=summary_token,
+        home=home,
+    )
+
+
+def _issue_scoped_runtime_binding_for_project_login(
+    *,
+    home: Path,
+    project_dir: Path,
+    stream: TextIO,
+) -> bool:
+    try:
+        summary = load_credential()
+    except CredentialError as exc:
+        print(
+            f"Project connection incomplete: Console summary custody failed ({exc.code}).",
+            file=stream,
+        )
+        return False
+    if summary is None:
+        print(
+            "Project connection incomplete: Console summary credential is missing.",
+            file=stream,
+        )
+        return False
+    paths = proxy_paths(home)
+    try:
+        config = load_proxy_config(paths.config_path)
+    except ProxyCliError:
+        print(
+            "Project connection incomplete: proxy config is unavailable for binding.",
+            file=stream,
+        )
+        return False
+    identity_path = paths.identity_path(config.avp.agent_name)
+    try:
+        identity = _read_json(identity_path, "agent identity")
+    except ProxyCliError:
+        print(
+            "Project connection incomplete: agent identity is unavailable for binding.",
+            file=stream,
+        )
+        return False
+    passphrase_file = _register_guidance_passphrase_file(home)
+    passphrase = None
+    if passphrase_file is not None and passphrase_file.is_file():
+        try:
+            passphrase = _read_passphrase_file(passphrase_file)
+        except ProxyCliError:
+            passphrase = None
+    try:
+        agent = _load_proxy_agent(
+            identity=identity,
+            config=config,
+            passphrase=passphrase,
+        )
+    except ProxyCliError:
+        print(
+            "Project connection incomplete: agent identity is unavailable for binding.",
+            file=stream,
+        )
+        return False
+    try:
+        issue_and_store_scoped_runtime_binding(
+            agent=agent,
+            summary_token=summary.token,
+            home=home,
+        )
+    except (AgentBindingClientError, CredentialError) as exc:
+        code = getattr(exc, "code", "runtime_binding_failed")
+        print(
+            f"Project connection incomplete: runtime binding issuance failed ({code}).",
+            file=stream,
+        )
+        return False
+    return True
+
+
 def _pair_machine_console_credentials_for_project_connect(
     *,
     open_browser: bool,
@@ -5181,14 +5305,8 @@ def _pair_machine_console_credentials_for_project_connect(
     stream = out or sys.stderr
     with console_login_lock():
         summary, binding = _load_dual_console_credentials_or_raise()
-        if summary is not None and binding is not None:
+        if summary is not None:
             return
-        if summary is not None and binding is None:
-            raise ProxyCliError(
-                "Console connection is incomplete (missing runtime binding credential). "
-                "Run logout, then retry project login.",
-                exit_code=1,
-            )
 
         if _acquire_console_credential_via_attach(
             attach_client=None,
@@ -5221,19 +5339,8 @@ def _pair_machine_console_credentials_for_project_connect(
                 ) from exc
 
             summary, binding = _load_dual_console_credentials_or_raise()
-            if summary is not None and binding is not None:
-                return
             if summary is not None:
-                _revoke_orphan_console_token(
-                    pairing,
-                    token.token,
-                    runtime_binding_token=token.runtime_binding_token,
-                )
-                raise ProxyCliError(
-                    "Console login stored a summary credential but not the required "
-                    "runtime binding credential; not connected.",
-                    exit_code=1,
-                )
+                return
 
             try:
                 _store_console_pairing_credentials(token)
@@ -5249,11 +5356,11 @@ def _pair_machine_console_credentials_for_project_connect(
                     exit_code=1,
                 ) from exc
 
-        summary, binding = _load_dual_console_credentials_or_raise()
-        if summary is None or binding is None:
+        summary, _binding = _load_dual_console_credentials_or_raise()
+        if summary is None:
             raise ProxyCliError(
-                "Console login incomplete; dual credentials are required before "
-                "project registration.",
+                "Console login incomplete; a Console summary credential is required "
+                "before project registration.",
                 exit_code=1,
             )
 
@@ -5323,8 +5430,8 @@ def run_console_project_login_cli(
     _validate_project_connect_identity(home)
 
     try:
-        summary_before, binding_before = _load_dual_console_credentials_or_raise()
-        credential_reused = summary_before is not None and binding_before is not None
+        summary_before, _binding_before = _load_dual_console_credentials_or_raise()
+        credential_reused = summary_before is not None
         if not credential_reused:
             _pair_machine_console_credentials_for_project_connect(
                 open_browser=open_browser,
@@ -5368,6 +5475,13 @@ def run_console_project_login_cli(
             file=stream,
         )
         return reg_code
+
+    if not _issue_scoped_runtime_binding_for_project_login(
+        home=home,
+        project_dir=target,
+        stream=stream,
+    ):
+        return 1
 
     identity_after = _read_json(
         proxy_paths(home).identity_path(

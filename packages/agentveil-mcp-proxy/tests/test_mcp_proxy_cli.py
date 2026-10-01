@@ -5848,6 +5848,26 @@ def _install_connector_status_mocks(monkeypatch, connector: str) -> None:
         raise AssertionError(f"unsupported connector {connector!r}")
 
 
+def _install_project_login_post_login_fences(monkeypatch) -> None:
+    """Keep project-login tests off live Console sync and credential repair paths."""
+
+    monkeypatch.setattr(
+        proxy_cli,
+        "_observe_project_connector_status_for_login",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        proxy_cli,
+        "_best_effort_console_project_status_sync",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        proxy_cli,
+        "_best_effort_console_free_builder_sync",
+        lambda **_kwargs: None,
+    )
+
+
 _CONNECTOR_SETUP_STATUS_CASES = [
     ("cursor", ["setup", "cursor", "--workspace"], ["setup", "status", "--workspace"]),
     ("claude-code", ["setup", "claude-code", "--project-dir"], ["setup", "status", "--project-dir"]),
@@ -6144,12 +6164,47 @@ def _dual_console_pairing_token() -> PairingToken:
     )
 
 
+def _install_project_login_binding_stub(monkeypatch, *, fail: bool = False) -> dict:
+    from agentveil_mcp_proxy.console_agent_binding_client import (
+        AgentBindingClientError,
+        ConsoleAgentBindingClient,
+        RuntimeBindingIssuance,
+    )
+
+    state = {"calls": 0, "agents": []}
+
+    def _fake_issue(self, *, agent, summary_token):
+        state["calls"] += 1
+        state["agents"].append(getattr(agent, "did", None))
+        if fail:
+            raise AgentBindingClientError("runtime_binding_failed")
+        token = CONSOLE_BINDING_TOKEN if state["calls"] == 1 else "scoped-child-token-agent-b-0123456789ab"
+        return RuntimeBindingIssuance(
+            token=token,
+            scope=RUNTIME_BINDING_SCOPE,
+            result="issued",
+        )
+
+    monkeypatch.setattr(ConsoleAgentBindingClient, "issue", _fake_issue)
+    return state
+
+
 def _install_machine_dual_console_credentials(tmp_path, monkeypatch) -> Path:
     avp_home = tmp_path / "machine-avp"
     avp_home.mkdir()
     monkeypatch.setenv("AVP_HOME", str(avp_home))
     save_credential(CONSOLE_TOKEN, home=avp_home)
     save_runtime_binding_credential(CONSOLE_BINDING_TOKEN, home=avp_home)
+    _install_project_login_binding_stub(monkeypatch)
+    return avp_home
+
+
+def _install_machine_summary_console_credentials(tmp_path, monkeypatch) -> Path:
+    avp_home = tmp_path / "machine-avp"
+    avp_home.mkdir()
+    monkeypatch.setenv("AVP_HOME", str(avp_home))
+    save_credential(CONSOLE_TOKEN, home=avp_home)
+    _install_project_login_binding_stub(monkeypatch)
     return avp_home
 
 
@@ -6188,6 +6243,8 @@ def test_project_login_registers_selected_existing_identity_after_pairing(
     )
     _install_console_client(monkeypatch, client)
     _install_connector_status_mocks(monkeypatch, "codex")
+    _install_project_login_binding_stub(monkeypatch)
+    _install_project_login_post_login_fences(monkeypatch)
 
     with _fake_avp_registration_backend() as (base_url, state):
         did = _seed_identity_on_fake_backend(state, home, passphrase=None)
@@ -6223,6 +6280,7 @@ def test_project_login_uses_existing_console_credential_without_repairing(
     client = _FakeConsoleClient(fail_if_used=True)
     _install_console_client(monkeypatch, client)
     _install_connector_status_mocks(monkeypatch, "claude-code")
+    _install_project_login_post_login_fences(monkeypatch)
     identity_before = _load(proxy_paths(home).identity_path("proxy"))
 
     with _fake_avp_registration_backend() as (base_url, state):
@@ -6249,19 +6307,26 @@ def test_projectless_login_setup_and_status_never_register_agent(
     _install_connector_status_mocks(monkeypatch, "codex")
 
     register_calls = {"count": 0}
+    issuer_calls = {"count": 0}
     original_register = proxy_cli.register_proxy
 
     def counting_register(**kwargs):
         register_calls["count"] += 1
         return original_register(**kwargs)
 
+    def forbidden_issuer(**kwargs):
+        issuer_calls["count"] += 1
+        raise AssertionError("issuer must not run outside project login")
+
     monkeypatch.setattr(proxy_cli, "register_proxy", counting_register)
+    monkeypatch.setattr(proxy_cli, "issue_and_store_scoped_runtime_binding", forbidden_issuer)
 
     assert proxy_cli.run_console_login_cli(open_browser=False) == 0
     capsys.readouterr()
     assert main(["setup", "status", "--client", "codex", "--project-dir", str(project), "--json"]) == 0
     capsys.readouterr()
     assert register_calls["count"] == 0
+    assert issuer_calls["count"] == 0
 
 
 def test_project_login_encrypted_cursor_identity_preserves_custody_and_hides_secrets(
@@ -6276,6 +6341,7 @@ def test_project_login_encrypted_cursor_identity_preserves_custody_and_hides_sec
     assert identity_before.get("encrypted") is True
     _install_machine_dual_console_credentials(tmp_path, monkeypatch)
     _install_connector_status_mocks(monkeypatch, "cursor")
+    _install_project_login_post_login_fences(monkeypatch)
 
     with _fake_avp_registration_backend() as (base_url, state):
         from agentveil_mcp_proxy import cursor_setup
@@ -6302,6 +6368,7 @@ def test_project_login_registration_failure_preserves_identity_credential_and_in
     home = _seed_project_proxy_identity(project, "gemini-cli", registered=False)
     identity_before = _load(proxy_paths(home).identity_path("proxy"))
     avp_home = _install_machine_dual_console_credentials(tmp_path, monkeypatch)
+    _install_project_login_post_login_fences(monkeypatch)
     _install_fake_register(
         monkeypatch,
         raises=AVPValidationError("rejected", status_code=403),
@@ -6330,6 +6397,7 @@ def test_project_login_repeat_is_idempotent_and_never_mints_new_identity(
     identity_before = _load(proxy_paths(home).identity_path("proxy"))
     _install_machine_dual_console_credentials(tmp_path, monkeypatch)
     _install_connector_status_mocks(monkeypatch, "codex")
+    _install_project_login_post_login_fences(monkeypatch)
 
     with _fake_avp_registration_backend() as (base_url, state):
         did = _seed_identity_on_fake_backend(state, home, passphrase=None)
@@ -6356,6 +6424,7 @@ def test_project_login_409_malformed_is_verified_false_preserves_identity_and_cr
     identity_before = _load(proxy_paths(home).identity_path("proxy"))
     avp_home = _install_machine_dual_console_credentials(tmp_path, monkeypatch)
     _install_connector_status_mocks(monkeypatch, "codex")
+    _install_project_login_post_login_fences(monkeypatch)
     credential_before = load_credential(home=avp_home)
     binding_before = load_runtime_binding_credential(home=avp_home)
 
@@ -6386,6 +6455,8 @@ def test_project_login_subprocess_cli_sequence(tmp_path):
     identity_before = _load(proxy_paths(home).identity_path("proxy"))
     avp_home = tmp_path / "machine-avp"
     avp_home.mkdir()
+    isolated_home = tmp_path / "isolated-home"
+    isolated_home.mkdir()
     save_credential(CONSOLE_TOKEN, home=avp_home)
     save_runtime_binding_credential(CONSOLE_BINDING_TOKEN, home=avp_home)
     repo_root = Path(__file__).resolve().parents[3]
@@ -6394,6 +6465,7 @@ def test_project_login_subprocess_cli_sequence(tmp_path):
         f"""import hashlib
 import json
 import os
+import re
 import secrets
 import sys
 import threading
@@ -6404,15 +6476,65 @@ from nacl.signing import VerifyKey
 
 sys.path.insert(0, {str(repo_root)!r})
 sys.path.insert(0, {str(repo_root / "packages" / "agentveil-mcp-proxy")!r})
+isolated_home = Path({str(isolated_home)!r})
+isolated_home.mkdir(parents=True, exist_ok=True)
+os.environ["HOME"] = str(isolated_home)
+os.environ["USERPROFILE"] = str(isolated_home)
 os.environ["AVP_HOME"] = {str(avp_home)!r}
 
+import agentveil_mcp_proxy.console_agent_binding_client as binding_mod
+from agentveil_mcp_proxy.console_agent_binding_client import RawResponse, _REQUEST_BODY
+from agentveil_mcp_proxy.console_credentials import RUNTIME_BINDING_SCOPE
 from agentveil_mcp_proxy.cli import main, proxy_paths
+
+_BINDING_PATH = "/v1/controlled-alternatives/av02/runtime/binding"
+_SUBPROCESS_CHILD_TOKEN = "subprocess-scoped-child-token-0123456789ab"
+
+def _parse_auth_v2(headers):
+    authorization = headers["Authorization"]
+    return dict(re.findall(r'(\\w+)=\"([^\"]+)\"', authorization))
+
+def _binding_transport(method, url, *, headers, body, timeout):
+    if body != _REQUEST_BODY:
+        return RawResponse(status=503, content_types=("application/json",), body=b"{{}}", cache_control=("no-store",))
+    parsed = _parse_auth_v2(dict(headers))
+    message = (
+        f"v2:POST:{{_BINDING_PATH}}::{{parsed['ts']}}:{{parsed['nonce']}}:"
+        f"{{hashlib.sha256(body).hexdigest()}}"
+    )
+    VerifyKey(bytes.fromhex(State.public_key_hex)).verify(
+        message.encode(),
+        bytes.fromhex(parsed["sig"]),
+    )
+    response_body = json.dumps(
+        {{
+            "schema_version": "runtime/binding-response/1",
+            "runtime_binding_token": _SUBPROCESS_CHILD_TOKEN,
+            "scope": RUNTIME_BINDING_SCOPE,
+            "result": "issued",
+        }},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return RawResponse(
+        status=200,
+        content_types=("application/json",),
+        body=response_body,
+        cache_control=("no-store",),
+    )
+
+binding_mod._urllib_transport = _binding_transport
+
+import agentveil_mcp_proxy.cli as cli_mod
+cli_mod._observe_project_connector_status_for_login = lambda **_kwargs: None
+cli_mod._best_effort_console_project_status_sync = lambda **_kwargs: None
+cli_mod._best_effort_console_free_builder_sync = lambda **_kwargs: None
 
 POW_DIFFICULTY = {_FAKE_REGISTRATION_POW_DIFFICULTY}
 
 class State:
     agents = {{}}
     challenges = {{}}
+    public_key_hex = ""
 
 def _pow_valid(challenge, nonce, difficulty):
     digest = hashlib.sha256((challenge + nonce).encode()).digest()
@@ -6520,6 +6642,7 @@ agent = load_agent_from_identity(
     agent_name=identity["name"],
     passphrase=None,
 )
+State.public_key_hex = agent.public_key_hex
 State.agents[agent.did] = {{"public_key_hex": agent.public_key_hex, "is_verified": False}}
 
 server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -6549,6 +6672,8 @@ raise SystemExit(code)
     )
     env = os.environ.copy()
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["HOME"] = str(isolated_home)
+    env["USERPROFILE"] = str(isolated_home)
     env["PYTHONPATH"] = os.pathsep.join([
         str(repo_root),
         str(repo_root / "packages" / "agentveil-mcp-proxy"),
@@ -6560,6 +6685,7 @@ raise SystemExit(code)
         capture_output=True,
         text=True,
         check=False,
+        timeout=30,
     )
     assert result.returncode == 0, result.stderr
     identity = _load(proxy_paths(home).identity_path("proxy"))
@@ -6569,6 +6695,21 @@ raise SystemExit(code)
     combined = result.stdout + result.stderr
     assert CONSOLE_TOKEN not in combined
     _assert_bounded_project_login_output(combined, identity_before, home=home)
+    from agentveil_mcp_proxy.console_credentials import (
+        load_runtime_binding_credential,
+        load_scoped_runtime_binding_credential,
+    )
+
+    summary = load_credential(home=avp_home)
+    assert summary is not None
+    scoped = load_scoped_runtime_binding_credential(
+        identity["did"],
+        summary.token,
+        home=avp_home,
+    )
+    assert scoped is not None
+    assert scoped.token == "subprocess-scoped-child-token-0123456789ab"
+    assert load_runtime_binding_credential(home=avp_home).token == CONSOLE_BINDING_TOKEN
 
 
 def test_project_login_external_passphrase_file_registers_via_fake_backend(
@@ -6587,6 +6728,7 @@ def test_project_login_external_passphrase_file_registers_via_fake_backend(
     identity_before = _load(proxy_paths(home).identity_path("proxy"))
     _install_machine_dual_console_credentials(tmp_path, monkeypatch)
     _install_connector_status_mocks(monkeypatch, "cursor")
+    _install_project_login_post_login_fences(monkeypatch)
 
     with _fake_avp_registration_backend() as (base_url, state):
         _seed_identity_on_fake_backend(state, home, passphrase_file=external_passphrase)
@@ -6611,6 +6753,7 @@ def test_project_login_two_home_selection_keeps_other_project_identity(
     identity_b_before = _load(proxy_paths(home_b).identity_path("proxy"))
     _install_machine_dual_console_credentials(tmp_path, monkeypatch)
     _install_connector_status_mocks(monkeypatch, "codex")
+    _install_project_login_post_login_fences(monkeypatch)
 
     with _fake_avp_registration_backend() as (base_url, state):
         _seed_identity_on_fake_backend(state, home_a, passphrase=None)
@@ -6619,6 +6762,114 @@ def test_project_login_two_home_selection_keeps_other_project_identity(
     capsys.readouterr()
     identity_b_after = _load(proxy_paths(home_b).identity_path("proxy"))
     assert identity_b_after == identity_b_before
+
+
+def test_project_login_binding_failure_returns_incomplete_without_success_claim(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    home = _seed_project_proxy_identity(project, "codex", registered=False)
+    _install_machine_summary_console_credentials(tmp_path, monkeypatch)
+    _install_project_login_binding_stub(monkeypatch, fail=True)
+    _install_connector_status_mocks(monkeypatch, "codex")
+    _install_project_login_post_login_fences(monkeypatch)
+    identity_before = _load(proxy_paths(home).identity_path("proxy"))
+
+    with _fake_avp_registration_backend() as (base_url, state):
+        _seed_identity_on_fake_backend(state, home, passphrase=None)
+        _set_proxy_home_base_url(home, base_url)
+        assert main(_project_login_argv(project, "codex")) == 1
+    out, err = capsys.readouterr()
+    combined = out + err
+    assert "Project connection incomplete" in combined
+    assert "existing agent registered with the backend" not in combined
+    assert identity_before["did"] == _load(proxy_paths(home).identity_path("proxy"))["did"]
+
+
+@pytest.mark.parametrize("connector", ["codex", "cursor", "claude-code", "gemini-cli"])
+def test_project_login_summary_only_stores_scoped_child_per_connector(
+    tmp_path,
+    monkeypatch,
+    connector: str,
+):
+    from agentveil_mcp_proxy.console_credentials import load_scoped_runtime_binding_credential
+
+    project = tmp_path / f"project-{connector}"
+    project.mkdir()
+    home = _seed_project_proxy_identity(project, connector, registered=False)
+    _install_machine_summary_console_credentials(tmp_path, monkeypatch)
+    binding_state = _install_project_login_binding_stub(monkeypatch)
+    _install_connector_status_mocks(monkeypatch, connector)
+    _install_project_login_post_login_fences(monkeypatch)
+
+    with _fake_avp_registration_backend() as (base_url, state):
+        if connector == "cursor":
+            from agentveil_mcp_proxy import cursor_setup
+
+            _seed_identity_on_fake_backend(
+                state,
+                home,
+                passphrase_file=cursor_setup.passphrase_path(home),
+            )
+        else:
+            _seed_identity_on_fake_backend(state, home, passphrase=None)
+        _set_proxy_home_base_url(home, base_url)
+        assert main(_project_login_argv(project, connector)) == 0
+
+    summary = load_credential()
+    assert summary is not None
+    token = load_scoped_runtime_binding_credential(
+        _load(proxy_paths(home).identity_path("proxy"))["did"],
+        summary.token,
+        home=home,
+    )
+    assert token is not None
+    assert binding_state["calls"] >= 1
+
+
+def test_project_login_summary_only_stores_scoped_child_per_agent(
+    tmp_path,
+    monkeypatch,
+):
+    from agentveil_mcp_proxy.console_credentials import load_scoped_runtime_binding_credential
+
+    project_a = tmp_path / "project-a"
+    project_b = tmp_path / "project-b"
+    project_a.mkdir()
+    project_b.mkdir()
+    home_a = _seed_project_proxy_identity(project_a, "codex", registered=False)
+    home_b = _seed_project_proxy_identity(project_b, "codex", registered=False)
+    _install_machine_summary_console_credentials(tmp_path, monkeypatch)
+    binding_state = _install_project_login_binding_stub(monkeypatch)
+    _install_connector_status_mocks(monkeypatch, "codex")
+    _install_project_login_post_login_fences(monkeypatch)
+
+    with _fake_avp_registration_backend() as (base_url, state):
+        _seed_identity_on_fake_backend(state, home_a, passphrase=None)
+        _set_proxy_home_base_url(home_a, base_url)
+        assert main(_project_login_argv(project_a, "codex")) == 0
+        _seed_identity_on_fake_backend(state, home_b, passphrase=None)
+        _set_proxy_home_base_url(home_b, base_url)
+        assert main(_project_login_argv(project_b, "codex")) == 0
+
+    assert binding_state["calls"] == 2
+    assert binding_state["agents"][0] != binding_state["agents"][1]
+    summary = load_credential()
+    token_a = load_scoped_runtime_binding_credential(
+        _load(proxy_paths(home_a).identity_path("proxy"))["did"],
+        summary.token,
+        home=home_a,
+    )
+    token_b = load_scoped_runtime_binding_credential(
+        _load(proxy_paths(home_b).identity_path("proxy"))["did"],
+        summary.token,
+        home=home_b,
+    )
+    assert token_a is not None and token_b is not None
+    assert token_a.token != token_b.token
 
 
 def test_project_login_partial_pairing_never_registers(
@@ -6638,6 +6889,7 @@ def test_project_login_partial_pairing_never_registers(
         poll_error=PairingClientError("transport_failed"),
     )
     _install_console_client(monkeypatch, client)
+    _install_project_login_post_login_fences(monkeypatch)
     register_calls = {"count": 0}
     original_register = proxy_cli.register_proxy
 

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -1570,3 +1571,173 @@ def test_readiness_fallback_does_not_retry_twice_on_repeated_400():
     with pytest.raises(ProjectStatusClientError, match="unexpected_status"):
         client.upload(summary, bearer_token=TOKEN)
     assert len(transport.calls) == 2
+
+
+def test_sync_uses_shared_correlation_root_when_workspace_is_narrower(
+    tmp_path,
+    monkeypatch,
+):
+    console_home = tmp_path / "console-home"
+    console_home.mkdir()
+    monkeypatch.setenv("AVP_HOME", str(console_home))
+    from agentveil_mcp_proxy.cli import init_proxy, proxy_paths
+    from agentveil_mcp_proxy.console_credentials import (
+        save_credential,
+        save_scoped_runtime_binding_credential,
+    )
+    from agentveil_mcp_proxy.console_project_status_client import (
+        build_client_installation_ref,
+        correlation_root_for_client_installation_ref,
+    )
+
+    project = tmp_path / "service"
+    project.mkdir()
+    profile = project / "product-profile"
+    workspace = profile / "workspace"
+    workspace.mkdir(parents=True)
+    home = project / ".avp"
+    init_proxy(home=home, agent_name="proxy", plaintext=True)
+    config_path = proxy_paths(home).config_path
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["downstream"] = {
+        "name": "product-route",
+        "command": "noop",
+        "env": {"PRODUCT_ROUTE_PROFILE_ROOT": str(profile)},
+    }
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    identity = json.loads(proxy_paths(home).identity_path("proxy").read_text(encoding="utf-8"))
+    agent_did = identity["did"]
+    summary_token = "summary-token-scoped-0123456789abcdef0123456789ab"
+    save_scoped_runtime_binding_credential(
+        "scoped-runtime-binding-token-value-0123456789ab",
+        agent_did=agent_did,
+        summary_token=summary_token,
+        home=home,
+    )
+    save_credential(TOKEN, home=console_home)
+    correlation_root = correlation_root_for_client_installation_ref(
+        project_dir=project,
+        runtime_home=home,
+    )
+    expected_ref = build_client_installation_ref(
+        canonical_project_root=workspace,
+        agent_did=agent_did,
+    )
+    assert correlation_root == workspace.resolve()
+    assert expected_ref is not None
+    transport = FakeTransport([
+        lambda body: _json_response(200, _backend_ingest_response_for_request(body)),
+    ])
+    result = sync_project_status(
+        connector="codex",
+        connector_status=_advisory_status(),
+        project_dir=project,
+        runtime_home=home,
+        load_credential_fn=lambda home=None: StoredCredential(
+            scope=CREDENTIAL_SCOPE,
+            token=TOKEN,
+        ),
+        transport=transport,
+        clock=lambda: 1_785_844_800.0,
+    )
+    assert result == "accepted"
+    payload = json.loads(transport.calls[0]["body"].decode("utf-8"))
+    assert payload.get("client_installation_ref") == expected_ref
+
+
+def test_sync_omits_client_installation_ref_without_scoped_opt_in(tmp_path):
+    from agentveil_mcp_proxy.cli import init_proxy
+
+    project = tmp_path / "service"
+    project.mkdir()
+    home = project / ".avp"
+    init_proxy(home=home, agent_name="proxy", plaintext=True)
+    transport = FakeTransport([
+        lambda body: _json_response(200, _backend_ingest_response_for_request(body)),
+    ])
+    result = sync_project_status(
+        connector="codex",
+        connector_status=_advisory_status(),
+        project_dir=project,
+        runtime_home=home,
+        load_credential_fn=lambda home=None: StoredCredential(
+            scope=CREDENTIAL_SCOPE,
+            token=TOKEN,
+        ),
+        transport=transport,
+        clock=lambda: 1_785_844_800.0,
+    )
+    assert result == "accepted"
+    payload = json.loads(transport.calls[0]["body"].decode("utf-8"))
+    assert "client_installation_ref" not in payload
+
+
+def test_sync_keeps_client_installation_ref_when_scoped_marker_unreadable(tmp_path):
+    import agentveil_mcp_proxy.console_credentials as creds
+    from agentveil_mcp_proxy.cli import init_proxy, proxy_paths
+    from agentveil_mcp_proxy.console_credentials import (
+        console_credential_home_for_runtime,
+        save_scoped_runtime_binding_credential,
+    )
+    from agentveil_mcp_proxy.console_project_status_client import (
+        build_client_installation_ref,
+        correlation_root_for_client_installation_ref,
+    )
+
+    project = tmp_path / "service"
+    project.mkdir()
+    profile = project / "product-profile"
+    workspace = profile / "workspace"
+    workspace.mkdir(parents=True)
+    home = project / ".avp"
+    init_proxy(home=home, agent_name="proxy", plaintext=True)
+    config_path = proxy_paths(home).config_path
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["downstream"] = {
+        "name": "product-route",
+        "command": "noop",
+        "env": {"PRODUCT_ROUTE_PROFILE_ROOT": str(profile)},
+    }
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    identity = json.loads(proxy_paths(home).identity_path("proxy").read_text(encoding="utf-8"))
+    agent_did = identity["did"]
+    save_scoped_runtime_binding_credential(
+        "scoped-runtime-binding-token-0123456789ab",
+        agent_did=agent_did,
+        summary_token=TOKEN,
+        home=home,
+    )
+    custody_home = console_credential_home_for_runtime(home)
+    assert custody_home is not None
+    marker = (
+        creds.credential_directory(custody_home)
+        / creds._scoped_source_marker_filename(agent_did)
+    )
+    marker.write_bytes(b"{not-json")
+    os.chmod(marker, 0o600)
+    correlation_root = correlation_root_for_client_installation_ref(
+        project_dir=project,
+        runtime_home=home,
+    )
+    expected_ref = build_client_installation_ref(
+        canonical_project_root=correlation_root,
+        agent_did=agent_did,
+    )
+    transport = FakeTransport([
+        lambda body: _json_response(200, _backend_ingest_response_for_request(body)),
+    ])
+    result = sync_project_status(
+        connector="codex",
+        connector_status=_advisory_status(),
+        project_dir=project,
+        runtime_home=home,
+        load_credential_fn=lambda home=None: StoredCredential(
+            scope=CREDENTIAL_SCOPE,
+            token=TOKEN,
+        ),
+        transport=transport,
+        clock=lambda: 1_785_844_800.0,
+    )
+    assert result == "accepted"
+    payload = json.loads(transport.calls[0]["body"].decode("utf-8"))
+    assert payload.get("client_installation_ref") == expected_ref

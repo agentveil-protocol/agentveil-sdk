@@ -2,7 +2,10 @@
 
 import gzip
 import hashlib
+import io
 import json
+import os
+import sys
 import re
 import secrets
 import socketserver
@@ -726,6 +729,137 @@ def test_runtime_heartbeat_never_sends_runtime_binding_header(
     assert seen[0].headers[transport.CONSOLE_CREDENTIAL_HEADER] == SUMMARY_TOKEN
 
 
+def test_build_context_uses_canonical_root_for_client_installation_ref(
+    identity, tmp_path,
+):
+    from agentveil_mcp_proxy.console_credentials import (
+        save_credential,
+        save_scoped_runtime_binding_credential,
+    )
+    from agentveil_mcp_proxy.console_project_status_client import (
+        build_client_installation_ref,
+    )
+
+    project = tmp_path / "workspace"
+    project.mkdir()
+    save_credential(SUMMARY_TOKEN, home=tmp_path)
+    save_scoped_runtime_binding_credential(
+        BINDING_TOKEN,
+        agent_did=identity[1].did,
+        summary_token=SUMMARY_TOKEN,
+        home=tmp_path,
+    )
+    expected_ref = build_client_installation_ref(
+        canonical_project_root=project,
+        agent_did=identity[1].did,
+    )
+    runtime_id = RUNTIME_ID
+    from agentveil_mcp_proxy.console_credentials import scoped_runtime_binding_namespace_hash
+
+    state_dir = tmp_path / (
+        "ca-agent-" + scoped_runtime_binding_namespace_hash(identity[1].did, SUMMARY_TOKEN)[:32]
+    )
+    state_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(state_dir, 0o700)
+    ca_dir = state_dir / "controlled-alternatives"
+    ca_dir.mkdir()
+    os.chmod(ca_dir, 0o700)
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            {
+                "runtime_version": "1.0.0",
+                "contract_range": "av02.v1",
+                "catalog_digest": "aa" * 32,
+                "declared_executor_capabilities": list(
+                    transport._AV02_DECLARED_EXECUTOR_CAPABILITIES
+                ),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    state_file = ca_dir / "av02-runtime-state.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "schema_version": "av02-runtime-state/1",
+                "runtime_installation_id": runtime_id,
+                "registration_fingerprint": fingerprint,
+            }
+        ),
+        encoding="utf-8",
+    )
+    import stat as stat_mod
+
+    os.chmod(state_file, stat_mod.S_IRUSR | stat_mod.S_IWUSR)
+    assert transport.read_cached_av02_runtime_installation_id(state_dir) == runtime_id
+    assert expected_ref is not None
+    bound = transport.build_controlled_alternative_context(
+        agent=identity[1],
+        base_url="https://agentveil.dev",
+        state_root=tmp_path,
+        summary_token=SUMMARY_TOKEN,
+        canonical_project_root=project,
+    )
+    assert bound is not None and bound.heartbeat is not None
+
+
+def test_correlation_root_matches_between_status_and_run_proxy_paths(
+    identity, tmp_path,
+):
+    from agentveil_mcp_proxy.cli import init_proxy, proxy_paths, run_proxy
+    from agentveil_mcp_proxy.console_project_status_client import (
+        build_client_installation_ref,
+        correlation_root_for_client_installation_ref,
+    )
+
+    project = tmp_path / "service"
+    project.mkdir()
+    profile = project / "product-profile"
+    workspace = profile / "workspace"
+    workspace.mkdir(parents=True)
+    home = project / ".avp"
+    init_proxy(home=home, agent_name="proxy", plaintext=True)
+    config_path = proxy_paths(home).config_path
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["downstream"] = {
+        "name": "product-route",
+        "command": sys.executable,
+        "args": ["-c", "import time; time.sleep(3600)"],
+        "env": {"PRODUCT_ROUTE_PROFILE_ROOT": str(profile)},
+    }
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    def capture_build(**kwargs):
+        captured["canonical_project_root"] = kwargs.get("canonical_project_root")
+        return transport.build_controlled_alternative_context(**kwargs)
+
+    import agentveil_mcp_proxy.cli as proxy_cli
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(proxy_cli, "build_controlled_alternative_context", capture_build)
+    try:
+        assert run_proxy(
+            home=home,
+            client_in=io.StringIO(""),
+            out=io.StringIO(),
+            approval_ui_mode="none",
+        ) == 0
+    finally:
+        monkeypatch.undo()
+    status_root = correlation_root_for_client_installation_ref(
+        project_dir=project,
+        runtime_home=home,
+    )
+    assert status_root == workspace.resolve()
+    assert captured["canonical_project_root"] == status_root
+    assert build_client_installation_ref(
+        canonical_project_root=status_root,
+        agent_did=identity[1].did,
+    ) is not None
+
+
 def test_context_without_active_authority_does_not_load_provider(identity, tmp_path):
     loaded = []
     ca.set_controlled_alternative_authority_loader(lambda: None)
@@ -738,3 +872,381 @@ def test_context_without_active_authority_does_not_load_provider(identity, tmp_p
     finally:
         ca.set_controlled_alternative_authority_loader(None)
         ca.set_controlled_alternative_provider_loader(None)
+
+
+SUMMARY_TOKEN = "bounded-summary-upload-token-0123456789ab"
+SUMMARY_TOKEN_B = "bounded-summary-upload-token-b0123456789ab"
+BINDING_TOKEN = "issued-runtime-binding-token-0123456789ab"
+LEGACY_BINDING = "legacy-global-runtime-binding-token-0123456789ab"
+
+
+def _patch_heartbeat_exchange(monkeypatch):
+    exchanges = []
+
+    def capture(url, headers, body, method="POST"):
+        exchanges.append(body)
+        return 200, {"schema_version": "1", "status": "active"}
+
+    monkeypatch.setattr(transport, "_run_bounded_exchange", capture)
+    return exchanges
+
+
+def test_opted_in_fresh_context_source_change_never_sends_schema1_heartbeat(
+    identity, tmp_path, monkeypatch,
+):
+    from agentveil_mcp_proxy.console_credentials import (
+        save_scoped_runtime_binding_credential,
+    )
+
+    save_runtime_binding_credential(LEGACY_BINDING, home=tmp_path)
+    save_credential(SUMMARY_TOKEN, home=tmp_path)
+    save_scoped_runtime_binding_credential(
+        BINDING_TOKEN,
+        agent_did=identity[1].did,
+        summary_token=SUMMARY_TOKEN,
+        home=tmp_path,
+    )
+    save_credential(SUMMARY_TOKEN_B, home=tmp_path)
+    exchanges = _patch_heartbeat_exchange(monkeypatch)
+    bound = transport.build_controlled_alternative_context(
+        agent=identity[1],
+        base_url="https://agentveil.dev",
+        state_root=tmp_path,
+    )
+    assert bound is not None and bound.heartbeat is not None
+    assert bound.heartbeat(SUMMARY_TOKEN_B, "2026-09-15T12:00:00Z") == (401, {})
+    assert exchanges == []
+
+
+def test_unreadable_scoped_source_marker_never_sends_schema1_heartbeat(
+    identity, tmp_path, monkeypatch,
+):
+    import agentveil_mcp_proxy.console_credentials as creds
+
+    save_runtime_binding_credential(LEGACY_BINDING, home=tmp_path)
+    save_credential(SUMMARY_TOKEN, home=tmp_path)
+    marker = (
+        creds.credential_directory(tmp_path)
+        / creds._scoped_source_marker_filename(identity[1].did)
+    )
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_bytes(b"{not-json")
+    os.chmod(marker, 0o600)
+    exchanges = _patch_heartbeat_exchange(monkeypatch)
+    bound = transport.build_controlled_alternative_context(
+        agent=identity[1],
+        base_url="https://agentveil.dev",
+        state_root=tmp_path,
+        summary_token=SUMMARY_TOKEN,
+    )
+    assert bound is not None and bound.heartbeat is not None
+    assert bound.heartbeat(SUMMARY_TOKEN, "2026-09-15T12:00:00Z") == (401, {})
+    assert exchanges == []
+
+
+def test_malformed_scoped_binding_never_sends_schema1_heartbeat(
+    identity, tmp_path, monkeypatch,
+):
+    import agentveil_mcp_proxy.console_credentials as creds
+    from agentveil_mcp_proxy.console_credentials import (
+        save_scoped_runtime_binding_credential,
+        scoped_runtime_binding_namespace_hash,
+    )
+
+    save_runtime_binding_credential(LEGACY_BINDING, home=tmp_path)
+    save_credential(SUMMARY_TOKEN, home=tmp_path)
+    save_scoped_runtime_binding_credential(
+        BINDING_TOKEN,
+        agent_did=identity[1].did,
+        summary_token=SUMMARY_TOKEN,
+        home=tmp_path,
+    )
+    namespace = scoped_runtime_binding_namespace_hash(identity[1].did, SUMMARY_TOKEN)
+    directory = creds.credential_directory(tmp_path)
+    bad_file = directory / f"runtime-binding-scoped-{namespace}.json"
+    bad_file.write_text("{", encoding="utf-8")
+    os.chmod(bad_file, 0o600)
+    exchanges = _patch_heartbeat_exchange(monkeypatch)
+    bound = transport.build_controlled_alternative_context(
+        agent=identity[1],
+        base_url="https://agentveil.dev",
+        state_root=tmp_path,
+        summary_token=SUMMARY_TOKEN,
+    )
+    assert bound is not None and bound.heartbeat is not None
+    assert bound.heartbeat(SUMMARY_TOKEN, "2026-09-15T12:00:00Z") == (401, {})
+    assert exchanges == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX scoped filename custody")
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        "malformed_json",
+        "symlink",
+        "world_readable",
+    ],
+)
+def test_malformed_scoped_binding_without_marker_never_sends_schema1_heartbeat(
+    identity, tmp_path, monkeypatch, corrupt,
+):
+    import agentveil_mcp_proxy.console_credentials as creds
+    from agentveil_mcp_proxy.console_credentials import (
+        scoped_runtime_binding_namespace_hash,
+    )
+
+    save_runtime_binding_credential(LEGACY_BINDING, home=tmp_path)
+    save_credential(SUMMARY_TOKEN, home=tmp_path)
+    namespace = scoped_runtime_binding_namespace_hash(identity[1].did, SUMMARY_TOKEN)
+    directory = creds.credential_directory(tmp_path)
+    directory.mkdir(parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+    bad_file = directory / f"runtime-binding-scoped-{namespace}.json"
+    if corrupt == "malformed_json":
+        bad_file.write_text("{", encoding="utf-8")
+        os.chmod(bad_file, 0o600)
+    elif corrupt == "symlink":
+        real = tmp_path / "real-scoped.json"
+        real.write_text("{}", encoding="utf-8")
+        os.symlink(real, bad_file)
+    else:
+        bad_file.write_text("{}", encoding="utf-8")
+        os.chmod(bad_file, 0o644)
+    assert not (
+        directory / creds._scoped_source_marker_filename(identity[1].did)
+    ).exists()
+    exchanges = _patch_heartbeat_exchange(monkeypatch)
+    bound = transport.build_controlled_alternative_context(
+        agent=identity[1],
+        base_url="https://agentveil.dev",
+        state_root=tmp_path,
+        summary_token=SUMMARY_TOKEN,
+    )
+    assert bound is not None and bound.heartbeat is not None
+    assert bound.heartbeat(SUMMARY_TOKEN, "2026-09-15T12:00:00Z") == (401, {})
+    assert exchanges == []
+
+
+def test_resolve_failure_sticky_malformed_blocks_schema1_heartbeat(
+    identity, tmp_path, monkeypatch,
+):
+    from agentveil_mcp_proxy.console_credentials import CredentialError
+
+    save_runtime_binding_credential(LEGACY_BINDING, home=tmp_path)
+    save_credential(SUMMARY_TOKEN, home=tmp_path)
+
+    def _fail(*_args, **_kwargs):
+        raise CredentialError("credential_unreadable")
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_credentials.resolve_runtime_binding_for_context",
+        _fail,
+    )
+    exchanges = _patch_heartbeat_exchange(monkeypatch)
+    bound = transport.build_controlled_alternative_context(
+        agent=identity[1],
+        base_url="https://agentveil.dev",
+        state_root=tmp_path,
+        summary_token=SUMMARY_TOKEN,
+    )
+    assert bound is not None and bound.heartbeat is not None
+    assert bound.heartbeat(SUMMARY_TOKEN, "2026-09-15T12:00:00Z") == (401, {})
+    assert exchanges == []
+
+
+def test_second_scoped_load_failure_sticky_malformed_blocks_schema1_heartbeat(
+    identity, tmp_path, monkeypatch,
+):
+    from agentveil_mcp_proxy.console_credentials import (
+        CredentialError,
+        load_scoped_runtime_binding_credential,
+        save_scoped_runtime_binding_credential,
+    )
+
+    save_runtime_binding_credential(LEGACY_BINDING, home=tmp_path)
+    save_credential(SUMMARY_TOKEN, home=tmp_path)
+    save_scoped_runtime_binding_credential(
+        BINDING_TOKEN,
+        agent_did=identity[1].did,
+        summary_token=SUMMARY_TOKEN,
+        home=tmp_path,
+    )
+    real_load = load_scoped_runtime_binding_credential
+    calls = {"count": 0}
+
+    def _load(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] >= 2:
+            raise CredentialError("credential_invalid")
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_credentials.load_scoped_runtime_binding_credential",
+        _load,
+    )
+    exchanges = _patch_heartbeat_exchange(monkeypatch)
+    bound = transport.build_controlled_alternative_context(
+        agent=identity[1],
+        base_url="https://agentveil.dev",
+        state_root=tmp_path,
+        summary_token=SUMMARY_TOKEN,
+    )
+    assert bound is not None and bound.heartbeat is not None
+    assert bound.heartbeat(SUMMARY_TOKEN, "2026-09-15T12:00:00Z") == (401, {})
+    assert exchanges == []
+
+
+def test_hosted_scoped_custody_failure_quarantines_hybrid_and_provider(
+    identity, tmp_path, monkeypatch,
+):
+    from agentveil_mcp_proxy.console_credentials import (
+        save_scoped_runtime_binding_credential,
+        scoped_runtime_binding_namespace_hash,
+    )
+    from agentveil_mcp_proxy.controlled_alternatives_runtime import (
+        bind_controlled_alternative_runtime,
+    )
+
+    hybrid_calls: list[str] = []
+
+    def blocked_exchange(url, headers, body, method="POST"):
+        hybrid_calls.append(url)
+        return 401, {}
+
+    monkeypatch.setattr(transport, "_run_bounded_exchange", blocked_exchange)
+    project = tmp_path / "workspace"
+    project.mkdir()
+    home = project / ".avp"
+    home.mkdir()
+    save_runtime_binding_credential(LEGACY_BINDING, home=home)
+    save_credential(SUMMARY_TOKEN, home=home)
+    save_scoped_runtime_binding_credential(
+        BINDING_TOKEN,
+        agent_did=identity[1].did,
+        summary_token=SUMMARY_TOKEN,
+        home=home,
+    )
+    namespace = scoped_runtime_binding_namespace_hash(identity[1].did, SUMMARY_TOKEN)
+    bad = home / "console" / f"runtime-binding-scoped-{namespace}.json"
+    bad.parent.mkdir(parents=True, exist_ok=True)
+    bad.write_text("{", encoding="utf-8")
+    os.chmod(bad, 0o600)
+    runtime_context = transport.build_controlled_alternative_context(
+        agent=identity[1],
+        base_url="https://agentveil.dev",
+        state_root=home,
+        canonical_project_root=project,
+    )
+    assert runtime_context is not None
+    assert runtime_context.contract_version == transport.CONTEXT_VERSION_V2
+    assert runtime_context.runtime_register is None
+    assert runtime_context.request("preflight", {}) == (401, {})
+    assert hybrid_calls == []
+    bound = bind_controlled_alternative_runtime(
+        home=home,
+        downstream={"name": "synthetic", "command": "noop", "cwd": str(project)},
+        runtime_context=runtime_context,
+    )
+    assert bound is None
+
+
+_HYBRID_DECIDE_PAYLOAD = {
+    "contract_version": "1",
+    "profile_id": "controlled-alternatives-profile",
+    "alternative_id": "filesystem-stage-delete",
+    "operation_ref": "op-ref-canary-001",
+    "action_family": "filesystem",
+    "semantic_category": "write",
+    "invocation_phase": "propose",
+    "basename_hash": "ab" * 32,
+}
+
+
+@pytest.mark.parametrize("failure_mode", ["scoped_custody", "summary_source"])
+def test_live_pinned_scoped_state_blocks_hybrid_preflight_and_decide(
+    identity, tmp_path, monkeypatch, failure_mode,
+):
+    from agentveil_mcp_proxy.console_credentials import (
+        save_scoped_runtime_binding_credential,
+        scoped_runtime_binding_namespace_hash,
+    )
+
+    exchanges: list[str] = []
+
+    def exchange_ok(url, headers, body, method="POST"):
+        exchanges.append(url)
+        return 200, {"ok": True}
+
+    monkeypatch.setattr(transport, "_run_bounded_exchange", exchange_ok)
+    save_runtime_binding_credential(LEGACY_BINDING, home=tmp_path)
+    save_credential(SUMMARY_TOKEN, home=tmp_path)
+    save_scoped_runtime_binding_credential(
+        BINDING_TOKEN,
+        agent_did=identity[1].did,
+        summary_token=SUMMARY_TOKEN,
+        home=tmp_path,
+    )
+    runtime_context = transport.build_controlled_alternative_context(
+        agent=identity[1],
+        base_url="https://agentveil.dev",
+        state_root=tmp_path,
+    )
+    assert runtime_context is not None
+    assert runtime_context.contract_version == transport.CONTEXT_VERSION_V2
+    assert runtime_context.request("preflight", {}) == (200, {"ok": True})
+    assert len(exchanges) == 1
+    if failure_mode == "scoped_custody":
+        namespace = scoped_runtime_binding_namespace_hash(identity[1].did, SUMMARY_TOKEN)
+        bad = tmp_path / "console" / f"runtime-binding-scoped-{namespace}.json"
+        bad.write_text("{", encoding="utf-8")
+        os.chmod(bad, 0o600)
+    else:
+        save_credential(SUMMARY_TOKEN_B, home=tmp_path)
+    assert runtime_context.request("preflight", {}) == (401, {})
+    assert runtime_context.request("decide", _HYBRID_DECIDE_PAYLOAD) == (401, {})
+    assert len(exchanges) == 1
+
+
+def test_legacy_binding_without_summary_retains_av02_transport(
+    identity, tmp_path, monkeypatch,
+):
+    def register_ok(url, headers, body, method="POST"):
+        return 200, {
+            "schema_version": "runtime/register-response/1",
+            "runtime_installation_id": RUNTIME_ID,
+        }
+
+    monkeypatch.setattr(transport, "_run_bounded_exchange", register_ok)
+    save_runtime_binding_credential(BINDING_TOKEN, home=tmp_path)
+    runtime_context = transport.build_controlled_alternative_context(
+        agent=identity[1],
+        base_url="https://agentveil.dev",
+        state_root=tmp_path,
+    )
+    assert runtime_context.contract_version == transport.CONTEXT_VERSION_V2
+    assert callable(runtime_context.runtime_register)
+
+    class LegacyAv02Consumer:
+        def bind_runtime_context(self, context):
+            for name in (
+                "request",
+                "heartbeat",
+                "runtime_register",
+                "policy_evaluate",
+                "resolve_decision_verification_key",
+                "state_root",
+            ):
+                if not callable(getattr(context, name, None)) and name != "state_root":
+                    raise ValueError(f"missing_{name}")
+            if not isinstance(context.state_root, str):
+                raise ValueError("missing_state_root")
+            self.context = context
+            return self
+
+    consumer = transport.bind_installed_runtime_context(
+        LegacyAv02Consumer(),
+        runtime_context,
+    )
+    assert consumer.context is runtime_context
+    status, _payload = runtime_context.runtime_register(_register_payload())
+    assert status == 200

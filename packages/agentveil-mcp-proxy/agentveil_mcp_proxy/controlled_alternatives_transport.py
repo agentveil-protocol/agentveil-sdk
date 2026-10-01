@@ -6,9 +6,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import stat as stat_mod
 import subprocess
 import sys
 import time
@@ -359,8 +362,100 @@ def _validate_decision_verification_key_response(
     }
 
 
+_AV02_RUNTIME_STATE_SCHEMA = "av02-runtime-state/1"
+_AV02_STATE_FILENAME = "av02-runtime-state.json"
+_AV02_STATE_REL = "controlled-alternatives"
+_AV02_STATE_MAX_BYTES = 4096
+_AV02_DECLARED_EXECUTOR_CAPABILITIES = (
+    "filesystem.stage_delete.v1",
+    "filesystem.restore_staged.v1",
+    "filesystem.cleanup_staged.v1",
+    "protected_write.prepare_patch.v1",
+    "git.prepare_local_change.v1",
+    "protected_write.apply_prepared_patch.v1",
+)
+
+
+def _av02_registration_fingerprint() -> str:
+    canonical = {
+        "runtime_version": "1.0.0",
+        "contract_range": "av02.v1",
+        "catalog_digest": "aa" * 32,
+        "declared_executor_capabilities": list(_AV02_DECLARED_EXECUTOR_CAPABILITIES),
+    }
+    blob = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def _coerce_av02_runtime_state(raw: object) -> str | None:
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("schema_version") != _AV02_RUNTIME_STATE_SCHEMA:
+        return None
+    runtime_id = raw.get("runtime_installation_id")
+    fingerprint = raw.get("registration_fingerprint")
+    if not isinstance(runtime_id, str) or not _UUID.fullmatch(runtime_id):
+        return None
+    if not isinstance(fingerprint, str) or len(fingerprint) != 64:
+        return None
+    if fingerprint != _av02_registration_fingerprint():
+        return None
+    return runtime_id
+
+
+def read_cached_av02_runtime_installation_id(state_root: Path) -> str | None:
+    """Recover a validated thin opaque runtime id from the scoped state root only."""
+
+    directory = state_root / _AV02_STATE_REL
+    path = directory / _AV02_STATE_FILENAME
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    if stat_mod.S_ISLNK(st.st_mode) or not stat_mod.S_ISREG(st.st_mode):
+        return None
+    if st.st_nlink > 1:
+        return None
+    if sys.platform != "win32" and st.st_uid not in {0, os.getuid()}:
+        return None
+    if sys.platform != "win32" and (st.st_mode & 0o077):
+        return None
+    if st.st_size > _AV02_STATE_MAX_BYTES:
+        return None
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        raw = os.read(fd, _AV02_STATE_MAX_BYTES + 1)
+    except OSError:
+        return None
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    if len(raw) > _AV02_STATE_MAX_BYTES:
+        return None
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, TypeError):
+        return None
+    return _coerce_av02_runtime_state(parsed)
+
+
 def build_controlled_alternative_context(
-    *, agent: Any, base_url: str, state_root: Path,
+    *,
+    agent: Any,
+    base_url: str,
+    state_root: Path,
+    summary_token: str | None = None,
+    canonical_project_root: Path | None = None,
 ) -> ControlledAlternativeRuntimeContext | None:
     """Use an already loaded identity. Do not register, read keys, or send at startup."""
     try:
@@ -377,7 +472,22 @@ def build_controlled_alternative_context(
     except (AttributeError, TypeError, ValueError):
         return None
 
+    def _hosted_execution_quarantined() -> bool:
+        if url.scheme != "https" or url.netloc != "agentveil.dev":
+            return False
+        if binding_resolution["malformed"]:
+            return True
+        if _opt_in_blocks_legacy() and _binding_token() is None:
+            return True
+        if pinned_summary_fingerprint is not None and _binding_token() is None:
+            return True
+        return False
+
     def request(operation: str, payload: Mapping[str, str]) -> tuple[int, Mapping[str, Any]]:
+        if pinned_summary_fingerprint is not None and not _sync_live_scoped_custody():
+            return 401, {}
+        if _hosted_execution_quarantined():
+            return 401, {}
         try:
             from agentveil.auth import build_auth_header
 
@@ -401,23 +511,186 @@ def build_controlled_alternative_context(
             return 503, {}
 
     from agentveil_mcp_proxy.console_credentials import (
+        CredentialError,
+        _scoped_opt_in_blocks_legacy,
         console_credential_home_for_runtime,
+        load_credential,
         load_runtime_binding_credential,
+        load_scoped_runtime_binding_credential,
+        resolve_runtime_binding_for_context,
+        scoped_runtime_binding_namespace_hash,
+        summary_token_fingerprint,
+    )
+    from agentveil_mcp_proxy.console_project_status_client import (
+        build_client_installation_ref,
+    )
+    from agentveil_mcp_proxy.control_artifacts import (
+        ControlArtifactError,
+        ensure_control_directory,
     )
 
     credential_home = console_credential_home_for_runtime(state_root)
 
-    def _binding_token() -> str | None:
+    def _opt_in_blocks_legacy() -> bool:
+        return _scoped_opt_in_blocks_legacy(did, home=credential_home)
+
+    summary_source = summary_token
+    if summary_source is None:
         try:
-            stored = load_runtime_binding_credential(home=credential_home)
+            summary = load_credential(home=credential_home)
         except Exception:
+            summary = None
+        summary_source = None if summary is None else summary.token
+
+    binding_resolution: dict[str, object | None] = {
+        "token": None,
+        "scoped": False,
+        "malformed": False,
+    }
+    pinned_summary_fingerprint: str | None = None
+
+    def _binding_token() -> str | None:
+        if binding_resolution["malformed"]:
             return None
-        if stored is None:
+        token = binding_resolution["token"]
+        if not isinstance(token, str):
             return None
-        token = stored.token
         if not _BINDING.fullmatch(token):
             return None
         return token
+
+    def _apply_binding_resolution(
+        summary_token: str,
+        *,
+        stored_token: str | None,
+        scoped_ready: bool,
+    ) -> None:
+        if binding_resolution["malformed"]:
+            binding_resolution["token"] = None
+            binding_resolution["scoped"] = False
+            return
+        binding_resolution["token"] = stored_token
+        binding_resolution["scoped"] = scoped_ready
+
+    def _resolve_binding_for_summary(summary_token: str) -> None:
+        try:
+            stored = resolve_runtime_binding_for_context(
+                did,
+                summary_token,
+                state_root,
+            )
+        except CredentialError:
+            binding_resolution["malformed"] = True
+            binding_resolution["token"] = None
+            binding_resolution["scoped"] = False
+            return
+        except Exception:
+            binding_resolution["malformed"] = True
+            binding_resolution["token"] = None
+            binding_resolution["scoped"] = False
+            return
+        scoped_ready = False
+        if stored is not None:
+            try:
+                scoped_ready = (
+                    load_scoped_runtime_binding_credential(
+                        did,
+                        summary_token,
+                        home=state_root,
+                    )
+                    is not None
+                )
+            except Exception:
+                binding_resolution["malformed"] = True
+                scoped_ready = False
+        elif _opt_in_blocks_legacy():
+            binding_resolution["malformed"] = True
+        _apply_binding_resolution(
+            summary_token,
+            stored_token=None if stored is None else stored.token,
+            scoped_ready=scoped_ready,
+        )
+
+    def _resolve_legacy_binding_without_summary() -> None:
+        if _opt_in_blocks_legacy():
+            binding_resolution["malformed"] = True
+            binding_resolution["token"] = None
+            binding_resolution["scoped"] = False
+            return
+        try:
+            stored = load_runtime_binding_credential(home=credential_home)
+        except CredentialError:
+            binding_resolution["malformed"] = True
+            binding_resolution["token"] = None
+            binding_resolution["scoped"] = False
+            return
+        except Exception:
+            binding_resolution["malformed"] = True
+            binding_resolution["token"] = None
+            binding_resolution["scoped"] = False
+            return
+        token = None if stored is None else stored.token
+        if isinstance(token, str) and not _BINDING.fullmatch(token):
+            token = None
+        binding_resolution["token"] = token
+        binding_resolution["scoped"] = False
+
+    if summary_source is not None:
+        _resolve_binding_for_summary(summary_source)
+        if binding_resolution["scoped"] is True and summary_source is not None:
+            pinned_summary_fingerprint = summary_token_fingerprint(summary_source)
+    else:
+        _resolve_legacy_binding_without_summary()
+
+    effective_state_root = state_root
+    if binding_resolution["scoped"] is True and summary_source is not None:
+        namespace = scoped_runtime_binding_namespace_hash(did, summary_source)
+        scoped_root = state_root / f"ca-agent-{namespace[:32]}"
+        try:
+            ensure_control_directory(scoped_root)
+        except ControlArtifactError:
+            return None
+        effective_state_root = scoped_root
+
+    client_installation_ref: str | None = None
+    if canonical_project_root is not None:
+        client_installation_ref = build_client_installation_ref(
+            canonical_project_root=canonical_project_root,
+            agent_did=did,
+        )
+    runtime_installation_id: dict[str, str | None] = {
+        "value": read_cached_av02_runtime_installation_id(effective_state_root),
+    }
+
+    def _sync_live_scoped_custody() -> bool:
+        nonlocal pinned_summary_fingerprint
+        if pinned_summary_fingerprint is None:
+            return not binding_resolution["malformed"]
+        try:
+            summary = load_credential(home=credential_home)
+        except CredentialError:
+            binding_resolution["malformed"] = True
+            binding_resolution["token"] = None
+            return False
+        except Exception:
+            binding_resolution["malformed"] = True
+            binding_resolution["token"] = None
+            return False
+        if summary is None:
+            binding_resolution["token"] = None
+            return False
+        try:
+            current_fp = summary_token_fingerprint(summary.token)
+        except CredentialError:
+            binding_resolution["malformed"] = True
+            binding_resolution["token"] = None
+            return False
+        if current_fp != pinned_summary_fingerprint:
+            binding_resolution["malformed"] = True
+            binding_resolution["token"] = None
+            return False
+        _resolve_binding_for_summary(summary.token)
+        return _binding_token() is not None and not binding_resolution["malformed"]
 
     def _av02_exchange(
         operation: str,
@@ -434,6 +707,8 @@ def build_controlled_alternative_context(
                 normalized = _validate_evaluate_payload(payload)
             if normalized is None:
                 return 400, {}
+            if not _sync_live_scoped_custody():
+                return 401, {}
             binding = _binding_token()
             if binding is None:
                 return 401, {}
@@ -447,7 +722,12 @@ def build_controlled_alternative_context(
             return 503, {}
 
     def runtime_register(payload: Mapping[str, Any]) -> tuple[int, Mapping[str, Any]]:
-        return _av02_exchange("register", payload)
+        status, response = _av02_exchange("register", payload)
+        if status == 200 and isinstance(response, Mapping):
+            runtime_id = response.get("runtime_installation_id")
+            if isinstance(runtime_id, str) and _UUID.fullmatch(runtime_id):
+                runtime_installation_id["value"] = runtime_id
+        return status, response
 
     def policy_evaluate(payload: Mapping[str, Any]) -> tuple[int, Mapping[str, Any]]:
         return _av02_exchange("evaluate", payload)
@@ -457,6 +737,8 @@ def build_controlled_alternative_context(
             from agentveil.auth import build_auth_header
 
             if not isinstance(issuer_key_id, str) or not _ISSUER_KEY_ID.fullmatch(issuer_key_id):
+                return None
+            if not _sync_live_scoped_custody():
                 return None
             binding = _binding_token()
             if binding is None:
@@ -489,35 +771,82 @@ def build_controlled_alternative_context(
         try:
             from agentveil.auth import build_auth_header
 
-            if not isinstance(console_credential, str) or not _CONSOLE_CREDENTIAL.fullmatch(
+            if not isinstance(observed_at, str) or not _OBSERVED_AT.fullmatch(observed_at):
+                return 400, {}
+            if binding_resolution["malformed"]:
+                return 401, {}
+            if pinned_summary_fingerprint is not None:
+                if not _sync_live_scoped_custody():
+                    return 401, {}
+                try:
+                    summary = load_credential(home=credential_home)
+                except Exception:
+                    return 401, {}
+                if summary is None or summary.token != console_credential:
+                    return 401, {}
+            elif not isinstance(console_credential, str) or not _CONSOLE_CREDENTIAL.fullmatch(
                 console_credential
             ):
                 return 400, {}
-            if not isinstance(observed_at, str) or not _OBSERVED_AT.fullmatch(observed_at):
-                return 400, {}
-            body = json.dumps(
-                {
-                    "schema_version": "1",
-                    "status": "active",
-                    "observed_at": observed_at,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
             path = _PATHS["runtime_status"]
-            headers = build_auth_header(key, did, "POST", path, body)
-            headers[CONSOLE_CREDENTIAL_HEADER] = console_credential
+            scoped_active = binding_resolution["scoped"] is True
+            use_schema_v2 = (
+                scoped_active
+                and runtime_installation_id["value"] is not None
+                and client_installation_ref is not None
+            )
+            if scoped_active and not use_schema_v2:
+                return 401, {}
+            if _opt_in_blocks_legacy() and not use_schema_v2:
+                return 401, {}
+            if use_schema_v2:
+                binding = _binding_token()
+                if binding is None:
+                    return 401, {}
+                body = json.dumps(
+                    {
+                        "schema_version": "2",
+                        "status": "active",
+                        "observed_at": observed_at,
+                        "runtime_installation_id": runtime_installation_id["value"],
+                        "client_installation_ref": client_installation_ref,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                headers = build_auth_header(key, did, "POST", path, body, force_v2=True)
+                headers[CONSOLE_CREDENTIAL_HEADER] = console_credential
+                headers[RUNTIME_BINDING_HEADER] = binding
+            else:
+                body = json.dumps(
+                    {
+                        "schema_version": "1",
+                        "status": "active",
+                        "observed_at": observed_at,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                headers = build_auth_header(key, did, "POST", path, body)
+                headers[CONSOLE_CREDENTIAL_HEADER] = console_credential
             headers["Accept-Encoding"] = "identity"
             return _run_bounded_exchange(base_url.rstrip("/") + path, headers, body.decode())
         except Exception:
             return 503, {}
 
     hosted = url.scheme == "https" and url.netloc == "agentveil.dev"
-    binding_ready = hosted and _binding_token() is not None
+    if _hosted_execution_quarantined():
+        return ControlledAlternativeRuntimeContext(
+            request=request,
+            state_root=str(effective_state_root),
+            contract_version=CONTEXT_VERSION_V2,
+            heartbeat=heartbeat if hosted else None,
+        )
+    binding_ready = hosted and _binding_token() is not None and not binding_resolution["malformed"]
     if binding_ready:
         return ControlledAlternativeRuntimeContext(
             request=request,
-            state_root=str(state_root),
+            state_root=str(effective_state_root),
             contract_version=CONTEXT_VERSION_V2,
             heartbeat=heartbeat,
             runtime_register=runtime_register,
@@ -526,7 +855,7 @@ def build_controlled_alternative_context(
         )
     return ControlledAlternativeRuntimeContext(
         request=request,
-        state_root=str(state_root),
+        state_root=str(effective_state_root),
         contract_version=CONTEXT_VERSION,
         heartbeat=heartbeat if hosted else None,
     )

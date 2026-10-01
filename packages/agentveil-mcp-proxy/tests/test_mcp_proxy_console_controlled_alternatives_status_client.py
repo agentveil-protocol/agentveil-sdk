@@ -123,6 +123,73 @@ def test_immediate_and_periodic_heartbeat_then_owned_stop(tmp_path) -> None:
     assert "/private/canary" not in repr(dispatcher)
 
 
+def test_schema_two_ack_is_accepted(tmp_path) -> None:
+    called = threading.Event()
+
+    def heartbeat(_token: str, observed_at: str):
+        called.set()
+        return 200, {
+            "schema_version": "2",
+            "status": "active",
+            "observed_at": observed_at,
+            "result": "accepted",
+        }
+
+    dispatcher = ControlledAlternativesStatusDispatcher(
+        runtime_context=_context(heartbeat),
+        home=tmp_path,
+        load_credential_fn=_credential,
+    )
+    dispatcher.start()
+    assert called.wait(timeout=1.0)
+    deadline = time.monotonic() + 1.0
+    while dispatcher.last_result == "not_started" and time.monotonic() < deadline:
+        time.sleep(0.01)
+    dispatcher.stop()
+    assert dispatcher.last_result == "accepted"
+
+
+def test_heartbeat_reloads_credential_each_tick(tmp_path) -> None:
+    tokens = [
+        "bounded-summary-upload-token-001",
+        "bounded-summary-upload-token-002",
+    ]
+    seen: list[str] = []
+    state = {"index": 0}
+
+    def load_fn(home=None):
+        token = tokens[min(state["index"], len(tokens) - 1)]
+        return StoredCredential(scope=CREDENTIAL_SCOPE, token=token)
+
+    def heartbeat(token: str, observed_at: str):
+        seen.append(token)
+        if len(seen) == 1:
+            state["index"] = 1
+        return 200, _ack(observed_at)
+
+    reached_two = threading.Event()
+
+    def heartbeat_wrap(token: str, observed_at: str):
+        result = heartbeat(token, observed_at)
+        if len(seen) >= 2:
+            reached_two.set()
+        return result
+
+    dispatcher = ControlledAlternativesStatusDispatcher(
+        runtime_context=_context(heartbeat_wrap),
+        home=tmp_path,
+        load_credential_fn=load_fn,
+        interval_seconds=0.02,
+        clock=lambda: datetime(2026, 9, 15, 12, 0, tzinfo=timezone.utc)
+        + timedelta(seconds=len(seen)),
+    )
+    dispatcher.start()
+    assert reached_two.wait(timeout=1.0)
+    dispatcher.stop()
+    assert tokens[0] in seen
+    assert tokens[1] in seen
+
+
 def test_duplicate_newer_ack_is_accepted(tmp_path) -> None:
     called = threading.Event()
 

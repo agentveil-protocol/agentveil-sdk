@@ -25,11 +25,16 @@ from agentveil_mcp_proxy.console_credentials import (
     credential_path,
     delete_credential,
     delete_runtime_binding_credential,
+    delete_scoped_runtime_binding_credential,
     load_credential,
     load_runtime_binding_credential,
+    load_scoped_runtime_binding_credential,
+    resolve_runtime_binding_for_context,
     runtime_binding_credential_path,
     save_credential,
     save_runtime_binding_credential,
+    save_scoped_runtime_binding_credential,
+    scoped_runtime_binding_namespace_hash,
 )
 
 POSIX = os.name != "nt"
@@ -133,6 +138,220 @@ def test_delete_runtime_binding_credential(tmp_path):
     assert delete_runtime_binding_credential(home=tmp_path) is True
     assert load_runtime_binding_credential(home=tmp_path) is None
     assert load_credential(home=tmp_path) is None
+
+
+def test_scoped_runtime_binding_isolated_from_legacy_file(tmp_path):
+    agent_did = "did:key:z6MkhaWgW9R3mQ8p1k2v3N4m5L6n7O8p9Q0r1S2t3U4v5W6x7Y8z9"
+    summary = "summary-token-scoped-0123456789abcdef0123456789ab"
+    legacy = "legacy-runtime-binding-token-value-0123456789ab"
+    scoped = "scoped-runtime-binding-token-value-0123456789ab"
+    save_runtime_binding_credential(legacy, home=tmp_path)
+    save_scoped_runtime_binding_credential(
+        scoped,
+        agent_did=agent_did,
+        summary_token=summary,
+        home=tmp_path,
+    )
+    legacy_path = runtime_binding_credential_path(home=tmp_path)
+    assert legacy_path.read_text(encoding="utf-8").count(legacy) == 1
+    loaded = load_scoped_runtime_binding_credential(agent_did, summary, home=tmp_path)
+    assert loaded is not None and loaded.token == scoped
+    namespace = scoped_runtime_binding_namespace_hash(agent_did, summary)
+    assert legacy_path.name != f"runtime-binding-scoped-{namespace}.json"
+
+
+def test_resolve_runtime_binding_prefers_scoped_over_legacy(tmp_path):
+    agent_did = "did:key:z6MkhaWgW9R3mQ8p1k2v3N4m5L6n7O8p9Q0r1S2t3U4v5W6x7Y8z9"
+    summary = "summary-token-scoped-0123456789abcdef0123456789ab"
+    save_runtime_binding_credential("legacy-runtime-binding-token-value-0123456789ab", home=tmp_path)
+    save_scoped_runtime_binding_credential(
+        BINDING_TOKEN,
+        agent_did=agent_did,
+        summary_token=summary,
+        home=tmp_path,
+    )
+    resolved = resolve_runtime_binding_for_context(agent_did, summary, tmp_path)
+    assert resolved is not None and resolved.token == BINDING_TOKEN
+
+
+@pytest.mark.skipif(not POSIX, reason="filesystem custody is a POSIX guarantee")
+def test_corrupt_scoped_source_marker_fails_closed(tmp_path):
+    agent_did = "did:key:z6MkhaWgW9R3mQ8p1k2v3N4m5L6n7O8p9Q0r1S2t3U4v5W6x7Y8z9"
+    legacy = "legacy-global-runtime-binding-token-0123456789ab"
+    save_runtime_binding_credential(legacy, home=tmp_path)
+    marker_path = (
+        creds.credential_directory(tmp_path)
+        / creds._scoped_source_marker_filename(agent_did)
+    )
+    _write_raw(marker_path, b"{not-json", mode=0o600)
+    with pytest.raises(CredentialError):
+        creds._load_scoped_source_marker(agent_did, home=tmp_path)
+    assert resolve_runtime_binding_for_context(agent_did, "summary-token-a-0123456789abcdef0123456789ab", tmp_path) is None
+    assert creds.agent_scoped_runtime_opt_in_recorded(agent_did, home=tmp_path) is True
+
+
+def test_legacy_binding_without_summary_remains_usable(tmp_path):
+    agent_did = "did:key:z6MklegacyAgent012345678901234567890123456"
+    legacy = "legacy-global-runtime-binding-token-0123456789ab"
+    save_runtime_binding_credential(legacy, home=tmp_path)
+    resolved = resolve_runtime_binding_for_context(
+        agent_did,
+        "summary-token-a-0123456789abcdef0123456789ab",
+        tmp_path,
+    )
+    assert resolved is not None
+    assert resolved.token == legacy
+
+
+@pytest.mark.skipif(not POSIX, reason="filesystem custody is a POSIX guarantee")
+def test_load_scoped_binding_rejects_symlink(tmp_path):
+    agent_did = "did:key:z6MkhaWgW9R3mQ8p1k2v3N4m5L6n7O8p9Q0r1S2t3U4v5W6x7Y8z9"
+    summary = "summary-token-scoped-0123456789abcdef0123456789ab"
+    namespace = scoped_runtime_binding_namespace_hash(agent_did, summary)
+    filename = f"runtime-binding-scoped-{namespace}.json"
+    directory = creds.credential_directory(tmp_path)
+    directory.mkdir(parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+    real = tmp_path / "real-scoped.json"
+    real.write_text("{}", encoding="utf-8")
+    os.symlink(real, directory / filename)
+    with pytest.raises(CredentialError):
+        load_scoped_runtime_binding_credential(agent_did, summary, home=tmp_path)
+
+
+def test_scoped_store_failure_preserves_legacy_bytes(tmp_path, monkeypatch):
+    agent_did = "did:key:z6MkhaWgW9R3mQ8p1k2v3N4m5L6n7O8p9Q0r1S2t3U4v5W6x7Y8z9"
+    summary = "summary-token-scoped-0123456789abcdef0123456789ab"
+    legacy = "legacy-global-runtime-binding-token-0123456789ab"
+    save_runtime_binding_credential(legacy, home=tmp_path)
+    before = runtime_binding_credential_path(home=tmp_path).read_text(encoding="utf-8")
+    namespace = scoped_runtime_binding_namespace_hash(agent_did, summary)
+    scoped_name = f"runtime-binding-scoped-{namespace}.json"
+
+    real_atomic_write = creds._atomic_write_to_directory_fd
+
+    def _boom(dir_fd, filename, payload):
+        if filename == scoped_name:
+            raise CredentialError("credential_write_failed")
+        return real_atomic_write(dir_fd, filename, payload)
+
+    monkeypatch.setattr(creds, "_atomic_write_to_directory_fd", _boom)
+    with pytest.raises(CredentialError):
+        save_scoped_runtime_binding_credential(
+            BINDING_TOKEN,
+            agent_did=agent_did,
+            summary_token=summary,
+            home=tmp_path,
+        )
+    assert runtime_binding_credential_path(home=tmp_path).read_text(encoding="utf-8") == before
+    marker = (
+        creds.credential_directory(tmp_path)
+        / creds._scoped_source_marker_filename(agent_did)
+    )
+    assert marker.is_file()
+    assert load_scoped_runtime_binding_credential(agent_did, summary, home=tmp_path) is None
+    assert resolve_runtime_binding_for_context(agent_did, summary, home=tmp_path) is None
+    summary_b = "summary-token-b-0123456789abcdef0123456789ab"
+    assert resolve_runtime_binding_for_context(agent_did, summary_b, home=tmp_path) is None
+
+
+@pytest.mark.skipif(not POSIX, reason="filesystem custody is a POSIX guarantee")
+def test_scoped_marker_write_failure_leaves_no_scoped_secret(tmp_path, monkeypatch):
+    agent_did = "did:key:z6MkhaWgW9R3mQ8p1k2v3N4m5L6n7O8p9Q0r1S2t3U4v5W6x7Y8z9"
+    summary = "summary-token-scoped-0123456789abcdef0123456789ab"
+
+    def _marker_fail(*_args, **_kwargs):
+        raise CredentialError("credential_write_failed")
+
+    monkeypatch.setattr(creds, "_save_scoped_source_marker", _marker_fail)
+    with pytest.raises(CredentialError):
+        save_scoped_runtime_binding_credential(
+            BINDING_TOKEN,
+            agent_did=agent_did,
+            summary_token=summary,
+            home=tmp_path,
+        )
+    directory = creds.credential_directory(tmp_path)
+    assert not any(directory.glob("runtime-binding-scoped-*.json"))
+    assert not (
+        directory / creds._scoped_source_marker_filename(agent_did)
+    ).exists()
+
+
+def test_windows_scoped_marker_write_failure_leaves_no_binding(
+    tmp_path,
+    windows_backend,
+):
+    agent_did = "did:key:z6MkhaWgW9R3mQ8p1k2v3N4m5L6n7O8p9Q0r1S2t3U4v5W6x7Y8z9"
+    summary = "summary-token-scoped-0123456789abcdef0123456789ab"
+    marker_target = creds._windows_scoped_source_marker_target(tmp_path, agent_did)
+    windows_backend.fail_write_after = 0
+    with pytest.raises(CredentialError, match="credential_write_failed"):
+        save_scoped_runtime_binding_credential(
+            BINDING_TOKEN,
+            agent_did=agent_did,
+            summary_token=summary,
+            home=tmp_path,
+        )
+    assert marker_target not in windows_backend.values
+    namespace = scoped_runtime_binding_namespace_hash(agent_did, summary)
+    assert creds._windows_scoped_active_target(tmp_path, namespace) not in windows_backend.values
+
+
+def test_windows_scoped_secret_write_failure_after_marker_blocks_legacy(
+    tmp_path,
+    windows_backend,
+):
+    agent_did = "did:key:z6MkhaWgW9R3mQ8p1k2v3N4m5L6n7O8p9Q0r1S2t3U4v5W6x7Y8z9"
+    summary_a = "summary-token-a-0123456789abcdef0123456789ab"
+    summary_b = "summary-token-b-0123456789abcdef0123456789ab"
+    legacy = "legacy-global-runtime-binding-token-0123456789ab"
+    save_runtime_binding_credential(legacy, home=tmp_path)
+    marker_target = creds._windows_scoped_source_marker_target(tmp_path, agent_did)
+    windows_backend.fail_write_after = windows_backend.write_calls + 1
+    with pytest.raises(CredentialError, match="credential_write_failed"):
+        save_scoped_runtime_binding_credential(
+            BINDING_TOKEN,
+            agent_did=agent_did,
+            summary_token=summary_a,
+            home=tmp_path,
+        )
+    assert marker_target in windows_backend.values
+    namespace = scoped_runtime_binding_namespace_hash(agent_did, summary_a)
+    assert creds._windows_scoped_active_target(tmp_path, namespace) not in windows_backend.values
+    assert resolve_runtime_binding_for_context(agent_did, summary_a, home=tmp_path) is None
+    assert resolve_runtime_binding_for_context(agent_did, summary_b, home=tmp_path) is None
+    assert load_runtime_binding_credential(home=tmp_path).token == legacy
+
+
+def test_legacy_binding_survives_other_agent_scoped_credential(tmp_path):
+    agent_legacy = "did:key:z6MklegacyAgent012345678901234567890123456"
+    agent_scoped = "did:key:z6MkscopedAgent0123456789012345678901234567"
+    summary = "summary-token-a-0123456789abcdef0123456789ab"
+    legacy = "legacy-global-runtime-binding-token-0123456789ab"
+    save_runtime_binding_credential(legacy, home=tmp_path)
+    save_scoped_runtime_binding_credential(
+        "scoped-runtime-binding-token-b-0123456789ab",
+        agent_did=agent_scoped,
+        summary_token=summary,
+        home=tmp_path,
+    )
+    resolved = resolve_runtime_binding_for_context(agent_legacy, summary, tmp_path)
+    assert resolved is not None
+    assert resolved.token == legacy
+
+
+def test_delete_scoped_runtime_binding_credential(tmp_path):
+    agent_did = "did:key:z6MkhaWgW9R3mQ8p1k2v3N4m5L6n7O8p9Q0r1S2t3U4v5W6x7Y8z9"
+    summary = "summary-token-scoped-0123456789abcdef0123456789ab"
+    save_scoped_runtime_binding_credential(
+        BINDING_TOKEN,
+        agent_did=agent_did,
+        summary_token=summary,
+        home=tmp_path,
+    )
+    assert delete_scoped_runtime_binding_credential(agent_did, summary, home=tmp_path)
+    assert load_scoped_runtime_binding_credential(agent_did, summary, home=tmp_path) is None
 
 
 def test_runtime_binding_rejects_summary_scope(tmp_path):
@@ -502,6 +721,62 @@ def test_login_lock_survives_parent_directory_swap(tmp_path, monkeypatch):
 
 
 # --- Windows Credential Manager custody --------------------------------------
+
+
+def test_windows_scoped_binding_round_trip_without_plaintext_file(
+    tmp_path,
+    windows_backend,
+):
+    agent_did = "did:key:z6MkhaWgW9R3mQ8p1k2v3N4m5L6n7O8p9Q0r1S2t3U4v5W6x7Y8z9"
+    summary = "summary-token-scoped-0123456789abcdef0123456789ab"
+    scoped = "scoped-runtime-binding-token-value-0123456789ab"
+    save_scoped_runtime_binding_credential(
+        scoped,
+        agent_did=agent_did,
+        summary_token=summary,
+        home=tmp_path,
+    )
+    loaded = load_scoped_runtime_binding_credential(agent_did, summary, home=tmp_path)
+    assert loaded is not None and loaded.token == scoped
+    assert not any(tmp_path.rglob("runtime-binding-scoped-*.json"))
+
+
+def test_windows_scoped_source_change_blocks_legacy_fallback(
+    tmp_path,
+    windows_backend,
+):
+    agent_did = "did:key:z6MkhaWgW9R3mQ8p1k2v3N4m5L6n7O8p9Q0r1S2t3U4v5W6x7Y8z9"
+    summary_a = "summary-token-a-0123456789abcdef0123456789ab"
+    summary_b = "summary-token-b-0123456789abcdef0123456789ab"
+    legacy = "legacy-global-runtime-binding-token-0123456789ab"
+    save_runtime_binding_credential(legacy, home=tmp_path)
+    save_scoped_runtime_binding_credential(
+        BINDING_TOKEN,
+        agent_did=agent_did,
+        summary_token=summary_a,
+        home=tmp_path,
+    )
+    assert resolve_runtime_binding_for_context(agent_did, summary_b, home=tmp_path) is None
+    assert load_runtime_binding_credential(home=tmp_path).token == legacy
+
+
+def test_windows_other_agent_scoped_entry_preserves_legacy_agent(
+    tmp_path,
+    windows_backend,
+):
+    agent_legacy = "did:key:z6MklegacyAgent012345678901234567890123456"
+    agent_scoped = "did:key:z6MkscopedAgent0123456789012345678901234567"
+    summary = "summary-token-a-0123456789abcdef0123456789ab"
+    legacy = "legacy-global-runtime-binding-token-0123456789ab"
+    save_runtime_binding_credential(legacy, home=tmp_path)
+    save_scoped_runtime_binding_credential(
+        BINDING_TOKEN,
+        agent_did=agent_scoped,
+        summary_token=summary,
+        home=tmp_path,
+    )
+    resolved = resolve_runtime_binding_for_context(agent_legacy, summary, home=tmp_path)
+    assert resolved is not None and resolved.token == legacy
 
 
 def test_windows_save_load_delete_uses_current_user_credential_store(

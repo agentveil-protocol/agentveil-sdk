@@ -48,7 +48,8 @@ def _valid_ack(
         "result",
     }:
         return False
-    if payload.get("schema_version") != "1" or payload.get("status") != "active":
+    schema_version = payload.get("schema_version")
+    if schema_version not in {"1", "2"} or payload.get("status") != "active":
         return False
     result = payload.get("result")
     if result not in {"accepted", "duplicate"}:
@@ -121,7 +122,7 @@ class ControlledAlternativesStatusDispatcher:
         self._active = True
         self._worker = threading.Thread(
             target=self._run,
-            args=(heartbeat, credential.token),
+            args=(heartbeat,),
             name="console-ca-runtime-status",
             daemon=True,
         )
@@ -141,11 +142,17 @@ class ControlledAlternativesStatusDispatcher:
                 pass
         self._active = False
 
-    def _run(self, heartbeat: Heartbeat, console_credential: str) -> None:
+    def _run(self, heartbeat: Heartbeat) -> None:
         while not self._stop.is_set():
             try:
+                credential = self._load_credential_fn(home=self._home)
+                if credential is None or credential.scope != CREDENTIAL_SCOPE:
+                    self._last_result = "skipped_unsafe_credential"
+                    if self._stop.wait(self._interval_seconds):
+                        return
+                    continue
                 requested_at = _canonical_observed_at(self._clock())
-                status, payload = heartbeat(console_credential, requested_at)
+                status, payload = heartbeat(credential.token, requested_at)
                 self._last_result = (
                     "accepted"
                     if _valid_ack(status, payload, requested_at=requested_at)

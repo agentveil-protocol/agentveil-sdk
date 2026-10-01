@@ -10,9 +10,11 @@ response failures return bounded non-secret result codes without raising.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import stat as stat_mod
 import socket
 import ssl
 import subprocess
@@ -28,10 +30,15 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 from urllib.parse import urlsplit
 
+from agentveil_mcp_proxy.client_guidance import (
+    trusted_downstream_from_proxy_home,
+    trusted_project_workspace_root_from_downstream,
+)
 from agentveil_mcp_proxy.console_credentials import (
     CREDENTIAL_SCOPE,
     CredentialError,
     StoredCredential,
+    agent_scoped_runtime_opt_in_recorded,
     console_credential_home_for_runtime,
     load_credential,
 )
@@ -51,6 +58,8 @@ _INGEST_PATH = "/console/project-status/ingest"
 
 _REQUEST_TIMEOUT_SECONDS = 3.0
 _MAX_RESPONSE_BYTES = 16 * 1024
+_MAX_METADATA_BYTES = 8192
+_AGENT_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9._-]{0,63}$")
 _SCHEMA_VERSION = "1"
 _SCOPE_STATEMENT = "Configured project routes only"
 HOOK_STATUS_REFRESH_WORKER_ENV = "AGENTVEIL_HOOK_STATUS_REFRESH_WORKER"
@@ -68,6 +77,8 @@ _MAX_PACKAGE_VERSION_LENGTH = 64
 _CA_STATUS_INSTALLED_READY = "installed_ready"
 _CA_RUNTIME_REPORT_VALUES = frozenset({_CA_STATUS_INSTALLED_READY})
 
+_CLIENT_INSTALLATION_REF = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
 _REQUEST_KEYS = frozenset({
     "schema_version",
     "connector",
@@ -79,11 +90,13 @@ _REQUEST_KEYS = frozenset({
     "private_guardrails_status",
     "controlled_alternatives_status",
     "controlled_alternatives_package_version",
+    "client_installation_ref",
 })
 _REQUIRED_REQUEST_KEYS = _REQUEST_KEYS - {
     "package_version",
     "controlled_alternatives_status",
     "controlled_alternatives_package_version",
+    "client_installation_ref",
 }
 _RESPONSE_KEYS = frozenset({
     "workspace_id",
@@ -141,6 +154,7 @@ class ProjectStatusSummary:
     package_version: str | None = None
     controlled_alternatives_status: str | None = None
     controlled_alternatives_package_version: str | None = None
+    client_installation_ref: str | None = None
 
 
 Transport = Callable[..., RawResponse]
@@ -428,6 +442,51 @@ def _route_value_missing(value: object) -> bool:
     return not isinstance(value, str) or value == "missing"
 
 
+def correlation_root_for_client_installation_ref(
+    *,
+    project_dir: Path,
+    runtime_home: Path | None,
+) -> Path | None:
+    """Shared correlation root for status upload and runtime heartbeat."""
+
+    if runtime_home is not None:
+        downstream = trusted_downstream_from_proxy_home(runtime_home)
+        if downstream is not None:
+            workspace = trusted_project_workspace_root_from_downstream(downstream)
+            if workspace is not None:
+                return workspace
+    try:
+        return project_dir.expanduser().resolve(strict=True)
+    except OSError:
+        return None
+
+
+def build_client_installation_ref(
+    *,
+    canonical_project_root: Path,
+    agent_did: str,
+    origin: str = CONSOLE_ORIGIN,
+) -> str | None:
+    """Stable bounded opaque ref shared by project status and runtime heartbeat."""
+
+    if not isinstance(agent_did, str) or not agent_did.startswith("did:key:"):
+        return None
+    if origin != CONSOLE_ORIGIN:
+        return None
+    try:
+        canonical_root = Path(canonical_project_root).expanduser().resolve(strict=True)
+    except OSError:
+        return None
+    material = (
+        f"client-installation-ref/v1\n{origin}\n{agent_did}\n{canonical_root}\n"
+    ).encode("utf-8", "surrogatepass")
+    digest = hashlib.sha256(material).hexdigest()
+    ref = f"cir1.{digest[:120]}"
+    if _CLIENT_INSTALLATION_REF.fullmatch(ref) is None:
+        return None
+    return ref
+
+
 def normalize_connector_status(
     connector_status: Mapping[str, Any],
 ) -> tuple[str, str] | None:
@@ -465,6 +524,7 @@ def build_project_status_summary(
     package_version: str | None = None,
     controlled_alternatives_status: str | None = None,
     controlled_alternatives_package_version: str | None = None,
+    client_installation_ref: str | None = None,
     observed_at: str | None = None,
     clock: Clock | None = None,
 ) -> ProjectStatusSummary | None:
@@ -482,6 +542,13 @@ def build_project_status_summary(
         ca_version = None
     elif ca_version is None:
         ca_status = None
+    installation_ref = None
+    if client_installation_ref is not None:
+        if not isinstance(client_installation_ref, str):
+            return None
+        if _CLIENT_INSTALLATION_REF.fullmatch(client_installation_ref) is None:
+            return None
+        installation_ref = client_installation_ref
     if observed_at is not None:
         canonical_observed = _canonical_observed_at(_parse_rfc3339_utc(observed_at))
     else:
@@ -499,6 +566,7 @@ def build_project_status_summary(
         package_version=version,
         controlled_alternatives_status=ca_status,
         controlled_alternatives_package_version=ca_version,
+        client_installation_ref=installation_ref,
     )
 
 
@@ -526,6 +594,10 @@ def summary_to_request_payload(summary: ProjectStatusSummary) -> dict[str, str]:
         if ca_version is None:
             raise ProjectStatusClientError("invalid_request")
         payload["controlled_alternatives_package_version"] = ca_version
+    if summary.client_installation_ref is not None:
+        if _CLIENT_INSTALLATION_REF.fullmatch(summary.client_installation_ref) is None:
+            raise ProjectStatusClientError("invalid_request")
+        payload["client_installation_ref"] = summary.client_installation_ref
     if set(payload) - _REQUEST_KEYS:
         raise ProjectStatusClientError("invalid_request")
     if not _REQUIRED_REQUEST_KEYS.issubset(payload):
@@ -563,6 +635,7 @@ def _summary_without_controlled_alternatives_readiness(
         package_version=summary.package_version,
         controlled_alternatives_status=None,
         controlled_alternatives_package_version=None,
+        client_installation_ref=summary.client_installation_ref,
     )
 
 
@@ -697,6 +770,77 @@ def _resolve_credential(
     return credential, None
 
 
+def _read_bounded_public_metadata_json(path: Path) -> dict[str, Any] | None:
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    if stat_mod.S_ISLNK(st.st_mode) or not stat_mod.S_ISREG(st.st_mode):
+        return None
+    if st.st_nlink > 1:
+        return None
+    if sys.platform != "win32" and st.st_uid not in {0, os.getuid()}:
+        return None
+    if sys.platform != "win32" and (st.st_mode & 0o077):
+        return None
+    if st.st_size > _MAX_METADATA_BYTES:
+        return None
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        raw = os.read(fd, _MAX_METADATA_BYTES + 1)
+    except OSError:
+        return None
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    if len(raw) > _MAX_METADATA_BYTES:
+        return None
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, TypeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
+
+
+def _agent_did_from_runtime_home(runtime_home: Path) -> str | None:
+    """Read only the public DID from bounded local proxy identity metadata."""
+
+    try:
+        home = runtime_home.expanduser().resolve(strict=True)
+    except OSError:
+        return None
+    config_path = home / "mcp-proxy" / "config.json"
+    config_payload = _read_bounded_public_metadata_json(config_path)
+    if config_payload is None:
+        return None
+    avp = config_payload.get("avp")
+    if not isinstance(avp, dict):
+        return None
+    agent_name = avp.get("agent_name")
+    if not isinstance(agent_name, str) or _AGENT_NAME_RE.fullmatch(agent_name) is None:
+        return None
+    identity_path = home / "agents" / f"{agent_name}.json"
+    identity_payload = _read_bounded_public_metadata_json(identity_path)
+    if identity_payload is None:
+        return None
+    did = identity_payload.get("did")
+    if not isinstance(did, str) or not did.startswith("did:key:"):
+        return None
+    return did
+
+
 def sync_project_status(
     *,
     connector: str,
@@ -758,6 +902,23 @@ def sync_project_status(
         except Exception:
             ca_readiness = None
 
+    client_installation_ref = None
+    if runtime_home is not None:
+        agent_did = _agent_did_from_runtime_home(runtime_home)
+        if agent_did is not None and agent_scoped_runtime_opt_in_recorded(
+            agent_did,
+            home=runtime_home,
+        ):
+            correlation_root = correlation_root_for_client_installation_ref(
+                project_dir=project_dir,
+                runtime_home=runtime_home,
+            )
+            if correlation_root is not None:
+                client_installation_ref = build_client_installation_ref(
+                    canonical_project_root=correlation_root,
+                    agent_did=agent_did,
+                )
+
     try:
         summary = build_project_status_summary(
             connector=connector,
@@ -771,6 +932,7 @@ def sync_project_status(
             controlled_alternatives_package_version=(
                 None if ca_readiness is None else ca_readiness[1]
             ),
+            client_installation_ref=client_installation_ref,
             clock=clock,
         )
     except ProjectStatusClientError:
