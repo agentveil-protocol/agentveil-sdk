@@ -32,6 +32,8 @@ from agentveil_mcp_proxy.console_decision_summary_client import (
     DecisionSummaryPayload,
     RawResponse,
     TransportError,
+    _HOOK_DENIED_DETACHED_UPLOAD_MAX_ATTEMPTS,
+    _HOOK_DENIED_DETACHED_UPLOAD_RETRY_DELAY_SECONDS,
     _REQUEST_TIMEOUT_SECONDS,
     _SHUTDOWN_JOIN_TIMEOUT_SECONDS,
     attach_terminal_evidence_observer,
@@ -1874,6 +1876,167 @@ def test_hook_denied_worker_rejects_extra_raw_fields():
         )
         == 2
     )
+
+
+def _hook_denied_worker_stdin(**record_overrides):
+    payload = build_hook_denied_decision_summary_payload(
+        _hook_denied_record(**record_overrides)
+    )
+    assert payload is not None
+    encoded = json.dumps(payload_to_request_body(payload)).encode("utf-8")
+    return io.BytesIO(encoded), payload
+
+
+def test_hook_denied_worker_retries_unavailable_then_accepts(monkeypatch):
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_decision_summary_client.time.sleep",
+        lambda _seconds: None,
+    )
+    stdin, payload = _hook_denied_worker_stdin()
+    uploads: list[DecisionSummaryPayload] = []
+    outcomes = iter(["unavailable", "accepted"])
+
+    def _upload(item):
+        uploads.append(item)
+        return next(outcomes)
+
+    assert run_hook_denied_upload_worker(stdin=stdin, upload_fn=_upload) == 0
+    assert uploads == [payload, payload]
+
+
+def test_hook_denied_worker_stops_after_bounded_unavailable_attempts(monkeypatch):
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_decision_summary_client.time.sleep",
+        lambda _seconds: None,
+    )
+    stdin, _payload = _hook_denied_worker_stdin()
+    calls: list[int] = []
+
+    def _upload(_item):
+        calls.append(1)
+        return "unavailable"
+
+    assert run_hook_denied_upload_worker(stdin=stdin, upload_fn=_upload) == 1
+    assert len(calls) == _HOOK_DENIED_DETACHED_UPLOAD_MAX_ATTEMPTS
+
+
+def test_hook_denied_worker_does_not_retry_rejected_payload():
+    stdin, _payload = _hook_denied_worker_stdin()
+    calls: list[int] = []
+
+    def _upload(_item):
+        calls.append(1)
+        return "rejected"
+
+    assert run_hook_denied_upload_worker(stdin=stdin, upload_fn=_upload) == 1
+    assert len(calls) == 1
+
+
+def test_hook_denied_worker_does_not_retry_skipped_credential_outcome():
+    stdin, _payload = _hook_denied_worker_stdin()
+    calls: list[int] = []
+
+    def _upload(_item):
+        calls.append(1)
+        return "skipped_no_credential"
+
+    assert run_hook_denied_upload_worker(stdin=stdin, upload_fn=_upload) == 1
+    assert len(calls) == 1
+
+
+def test_hook_denied_worker_duplicate_ack_succeeds_without_retry():
+    stdin, payload = _hook_denied_worker_stdin()
+    uploads: list[DecisionSummaryPayload] = []
+
+    def _upload(item):
+        uploads.append(item)
+        return "duplicate"
+
+    assert run_hook_denied_upload_worker(stdin=stdin, upload_fn=_upload) == 0
+    assert uploads == [payload]
+
+
+def test_hook_denied_worker_retries_same_bounded_payload_without_raw_fields(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_decision_summary_client.time.sleep",
+        lambda _seconds: None,
+    )
+    stdin, payload = _hook_denied_worker_stdin(
+        session_id="privacy-retry-session",
+        input_ref={
+            "input_hash": "sha256:deadbeefdeadbeef",
+            "input_keys": ["command"],
+        },
+    )
+    uploads: list[DecisionSummaryPayload] = []
+    outcomes = iter(["unavailable", "unavailable", "accepted"])
+
+    def _upload(item):
+        uploads.append(item)
+        return next(outcomes)
+
+    assert run_hook_denied_upload_worker(stdin=stdin, upload_fn=_upload) == 0
+    assert len(uploads) == 3
+    assert uploads == [payload, payload, payload]
+    for item in uploads:
+        encoded = json.dumps(payload_to_request_body(item))
+        for forbidden in (
+            "git add .",
+            "/private/customer/workspace",
+            "privacy-retry-session",
+            "command",
+            "deadbeefdeadbeef",
+            TOKEN,
+        ):
+            assert forbidden not in encoded
+
+
+def test_detached_hook_spawn_remains_nonblocking_with_worker_retry_contract(
+    monkeypatch,
+    tmp_path,
+):
+    captured = {}
+
+    class _Stdin:
+        def write(self, value):
+            captured["input"] = value
+
+        def close(self):
+            captured["closed"] = True
+
+    class _Process:
+        stdin = _Stdin()
+
+        def wait(self):
+            return 0
+
+    def _popen(command, **kwargs):
+        captured["command"] = command
+        return _Process()
+
+    def _load_credential(**kwargs):
+        return StoredCredential(scope=CREDENTIAL_SCOPE, token=TOKEN)
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_decision_summary_client.subprocess.Popen",
+        _popen,
+    )
+
+    started = time.monotonic()
+    best_effort_spawn_hook_denied_summary(
+        _hook_denied_record(),
+        runtime_home=tmp_path / "project-home",
+        load_credential_fn=_load_credential,
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.1
+    assert captured["command"][-1] == "--hook-denied-upload-worker"
+    assert captured["closed"] is True
+    assert _HOOK_DENIED_DETACHED_UPLOAD_MAX_ATTEMPTS == 3
+    assert _HOOK_DENIED_DETACHED_UPLOAD_RETRY_DELAY_SECONDS == 0.25
 
 
 def test_detached_hook_upload_drops_project_avp_home(monkeypatch, tmp_path):

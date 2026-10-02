@@ -49,6 +49,8 @@ _MAX_DEDUP_KEYS = 4096
 _SHUTDOWN_JOIN_TIMEOUT_SECONDS = _REQUEST_TIMEOUT_SECONDS + 0.25
 _HOOK_DENIED_UPLOAD_QUEUE_CAPACITY = 256
 _MAX_HOOK_WORKER_INPUT_BYTES = 4096
+_HOOK_DENIED_DETACHED_UPLOAD_MAX_ATTEMPTS = 3
+_HOOK_DENIED_DETACHED_UPLOAD_RETRY_DELAY_SECONDS = 0.25
 
 _DECISION_ALLOWED = "allowed"
 _DECISION_DENIED = "denied"
@@ -887,6 +889,25 @@ def _hook_worker_payload_from_body(body: Mapping[str, Any]) -> DecisionSummaryPa
     )
 
 
+def _sync_hook_denied_detached_upload_with_retry(
+    payload: DecisionSummaryPayload,
+    uploader: UploadSummary,
+) -> str:
+    """Retry only transient unavailable outcomes inside the detached worker."""
+
+    last_outcome = "unavailable"
+    for attempt in range(_HOOK_DENIED_DETACHED_UPLOAD_MAX_ATTEMPTS):
+        outcome = uploader(payload)
+        if outcome in _HOOK_DENIED_UPLOAD_ACK_STATUSES:
+            return outcome
+        if outcome != "unavailable":
+            return outcome
+        last_outcome = outcome
+        if attempt + 1 < _HOOK_DENIED_DETACHED_UPLOAD_MAX_ATTEMPTS:
+            time.sleep(_HOOK_DENIED_DETACHED_UPLOAD_RETRY_DELAY_SECONDS)
+    return last_outcome
+
+
 def run_hook_denied_upload_worker(
     *,
     stdin: Any = None,
@@ -904,7 +925,7 @@ def run_hook_denied_upload_worker(
             return 2
         payload = _hook_worker_payload_from_body(decoded)
         uploader = upload_fn or sync_decision_summary
-        outcome = uploader(payload)
+        outcome = _sync_hook_denied_detached_upload_with_retry(payload, uploader)
     except Exception:
         return 2
     return 0 if outcome in _HOOK_DENIED_UPLOAD_ACK_STATUSES else 1
