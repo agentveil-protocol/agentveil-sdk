@@ -19,6 +19,7 @@ import pytest
 from agentveil_mcp_proxy.console_credentials import (
     CredentialError,
     StoredCredential,
+    load_credential,
     save_credential,
 )
 from agentveil_mcp_proxy.console_free_builder_client import (
@@ -1439,27 +1440,275 @@ def _seed_legacy_active_thin_install(tmp_path, monkeypatch) -> Path:
     return home
 
 
-def test_upgrade_explicit_project_home_does_not_use_global_credential(
+def _seed_project_legacy_with_global_credential(
     tmp_path,
     monkeypatch,
-):
-    from test_mcp_proxy_paid_provider import _build_wheel, _install_active_state
-
+    *,
+    project_home: Path | None = None,
+) -> tuple[Path, Path]:
     global_home = tmp_path / "global.avp"
     global_home.mkdir()
-    project_home = tmp_path / "project" / ".avp"
-    project_home.mkdir(parents=True)
-    monkeypatch.setenv("AVP_HOME", str(project_home))
+    resolved_project_home = project_home or (tmp_path / "project" / ".avp")
+    resolved_project_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("AVP_HOME", str(resolved_project_home))
     monkeypatch.setattr(
         "agentveil_mcp_proxy.console_credentials._global_console_credential_home",
         lambda: global_home,
     )
     save_credential(TOKEN, home=global_home)
-    wheel_bytes, _artifact_hash = _build_wheel(tmp_path / "legacy-wheel")
-    _install_active_state(project_home, wheel_bytes=wheel_bytes)
+    wheel_bytes, artifact_hash = _build_wheel(tmp_path / "legacy-wheel")
+    run_free_builder_install_flow(
+        wheel_bytes=wheel_bytes,
+        home=resolved_project_home,
+        activation_credential=TOKEN,
+        expectations=_expectations_for_wheel(wheel_bytes, artifact_hash),
+    )
+    install_state = json.loads(
+        install_state_path(resolved_project_home).read_text(encoding="utf-8")
+    )
+    assert install_state.get("install_composition_version") is None
+    skip = sync_free_builder_install(
+        home=resolved_project_home,
+        transport=BackendEchoTransport(
+            responses=_with_v1_fallback([_json_response(200, {"eligible": True})])
+        ),
+        discover_paid_provider_fn=lambda: _active_provider_snapshot(),
+    )
+    assert skip == "skipped_already_active"
+    return resolved_project_home, global_home
 
-    payload = upgrade_free_builder_to_paired(home=project_home, apply=False)
+
+def test_upgrade_explicit_project_home_uses_global_console_credential(
+    tmp_path,
+    monkeypatch,
+):
+    project_home, global_home = _seed_project_legacy_with_global_credential(
+        tmp_path,
+        monkeypatch,
+    )
+    from agentveil_mcp_proxy.console_credentials import credential_path
+
+    assert not credential_path(project_home).exists()
+    prior_install_bytes = install_state_path(project_home).read_bytes()
+    global_credential_before = credential_path(global_home).read_bytes()
+    base_bytes, base_hash = _build_base_wheel(tmp_path / "base")
+    thin_bytes, thin_hash = _build_thin_wheel(tmp_path / "thin")
+    transport = BackendEchoTransport(
+        responses=[
+            _json_response(
+                200,
+                _v2_eligible_response(
+                    base_hash=base_hash,
+                    base_size=len(base_bytes),
+                    thin_hash=thin_hash,
+                    thin_size=len(thin_bytes),
+                ),
+            ),
+        ]
+    )
+    credential_homes: list[Path | None] = []
+
+    def _load_credential(*, home=None):
+        credential_homes.append(home)
+        return load_credential(home=home)
+
+    payload = upgrade_free_builder_to_paired(
+        home=project_home,
+        apply=False,
+        transport=transport,
+        load_credential_fn=_load_credential,
+    )
+    assert payload["result_code"] == "preview_ready"
+    assert len(transport.calls) == 1
+    assert credential_homes == [global_home]
+    assert install_state_path(project_home).read_bytes() == prior_install_bytes
+    assert credential_path(global_home).read_bytes() == global_credential_before
+
+
+def test_upgrade_global_credential_installs_pair_only_into_project_home(
+    tmp_path,
+    monkeypatch,
+):
+    project_home, global_home = _seed_project_legacy_with_global_credential(
+        tmp_path,
+        monkeypatch,
+    )
+    from agentveil_mcp_proxy.console_credentials import credential_path
+
+    global_install_before = (
+        install_state_path(global_home).read_text(encoding="utf-8")
+        if install_state_path(global_home).is_file()
+        else None
+    )
+    global_vendor_before = sorted(global_home.rglob("*")) if global_home.exists() else []
+    global_credential_before = credential_path(global_home).read_bytes()
+    transport = _two_home_v2_transport(tmp_path)
+    payload = upgrade_free_builder_to_paired(
+        home=project_home,
+        apply=True,
+        transport=transport,
+    )
+    assert payload["result_code"] == "upgraded"
+    project_state = json.loads(install_state_path(project_home).read_text(encoding="utf-8"))
+    assert project_state["install_composition_version"] == COMPOSED_INSTALL_COMPOSITION_VERSION
+    if global_install_before is None:
+        assert not install_state_path(global_home).is_file()
+    else:
+        assert install_state_path(global_home).read_text(encoding="utf-8") == global_install_before
+    global_vendor_after = sorted(global_home.rglob("*")) if global_home.exists() else []
+    assert global_vendor_after == global_vendor_before
+    assert credential_path(global_home).read_bytes() == global_credential_before
+    assert len(transport.calls) == 3
+
+
+def test_upgrade_symlink_project_runtime_home_skips_before_global_credential_or_network(
+    tmp_path,
+    monkeypatch,
+):
+    global_home = tmp_path / "global.avp"
+    global_home.mkdir()
+    project_home = tmp_path / "project" / ".avp"
+    project_home.parent.mkdir(parents=True)
+    project_home.symlink_to(global_home)
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_credentials._global_console_credential_home",
+        lambda: global_home,
+    )
+    save_credential(TOKEN, home=global_home)
+    transport = _two_home_v2_transport(tmp_path)
+    credential_homes: list[Path | None] = []
+
+    def _load_credential(*, home=None):
+        credential_homes.append(home)
+        from agentveil_mcp_proxy.console_credentials import CREDENTIAL_SCOPE
+
+        return StoredCredential(scope=CREDENTIAL_SCOPE, token=TOKEN)
+
+    payload = upgrade_free_builder_to_paired(
+        home=project_home,
+        apply=False,
+        transport=transport,
+        load_credential_fn=_load_credential,
+    )
+    assert payload["result_code"] == "skipped_unsafe_runtime_home"
+    assert credential_homes == []
+    assert transport.calls == []
+
+
+def test_upgrade_cli_symlink_project_runtime_home_skips_before_credential_or_network(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    global_home = tmp_path / "global.avp"
+    global_home.mkdir()
+    project_home = tmp_path / "project" / ".avp"
+    project_home.parent.mkdir(parents=True)
+    project_home.symlink_to(global_home)
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_credentials._global_console_credential_home",
+        lambda: global_home,
+    )
+    from agentveil_mcp_proxy.console_credentials import credential_path
+
+    save_credential(TOKEN, home=global_home)
+    global_credential_before = credential_path(global_home).read_bytes()
+    transport = _two_home_v2_transport(tmp_path)
+    credential_homes: list[Path | None] = []
+
+    def _load_credential(*, home=None):
+        credential_homes.append(home)
+        from agentveil_mcp_proxy.console_credentials import CREDENTIAL_SCOPE
+
+        return StoredCredential(scope=CREDENTIAL_SCOPE, token=TOKEN)
+
+    code = run_paid_upgrade_free_builder_cli(
+        home=project_home,
+        apply=False,
+        output_json=True,
+        transport=transport,
+        load_credential_fn=_load_credential,
+    )
+    assert code == 1
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    assert payload["result_code"] == "skipped_unsafe_runtime_home"
+    assert credential_homes == []
+    assert transport.calls == []
+    scan_paid_output_for_leaks(out, secrets=(TOKEN, SECRET))
+    assert TOKEN not in out
+    assert str(project_home) not in out
+    assert str(global_home) not in out
+    assert credential_path(global_home).read_bytes() == global_credential_before
+
+
+def test_upgrade_project_home_without_global_credential_stays_offline(
+    tmp_path,
+    monkeypatch,
+):
+    project_home, global_home = _seed_project_legacy_with_global_credential(
+        tmp_path,
+        monkeypatch,
+    )
+    from agentveil_mcp_proxy.console_credentials import delete_credential
+
+    delete_credential(home=global_home)
+    transport = _two_home_v2_transport(tmp_path)
+    payload = upgrade_free_builder_to_paired(
+        home=project_home,
+        apply=False,
+        transport=transport,
+    )
     assert payload["result_code"] == "skipped_no_credential"
+    assert transport.calls == []
+
+
+def test_upgrade_rejects_wrong_scope_global_credential_before_network(
+    tmp_path,
+    monkeypatch,
+):
+    project_home, global_home = _seed_project_legacy_with_global_credential(
+        tmp_path,
+        monkeypatch,
+    )
+    from agentveil_mcp_proxy.console_credentials import credential_path
+
+    raw = json.loads(credential_path(global_home).read_text(encoding="utf-8"))
+    raw["scope"] = "wrong-scope"
+    credential_path(global_home).write_text(json.dumps(raw), encoding="utf-8")
+    transport = _two_home_v2_transport(tmp_path)
+    payload = upgrade_free_builder_to_paired(
+        home=project_home,
+        apply=False,
+        transport=transport,
+    )
+    assert payload["result_code"] == "skipped_unsafe_credential"
+    assert transport.calls == []
+
+
+def test_upgrade_global_credential_output_omits_token_and_homes(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    project_home, global_home = _seed_project_legacy_with_global_credential(
+        tmp_path,
+        monkeypatch,
+    )
+    transport = _two_home_v2_transport(tmp_path)
+    code = run_paid_upgrade_free_builder_cli(
+        home=project_home,
+        apply=False,
+        output_json=True,
+        transport=transport,
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    scan_paid_output_for_leaks(out, secrets=(TOKEN, SECRET))
+    assert TOKEN not in out
+    assert str(project_home) not in out
+    assert str(global_home) not in out
+    assert ".avp" not in out
 
 
 def test_upgrade_preview_without_apply_does_not_mutate_or_download(tmp_path, monkeypatch):

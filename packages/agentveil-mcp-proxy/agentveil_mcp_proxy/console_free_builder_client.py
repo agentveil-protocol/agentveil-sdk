@@ -711,6 +711,24 @@ _UPGRADE_BOUNDED_PAYLOAD_KEYS = frozenset(
 _UPGRADE_TARGET_COMPONENT_KEYS = frozenset({"role", "package_name", "package_version"})
 
 
+def _upgrade_skip_before_credential(*, home: Path | None) -> str | None:
+    """Install-home and unsafe-runtime preflight before any credential read."""
+
+    install_home = resolve_free_builder_install_home(home).expanduser()
+    from agentveil_mcp_proxy.console_credentials import (
+        project_runtime_home_automatic_sync_preflight_skip,
+    )
+
+    preflight = project_runtime_home_automatic_sync_preflight_skip(install_home)
+    if preflight is not None:
+        return preflight
+
+    from agentveil_mcp_proxy.paid_activation import bound_avp_home
+
+    with bound_avp_home(install_home):
+        return _upgrade_untrusted_local_paths_issue(install_home)
+
+
 def _upgrade_untrusted_local_paths_issue(home: Path) -> str | None:
     """Reject symlink or untrusted path components before reading paid local state."""
 
@@ -939,15 +957,18 @@ def upgrade_free_builder_to_paired(
         load_install_state,
     )
 
-    resolved_home = credential_home(home)
+    skip_before_credential = _upgrade_skip_before_credential(home=home)
+    if skip_before_credential is not None:
+        return _build_upgrade_payload(result_code=skip_before_credential, apply=apply)
+
+    resolved_home = resolve_free_builder_install_home(home).expanduser()
     with bound_avp_home(resolved_home):
-        credential, skip = _resolve_credential(home=home, load_credential_fn=load_credential_fn)
+        credential, skip = _resolve_credential_for_setup_sync(
+            home=home,
+            load_credential_fn=load_credential_fn,
+        )
         if skip is not None:
             return _build_upgrade_payload(result_code=skip, apply=apply)
-
-        path_issue = _upgrade_untrusted_local_paths_issue(resolved_home)
-        if path_issue is not None:
-            return _build_upgrade_payload(result_code=path_issue, apply=apply)
 
         discover = discover_paid_provider_fn or discover_paid_provider
         local_issue = _legacy_console_thin_upgrade_issue(
@@ -1084,7 +1105,19 @@ def run_paid_upgrade_free_builder_cli(
     """Run bounded preview/apply upgrade for legacy Console free Builder installs."""
 
     stream = out or sys.stdout
-    credential, _skip = _resolve_credential(home=home, load_credential_fn=load_credential_fn)
+    skip_before_credential = _upgrade_skip_before_credential(home=home)
+    if skip_before_credential is not None:
+        payload = _build_upgrade_payload(
+            result_code=skip_before_credential,
+            apply=apply,
+        )
+        _emit_upgrade_payload(payload, output_json=output_json, out=stream, secrets=())
+        return 1
+
+    credential, _skip = _resolve_credential_for_setup_sync(
+        home=home,
+        load_credential_fn=load_credential_fn,
+    )
     secret_markers: tuple[str, ...] = ()
     if credential is not None and credential.token:
         secret_markers = (credential.token,)
