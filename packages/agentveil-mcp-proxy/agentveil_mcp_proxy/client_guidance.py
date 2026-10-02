@@ -102,6 +102,18 @@ NATIVE_PATCH_REDIRECT_INSTRUCTION = (
     "and bounded path, preserving the same path, content, and intent and the redirect_context exactly. "
     "If that route is unavailable, stop and tell the user. Do not bypass through native tools."
 )
+NATIVE_EXACT_DELETE_REDIRECT_INSTRUCTION = (
+    "Direct native delete was blocked before mutation. "  # claim-check: allow tested exact-delete redirect copy.
+    "The user already requested deletion of one exact bounded workspace target. "
+    "User intent is not execution authority. "
+    "Call the AgentVeil controlled MCP tool agentveil_stage_delete once with the "
+    "same bounded path without asking the user to repeat the same confirmation. "
+    "AgentVeil still classifies the call and may deny it or return approval_required. "
+    "Pass redirect_context unchanged when it is present in the hook message. "
+    "If the controlled MCP route is unavailable, stop and tell the user. "
+    "Do not retry, request another approval, inspect raw configuration, or bypass "
+    "through native tools."
+)
 # claim-check: allow hook denial copy covered by route-unavailable negative tests.
 NATIVE_FILE_WRITE_ROUTE_UNAVAILABLE_INSTRUCTION = (
     "Direct native file mutation was blocked before mutation. "  # claim-check: allow tested hook denial copy.
@@ -1815,7 +1827,22 @@ def native_hook_deny_instruction(
 
     live_ready = redirect_route_ready is True
     static_ready = static_route_ready is True
-    if native_tool in _NATIVE_FILE_WRITE_DENY_TOOLS:
+    envelope: NativeControlledGuidanceEnvelope | None = None
+    if tool_input is not None:
+        envelope = build_native_controlled_guidance_envelope(
+            native_tool=native_tool,
+            tool_input=tool_input,
+            redirect_route_ready=live_ready,
+            static_route_ready=static_ready,
+        )
+    exact_delete_available = (
+        envelope is not None
+        and envelope.suggestion_status == "available"
+        and envelope.reason == "exact_single_target_delete"
+    )
+    if exact_delete_available and live_ready:
+        base = NATIVE_EXACT_DELETE_REDIRECT_INSTRUCTION
+    elif native_tool in _NATIVE_FILE_WRITE_DENY_TOOLS:
         if live_ready:
             if native_tool in {"apply_patch", "ApplyPatch"}:
                 base = NATIVE_PATCH_REDIRECT_INSTRUCTION
@@ -1833,12 +1860,7 @@ def native_hook_deny_instruction(
         base = NATIVE_SHELL_NO_MCP_ROUTE_INSTRUCTION
     if tool_input is None:
         return base
-    envelope = build_native_controlled_guidance_envelope(
-        native_tool=native_tool,
-        tool_input=tool_input,
-        redirect_route_ready=live_ready,
-        static_route_ready=static_ready,
-    )
+    assert envelope is not None
     return f"{base} {format_native_controlled_guidance_text(envelope)}"
 
 
@@ -2181,6 +2203,7 @@ __all__ = [
     "NATIVE_CONTROLLED_GUIDANCE_SCHEMA_VERSION",
     "NATIVE_CONTROLLED_STAGE_DELETE_PLAYBOOK_ID",
     "NATIVE_CONTROLLED_MCP_REDIRECT_INSTRUCTION",
+    "NATIVE_EXACT_DELETE_REDIRECT_INSTRUCTION",
     "NATIVE_FILE_WRITE_REDIRECT_INSTRUCTION",
     "NATIVE_FILE_WRITE_ROUTE_UNAVAILABLE_INSTRUCTION",
     "NATIVE_SHELL_HARD_BLOCK_INSTRUCTION",

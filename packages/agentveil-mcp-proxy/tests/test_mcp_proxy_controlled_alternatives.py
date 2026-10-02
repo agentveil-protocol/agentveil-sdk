@@ -4079,3 +4079,23 @@ def test_legacy_single_package_install_state_still_resolves_controlled_provider(
     provider, error = resolve_vendored_controlled_alternative_provider(home=home)
     assert error is None
     assert provider is not None
+
+
+_LEGACY_AMBIGUOUS_STAGE_DELETE_DESCRIPTION = (
+    "Call agentveil_stage_delete with path before native delete"
+)
+
+
+def test_stage_delete_description_continues_exact_user_intent_without_repeat_confirmation() -> None:
+    """Prior wording implied a fresh pre-native step instead of continuing existing intent."""
+
+    stage = build_semantic_controlled_alternative_tool_schema("filesystem.stage_delete.v1")
+    description = stage["description"]
+    lowered = description.lower()
+    assert _LEGACY_AMBIGUOUS_STAGE_DELETE_DESCRIPTION.lower() not in lowered
+    assert "already requested deletion" in lowered
+    assert "without asking the user to repeat the same confirmation" in lowered
+    assert "user intent is not execution authority" in lowered
+    assert "agentveil still classifies the call" in lowered
+    assert "approval_required" in lowered
+    assert "native destructive delete may be denied" in lowered

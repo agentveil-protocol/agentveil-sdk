@@ -16,6 +16,7 @@ import pytest
 from agentveil_mcp_proxy.client_guidance import (
     NATIVE_CONTROLLED_ALTERNATIVE_ID_STAGE_DELETE,
     NATIVE_CONTROLLED_ALTERNATIVE_TOOL_CONTRACT,
+    NATIVE_EXACT_DELETE_REDIRECT_INSTRUCTION,
     NATIVE_FILE_WRITE_REDIRECT_INSTRUCTION,
     NATIVE_FILE_WRITE_ROUTE_UNAVAILABLE_INSTRUCTION,
     NATIVE_SHELL_HARD_BLOCK_INSTRUCTION,
@@ -1151,3 +1152,88 @@ def test_owned_git_exclude_non_git_project_is_noop(tmp_path: Path) -> None:
 
     assert add_agentveil_owned_git_excludes(project, (".codex/hooks.json",)) == ()
     assert not (project / ".git").exists()
+
+
+_REPEAT_CONTINUATION_MARKERS = (
+    "without asking the user to repeat the same confirmation",
+    "user intent is not execution authority",
+    "agentveil still classifies the call",
+    "approval_required",
+)
+
+
+def test_exact_delete_redirect_guidance_continues_without_repeat_confirmation() -> None:
+    message = native_hook_deny_instruction(
+        native_tool="apply_patch",
+        risk_class="write",
+        redirect_route_ready=True,
+        tool_input={"patch": _EXACT_DELETE_PATCH},
+    )
+    assert message.startswith(NATIVE_EXACT_DELETE_REDIRECT_INSTRUCTION)
+    lowered = message.lower()
+    for marker in _REPEAT_CONTINUATION_MARKERS:
+        assert marker in lowered
+    assert "agentveil_stage_delete once" in lowered
+    assert "suggestion_status=available" in message
+    assert "alternative.tool_contract=agentveil_stage_delete" in message
+
+
+def test_no_repeat_confirmation_guidance_preserves_agentveil_authority_boundary() -> None:
+    message = native_hook_deny_instruction(
+        native_tool="Delete",
+        risk_class="write",
+        redirect_route_ready=True,
+        tool_input={"path": _EXACT_DELETE_PATH},
+    )
+    lowered = message.lower()
+    for marker in _REPEAT_CONTINUATION_MARKERS:
+        assert marker in lowered
+    assert " is authorized" not in lowered
+    assert "permission granted" not in lowered
+    assert "capability granted" not in lowered
+    assert "non-authorizing" in lowered
+
+
+def test_no_repeat_confirmation_guidance_never_bypasses_unavailable_route() -> None:
+    message = native_hook_deny_instruction(
+        native_tool="apply_patch",
+        risk_class="write",
+        redirect_route_ready=False,
+        tool_input={"patch": _EXACT_DELETE_PATCH},
+    )
+    assert message.startswith(NATIVE_FILE_WRITE_ROUTE_UNAVAILABLE_INSTRUCTION)
+    assert "without asking the user to repeat the same confirmation" not in message.lower()
+    assert "agentveil_stage_delete once" not in message.lower()
+    assert "suggestion_status=unavailable" in message
+    assert "alternative=null" in message
+
+
+def test_no_repeat_confirmation_guidance_is_shared_not_connector_specific() -> None:
+    message = native_hook_deny_instruction(
+        native_tool="apply_patch",
+        risk_class="write",
+        redirect_route_ready=True,
+        tool_input={"patch": _EXACT_DELETE_PATCH},
+    )
+    for connector in ("cursor", "codex", "claude", "gemini"):
+        assert connector not in message.lower()
+
+
+def test_no_repeat_confirmation_guidance_remains_bounded_and_private() -> None:
+    secret_patch = (
+        "*** Begin Patch\n"
+        f"*** Delete File: {_CANARY_ABS}\n"
+        "secret-canary-token\n"
+        "*** End Patch"
+    )
+    message = native_hook_deny_instruction(
+        native_tool="apply_patch",
+        risk_class="write",
+        redirect_route_ready=True,
+        tool_input={"patch": secret_patch},
+    )
+    assert _CANARY_ABS not in message
+    assert "secret-canary-token" not in message
+    assert "/private/" not in message
+    assert "alternative=null" in message
+    assert "without asking the user to repeat the same confirmation" not in message.lower()

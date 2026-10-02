@@ -55,9 +55,13 @@ STAGE_DELETE_RESTORE_HANDOFF_NOTE = (
 _SEMANTIC_ALTERNATIVE_DESCRIPTIONS: Mapping[str, str] = MappingProxyType({
     "filesystem.stage_delete.v1": (
         "Prefer this AgentVeil tool for recoverable deletion of one bounded workspace "
-        "file or directory. Call agentveil_stage_delete with path before native delete; "
-        "native destructive delete may be denied. Autonomous only when policy allows. "
-        "On success, the result includes quarantine_entry_id. "
+        "file or directory. When the user already requested deletion of that exact "
+        "bounded target and a native mutation was blocked before it occurred, call "  # claim-check: allow tested stage-delete description copy.
+        "agentveil_stage_delete once with the same path without asking the user to "
+        "repeat the same confirmation. User intent is not execution authority; "
+        "AgentVeil still classifies the call and may deny it or return "
+        "approval_required. native destructive delete may be denied. Autonomous only "
+        "when policy allows. On success, the result includes quarantine_entry_id. "
         f"{RESTORE_QUARANTINE_ENTRY_ID_INSTRUCTION} "
         "The ID is a local restore reference only; it is not authority or approval."
     ),
