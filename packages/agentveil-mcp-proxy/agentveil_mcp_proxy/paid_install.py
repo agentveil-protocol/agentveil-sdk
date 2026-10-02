@@ -60,7 +60,11 @@ COMPOSED_BASE_ARTIFACT_ID = "art_pkg_private_guardrails_base_001"
 COMPOSED_BASE_PACKAGE_NAME = "agentveil-private-guardrails-base"
 COMPOSED_BASE_PACKAGE_VERSION = "0.1.0"
 COMPOSED_THIN_ARTIFACT_ID = "art_pkg_ca_basic_006"
-COMPOSED_THIN_PACKAGE_VERSION = "0.1.5"
+COMPOSED_THIN_PACKAGE_VERSION = "0.1.6"
+COMPOSED_THIN_PACKAGE_VERSION_PREDECESSOR = "0.1.5"
+READABLE_COMPOSED_THIN_PACKAGE_VERSIONS = frozenset(
+    {COMPOSED_THIN_PACKAGE_VERSION, COMPOSED_THIN_PACKAGE_VERSION_PREDECESSOR}
+)
 COMPOSED_INSTALL_COMPOSITION_VERSION = "1"
 COMPONENT_ROLE_BASE = "base_private_guardrails"
 COMPONENT_ROLE_THIN = "controlled_alternatives_basic"
@@ -553,7 +557,15 @@ def _assert_install_components_bounded(components: Any) -> list[dict[str, str]]:
     return parsed
 
 
-def _validate_split_install_state(data: Mapping[str, Any]) -> None:
+def is_readable_composed_thin_package_version(version: str) -> bool:
+    try:
+        normalized = validate_bounded_package_version(version)
+    except PaidInstallError:
+        return False
+    return normalized in READABLE_COMPOSED_THIN_PACKAGE_VERSIONS
+
+
+def _validate_split_install_state(data: Mapping[str, Any], *, for_write: bool = False) -> None:
     version = data.get("install_composition_version")
     if version is None and data.get("install_components") is None:
         return
@@ -564,11 +576,19 @@ def _validate_split_install_state(data: Mapping[str, Any]) -> None:
     if {entry["role"] for entry in components} != expected_roles:
         raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
     by_role = {entry["role"]: entry for entry in components}
+    allowed_thin_versions = (
+        frozenset({COMPOSED_THIN_PACKAGE_VERSION})
+        if for_write
+        else READABLE_COMPOSED_THIN_PACKAGE_VERSIONS
+    )
     for spec in COMPOSED_PAID_INSTALL_COMPONENTS:
         entry = by_role[spec.role]
         if entry["package_name"] != spec.package_name:
             raise PaidInstallError(ERROR_PACKAGE_NAME_MISMATCH, exit_code=1)
-        if entry["package_version"] != spec.package_version:
+        if spec.role == COMPONENT_ROLE_THIN:
+            if entry["package_version"] not in allowed_thin_versions:
+                raise PaidInstallError(ERROR_VERSION_MISMATCH, exit_code=1)
+        elif entry["package_version"] != spec.package_version:
             raise PaidInstallError(ERROR_VERSION_MISMATCH, exit_code=1)
     top_name = data.get("package_name")
     top_version = data.get("package_version")
@@ -696,6 +716,8 @@ def load_install_state(path: Path) -> dict[str, Any] | None:
 
 def write_install_state(path: Path, data: Mapping[str, Any]) -> None:
     assert_install_metadata_bounded(data)
+    if data.get("install_composition_version") is not None:
+        _validate_split_install_state(data, for_write=True)
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         os.chmod(path.parent, 0o700)

@@ -25,6 +25,7 @@ from agentveil_mcp_proxy.paid_install import (
     COMPOSED_INSTALL_COMPOSITION_VERSION,
     COMPOSED_THIN_ARTIFACT_ID,
     COMPOSED_THIN_PACKAGE_VERSION,
+    COMPOSED_THIN_PACKAGE_VERSION_PREDECESSOR,
     COMPONENT_ROLE_BASE,
     COMPONENT_ROLE_THIN,
     DEFAULT_ARTIFACT_ID,
@@ -795,7 +796,7 @@ def test_paid_activate_install_uses_composed_artifact_sequence(tmp_path, mock_pa
     ]
     assert COMPOSED_BASE_ARTIFACT_ID == "art_pkg_private_guardrails_base_001"
     assert COMPOSED_THIN_ARTIFACT_ID == "art_pkg_ca_basic_006"
-    assert COMPOSED_THIN_PACKAGE_VERSION == "0.1.5"
+    assert COMPOSED_THIN_PACKAGE_VERSION == "0.1.6"
     assert _MockPaidBackendHandler.state.entitlement_call_count == 1
     assert _MockPaidBackendHandler.state.safety_call_count == 1
     assert _MockPaidBackendHandler.state.authorize_call_count == 2
@@ -2210,6 +2211,59 @@ def test_malformed_split_install_state_fails_closed_without_fallback(tmp_path, m
     assert load_install_state(install_state_path(home)) is None
     provider, error = resolve_vendored_controlled_alternative_provider(home=home)
     assert provider is None and error is not None
+
+
+def _composed_split_install_payload(*, thin_version: str) -> dict[str, object]:
+    return {
+        "status": STATUS_ACTIVE,
+        "provider_id": "private_v1",
+        "package_name": COMPOSED_BASE_PACKAGE_NAME,
+        "package_version": COMPOSED_BASE_PACKAGE_VERSION,
+        "install_composition_version": COMPOSED_INSTALL_COMPOSITION_VERSION,
+        "install_components": [
+            {
+                "role": COMPONENT_ROLE_BASE,
+                "package_name": COMPOSED_BASE_PACKAGE_NAME,
+                "package_version": COMPOSED_BASE_PACKAGE_VERSION,
+            },
+            {
+                "role": COMPONENT_ROLE_THIN,
+                "package_name": THIN_PACKAGE_NAME,
+                "package_version": thin_version,
+            },
+        ],
+        "public_fallback_available": True,
+        "error_code": None,
+        "last_installed_at": "2026-08-08T12:00:00+00:00",
+        "install_safety_state": "verified",
+        "install_safety_reason": None,
+    }
+
+
+def test_load_install_state_reads_predecessor_composed_thin_version(tmp_path):
+    home = tmp_path / "avp-home"
+    install_path = install_state_path(home)
+    install_path.parent.mkdir(parents=True, exist_ok=True)
+    install_path.write_text(
+        json.dumps(_composed_split_install_payload(thin_version=COMPOSED_THIN_PACKAGE_VERSION_PREDECESSOR)),
+        encoding="utf-8",
+    )
+    loaded = load_install_state(install_path)
+    assert loaded is not None
+    thin_entry = next(
+        entry for entry in loaded["install_components"] if entry["role"] == COMPONENT_ROLE_THIN
+    )
+    assert thin_entry["package_version"] == COMPOSED_THIN_PACKAGE_VERSION_PREDECESSOR
+
+
+def test_write_install_state_rejects_unknown_composed_thin_version(tmp_path):
+    home = tmp_path / "avp-home"
+    install_path = install_state_path(home)
+    with pytest.raises(PaidInstallError, match=ERROR_VERSION_MISMATCH):
+        write_install_state(
+            install_path,
+            _composed_split_install_payload(thin_version="0.1.4"),
+        )
 
 
 def test_repeated_composed_install_leaves_no_staging_residue(tmp_path, mock_paid_backend, monkeypatch):

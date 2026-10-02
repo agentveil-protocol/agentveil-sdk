@@ -441,6 +441,66 @@ def _decode_eligibility_v2_response(response: RawResponse) -> FreeBuilderEligibi
     return FreeBuilderEligibilityV2(eligible=True, components=tuple(parsed_components))
 
 
+def _decode_v2_composed_upgrade_eligibility_response(
+    response: RawResponse,
+) -> FreeBuilderEligibilityV2:
+    """Decode v2 eligibility for composed thin upgrade; base fixed, thin version open."""
+
+    if response.status == 404:
+        raise FreeBuilderClientError("v2_not_found")
+    if response.status != 200:
+        raise FreeBuilderClientError("unexpected_status")
+    if len(response.content_types) != 1:
+        raise FreeBuilderClientError("bad_content_type")
+    _validate_json_content_type(response.content_types[0])
+    if len(response.body) > _MAX_JSON_RESPONSE_BYTES:
+        raise FreeBuilderClientError("response_too_large")
+    try:
+        parsed = json.loads(response.body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise FreeBuilderClientError("malformed_body") from exc
+    if not isinstance(parsed, dict):
+        raise FreeBuilderClientError("malformed_body")
+    eligible = parsed.get("eligible")
+    if not isinstance(eligible, bool):
+        raise FreeBuilderClientError("malformed_body")
+    if not eligible:
+        if set(parsed) - _V2_ELIGIBILITY_INELIGIBLE_KEYS:
+            raise FreeBuilderClientError("malformed_body")
+        error_code = parsed.get("error_code")
+        if error_code is not None and (not isinstance(error_code, str) or not error_code):
+            raise FreeBuilderClientError("malformed_body")
+        return FreeBuilderEligibilityV2(eligible=False, error_code=error_code)
+    if set(parsed) != _V2_ELIGIBILITY_ELIGIBLE_KEYS:
+        raise FreeBuilderClientError("malformed_body")
+    contract_version = parsed.get("contract_version")
+    if contract_version != _V2_CONTRACT_VERSION:
+        raise FreeBuilderClientError("malformed_body")
+    components_raw = parsed.get("components")
+    if not isinstance(components_raw, list) or len(components_raw) != len(_V2_EXPECTED_COMPONENTS):
+        raise FreeBuilderClientError("malformed_body")
+    parsed_components = [_decode_v2_component(entry) for entry in components_raw]
+    roles = [component.role for component in parsed_components]
+    if len(set(roles)) != len(roles):
+        raise FreeBuilderClientError("malformed_body")
+    expected_base_role, expected_base_name, expected_base_version = _V2_EXPECTED_COMPONENTS[0]
+    expected_thin_role, expected_thin_name, _expected_thin_version = _V2_EXPECTED_COMPONENTS[1]
+    base_component = parsed_components[0]
+    thin_component = parsed_components[1]
+    if base_component.role != expected_base_role:
+        raise FreeBuilderClientError("malformed_body")
+    if (
+        base_component.package_name != expected_base_name
+        or base_component.package_version != expected_base_version
+    ):
+        raise FreeBuilderClientError("malformed_body")
+    if thin_component.role != expected_thin_role:
+        raise FreeBuilderClientError("malformed_body")
+    if thin_component.package_name != expected_thin_name:
+        raise FreeBuilderClientError("malformed_body")
+    return FreeBuilderEligibilityV2(eligible=True, components=tuple(parsed_components))
+
+
 def _decode_eligibility_response(response: RawResponse) -> FreeBuilderEligibility:
     if response.status == 404:
         raise FreeBuilderClientError("unavailable")
@@ -578,6 +638,28 @@ class ConsoleFreeBuilderClient:
             accept="application/json",
         )
         return _decode_eligibility_v2_response(response)
+
+    def check_eligibility_v2_for_composed_upgrade(
+        self,
+        *,
+        bearer_token: str,
+        platform: str,
+        python_version: str,
+    ) -> FreeBuilderEligibilityV2:
+        bounded_platform = _validate_platform(platform)
+        bounded_python = _validate_python_version(python_version)
+        path = (
+            f"{_ELIGIBILITY_V2_PATH}?platform={bounded_platform}"
+            f"&python_version={bounded_python}"
+        )
+        response = self._request(
+            "GET",
+            path,
+            bearer_token=bearer_token,
+            body=None,
+            accept="application/json",
+        )
+        return _decode_v2_composed_upgrade_eligibility_response(response)
 
     def download_package(
         self,
@@ -768,6 +850,199 @@ def _bounded_v2_component_summary(
     ]
 
 
+@dataclass(frozen=True)
+class _ComposedUpgradeLocalState:
+    current_package_name: str
+    current_package_version: str
+    installed_thin_version: str
+
+
+def _bounded_version_sort_key(version: str) -> tuple[int, int, int]:
+    from agentveil_mcp_proxy.paid_install import validate_bounded_package_version
+
+    normalized = validate_bounded_package_version(version)
+    parts: list[int] = []
+    for segment in normalized.split("."):
+        digits = ""
+        for char in segment:
+            if char.isdigit():
+                digits += char
+            else:
+                break
+        parts.append(int(digits or "0"))
+    while len(parts) < 3:
+        parts.append(0)
+    return parts[0], parts[1], parts[2]
+
+
+def _is_strictly_newer_bounded_version(candidate: str, installed: str) -> bool:
+    return _bounded_version_sort_key(candidate) > _bounded_version_sort_key(installed)
+
+
+def _composed_upgrade_target_issue(
+    *,
+    installed_thin_version: str,
+    components: tuple[FreeBuilderV2Component, ...],
+) -> str | None:
+    if len(components) != 2:
+        return "rejected"
+    base_component, thin_component = components
+    if (
+        base_component.role != COMPONENT_ROLE_BASE
+        or base_component.package_name != COMPOSED_BASE_PACKAGE_NAME
+        or base_component.package_version != COMPOSED_BASE_PACKAGE_VERSION
+    ):
+        return "rejected"
+    if (
+        thin_component.role != COMPONENT_ROLE_THIN
+        or thin_component.package_name != FREE_BUILDER_PACKAGE_NAME
+    ):
+        return "rejected"
+    if not _is_strictly_newer_bounded_version(
+        thin_component.package_version,
+        installed_thin_version,
+    ):
+        return "rejected"
+    return None
+
+
+def _composed_console_pair_upgrade_context(
+    *,
+    home: Path,
+    discover_paid_provider_fn: DiscoverPaidProvider,
+) -> tuple[str | None, _ComposedUpgradeLocalState | None]:
+    """Return local composed upgrade context or a rejection when composition is present."""
+
+    from agentveil_mcp_proxy.paid_activation import (
+        PaidActivationError,
+        TERMINAL_INACTIVE_ACTIVATION_STATUSES,
+        activation_path,
+        assert_activation_metadata_bounded,
+        load_activation_state,
+    )
+    from agentveil_mcp_proxy.paid_install import (
+        BOUNDED_INSTALL_KEYS,
+        COMPOSED_INSTALL_COMPOSITION_VERSION,
+        INSTALL_SAFETY_STATE_VERIFIED,
+        PaidInstallError,
+        PROVIDER_ID,
+        assert_install_metadata_bounded,
+        install_state_path,
+        load_install_state,
+        resolve_vendored_paid_provider,
+        vendor_root,
+        _validate_split_install_state,
+    )
+    from agentveil_mcp_proxy.paid_provider import (
+        STATUS_ACTIVE,
+        STATUS_MISSING,
+        STATUS_WITHIN_GRACE,
+    )
+
+    install_path = install_state_path(home)
+    install_state = load_install_state(install_path)
+    if install_state is None:
+        if install_path.is_file():
+            try:
+                raw_payload = json.loads(install_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                return "rejected_ineligible_local_state", None
+            if isinstance(raw_payload, dict) and raw_payload.get(
+                "install_composition_version"
+            ) is not None:
+                return "rejected_ineligible_local_state", None
+        return None, None
+    if install_state.get("install_composition_version") is None:
+        return None, None
+    if install_state.get("status") != STATUS_ACTIVE:
+        return "rejected_ineligible_local_state", None
+    if set(install_state) - BOUNDED_INSTALL_KEYS:
+        return "rejected_ineligible_local_state", None
+    if install_state.get("install_composition_version") != COMPOSED_INSTALL_COMPOSITION_VERSION:
+        return "rejected_ineligible_local_state", None
+    if install_state.get("install_safety_state") != INSTALL_SAFETY_STATE_VERIFIED:
+        return "rejected_ineligible_local_state", None
+    provider_id = install_state.get("provider_id")
+    if not isinstance(provider_id, str) or provider_id != PROVIDER_ID:
+        return "rejected_ineligible_local_state", None
+    try:
+        assert_install_metadata_bounded(install_state)
+        _validate_split_install_state(install_state)
+    except PaidInstallError:
+        return "rejected_ineligible_local_state", None
+
+    try:
+        snapshot = discover_paid_provider_fn()
+    except Exception:
+        return "rejected_ineligible_local_state", None
+
+    guard = _resolve_provider_guard(snapshot)
+    if guard == "skipped_existing_paid_state":
+        return "rejected_paid_terminal_state", None
+    if guard != "skipped_already_active":
+        return "rejected_ineligible_local_state", None
+
+    discovered_id = getattr(snapshot, "provider_id", None)
+    discovered_status = getattr(snapshot, "status", None)
+    if discovered_status != STATUS_ACTIVE:
+        return "rejected_ineligible_local_state", None
+    if discovered_id is not None and str(discovered_id) != provider_id:
+        return "rejected_ineligible_local_state", None
+
+    base_vendor = vendor_root(home) / (
+        f"{COMPOSED_BASE_PACKAGE_NAME}-{COMPOSED_BASE_PACKAGE_VERSION}"
+    )
+    if not base_vendor.is_dir():
+        return "rejected_ineligible_local_state", None
+
+    components = install_state.get("install_components")
+    if not isinstance(components, list):
+        return "rejected_ineligible_local_state", None
+    thin_version: str | None = None
+    for entry in components:
+        if isinstance(entry, dict) and entry.get("role") == COMPONENT_ROLE_THIN:
+            version = entry.get("package_version")
+            name = entry.get("package_name")
+            if isinstance(version, str) and isinstance(name, str):
+                if name != FREE_BUILDER_PACKAGE_NAME:
+                    return "rejected_ineligible_local_state", None
+                thin_version = version
+    if thin_version is None:
+        return "rejected_ineligible_local_state", None
+
+    thin_vendor = vendor_root(home) / f"{FREE_BUILDER_PACKAGE_NAME}-{thin_version}"
+    if not thin_vendor.is_dir():
+        return "rejected_ineligible_local_state", None
+
+    if resolve_vendored_paid_provider(home=home) is None:
+        return "rejected_ineligible_local_state", None
+
+    activation = load_activation_state(activation_path(home))
+    if activation is not None:
+        try:
+            assert_activation_metadata_bounded(activation)
+        except PaidActivationError:
+            return "rejected_ineligible_local_state", None
+        status = activation.get("status")
+        if status in TERMINAL_INACTIVE_ACTIVATION_STATUSES:
+            return "rejected_paid_terminal_state", None
+        if status in {STATUS_WITHIN_GRACE}:
+            return "rejected_paid_terminal_state", None
+        if status not in {STATUS_ACTIVE, STATUS_MISSING}:
+            return "rejected_ineligible_local_state", None
+
+    current_name = install_state.get("package_name")
+    current_version = install_state.get("package_version")
+    if not isinstance(current_name, str) or not isinstance(current_version, str):
+        return "rejected_ineligible_local_state", None
+
+    return None, _ComposedUpgradeLocalState(
+        current_package_name=current_name,
+        current_package_version=current_version,
+        installed_thin_version=thin_version,
+    )
+
+
 def _legacy_console_thin_upgrade_issue(
     *,
     home: Path,
@@ -946,8 +1221,9 @@ def upgrade_free_builder_to_paired(
     discover_paid_provider_fn: DiscoverPaidProvider | None = None,
     transport: Transport | None = None,
     paired_install_flow_fn: Callable[..., None] | None = None,
+    composed_thin_upgrade_flow_fn: Callable[..., None] | None = None,
 ) -> dict[str, Any]:
-    """Explicit legacy Console thin -> v2 paired upgrade; preview unless apply=True."""
+    """Explicit Console thin or composed-pair upgrade; preview unless apply=True."""
 
     from agentveil_mcp_proxy.paid_activation import bound_avp_home
     from agentveil_mcp_proxy.paid_install import (
@@ -971,12 +1247,21 @@ def upgrade_free_builder_to_paired(
             return _build_upgrade_payload(result_code=skip, apply=apply)
 
         discover = discover_paid_provider_fn or discover_paid_provider
-        local_issue = _legacy_console_thin_upgrade_issue(
+        composed_issue, composed_local = _composed_console_pair_upgrade_context(
             home=resolved_home,
             discover_paid_provider_fn=discover,
         )
-        if local_issue is not None:
-            return _build_upgrade_payload(result_code=local_issue, apply=apply)
+        composed_upgrade = composed_local is not None
+        if composed_issue is not None and not composed_upgrade:
+            return _build_upgrade_payload(result_code=composed_issue, apply=apply)
+
+        if not composed_upgrade:
+            local_issue = _legacy_console_thin_upgrade_issue(
+                home=resolved_home,
+                discover_paid_provider_fn=discover,
+            )
+            if local_issue is not None:
+                return _build_upgrade_payload(result_code=local_issue, apply=apply)
 
         install_state = load_install_state(install_state_path(resolved_home))
         if install_state is None:
@@ -984,8 +1269,14 @@ def upgrade_free_builder_to_paired(
                 result_code="rejected_ineligible_local_state",
                 apply=apply,
             )
-        current_name = str(install_state.get("package_name"))
-        current_version = str(install_state.get("package_version"))
+        if composed_upgrade and composed_local is not None:
+            current_name = composed_local.current_package_name
+            current_version = composed_local.current_package_version
+            installed_thin_version = composed_local.installed_thin_version
+        else:
+            current_name = str(install_state.get("package_name"))
+            current_version = str(install_state.get("package_version"))
+            installed_thin_version = ""
 
         resolved_platform = _validate_platform(platform or current_platform_name())
         resolved_python = _validate_python_version(python_version or current_python_version())
@@ -993,11 +1284,18 @@ def upgrade_free_builder_to_paired(
         assert credential is not None
 
         try:
-            eligibility_v2 = client.check_eligibility_v2(
-                bearer_token=credential.token,
-                platform=resolved_platform,
-                python_version=resolved_python,
-            )
+            if composed_upgrade:
+                eligibility_v2 = client.check_eligibility_v2_for_composed_upgrade(
+                    bearer_token=credential.token,
+                    platform=resolved_platform,
+                    python_version=resolved_python,
+                )
+            else:
+                eligibility_v2 = client.check_eligibility_v2(
+                    bearer_token=credential.token,
+                    platform=resolved_platform,
+                    python_version=resolved_python,
+                )
         except FreeBuilderClientError as exc:
             if exc.code == "v2_not_found":
                 return _build_upgrade_payload(result_code="rejected", apply=apply)
@@ -1010,6 +1308,14 @@ def upgrade_free_builder_to_paired(
         if len(eligibility_v2.components) != 2:
             return _build_upgrade_payload(result_code="rejected", apply=apply)
 
+        if composed_upgrade:
+            target_issue = _composed_upgrade_target_issue(
+                installed_thin_version=installed_thin_version,
+                components=eligibility_v2.components,
+            )
+            if target_issue is not None:
+                return _build_upgrade_payload(result_code=target_issue, apply=apply)
+
         target_summary = _bounded_v2_component_summary(eligibility_v2.components)
         if not apply:
             return _build_upgrade_payload(
@@ -1020,10 +1326,45 @@ def upgrade_free_builder_to_paired(
                 target_components=target_summary,
             )
 
-        base_component = eligibility_v2.components[0]
         thin_component = eligibility_v2.components[1]
-        base_expectations = expectations_from_v2_component(base_component)
         thin_expectations = expectations_from_v2_component(thin_component)
+
+        if composed_upgrade:
+            try:
+                thin_wheel_bytes = client.download_package_v2(
+                    bearer_token=credential.token,
+                    role=thin_component.role,
+                    platform=resolved_platform,
+                    python_version=resolved_python,
+                )
+            except FreeBuilderClientError as exc:
+                if exc.code in {"transport_failed", "unavailable"}:
+                    return _build_upgrade_payload(result_code="unavailable", apply=True)
+                return _build_upgrade_payload(result_code="rejected", apply=True)
+
+            thin_upgrade = composed_thin_upgrade_flow_fn or _default_composed_thin_upgrade_flow
+            try:
+                thin_upgrade(
+                    thin_wheel_bytes=thin_wheel_bytes,
+                    home=resolved_home,
+                    thin_expectations=thin_expectations,
+                    prior_install_state=install_state,
+                )
+            except FreeBuilderInstallError:
+                return _build_upgrade_payload(result_code="skipped_install_failed", apply=True)
+            except Exception:
+                return _build_upgrade_payload(result_code="skipped_install_failed", apply=True)
+
+            return _build_upgrade_payload(
+                result_code="upgraded",
+                apply=True,
+                current_package_name=current_name,
+                current_package_version=current_version,
+                target_components=target_summary,
+            )
+
+        base_component = eligibility_v2.components[0]
+        base_expectations = expectations_from_v2_component(base_component)
 
         try:
             base_wheel_bytes = client.download_package_v2(
@@ -1331,6 +1672,268 @@ def _default_install_flow(
         expectations=expectations,
         discover_paid_provider_fn=discover_paid_provider_fn,
     )
+
+
+def _default_composed_thin_upgrade_flow(
+    *,
+    thin_wheel_bytes: bytes,
+    home: Path,
+    thin_expectations: FreeBuilderWheelExpectations,
+    prior_install_state: Mapping[str, Any],
+) -> None:
+    import contextlib
+    import os
+    import secrets
+
+    from agentveil_mcp_proxy.paid_activation import utc_now_iso
+    from agentveil_mcp_proxy.paid_install import (
+        COMPOSED_THIN_ARTIFACT_ID,
+        INSTALL_SAFETY_STATE_VERIFIED,
+        PROVIDER_ID,
+        FreeBuilderInstallError,
+        PaidInstallError,
+        vendor_root,
+        _ComposedInstallComponentSpec,
+        _StagedComposedComponent,
+        _assert_live_vendored_paid_provider_active,
+        _assert_staged_vendored_controlled_alternative_authority_loadable,
+        _assert_staged_vendored_controlled_alternative_resolves,
+        _assert_trusted_home_path,
+        _commit_wheel_cache,
+        _discard_staged_composed_component,
+        _release_wheel_cache_backup,
+        _rollback_composed_install_durable_state,
+        _vendor_live_dir,
+        _vendor_stage_dir,
+        install_state_path,
+        install_wheel_to_vendor,
+        verify_free_builder_wheel_artifact,
+        write_install_state,
+    )
+
+    if (
+        thin_expectations.artifact_hash is None
+        or thin_expectations.artifact_size_bytes is None
+        or thin_expectations.package_name is None
+        or thin_expectations.package_version is None
+    ):
+        raise FreeBuilderInstallError("artifact_hash_required")
+
+    target_thin_version = thin_expectations.package_version
+    thin_spec = _ComposedInstallComponentSpec(
+        role=COMPONENT_ROLE_THIN,
+        artifact_id=COMPOSED_THIN_ARTIFACT_ID,
+        package_name=FREE_BUILDER_PACKAGE_NAME,
+        package_version=target_thin_version,
+    )
+    verify_free_builder_wheel_artifact(
+        thin_wheel_bytes,
+        expectations=FreeBuilderWheelExpectations(
+            artifact_hash=thin_expectations.artifact_hash,
+            artifact_size_bytes=thin_expectations.artifact_size_bytes,
+            package_name=thin_spec.package_name,
+            package_version=thin_spec.package_version,
+        ),
+    )
+
+    _assert_trusted_home_path(home, home / "paid")
+    _assert_trusted_home_path(home, vendor_root(home))
+
+    wheel_dir = home / "paid" / "cache"
+    install_path = install_state_path(home)
+    prior_install_bytes = install_path.read_bytes() if install_path.is_file() else None
+    prior_activation_bytes = _read_prior_activation_bytes_for_upgrade(home)
+    base_live_dir = _vendor_live_dir(
+        home,
+        package_name=COMPOSED_BASE_PACKAGE_NAME,
+        package_version=COMPOSED_BASE_PACKAGE_VERSION,
+    )
+
+    wheel_path = wheel_dir / f"{thin_spec.package_name}-{thin_spec.package_version}.whl"
+    wheel_stage_path = wheel_dir / (
+        f".staging-{thin_spec.package_name}-{thin_spec.package_version}-"
+        f"{secrets.token_hex(8)}.whl"
+    )
+    target_dir = _vendor_live_dir(
+        home,
+        package_name=thin_spec.package_name,
+        package_version=thin_spec.package_version,
+    )
+    stage_dir = _vendor_stage_dir(
+        home,
+        package_name=thin_spec.package_name,
+        package_version=thin_spec.package_version,
+    )
+    staged = _StagedComposedComponent(
+        spec=thin_spec,
+        wheel_stage_path=wheel_stage_path,
+        wheel_path=wheel_path,
+        stage_dir=stage_dir,
+        target_dir=target_dir,
+    )
+    published_vendors: list[tuple[_StagedComposedComponent, object]] = []
+    published_caches: list[tuple[Path, object]] = []
+
+    try:
+        wheel_stage_path.parent.mkdir(parents=True, exist_ok=True)
+        wheel_stage_path.write_bytes(thin_wheel_bytes)
+        os.chmod(wheel_stage_path, 0o600)
+        install_wheel_to_vendor(
+            home=home,
+            wheel_path=wheel_stage_path,
+            target_dir=stage_dir,
+            expected_package_name=thin_spec.package_name,
+            expected_package_version=thin_spec.package_version,
+            require_empty_target=True,
+        )
+        _assert_staged_vendored_controlled_alternative_resolves(
+            home=home,
+            vendor_dir=stage_dir,
+            package_name=thin_spec.package_name,
+            package_version=thin_spec.package_version,
+        )
+        _assert_staged_vendored_controlled_alternative_authority_loadable(
+            home=home,
+            vendor_dir=stage_dir,
+            package_name=thin_spec.package_name,
+            package_version=thin_spec.package_version,
+        )
+        _assert_live_vendored_paid_provider_active(
+            home=home,
+            vendor_dir=base_live_dir,
+            package_name=COMPOSED_BASE_PACKAGE_NAME,
+            package_version=COMPOSED_BASE_PACKAGE_VERSION,
+            provider_id=PROVIDER_ID,
+        )
+
+        prior_components = prior_install_state.get("install_components")
+        if not isinstance(prior_components, list):
+            raise FreeBuilderInstallError("install_failed")
+        next_components: list[dict[str, str]] = []
+        for entry in prior_components:
+            if not isinstance(entry, dict):
+                raise FreeBuilderInstallError("install_failed")
+            role = entry.get("role")
+            package_name = entry.get("package_name")
+            package_version = entry.get("package_version")
+            if not isinstance(role, str) or not isinstance(package_name, str):
+                raise FreeBuilderInstallError("install_failed")
+            if role == COMPONENT_ROLE_THIN:
+                package_version = target_thin_version
+            elif not isinstance(package_version, str):
+                raise FreeBuilderInstallError("install_failed")
+            next_components.append(
+                {
+                    "role": role,
+                    "package_name": package_name,
+                    "package_version": str(package_version),
+                }
+            )
+
+        from agentveil_mcp_proxy.paid_provider import STATUS_ACTIVE
+
+        install_state = {
+            "status": STATUS_ACTIVE,
+            "provider_id": PROVIDER_ID,
+            "package_name": COMPOSED_BASE_PACKAGE_NAME,
+            "package_version": COMPOSED_BASE_PACKAGE_VERSION,
+            "install_composition_version": prior_install_state.get("install_composition_version"),
+            "install_components": next_components,
+            "public_fallback_available": prior_install_state.get("public_fallback_available", True),
+            "error_code": None,
+            "last_installed_at": utc_now_iso(),
+            "install_safety_state": INSTALL_SAFETY_STATE_VERIFIED,
+            "install_safety_reason": None,
+        }
+
+        from agentveil_mcp_proxy.paid_install import _publish_staged_vendor
+
+        try:
+            vendor_publish_rollback = _publish_staged_vendor(
+                home=home,
+                stage_dir=staged.stage_dir,
+                live_dir=staged.target_dir,
+            )
+            published_vendors.append((staged, vendor_publish_rollback))
+            cache_rollback = _commit_wheel_cache(
+                wheel_stage_path=staged.wheel_stage_path,
+                wheel_path=staged.wheel_path,
+                retain_backup=True,
+            )
+            published_caches.append((staged.wheel_path, cache_rollback))
+            write_install_state(install_path, install_state)
+            _assert_live_vendored_paid_provider_active(
+                home=home,
+                vendor_dir=base_live_dir,
+                package_name=COMPOSED_BASE_PACKAGE_NAME,
+                package_version=COMPOSED_BASE_PACKAGE_VERSION,
+                provider_id=PROVIDER_ID,
+            )
+            for _wheel_path, cache_rollback in published_caches:
+                with contextlib.suppress(Exception):
+                    _release_wheel_cache_backup(cache_rollback)
+        except Exception as exc:
+            _rollback_composed_install_durable_state(
+                home=home,
+                install_path=install_path,
+                prior_install_bytes=prior_install_bytes,
+                prior_activation_bytes=prior_activation_bytes,
+                published_vendors=published_vendors,
+                published_caches=published_caches,
+            )
+            if isinstance(exc, PaidInstallError):
+                raise FreeBuilderInstallError(str(exc.args[0])) from exc
+            raise FreeBuilderInstallError("install_publish_failed") from exc
+    except PaidInstallError as exc:
+        _discard_staged_composed_component(staged)
+        _restore_composed_upgrade_durable_bytes(
+            home=home,
+            install_path=install_path,
+            prior_install_bytes=prior_install_bytes,
+            prior_activation_bytes=prior_activation_bytes,
+        )
+        raise FreeBuilderInstallError(str(exc.args[0])) from exc
+    except FreeBuilderInstallError:
+        _discard_staged_composed_component(staged)
+        _restore_composed_upgrade_durable_bytes(
+            home=home,
+            install_path=install_path,
+            prior_install_bytes=prior_install_bytes,
+            prior_activation_bytes=prior_activation_bytes,
+        )
+        raise
+    except Exception:
+        _discard_staged_composed_component(staged)
+        _restore_composed_upgrade_durable_bytes(
+            home=home,
+            install_path=install_path,
+            prior_install_bytes=prior_install_bytes,
+            prior_activation_bytes=prior_activation_bytes,
+        )
+        raise FreeBuilderInstallError("free_builder_install_failed")
+
+
+def _read_prior_activation_bytes_for_upgrade(home: Path) -> bytes | None:
+    from agentveil_mcp_proxy.paid_install import _read_prior_activation_bytes
+
+    return _read_prior_activation_bytes(home)
+
+
+def _restore_composed_upgrade_durable_bytes(
+    *,
+    home: Path,
+    install_path: Path,
+    prior_install_bytes: bytes | None,
+    prior_activation_bytes: bytes | None,
+) -> None:
+    from agentveil_mcp_proxy.paid_activation import activation_path
+    from agentveil_mcp_proxy.paid_install import (
+        _restore_activation_state_bytes,
+        _restore_install_state_bytes,
+    )
+
+    _restore_activation_state_bytes(activation_path(home), prior_activation_bytes)
+    _restore_install_state_bytes(install_path, prior_install_bytes)
 
 
 def _default_paired_install_flow(

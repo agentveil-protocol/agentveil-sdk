@@ -40,6 +40,7 @@ from agentveil_mcp_proxy.paid_install import (
     COMPOSED_BASE_PACKAGE_VERSION,
     COMPOSED_INSTALL_COMPOSITION_VERSION,
     COMPOSED_THIN_PACKAGE_VERSION,
+    COMPOSED_THIN_PACKAGE_VERSION_PREDECESSOR,
     COMPONENT_ROLE_BASE,
     COMPONENT_ROLE_THIN,
     DEFAULT_PACKAGE_NAME,
@@ -215,6 +216,7 @@ def _v2_eligible_response(
     base_size: int,
     thin_hash: str,
     thin_size: int,
+    thin_package_version: str = COMPOSED_THIN_PACKAGE_VERSION,
 ) -> dict[str, object]:
     return {
         "eligible": True,
@@ -230,7 +232,7 @@ def _v2_eligible_response(
             {
                 "role": COMPONENT_ROLE_THIN,
                 "package_name": PACKAGE_NAME,
-                "package_version": COMPOSED_THIN_PACKAGE_VERSION,
+                "package_version": thin_package_version,
                 "artifact_hash": thin_hash,
                 "artifact_size_bytes": thin_size,
             },
@@ -341,7 +343,7 @@ def _build_base_wheel(tmp_path: Path) -> tuple[bytes, str]:
     )
 
 
-def _build_thin_wheel(tmp_path: Path) -> tuple[bytes, str]:
+def _build_thin_wheel_for_version(tmp_path: Path, package_version: str) -> tuple[bytes, str]:
     module = PACKAGE_NAME.replace("-", "_")
     ca_source = """
 class _Provider:
@@ -359,24 +361,28 @@ def build_provider():
         f"ca_route_v1 = {module}.controlled_provider:build_provider\n"
     )
     tmp_path.mkdir(parents=True, exist_ok=True)
-    wheel_path = tmp_path / f"{PACKAGE_NAME}-{COMPOSED_THIN_PACKAGE_VERSION}.whl"
+    wheel_path = tmp_path / f"{PACKAGE_NAME}-{package_version}.whl"
     with zipfile.ZipFile(wheel_path, "w") as archive:
         archive.writestr(f"{module}/__init__.py", "provider_id = 'private_v1'\n")
         archive.writestr(f"{module}/controlled_provider.py", ca_source)
         archive.writestr(
-            f"{module}-{COMPOSED_THIN_PACKAGE_VERSION}.dist-info/METADATA",
-            f"Name: {PACKAGE_NAME}\nVersion: {COMPOSED_THIN_PACKAGE_VERSION}\n",
+            f"{module}-{package_version}.dist-info/METADATA",
+            f"Name: {PACKAGE_NAME}\nVersion: {package_version}\n",
         )
         archive.writestr(
-            f"{module}-{COMPOSED_THIN_PACKAGE_VERSION}.dist-info/entry_points.txt",
+            f"{module}-{package_version}.dist-info/entry_points.txt",
             entry_points,
         )
         archive.writestr(
-            f"{module}-{COMPOSED_THIN_PACKAGE_VERSION}.dist-info/WHEEL",
+            f"{module}-{package_version}.dist-info/WHEEL",
             "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
         )
     wheel_bytes = wheel_path.read_bytes()
     return wheel_bytes, sha256_hex(wheel_bytes)
+
+
+def _build_thin_wheel(tmp_path: Path) -> tuple[bytes, str]:
+    return _build_thin_wheel_for_version(tmp_path, COMPOSED_THIN_PACKAGE_VERSION)
 
 
 @pytest.fixture(autouse=True)
@@ -1440,6 +1446,71 @@ def _seed_legacy_active_thin_install(tmp_path, monkeypatch) -> Path:
     return home
 
 
+def _present_composed_thin_as_predecessor(home: Path) -> None:
+    import shutil
+
+    current = COMPOSED_THIN_PACKAGE_VERSION
+    predecessor = COMPOSED_THIN_PACKAGE_VERSION_PREDECESSOR
+    if current == predecessor:
+        return
+    install_path = install_state_path(home)
+    state = json.loads(install_path.read_text(encoding="utf-8"))
+    for entry in state.get("install_components", []):
+        if isinstance(entry, dict) and entry.get("role") == COMPONENT_ROLE_THIN:
+            entry["package_version"] = predecessor
+    install_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    cur_vendor = vendor_root(home) / f"{PACKAGE_NAME}-{current}"
+    pred_vendor = vendor_root(home) / f"{PACKAGE_NAME}-{predecessor}"
+    if cur_vendor.is_dir():
+        if pred_vendor.exists():
+            shutil.rmtree(pred_vendor)
+        shutil.move(str(cur_vendor), str(pred_vendor))
+    cache_dir = home / "paid" / "cache"
+    cur_cache = cache_dir / f"{PACKAGE_NAME}-{current}.whl"
+    pred_cache = cache_dir / f"{PACKAGE_NAME}-{predecessor}.whl"
+    if cur_cache.is_file():
+        if pred_cache.exists():
+            pred_cache.unlink()
+        shutil.move(str(cur_cache), str(pred_cache))
+
+
+def _seed_composed_active_pair_install(tmp_path, monkeypatch) -> Path:
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    save_credential(TOKEN, home=home)
+    base_bytes, base_hash = _build_base_wheel(tmp_path / "composed-base")
+    thin_bytes, thin_hash = _build_thin_wheel(tmp_path / "composed-thin")
+    run_free_builder_paired_install_flow(
+        base_wheel_bytes=base_bytes,
+        thin_wheel_bytes=thin_bytes,
+        home=home,
+        activation_credential=TOKEN,
+        base_expectations=FreeBuilderWheelExpectations(
+            artifact_hash=base_hash,
+            artifact_size_bytes=len(base_bytes),
+            package_name=COMPOSED_BASE_PACKAGE_NAME,
+            package_version=COMPOSED_BASE_PACKAGE_VERSION,
+        ),
+        thin_expectations=FreeBuilderWheelExpectations(
+            artifact_hash=thin_hash,
+            artifact_size_bytes=len(thin_bytes),
+            package_name=PACKAGE_NAME,
+            package_version=COMPOSED_THIN_PACKAGE_VERSION,
+        ),
+        discover_paid_provider_fn=lambda: _active_provider_snapshot(),
+    )
+    _present_composed_thin_as_predecessor(home)
+    install_state = json.loads(install_state_path(home).read_text(encoding="utf-8"))
+    assert install_state.get("install_composition_version") == COMPOSED_INSTALL_COMPOSITION_VERSION
+    thin_entry = next(
+        entry
+        for entry in install_state["install_components"]
+        if entry["role"] == COMPONENT_ROLE_THIN
+    )
+    assert thin_entry["package_version"] == COMPOSED_THIN_PACKAGE_VERSION_PREDECESSOR
+    return home
+
+
 def _seed_project_legacy_with_global_credential(
     tmp_path,
     monkeypatch,
@@ -1830,7 +1901,7 @@ def test_upgrade_rejects_already_composed_install(tmp_path, monkeypatch):
             {
                 "role": COMPONENT_ROLE_THIN,
                 "package_name": PACKAGE_NAME,
-                "package_version": COMPOSED_THIN_PACKAGE_VERSION,
+                "package_version": COMPOSED_THIN_PACKAGE_VERSION_PREDECESSOR,
             },
         ],
         "public_fallback_available": True,
@@ -1839,11 +1910,234 @@ def test_upgrade_rejects_already_composed_install(tmp_path, monkeypatch):
         "install_safety_state": "verified",
         "install_safety_reason": None,
     }
-    write_install_state(install_path, composed)
+    install_path.write_text(json.dumps(composed, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     transport = BackendEchoTransport()
     payload = upgrade_free_builder_to_paired(home=home, apply=False, transport=transport)
-    assert payload["result_code"] == "rejected_already_composed"
+    assert payload["result_code"] == "rejected_ineligible_local_state"
     assert transport.calls == []
+
+
+def test_upgrade_composed_pair_preview_allows_exact_newer_thin(tmp_path, monkeypatch):
+    home = _seed_composed_active_pair_install(tmp_path, monkeypatch)
+    prior_install_bytes = install_state_path(home).read_bytes()
+    base_bytes, base_hash = _build_base_wheel(tmp_path / "upgrade-base")
+    thin_bytes, thin_hash = _build_thin_wheel_for_version(
+        tmp_path / "upgrade-thin",
+        COMPOSED_THIN_PACKAGE_VERSION,
+    )
+    transport = BackendEchoTransport(
+        responses=[
+            _json_response(
+                200,
+                _v2_eligible_response(
+                    base_hash=base_hash,
+                    base_size=len(base_bytes),
+                    thin_hash=thin_hash,
+                    thin_size=len(thin_bytes),
+                    thin_package_version=COMPOSED_THIN_PACKAGE_VERSION,
+                ),
+            ),
+        ]
+    )
+    payload = upgrade_free_builder_to_paired(home=home, apply=False, transport=transport)
+    assert payload["result_code"] == "preview_ready"
+    assert payload["upgrade_available"] is True
+    assert len(transport.calls) == 1
+    assert install_state_path(home).read_bytes() == prior_install_bytes
+    thin_target = payload["target_components"][1]
+    assert thin_target["package_version"] == COMPOSED_THIN_PACKAGE_VERSION
+
+
+def test_upgrade_composed_pair_apply_replaces_only_thin_with_newer_server_target(
+    tmp_path, monkeypatch,
+):
+    home = _seed_composed_active_pair_install(tmp_path, monkeypatch)
+    base_vendor = vendor_root(home) / (
+        f"{COMPOSED_BASE_PACKAGE_NAME}-{COMPOSED_BASE_PACKAGE_VERSION}"
+    )
+    base_marker = base_vendor / "base-marker.txt"
+    base_marker.write_text("keep-base", encoding="utf-8")
+    prior_base_marker = base_marker.read_bytes()
+    prior_thin_vendor = vendor_root(home) / (
+        f"{PACKAGE_NAME}-{COMPOSED_THIN_PACKAGE_VERSION_PREDECESSOR}"
+    )
+    assert prior_thin_vendor.is_dir()
+
+    base_bytes, base_hash = _build_base_wheel(tmp_path / "upgrade-base")
+    thin_bytes, thin_hash = _build_thin_wheel_for_version(
+        tmp_path / "upgrade-thin",
+        COMPOSED_THIN_PACKAGE_VERSION,
+    )
+    transport = BackendEchoTransport(
+        responses=[
+            _json_response(
+                200,
+                _v2_eligible_response(
+                    base_hash=base_hash,
+                    base_size=len(base_bytes),
+                    thin_hash=thin_hash,
+                    thin_size=len(thin_bytes),
+                    thin_package_version=COMPOSED_THIN_PACKAGE_VERSION,
+                ),
+            ),
+            _octet_response(200, thin_bytes),
+        ]
+    )
+    payload = upgrade_free_builder_to_paired(home=home, apply=True, transport=transport)
+    assert payload["result_code"] == "upgraded"
+    assert len(transport.calls) == 2
+    assert base_marker.read_bytes() == prior_base_marker
+    new_thin_vendor = vendor_root(home) / (
+        f"{PACKAGE_NAME}-{COMPOSED_THIN_PACKAGE_VERSION}"
+    )
+    assert new_thin_vendor.is_dir()
+    install_state = json.loads(install_state_path(home).read_text(encoding="utf-8"))
+    thin_entry = next(
+        entry
+        for entry in install_state["install_components"]
+        if entry["role"] == COMPONENT_ROLE_THIN
+    )
+    assert thin_entry["package_version"] == COMPOSED_THIN_PACKAGE_VERSION
+
+
+def test_upgrade_composed_pair_rejects_same_or_older_target_before_download(
+    tmp_path, monkeypatch,
+):
+    home = _seed_composed_active_pair_install(tmp_path, monkeypatch)
+    prior_install_bytes = install_state_path(home).read_bytes()
+    base_bytes, base_hash = _build_base_wheel(tmp_path / "same-base")
+    thin_bytes, thin_hash = _build_thin_wheel_for_version(
+        tmp_path / "same-thin",
+        COMPOSED_THIN_PACKAGE_VERSION_PREDECESSOR,
+    )
+    transport = BackendEchoTransport(
+        responses=[
+            _json_response(
+                200,
+                _v2_eligible_response(
+                    base_hash=base_hash,
+                    base_size=len(base_bytes),
+                    thin_hash=thin_hash,
+                    thin_size=len(thin_bytes),
+                    thin_package_version=COMPOSED_THIN_PACKAGE_VERSION_PREDECESSOR,
+                ),
+            ),
+        ]
+    )
+    payload = upgrade_free_builder_to_paired(home=home, apply=True, transport=transport)
+    assert payload["result_code"] == "rejected"
+    assert len(transport.calls) == 1
+    assert install_state_path(home).read_bytes() == prior_install_bytes
+
+
+def test_upgrade_composed_pair_rejects_malformed_or_authority_expanding_local_components(
+    tmp_path, monkeypatch,
+):
+    home = _seed_composed_active_pair_install(tmp_path, monkeypatch)
+    install_path = install_state_path(home)
+    install_state = json.loads(install_path.read_text(encoding="utf-8"))
+    install_state["install_components"][1]["artifact_id"] = "art_pkg_ca_basic_escape"
+    install_path.write_text(json.dumps(install_state, indent=2) + "\n", encoding="utf-8")
+    transport = BackendEchoTransport()
+    payload = upgrade_free_builder_to_paired(home=home, apply=False, transport=transport)
+    assert payload["result_code"] == "rejected_ineligible_local_state"
+    assert transport.calls == []
+
+
+def test_upgrade_composed_pair_install_failure_preserves_prior_pair(tmp_path, monkeypatch):
+    home = _seed_composed_active_pair_install(tmp_path, monkeypatch)
+    install_path = install_state_path(home)
+    prior_install_bytes = install_path.read_bytes()
+    activation_file = activation_path(home)
+    prior_activation_bytes = (
+        activation_file.read_bytes() if activation_file.is_file() else None
+    )
+    base_vendor = vendor_root(home) / (
+        f"{COMPOSED_BASE_PACKAGE_NAME}-{COMPOSED_BASE_PACKAGE_VERSION}"
+    )
+    base_marker = base_vendor / "base-marker.txt"
+    base_marker.write_text("keep-base", encoding="utf-8")
+    prior_base_marker = base_marker.read_bytes()
+
+    base_bytes, base_hash = _build_base_wheel(tmp_path / "rollback-base")
+    thin_bytes, thin_hash = _build_thin_wheel_for_version(
+        tmp_path / "rollback-thin",
+        COMPOSED_THIN_PACKAGE_VERSION,
+    )
+    transport = BackendEchoTransport(
+        responses=[
+            _json_response(
+                200,
+                _v2_eligible_response(
+                    base_hash=base_hash,
+                    base_size=len(base_bytes),
+                    thin_hash=thin_hash,
+                    thin_size=len(thin_bytes),
+                    thin_package_version=COMPOSED_THIN_PACKAGE_VERSION,
+                ),
+            ),
+            _octet_response(200, thin_bytes),
+        ]
+    )
+
+    import agentveil_mcp_proxy.paid_install as paid_install_module
+
+    original_write = paid_install_module.write_install_state
+
+    def _fail_write(path, data):  # noqa: ANN001
+        if path == install_path:
+            raise OSError("simulated install state write failure")
+        return original_write(path, data)
+
+    monkeypatch.setattr(paid_install_module, "write_install_state", _fail_write)
+    payload = upgrade_free_builder_to_paired(home=home, apply=True, transport=transport)
+    assert payload["result_code"] == "skipped_install_failed"
+    assert install_path.read_bytes() == prior_install_bytes
+    if prior_activation_bytes is None:
+        assert not activation_file.is_file()
+    else:
+        assert activation_file.read_bytes() == prior_activation_bytes
+    assert base_marker.read_bytes() == prior_base_marker
+    assert not (
+        vendor_root(home) / f"{PACKAGE_NAME}-{COMPOSED_THIN_PACKAGE_VERSION}"
+    ).exists()
+    assert list(vendor_root(home).glob(".staging-*")) == []
+
+
+def test_upgrade_composed_pair_output_is_bounded(tmp_path, monkeypatch, capsys):
+    home = _seed_composed_active_pair_install(tmp_path, monkeypatch)
+    base_bytes, base_hash = _build_base_wheel(tmp_path / "privacy-base")
+    thin_bytes, thin_hash = _build_thin_wheel_for_version(
+        tmp_path / "privacy-thin",
+        COMPOSED_THIN_PACKAGE_VERSION,
+    )
+    transport = BackendEchoTransport(
+        responses=[
+            _json_response(
+                200,
+                _v2_eligible_response(
+                    base_hash=base_hash,
+                    base_size=len(base_bytes),
+                    thin_hash=thin_hash,
+                    thin_size=len(thin_bytes),
+                    thin_package_version=COMPOSED_THIN_PACKAGE_VERSION,
+                ),
+            ),
+        ]
+    )
+    code = run_paid_upgrade_free_builder_cli(
+        home=home,
+        apply=False,
+        output_json=True,
+        transport=transport,
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    assert set(payload) <= _UPGRADE_JSON_KEYS
+    scan_paid_output_for_leaks(out, secrets=(TOKEN, SECRET))
+    assert TOKEN not in out
+    assert str(home) not in out
 
 
 def test_upgrade_rejects_paid_license_install(tmp_path, monkeypatch):
