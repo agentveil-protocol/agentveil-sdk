@@ -1133,6 +1133,58 @@ def test_semantic_apply_prepared_patch_classifies_as_write_without_leaking_ref()
     assert "/Users/" not in dumped
 
 
+def test_caller_cannot_supply_or_override_phase_correlation_identity() -> None:
+    from agentveil_mcp_proxy.controlled_alternatives import (
+        GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+        SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME,
+    )
+    from agentveil_mcp_proxy.controlled_alternatives_runtime import (
+        bounded_phase_correlation_id_for_apply_local_input,
+    )
+
+    artifact_ref = "d00df00ddeadbeef0123456789abcdef"
+    artifact_hash = "ab" * 32
+    expected = bounded_phase_correlation_id_for_apply_local_input(
+        {
+            "prepared_artifact_ref": artifact_ref,
+            "prepared_artifact_hash": artifact_hash,
+        }
+    )
+    classifier = ToolCallClassifier(_config(), server_name="downstream")
+    forged = classifier.classify(
+        tool=SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME,
+        arguments={
+            "prepared_artifact_ref": artifact_ref,
+            "prepared_artifact_hash": artifact_hash,
+            "bounded_phase_correlation_id": "pc." + ("f" * 32),
+            "phase_correlation_id": "pc." + ("e" * 32),
+            "correlation_token": "caller-token",
+        },
+    )
+    assert forged.metadata_evidence is not None
+    assert forged.metadata_evidence["bounded_phase_correlation_id"] == expected
+    assert forged.metadata_evidence["bounded_phase_correlation_id"] != "pc." + ("f" * 32)
+    assert "bounded_phase_correlation_id" not in json.dumps(forged.backend_metadata())
+    assert forged.local_evidence_metadata()["bounded_phase_correlation_id"] == expected
+    generic = classifier.classify(
+        tool=GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME,
+        arguments={
+            "alternative_id": "protected_write.apply_prepared_patch.v1",
+            "input": {
+                "prepared_artifact_ref": artifact_ref,
+                "prepared_artifact_hash": artifact_hash,
+            },
+            "bounded_phase_correlation_id": "pc." + ("a" * 32),
+            "correlation_token": "caller-token",
+        },
+    )
+    assert generic.metadata_evidence is not None
+    assert generic.metadata_evidence["bounded_phase_correlation_id"] == expected
+    dumped = json.dumps(generic.local_evidence_metadata())
+    assert artifact_ref not in dumped
+    assert "caller-token" not in dumped
+
+
 def test_semantic_prepare_git_change_classifies_as_write_without_leaking_path() -> None:
     from agentveil_mcp_proxy.controlled_alternatives import SEMANTIC_PREPARE_GIT_CHANGE_TOOL_NAME
 

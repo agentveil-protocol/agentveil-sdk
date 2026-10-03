@@ -44,6 +44,7 @@ _REQUEST_TIMEOUT_SECONDS = 3.0
 _MAX_RESPONSE_BYTES = 16 * 1024
 _SCHEMA_VERSION = "1"
 _CONTROLLED_ALTERNATIVE_SCHEMA_VERSION = "2"
+_CORRELATED_CONTROLLED_ALTERNATIVE_SCHEMA_VERSION = "3"
 _DEFAULT_QUEUE_CAPACITY = 256
 _MAX_DEDUP_KEYS = 4096
 _SHUTDOWN_JOIN_TIMEOUT_SECONDS = _REQUEST_TIMEOUT_SECONDS + 0.25
@@ -118,6 +119,7 @@ _REQUEST_KEYS = frozenset({
     "verification_level",
     "result_hash",
     "redirected",
+    "bounded_phase_correlation_id",
 })
 _RESPONSE_KEYS = frozenset({
     "schema_version",
@@ -139,6 +141,7 @@ _SOURCE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _PROOF_HASH_RE = re.compile(r"^[a-f0-9]{64}$")
 _RESULT_HASH_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
+_BOUNDED_PHASE_CORRELATION_ID_RE = re.compile(r"^pc\.[a-f0-9]{32}$")
 _FORBIDDEN_EVENT_ID_FRAGMENTS = ("/Users/", "/home/", "../", "..\\", "C:\\")
 _FORBIDDEN_EVENT_ID_SUBSTRINGS = (
     "secret",
@@ -204,6 +207,7 @@ class DecisionSummaryPayload:
     verification_level: str | None = None
     result_hash: str | None = None
     redirected: bool | None = None
+    bounded_phase_correlation_id: str | None = None
 
 
 Transport = Callable[..., RawResponse]
@@ -535,7 +539,7 @@ def _controlled_summary_fields(record: PendingApproval) -> dict[str, Any] | None
     )
     if redirect_fields_present and not redirected:
         return None
-    return {
+    fields: dict[str, Any] = {
         "controlled_alternative_id": alternative_id,
         "controlled_outcome": outcome,
         "rollback_available": rollback_available,
@@ -543,6 +547,14 @@ def _controlled_summary_fields(record: PendingApproval) -> dict[str, Any] | None
         "result_hash": result_hash,
         "redirected": redirected,
     }
+    phase_correlation = metadata.get("bounded_phase_correlation_id")
+    if phase_correlation is not None:
+        if not isinstance(phase_correlation, str) or not _BOUNDED_PHASE_CORRELATION_ID_RE.fullmatch(
+            phase_correlation
+        ):
+            return None
+        fields["bounded_phase_correlation_id"] = phase_correlation
+    return fields
 
 
 def _record_declares_controlled_alternative(record: PendingApproval) -> bool:
@@ -605,12 +617,15 @@ def build_decision_summary_payload(
     controlled_fields = _controlled_summary_fields(record)
     if _record_declares_controlled_alternative(record) and controlled_fields is None:
         return None
+    schema_version = _SCHEMA_VERSION
+    if controlled_fields is not None:
+        schema_version = (
+            _CORRELATED_CONTROLLED_ALTERNATIVE_SCHEMA_VERSION
+            if controlled_fields.get("bounded_phase_correlation_id") is not None
+            else _CONTROLLED_ALTERNATIVE_SCHEMA_VERSION
+        )
     return DecisionSummaryPayload(
-        schema_version=(
-            _CONTROLLED_ALTERNATIVE_SCHEMA_VERSION
-            if controlled_fields is not None
-            else _SCHEMA_VERSION
-        ),
+        schema_version=schema_version,
         event_id=event_id,
         action_family=action_family,
         decision=decision,
@@ -989,6 +1004,7 @@ def payload_to_request_body(payload: DecisionSummaryPayload) -> dict[str, Any]:
     if payload.schema_version not in {
         _SCHEMA_VERSION,
         _CONTROLLED_ALTERNATIVE_SCHEMA_VERSION,
+        _CORRELATED_CONTROLLED_ALTERNATIVE_SCHEMA_VERSION,
     }:
         raise DecisionSummaryClientError("invalid_request")
     body: dict[str, Any] = {
@@ -1012,7 +1028,10 @@ def payload_to_request_body(payload: DecisionSummaryPayload) -> dict[str, Any]:
         payload.result_hash,
         payload.redirected,
     )
-    if payload.schema_version == _CONTROLLED_ALTERNATIVE_SCHEMA_VERSION:
+    if payload.schema_version in {
+        _CONTROLLED_ALTERNATIVE_SCHEMA_VERSION,
+        _CORRELATED_CONTROLLED_ALTERNATIVE_SCHEMA_VERSION,
+    }:
         if any(value is None for value in controlled_values):
             raise DecisionSummaryClientError("invalid_request")
         if payload.controlled_alternative_id not in KNOWN_CONTROLLED_ALTERNATIVE_IDS:
@@ -1045,6 +1064,15 @@ def payload_to_request_body(payload: DecisionSummaryPayload) -> dict[str, Any]:
             "result_hash": payload.result_hash,
             "redirected": payload.redirected,
         })
+        if payload.schema_version == _CORRELATED_CONTROLLED_ALTERNATIVE_SCHEMA_VERSION:
+            correlation_id = payload.bounded_phase_correlation_id
+            if not isinstance(correlation_id, str) or not _BOUNDED_PHASE_CORRELATION_ID_RE.fullmatch(
+                correlation_id
+            ):
+                raise DecisionSummaryClientError("invalid_request")
+            body["bounded_phase_correlation_id"] = correlation_id
+        elif payload.bounded_phase_correlation_id is not None:
+            raise DecisionSummaryClientError("invalid_request")
     elif any(value is not None for value in controlled_values):
         raise DecisionSummaryClientError("invalid_request")
     if set(body.keys()) - _REQUEST_KEYS:

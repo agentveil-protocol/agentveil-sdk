@@ -3814,3 +3814,97 @@ def test_existing_file_update_prepare_still_routes(tmp_path: Path) -> None:
         f"execute:{PREPARE}",
         f"verify:{PREPARE}",
     ]
+
+
+def test_prepare_and_apply_derive_same_bounded_phase_correlation_id(tmp_path: Path) -> None:
+    from agentveil_mcp_proxy.controlled_alternatives_runtime import (
+        bounded_phase_correlation_id_for_apply_local_input,
+        derive_bounded_phase_correlation_id,
+    )
+
+    binding = _apply_binding(tmp_path)
+    prepare = execute_controlled_alternative(
+        binding=binding,
+        arguments={"alternative_id": PREPARE, "input": {"path": SECRET_PATH, "patch": SECRET_PATCH}},
+        recheck=_ok_recheck(binding),
+    )
+    assert prepare["prepared_artifact_ref"] == PREPARED_REF
+    prepare_id = derive_bounded_phase_correlation_id(prepare["prepared_artifact_ref"])
+    apply_id = bounded_phase_correlation_id_for_apply_local_input(_apply_input())
+    assert prepare_id is not None
+    assert prepare_id == apply_id
+    apply = execute_controlled_alternative(
+        binding=binding,
+        arguments={"alternative_id": APPLY, "input": _apply_input()},
+        recheck=_ok_recheck(binding),
+    )
+    assert apply["mechanism_status"] == "success"
+    assert bounded_phase_correlation_id_for_apply_local_input(_apply_input()) == prepare_id
+
+
+def test_prepare_and_apply_user_path_share_bounded_phase_correlation(tmp_path: Path) -> None:
+    from agentveil_mcp_proxy.controlled_alternatives_runtime import (
+        bounded_phase_correlation_id_for_apply_local_input,
+        derive_bounded_phase_correlation_id,
+    )
+    from agentveil_mcp_proxy.evidence import ApprovalEvidenceStore
+
+    store = ApprovalEvidenceStore(tmp_path / "evidence.sqlite")
+
+    class _ObserveManager:
+        def __init__(self) -> None:
+            self.evidence_store = store
+            self.session_id = "sess-phase"
+            self.client_id = "client-phase"
+
+    manager = _ObserveManager()
+    binding, passthrough = _apply_bound_passthrough(tmp_path, approval_manager=manager)
+    prepare_ops_before = len(binding.provider.requests)
+    passthrough.handle_client_line(
+        _semantic_line(
+            "phase-prep",
+            SEMANTIC_PREPARE_PATCH_TOOL_NAME,
+            {"path": SECRET_PATH, "patch": SECRET_PATCH},
+        )
+    )
+    prepare_ops_after = len(binding.provider.requests)
+    assert prepare_ops_after == prepare_ops_before + 3
+    prepare_id = derive_bounded_phase_correlation_id(PREPARED_REF)
+    records = store.list_records()
+    prepare_records = [
+        row
+        for row in records
+        if row.tool_name == SEMANTIC_PREPARE_PATCH_TOOL_NAME
+    ]
+    assert len(prepare_records) == 1
+    prepare_metadata = json.loads(prepare_records[0].action_gate_metadata_jcs or "{}")
+    assert prepare_metadata["bounded_phase_correlation_id"] == prepare_id
+
+    apply_ops_before = len(binding.provider.requests)
+    passthrough.handle_client_line(
+        _semantic_line("phase-apply", SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME, _apply_input())
+    )
+    assert len(binding.provider.requests) == apply_ops_before + 3
+    apply_id = bounded_phase_correlation_id_for_apply_local_input(_apply_input())
+    assert apply_id == prepare_id
+    apply_records = [
+        row
+        for row in store.list_records()
+        if row.tool_name == SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME
+    ]
+    assert len(apply_records) == 1
+    apply_metadata = json.loads(apply_records[0].action_gate_metadata_jcs or "{}")
+    assert apply_metadata["bounded_phase_correlation_id"] == prepare_id
+    store.close()
+
+
+def test_distinct_prepared_artifacts_have_distinct_phase_correlation_ids() -> None:
+    from agentveil_mcp_proxy.controlled_alternatives_runtime import (
+        derive_bounded_phase_correlation_id,
+    )
+
+    first = derive_bounded_phase_correlation_id(PREPARED_REF)
+    second = derive_bounded_phase_correlation_id("cafebabedeadbeef0123456789abcdef")
+    assert first is not None
+    assert second is not None
+    assert first != second

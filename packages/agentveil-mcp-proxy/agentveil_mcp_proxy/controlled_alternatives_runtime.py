@@ -10,9 +10,11 @@ the local generic tool after ordinary policy/authority. The generic tool is not 
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import stat
 from typing import Any, Callable, Mapping
@@ -59,6 +61,11 @@ _PREPARE_PATCH = "protected_write.prepare_patch.v1"
 _APPLY_PATCH = APPLY_PREPARED_PATCH_ALTERNATIVE_ID
 _WRITE_ALTERNATIVES = frozenset({_STAGE_DELETE, _RESTORE})
 _JSONRPC_VERSION = "2.0"
+_PHASE_CORRELATION_DOMAIN = b"avp.console.controlled_alternative.bounded_phase_correlation.v1"
+_PHASE_CORRELATION_PREFIX = "pc."
+_PREPARED_ARTIFACT_REF_CHARS = 32
+_PREPARED_ARTIFACT_REF_ALPHABET = frozenset("0123456789abcdef")
+_BOUNDED_PHASE_CORRELATION_ID_RE = re.compile(r"^pc\.[a-f0-9]{32}$")
 
 
 class ControlledAlternativeExecutionAbort(Exception):
@@ -736,3 +743,75 @@ def _source_absent(raw_path: str) -> bool:
         return not os.path.lexists(raw_path)
     except OSError:
         return False
+
+
+def _validated_prepared_artifact_ref_for_phase_correlation(value: object) -> str | None:
+    if not isinstance(value, str) or len(value) != _PREPARED_ARTIFACT_REF_CHARS:
+        return None
+    if any(char not in _PREPARED_ARTIFACT_REF_ALPHABET for char in value):
+        return None
+    return value
+
+
+def accepted_bounded_phase_correlation_id(value: object) -> str | None:
+    """Return phase identity only when it matches the bounded Console grammar."""
+
+    if not isinstance(value, str):
+        return None
+    if not _BOUNDED_PHASE_CORRELATION_ID_RE.fullmatch(value):
+        return None
+    return value
+
+
+def derive_bounded_phase_correlation_id(prepared_artifact_ref: str) -> str | None:
+    """Return opaque phase identity for one validated prepared artifact ref."""
+
+    validated = _validated_prepared_artifact_ref_for_phase_correlation(prepared_artifact_ref)
+    if validated is None:
+        return None
+    digest = hashlib.sha256(
+        _PHASE_CORRELATION_DOMAIN + validated.encode("utf-8")
+    ).hexdigest()
+    candidate = f"{_PHASE_CORRELATION_PREFIX}{digest[:32]}"
+    if not _BOUNDED_PHASE_CORRELATION_ID_RE.fullmatch(candidate):
+        return None
+    return candidate
+
+
+def bounded_phase_correlation_id_for_apply_local_input(
+    raw_input: Mapping[str, Any],
+) -> str | None:
+    """Derive phase identity after apply-input mechanical validation."""
+
+    try:
+        local = validate_controlled_alternative_local_input(_APPLY_PATCH, raw_input)
+    except ControlledAlternativeValidationError:
+        return None
+    if local.prepared_artifact_ref is None:
+        return None
+    return derive_bounded_phase_correlation_id(local.prepared_artifact_ref)
+
+
+def bounded_phase_correlation_id_for_classification(
+    *,
+    tool: str,
+    arguments: Mapping[str, Any],
+    alternative_id: str | None,
+) -> str | None:
+    """Derive apply-phase identity early enough for terminal evidence."""
+
+    if alternative_id != _APPLY_PATCH:
+        return None
+    if tool == GENERIC_CONTROLLED_ALTERNATIVE_TOOL_NAME:
+        raw_input = arguments.get("input")
+    elif is_semantic_controlled_alternative_tool(tool):
+        raw_input = {
+            key: arguments[key]
+            for key in ("prepared_artifact_ref", "prepared_artifact_hash")
+            if key in arguments
+        }
+    else:
+        return None
+    if not isinstance(raw_input, Mapping):
+        return None
+    return bounded_phase_correlation_id_for_apply_local_input(raw_input)

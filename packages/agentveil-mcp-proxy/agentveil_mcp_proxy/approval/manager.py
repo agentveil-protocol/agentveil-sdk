@@ -39,6 +39,9 @@ from agentveil_mcp_proxy.approval.server import (
     redact_owner_client_id_for_display,
 )
 from agentveil_mcp_proxy.classification import ClassifiedToolCall, sha256_jcs
+from agentveil_mcp_proxy.controlled_alternatives_runtime import (
+    accepted_bounded_phase_correlation_id,
+)
 from agentveil_mcp_proxy.evidence import (
     ApprovalEvidenceError,
     ApprovalEvidenceStore,
@@ -1553,6 +1556,13 @@ class ApprovalManager:
             if isinstance(projection, Mapping) and projection:
                 # Store only already-normalized bounded projection from Runtime Gate.
                 action_gate_metadata["paid_approval_center_projection"] = dict(projection)
+        metadata_evidence = classification.metadata_evidence
+        if isinstance(metadata_evidence, Mapping):
+            phase_id = accepted_bounded_phase_correlation_id(
+                metadata_evidence.get("bounded_phase_correlation_id")
+            )
+            if phase_id is not None:
+                action_gate_metadata["bounded_phase_correlation_id"] = phase_id
         return ApprovalPrompt(
             request_id=request_id,
             client_id=self.client_id,

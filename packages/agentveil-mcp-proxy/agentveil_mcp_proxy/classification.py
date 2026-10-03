@@ -346,7 +346,7 @@ class ClassifiedToolCall:
     def local_evidence_metadata(self) -> dict[str, Any]:
         """Return local-only metadata for future evidence slices."""
 
-        return {
+        metadata = {
             "downstream_server": self.server,
             "tool": self.tool,
             "action_plain": self.action_plain,
@@ -365,6 +365,11 @@ class ClassifiedToolCall:
             "role": self.role,
             "authority": self.authority,
         }
+        if isinstance(self.metadata_evidence, Mapping):
+            phase_id = self.metadata_evidence.get("bounded_phase_correlation_id")
+            if isinstance(phase_id, str):
+                metadata["bounded_phase_correlation_id"] = phase_id
+        return metadata
 
 
 class ToolCallClassifier:
@@ -473,6 +478,19 @@ class ToolCallClassifier:
         if tool in _PACKAGE_INSTALL_CLONE_CONTEXT_TOOLS:
             collected = collect_install_metadata_evidence(tool=tool, arguments=args)
             metadata_evidence = collected or None
+        from agentveil_mcp_proxy.controlled_alternatives_runtime import (
+            bounded_phase_correlation_id_for_classification,
+        )
+
+        phase_correlation_id = bounded_phase_correlation_id_for_classification(
+            tool=tool,
+            arguments=args,
+            alternative_id=alternative_id,
+        )
+        if phase_correlation_id is not None:
+            merged = dict(metadata_evidence) if isinstance(metadata_evidence, Mapping) else {}
+            merged["bounded_phase_correlation_id"] = phase_correlation_id
+            metadata_evidence = merged
         content_risk_signals = derive_content_risk_signals(args)
         return ClassifiedToolCall(
             server=self.server_name,

@@ -69,6 +69,8 @@ from agentveil_mcp_proxy.controlled_alternatives_runtime import (
     ControlledAlternativeRuntimeBinding,
     alternative_id_from_arguments,
     controlled_alternative_catalog_collision,
+    accepted_bounded_phase_correlation_id,
+    derive_bounded_phase_correlation_id,
     execute_controlled_alternative,
     inject_controlled_alternative_tool,
     local_mcp_result,
@@ -4831,6 +4833,24 @@ class McpPassthrough:
                 **self._least_agency_metadata_fields(classification),
             )
             metadata = self._apply_verified_lineage_metadata(metadata)
+        elif isinstance(classification.controlled_alternative_id, str) and classification.controlled_alternative_id:
+            metadata = build_controlled_path_metadata(
+                fixture_id=self._controlled_path_fixture_id(classification),
+                tool_name=classification.tool,
+                policy_decision=classification.policy_evaluation.decision.value,
+                policy_rule_id=classification.policy_evaluation.policy_rule_id,
+                approval_status=ApprovalStatus.PENDING.value,
+                execution_status="not_reached",
+                target_reached=False,
+                request_id=outcome.request_id,
+                payload_hash=classification.payload_hash,
+                **self._least_agency_metadata_fields(classification),
+            )
+            metadata.update({
+                "controlled_alternative_id": classification.controlled_alternative_id,
+                "rollback_available": False,
+                "verification_level": "not_verified",
+            })
         else:
             metadata = build_redirect_automation_metadata(
                 fixture_id=self._controlled_path_fixture_id(classification),
@@ -4871,6 +4891,10 @@ class McpPassthrough:
         binding = self.controlled_runtime
         if binding is not None:
             metadata["project_scope_fingerprint"] = binding.route_id
+        self._attach_bounded_phase_correlation_metadata(
+            metadata,
+            classification=classification,
+        )
         try:
             store.annotate_controlled_path_metadata(
                 outcome.request_id,
@@ -4987,6 +5011,34 @@ class McpPassthrough:
         server = getattr(record, "downstream_server", "downstream")
         tool = getattr(record, "tool_name", "tool")
         return f"{server}.{tool}"
+
+    @staticmethod
+    def _bounded_phase_correlation_from_classification(
+        classification: ClassifiedToolCall | None,
+    ) -> str | None:
+        if classification is None:
+            return None
+        metadata = classification.metadata_evidence
+        if isinstance(metadata, Mapping):
+            return accepted_bounded_phase_correlation_id(
+                metadata.get("bounded_phase_correlation_id")
+            )
+        return None
+
+    @staticmethod
+    def _attach_bounded_phase_correlation_metadata(
+        metadata: dict[str, Any],
+        *,
+        classification: ClassifiedToolCall | None = None,
+        prepared_artifact_ref: str | None = None,
+    ) -> None:
+        phase_id = None
+        if isinstance(prepared_artifact_ref, str):
+            phase_id = derive_bounded_phase_correlation_id(prepared_artifact_ref)
+        if phase_id is None and classification is not None:
+            phase_id = McpPassthrough._bounded_phase_correlation_from_classification(classification)
+        if phase_id is not None:
+            metadata["bounded_phase_correlation_id"] = phase_id
 
     def _record_policy_block_controlled_path(
         self,
@@ -5140,6 +5192,14 @@ class McpPassthrough:
             "rollback_available": rollback_available,
             "verification_level": verification_level,
         })
+        prepared_ref = payload.get("prepared_artifact_ref")
+        if isinstance(prepared_ref, str):
+            self._attach_bounded_phase_correlation_metadata(
+                metadata,
+                prepared_artifact_ref=prepared_ref,
+            )
+        else:
+            self._attach_bounded_phase_correlation_metadata(metadata, classification=classification)
         try:
             if approval_outcome is not None and approval_outcome.approved:
                 annotate = getattr(store, "annotate_controlled_path_metadata", None)

@@ -2101,3 +2101,70 @@ def test_detached_hook_upload_without_console_credential_spawns_no_process(
     )
 
     assert popen_calls == []
+
+
+PREPARED_ARTIFACT_REF = "d00df00ddeadbeef0123456789abcdef"
+
+
+def test_correlated_controlled_summary_uses_v3_and_preserves_v2_without_correlation():
+    from agentveil_mcp_proxy.controlled_alternatives_runtime import (
+        derive_bounded_phase_correlation_id,
+    )
+
+    phase_id = derive_bounded_phase_correlation_id(PREPARED_ARTIFACT_REF)
+    assert phase_id is not None
+    correlated = build_decision_summary_payload(
+        _record(
+            action_gate_metadata_jcs=_controlled_metadata(
+                "protected_write.prepare_patch.v1",
+                bounded_phase_correlation_id=phase_id,
+            ),
+            result_hash=RESULT_HASH,
+        )
+    )
+    assert correlated is not None
+    assert correlated.schema_version == "3"
+    assert correlated.bounded_phase_correlation_id == phase_id
+    body = payload_to_request_body(correlated)
+    assert body["schema_version"] == "3"
+    assert body["bounded_phase_correlation_id"] == phase_id
+
+    uncorrelated = build_decision_summary_payload(
+        _record(
+            action_gate_metadata_jcs=_controlled_metadata(
+                "filesystem.stage_delete.v1",
+                target_reached=True,
+                rollback_available=True,
+            ),
+            result_hash=RESULT_HASH,
+        )
+    )
+    assert uncorrelated is not None
+    assert uncorrelated.schema_version == "2"
+    assert uncorrelated.bounded_phase_correlation_id is None
+    assert payload_to_request_body(uncorrelated)["schema_version"] == "2"
+
+
+def test_phase_correlation_summary_never_exposes_prepared_artifact_reference():
+    from agentveil_mcp_proxy.controlled_alternatives_runtime import (
+        derive_bounded_phase_correlation_id,
+    )
+
+    phase_id = derive_bounded_phase_correlation_id(PREPARED_ARTIFACT_REF)
+    payload = build_decision_summary_payload(
+        _record(
+            action_gate_metadata_jcs=_controlled_metadata(
+                "protected_write.apply_prepared_patch.v1",
+                target_reached=True,
+                bounded_phase_correlation_id=phase_id,
+            ),
+            result_hash=RESULT_HASH,
+        )
+    )
+    assert payload is not None
+    body = payload_to_request_body(payload)
+    encoded = json.dumps(body)
+    assert PREPARED_ARTIFACT_REF not in encoded
+    assert "prepared_artifact_ref" not in encoded
+    assert "prepared_artifact_hash" not in encoded
+    assert body["bounded_phase_correlation_id"] == phase_id

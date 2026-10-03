@@ -4535,3 +4535,181 @@ def test_concurrent_exact_grant_passthrough_mutations_once(tmp_path):
         server_b.stop()
         store_a.close()
         store_b.close()
+
+
+def _apply_approval_config() -> ProxyConfig:
+    from agentveil_mcp_proxy.controlled_alternatives import SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME
+
+    return ProxyConfig.from_dict(
+        {
+            "proxy_config_schema_version": 1,
+            "avp": {
+                "base_url": "https://agentveil.dev",
+                "agent_name": "agentveil-mcp-proxy",
+                "trusted_signer_dids": ["did:key:z6MktrustedSigner"],
+            },
+            "mode": "protect",
+            "privacy": {
+                "action": "redacted",
+                "resource": "hash",
+                "payload": "hash_only",
+                "evidence_upload": False,
+            },
+            "fallback": {
+                "read": "allow",
+                "write": "allow",
+                "destructive": "block",
+                "production": "block",  # claim-check: allow existing fallback risk-family key.
+                "financial": "block",
+                "unknown": "approval",
+            },
+            "policy": {
+                "id": "ca-apply-approval",
+                "policy_schema_version": 1,
+                "default_decision": "allow",
+                "default_risk_class": "read",
+                "rules": [
+                    {
+                        "id": "apply-approval",
+                        "source": "user",
+                        "decision": "approval",
+                        "risk_class": "write",
+                        "match": {
+                            "server": "plain",
+                            "tool": SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME,
+                        },
+                    }
+                ],
+            },
+            "approval": {
+                "approval_timeout_seconds": 300,
+                "on_timeout": "deny",
+                "ui_open_mode": "none",
+            },
+            "downstream": {},
+        }
+    )
+
+
+def test_denied_apply_preserves_bounded_phase_correlation_in_terminal_summary(tmp_path):
+    from agentveil_mcp_proxy.console_decision_summary_client import (
+        build_decision_summary_payload,
+        payload_to_request_body,
+    )
+    from agentveil_mcp_proxy.controlled_alternatives import (
+        APPLY_PREPARED_PATCH_ALTERNATIVE_ID,
+        SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME,
+    )
+    from agentveil_mcp_proxy.controlled_alternatives_runtime import (
+        bounded_phase_correlation_id_for_apply_local_input,
+        derive_bounded_phase_correlation_id,
+    )
+    from test_mcp_proxy_controlled_alternatives_runtime import (
+        PREPARED_REF,
+        _apply_bound_passthrough,
+        _apply_input,
+    )
+
+    config = _apply_approval_config()
+    store = ApprovalEvidenceStore(tmp_path / "evidence.sqlite")
+    server = ApprovalServer()
+    server.start()
+    observed: list[Any] = []
+    manager = ApprovalManager(
+        evidence_store=store,
+        approval_server=server,
+        config=config,
+        client_id=f"cursor:pid:{os.getpid()}",
+        session_id="session-deny-apply",
+        notifier=NoopNotifier(),
+        wait_for_decision=False,
+        browser_open=lambda _url: True,
+    )
+    manager.terminal_evidence_observer = observed.append
+    binding, passthrough = _apply_bound_passthrough(
+        tmp_path,
+        mode="protect",
+        approval_manager=manager,
+    )
+    passthrough.classifier = ToolCallClassifier(config, server_name="plain")
+    classification = passthrough.classifier.classify(
+        tool=SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME,
+        arguments=_apply_input(),
+    )
+
+    expected = derive_bounded_phase_correlation_id(PREPARED_REF)
+    assert expected == bounded_phase_correlation_id_for_apply_local_input(_apply_input())
+    before_calls = list(binding.provider.calls)
+    outcome = manager.request_approval(classification, reason="local_approval_required")
+    assert outcome.status == ApprovalStatus.PENDING.value
+    passthrough._annotate_pending_controlled_path(classification, outcome)
+    assert binding.provider.calls == before_calls
+
+    prompts = server.pending_prompts()
+    assert len(prompts) == 1
+    request_id = prompts[0].request_id
+    assert len([row for row in store.list_records() if row.request_id == request_id]) == 1
+
+    with httpx.Client() as client:
+        csrf = _get_csrf(client, server.approval_url(request_id))
+        deny_response = _post_decision(
+            client,
+            server.approval_url(request_id),
+            decision="deny",
+            csrf=csrf,
+        )
+    assert deny_response.status_code == 200
+
+    deadline = time.monotonic() + 3
+    while len(observed) < 1 and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert len(observed) == 1
+    terminal = observed[0]
+    assert terminal.request_id == request_id
+    assert terminal.status == ApprovalStatus.DENIED.value
+    metadata = json.loads(terminal.action_gate_metadata_jcs or "{}")
+    assert metadata["bounded_phase_correlation_id"] == expected
+    assert metadata["controlled_alternative_id"] == APPLY_PREPARED_PATCH_ALTERNATIVE_ID
+    summary_record = replace(
+        terminal,
+        result_hash="sha256:" + ("b" * 64),
+    )
+    payload = build_decision_summary_payload(summary_record)
+    assert payload is not None
+    assert payload.schema_version == "3"
+    assert payload.bounded_phase_correlation_id == expected
+    assert payload.controlled_outcome == "denied_safely"
+    assert PREPARED_REF not in json.dumps(payload_to_request_body(payload))
+
+    server.stop()
+    store.close()
+
+
+def test_apply_prompt_skips_invalid_bounded_phase_correlation_metadata(tmp_path):
+    from agentveil_mcp_proxy.controlled_alternatives import SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME
+    from test_mcp_proxy_controlled_alternatives_runtime import _apply_input
+
+    config = _apply_approval_config()
+    classifier = ToolCallClassifier(config, server_name="plain")
+    classification = classifier.classify(
+        tool=SEMANTIC_APPLY_PREPARED_PATCH_TOOL_NAME,
+        arguments=_apply_input(),
+    )
+    invalid = replace(
+        classification,
+        metadata_evidence={"bounded_phase_correlation_id": "pc." + ("g" * 32)},
+    )
+    manager, store, server, _cli = _manager(
+        tmp_path,
+        config=config,
+        wait_for_decision=False,
+    )
+    outcome = manager.request_approval(invalid, reason="local_approval_required")
+    assert outcome.status == ApprovalStatus.PENDING.value
+    record = store.get_pending(outcome.request_id)
+    assert record is not None
+    metadata = json.loads(record.action_gate_metadata_jcs or "{}")
+    assert "bounded_phase_correlation_id" not in metadata
+
+    server.stop()
+    store.close()
