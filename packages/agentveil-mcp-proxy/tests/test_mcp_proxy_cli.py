@@ -1204,7 +1204,8 @@ def _fake_avp_registration_backend(
         yield base_url, state
     finally:
         server.shutdown()
-        thread.join(timeout=5)
+        server.server_close()
+        thread.join(timeout=0.2)
 
 
 def _set_proxy_home_base_url(home: Path, base_url: str) -> None:
@@ -4471,10 +4472,12 @@ def test_console_project_status_sync_on_setup_status_for_connectors(
             home = kwargs["home"]
             _stub_project_proxy_home(home)
 
-        def fake_prepare(_workspace, *, force=False):
+        def fake_prepare(_workspace, *, force=False, initialize_product_route=False):
             home = cursor_setup.setup_home(_workspace)
             home.mkdir(parents=True, exist_ok=True)
-            (home / "passphrase").write_text("secret\n", encoding="utf-8")
+            if os.name != "nt":
+                os.chmod(home, 0o700)
+            _write_owner_only_passphrase_file(home / "passphrase")
             return home
 
         monkeypatch.setattr(proxy_cli, "init_proxy", fake_init_proxy)
@@ -4815,10 +4818,12 @@ def test_console_free_builder_sync_on_setup_status_for_connectors(
             home = kwargs["home"]
             _stub_project_proxy_home(home)
 
-        def fake_prepare(_workspace, *, force=False):
+        def fake_prepare(_workspace, *, force=False, initialize_product_route=False):
             home = cursor_setup.setup_home(_workspace)
             home.mkdir(parents=True, exist_ok=True)
-            (home / "passphrase").write_text("secret\n", encoding="utf-8")
+            if os.name != "nt":
+                os.chmod(home, 0o700)
+            _write_owner_only_passphrase_file(home / "passphrase")
             return home
 
         monkeypatch.setattr(proxy_cli, "init_proxy", fake_init_proxy)
@@ -5245,6 +5250,7 @@ def test_console_setup_succeeds_when_attach_unavailable(
     )
 
     project = tmp_path / "project"
+    project.mkdir()
     rc = main(["setup", "codex", "--project-dir", str(project), "--yes", "--json"])
     out, err = capsys.readouterr()
 
@@ -5405,10 +5411,12 @@ def test_console_attach_on_setup_for_connectors(
             home = kwargs["home"]
             _stub_project_proxy_home(home)
 
-        def fake_prepare(_workspace, *, force=False):
+        def fake_prepare(_workspace, *, force=False, initialize_product_route=False):
             home = cursor_setup.setup_home(_workspace)
             home.mkdir(parents=True, exist_ok=True)
-            (home / "passphrase").write_text("secret\n", encoding="utf-8")
+            if os.name != "nt":
+                os.chmod(home, 0o700)
+            _write_owner_only_passphrase_file(home / "passphrase")
             return home
 
         monkeypatch.setattr(proxy_cli, "init_proxy", fake_init_proxy)
@@ -5868,6 +5876,34 @@ def _install_project_login_post_login_fences(monkeypatch) -> None:
     )
 
 
+def _install_seeded_console_credentials_must_not_pair(monkeypatch) -> _FakeConsoleClient:
+    """Fail fast if setup/login falls through to live Console attach or pairing."""
+
+    client = _FakeConsoleClient(fail_if_used=True)
+    _install_console_client(monkeypatch, client)
+    return client
+
+
+def _install_guidance_registration_login_harness(monkeypatch) -> _FakeConsoleClient:
+    """Keep guidance follow-up logins on seeded machine credentials, not live Console."""
+
+    from nacl.pwhash import argon2id
+
+    monkeypatch.setattr(argon2id, "OPSLIMIT_MODERATE", argon2id.OPSLIMIT_MIN)
+    monkeypatch.setattr(argon2id, "MEMLIMIT_MODERATE", argon2id.MEMLIMIT_MIN)
+    _install_project_login_post_login_fences(monkeypatch)
+    monkeypatch.setattr(proxy_cli, "_best_effort_console_attach_credential", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_free_builder_client.sync_free_builder_install",
+        lambda **_kwargs: "skipped",
+    )
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.console_project_status_client.sync_project_status",
+        lambda **_kwargs: "accepted",
+    )
+    return _install_seeded_console_credentials_must_not_pair(monkeypatch)
+
+
 _CONNECTOR_SETUP_STATUS_CASES = [
     ("cursor", ["setup", "cursor", "--workspace"], ["setup", "status", "--workspace"]),
     ("claude-code", ["setup", "claude-code", "--project-dir"], ["setup", "status", "--project-dir"]),
@@ -6023,8 +6059,9 @@ def test_setup_common_registration_guidance_cursor_advertised_register_reaches_b
 
     project = tmp_path / "project"
     project.mkdir()
-    home = _seed_project_proxy_identity(project, "cursor", registered=False)
     _install_connector_status_mocks(monkeypatch, "cursor")
+    pairing_guard = _install_guidance_registration_login_harness(monkeypatch)
+    home = _seed_project_proxy_identity(project, "cursor", registered=False)
     _install_machine_dual_console_credentials(tmp_path, monkeypatch)
     monkeypatch.delenv("AVP_PROXY_PASSPHRASE", raising=False)
 
@@ -6043,6 +6080,8 @@ def test_setup_common_registration_guidance_cursor_advertised_register_reaches_b
     _assert_bounded_project_login_output(out + _err, identity_before, home=home)
     identity_after = _load(proxy_paths(home).identity_path("proxy"))
     assert identity_after.get("registered") is True
+    assert pairing_guard.started is False
+    assert pairing_guard.polled is False
 
 
 def test_setup_common_registration_guidance_json_actionable_from_nonproject_cwd(
@@ -6052,8 +6091,9 @@ def test_setup_common_registration_guidance_json_actionable_from_nonproject_cwd(
 ):
     project = tmp_path / "project"
     project.mkdir()
-    home = _seed_project_proxy_identity(project, "cursor", registered=False)
     _install_connector_status_mocks(monkeypatch, "cursor")
+    pairing_guard = _install_guidance_registration_login_harness(monkeypatch)
+    home = _seed_project_proxy_identity(project, "cursor", registered=False)
     _install_machine_dual_console_credentials(tmp_path, monkeypatch)
     monkeypatch.delenv("AVP_PROXY_PASSPHRASE", raising=False)
 
@@ -6079,6 +6119,8 @@ def test_setup_common_registration_guidance_json_actionable_from_nonproject_cwd(
     assert "existing agent registered with the backend" in out
     assert "Runtime readiness is separate" in out
     _assert_bounded_project_login_output(out + _err, identity_before, home=home)
+    assert pairing_guard.started is False
+    assert pairing_guard.polled is False
 
 
 def _seed_cursor_encrypted_with_external_passphrase_file(
@@ -6190,8 +6232,9 @@ def _install_project_login_binding_stub(monkeypatch, *, fail: bool = False) -> d
 
 
 def _install_machine_dual_console_credentials(tmp_path, monkeypatch) -> Path:
-    avp_home = tmp_path / "machine-avp"
-    avp_home.mkdir()
+    _ = tmp_path
+    avp_home = Path(os.environ["HOME"]).expanduser() / ".avp"
+    avp_home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("AVP_HOME", str(avp_home))
     save_credential(CONSOLE_TOKEN, home=avp_home)
     save_runtime_binding_credential(CONSOLE_BINDING_TOKEN, home=avp_home)
@@ -6200,8 +6243,9 @@ def _install_machine_dual_console_credentials(tmp_path, monkeypatch) -> Path:
 
 
 def _install_machine_summary_console_credentials(tmp_path, monkeypatch) -> Path:
-    avp_home = tmp_path / "machine-avp"
-    avp_home.mkdir()
+    _ = tmp_path
+    avp_home = Path(os.environ["HOME"]).expanduser() / ".avp"
+    avp_home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("AVP_HOME", str(avp_home))
     save_credential(CONSOLE_TOKEN, home=avp_home)
     _install_project_login_binding_stub(monkeypatch)
@@ -7474,6 +7518,67 @@ def test_secure_write_json_rejects_hardlinked_identity_target(tmp_path: Path) ->
         assert peer.read_bytes() == before
     finally:
         peer.unlink()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX runtime-home permissions")
+def test_init_proxy_non_custody_creates_missing_runtime_home_0700(tmp_path: Path) -> None:
+    home = tmp_path / "avp-home"
+    assert not home.exists()
+    result = init_proxy(
+        home=home,
+        agent_name="proxy",
+        policy_pack="github",
+        passphrase=TEST_PASSPHRASE,
+    )
+    assert result.identity_path.is_file()
+    assert stat.S_IMODE(home.stat().st_mode) == 0o700
+    assert stat.S_IMODE((home / "agents").stat().st_mode) == 0o700
+    assert stat.S_IMODE((home / "mcp-proxy").stat().st_mode) == 0o700
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX runtime-home permissions")
+def test_init_proxy_non_custody_accepts_existing_owner_controlled_0755_runtime_home(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "avp-home"
+    home.mkdir(mode=0o755)
+    result = init_proxy(
+        home=home,
+        agent_name="proxy",
+        policy_pack="github",
+        passphrase=TEST_PASSPHRASE,
+    )
+    assert result.identity_path.is_file()
+    assert stat.S_IMODE(home.stat().st_mode) == 0o755
+    assert (home / "agents" / "proxy.json").is_file()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink custody")
+def test_init_proxy_rejects_symlinked_custom_runtime_home_without_target_writes(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    external = tmp_path / "external-runtime"
+    external.mkdir(mode=0o700)
+    marker = external / "must-stay-empty.txt"
+    marker.write_bytes(b"keep\n")
+    home = project / "custom-runtime-home"
+    os.symlink(external, home, target_is_directory=True)
+    with pytest.raises(
+        ProxyCliError,
+        match=proxy_cli._PROJECT_LOCAL_RUNTIME_HOME_NOT_ACCEPTABLE,
+    ):
+        init_proxy(
+            home=home,
+            agent_name="proxy",
+            policy_pack="github",
+            passphrase=TEST_PASSPHRASE,
+        )
+    assert marker.read_bytes() == b"keep\n"
+    assert not (external / "agents").exists()
+    assert not (external / "mcp-proxy").exists()
+    assert not (project / "custom-runtime-home" / "agents").exists()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink custody")

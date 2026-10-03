@@ -777,6 +777,24 @@ def _mkdir_private_at(home_fd: int, name: str) -> None:
         pass
 
 
+def _open_non_custody_runtime_home(home: Path) -> int:
+    """Create or validate a runtime home for non-custody init and return its directory fd."""
+
+    target = Path(home).expanduser()
+    try:
+        entry = os.lstat(target)
+    except FileNotFoundError:
+        _mkdir_private(target)
+    except OSError as exc:
+        raise ProxyCliError(
+            "project-local secret runtime home is unavailable",
+        ) from exc
+    else:
+        if stat.S_ISLNK(entry.st_mode) or not stat.S_ISDIR(entry.st_mode):
+            raise ProxyCliError(_PROJECT_LOCAL_RUNTIME_HOME_NOT_ACCEPTABLE)
+    return _open_owner_controlled_directory_fd(target)
+
+
 def _project_local_relative_path(home: Path, target: Path) -> str:
     """Lexical descriptor-relative name; does not follow symlinks in path choice."""
 
@@ -1504,11 +1522,12 @@ def init_proxy(
     try:
         if project_local_secret_custody:
             _require_project_local_secret_custody_platform()
-            project_root = _selected_project_root_for_home(paths.home)
+            home_lex = Path(os.path.abspath(os.fspath(paths.home.expanduser())))
+            project_root = home_lex.parent
             custody_project_root_fd = _open_owner_controlled_directory_fd(project_root)
             try:
                 custody_home_fd = _open_project_local_runtime_home(
-                    paths.home,
+                    home_lex,
                     project_root_fd=custody_project_root_fd,
                 )
             except Exception:
@@ -1548,8 +1567,15 @@ def init_proxy(
             _mkdir_private_at(custody_home_fd, "agents")
             _mkdir_private_at(custody_home_fd, "mcp-proxy")
         else:
-            _mkdir_private(paths.agents_dir)
-            _mkdir_private(paths.proxy_dir)
+            runtime_home_fd = _open_non_custody_runtime_home(paths.home)
+            try:
+                _mkdir_private_at(runtime_home_fd, "agents")
+                _mkdir_private_at(runtime_home_fd, "mcp-proxy")
+            finally:
+                try:
+                    os.close(runtime_home_fd)
+                except OSError:
+                    pass
 
         if custody_home_fd is not None:
             _assert_project_local_runtime_home_path_matches_fd(paths.home, custody_home_fd)

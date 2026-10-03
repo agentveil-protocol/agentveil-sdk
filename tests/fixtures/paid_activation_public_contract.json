@@ -68,7 +68,7 @@
           {
             "role": "controlled_alternatives_basic",
             "package_name": "agentveil-private-policy-thin",
-            "package_version": "0.1.5"
+            "package_version": "0.1.7"
           }
         ],
         "public_fallback_available": true,

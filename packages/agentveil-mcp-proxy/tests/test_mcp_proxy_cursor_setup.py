@@ -407,10 +407,15 @@ def _mock_successful_setup(monkeypatch, tmp_path):
         (home / "mcp-proxy").mkdir(parents=True, exist_ok=True)
         (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
 
-    def fake_prepare(_workspace, *, force=False):
+    def fake_prepare(_workspace, *, force=False, initialize_product_route=False):
         home = cursor_setup.setup_home(_workspace)
         home.mkdir(parents=True, exist_ok=True)
-        (home / "passphrase").write_text("secret\n", encoding="utf-8")
+        if os.name != "nt":
+            os.chmod(home, 0o700)
+        passphrase = home / "passphrase"
+        passphrase.write_text("secret\n", encoding="utf-8")
+        if os.name != "nt":
+            passphrase.chmod(stat.S_IRUSR | stat.S_IWUSR)
         return home
 
     def fake_ensure_running(**_kwargs):
@@ -721,10 +726,15 @@ def test_cli_setup_cursor_fails_when_center_not_running(tmp_path, monkeypatch, c
         (home / "mcp-proxy").mkdir(parents=True, exist_ok=True)
         (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
 
-    def fake_prepare(_workspace, *, force=False):
+    def fake_prepare(_workspace, *, force=False, initialize_product_route=False):
         home = cursor_setup.setup_home(_workspace)
         home.mkdir(parents=True, exist_ok=True)
-        (home / "passphrase").write_text("secret\n", encoding="utf-8")
+        if os.name != "nt":
+            os.chmod(home, 0o700)
+        passphrase = home / "passphrase"
+        passphrase.write_text("secret\n", encoding="utf-8")
+        if os.name != "nt":
+            passphrase.chmod(stat.S_IRUSR | stat.S_IWUSR)
         return home
 
     def fake_ensure_running(**_kwargs):
@@ -756,10 +766,15 @@ def test_cli_setup_cursor_json_does_not_leak_approval_url(tmp_path, monkeypatch,
         (home / "mcp-proxy").mkdir(parents=True, exist_ok=True)
         (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
 
-    def fake_prepare(_workspace, *, force=False):
+    def fake_prepare(_workspace, *, force=False, initialize_product_route=False):
         home = cursor_setup.setup_home(_workspace)
         home.mkdir(parents=True, exist_ok=True)
-        (home / "passphrase").write_text("secret\n", encoding="utf-8")
+        if os.name != "nt":
+            os.chmod(home, 0o700)
+        passphrase = home / "passphrase"
+        passphrase.write_text("secret\n", encoding="utf-8")
+        if os.name != "nt":
+            passphrase.chmod(stat.S_IRUSR | stat.S_IWUSR)
         return home
 
     def fake_ensure_running(**_kwargs):
@@ -929,10 +944,15 @@ def test_setup_cursor_attempts_console_project_status_sync(tmp_path, monkeypatch
         (home / "mcp-proxy").mkdir(parents=True, exist_ok=True)
         (home / "mcp-proxy" / "config.json").write_text("{}", encoding="utf-8")
 
-    def fake_prepare(_workspace, *, force=False):
+    def fake_prepare(_workspace, *, force=False, initialize_product_route=False):
         home = cursor_setup.setup_home(_workspace)
         home.mkdir(parents=True, exist_ok=True)
-        (home / "passphrase").write_text("secret\n", encoding="utf-8")
+        if os.name != "nt":
+            os.chmod(home, 0o700)
+        passphrase = home / "passphrase"
+        passphrase.write_text("secret\n", encoding="utf-8")
+        if os.name != "nt":
+            passphrase.chmod(stat.S_IRUSR | stat.S_IWUSR)
         return home
 
     def fake_ensure_running(**_kwargs):

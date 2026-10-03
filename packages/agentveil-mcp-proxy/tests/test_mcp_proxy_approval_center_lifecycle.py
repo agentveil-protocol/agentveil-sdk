@@ -522,6 +522,7 @@ def test_prepare_stale_replaces_before_new_start(managed_project_home, monkeypat
     assert center2.state == "running"
     assert center2.pid is not None
     assert center2.pid != pid
+    tracker.track(home, center2.pid)
 
 
 def test_launch_stop_uses_managed_center_stop(managed_project_home):
