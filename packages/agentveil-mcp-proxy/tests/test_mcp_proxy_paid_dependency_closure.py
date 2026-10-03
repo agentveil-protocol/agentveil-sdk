@@ -15,6 +15,11 @@ from pathlib import Path
 import pytest
 from packaging.version import Version
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
+    import tomli as tomllib
+
 from agentveil_mcp_proxy.paid_install import (
     COMPOSED_THIN_ARTIFACT_ID,
     COMPOSED_THIN_PACKAGE_VERSION,
@@ -29,7 +34,7 @@ CANONICAL_CONTRACT_PATH = (
     / "installed_provider_activation_handoff_v1.json"
 )
 SDK_VERSION = "0.7.23"
-PROXY_VERSION = "0.7.49"
+PROXY_VERSION = "0.7.50"
 BASE_PACKAGE_NAME = "agentveil-private-guardrails-base"
 BASE_PACKAGE_VERSION = "0.1.0"
 THIN_PACKAGE_NAME = "agentveil-private-policy-thin"
@@ -725,6 +730,13 @@ def test_clean_python312_install_resolves_crypto_dependencies_and_runs_handoff(
         assert RAW_LICENSE_KEY not in proc.stderr
     finally:
         shutil.rmtree(work_root, ignore_errors=True)
+
+
+def test_current_proxy_version_is_release_candidate():
+    with (MCP_PROXY_ROOT / "pyproject.toml").open("rb") as handle:
+        pyproject = tomllib.load(handle)
+    assert pyproject["project"]["version"] == PROXY_VERSION
+    assert PROXY_VERSION == "0.7.50"
 
 
 def test_missing_cryptography_fails_closed_without_active_state(built_public_wheels):

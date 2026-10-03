@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
+import subprocess
+import sys
+import zipfile
 from pathlib import Path
 
 try:
@@ -11,6 +15,8 @@ except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[3]
+CURRENT_PROXY_VERSION = "0.7.50"
 
 
 def _release_acceptance_module():
@@ -71,7 +77,7 @@ def test_proxy_package_depends_on_public_sdk():
         pyproject = tomllib.load(f)
 
     dependencies = pyproject["project"].get("dependencies", [])
-    assert pyproject["project"]["version"] == "0.7.49"
+    assert pyproject["project"]["version"] == CURRENT_PROXY_VERSION
     assert "agentveil>=0.7.23,<0.8" in dependencies
     assert "cryptography>=42.0.0" in dependencies
     assert "mcp>=1.0.0,<2" in dependencies
@@ -121,3 +127,87 @@ def test_installed_wheel_acceptance_runners_default_to_build_role():
 
         assert args.role == "build"
         assert "build" in module.ACCEPTANCE_ROLE_CHOICES
+
+
+def test_mcp_proxy_package_metadata():
+    with (PACKAGE_ROOT / "pyproject.toml").open("rb") as f:
+        pyproject = tomllib.load(f)
+
+    project = pyproject["project"]
+    assert project["name"] == "agentveil-mcp-proxy"
+    assert project["version"] == CURRENT_PROXY_VERSION
+    assert "agentveil>=0.7.23,<0.8" in project.get("dependencies", [])
+
+
+def test_built_proxy_wheel_uses_current_version(tmp_path):
+    out_dir = tmp_path / "dist"
+    out_dir.mkdir()
+    subprocess.run(
+        [sys.executable, "-m", "build", "--wheel", "--outdir", str(out_dir), str(PACKAGE_ROOT)],
+        check=True,
+    )
+    wheels = sorted(out_dir.glob("agentveil_mcp_proxy-*.whl"))
+    assert len(wheels) == 1
+    wheel = wheels[0]
+    assert wheel.name == f"agentveil_mcp_proxy-{CURRENT_PROXY_VERSION}-py3-none-any.whl"
+
+    with zipfile.ZipFile(wheel) as archive:
+        metadata_name = next(name for name in archive.namelist() if name.endswith("/METADATA"))
+        metadata = archive.read(metadata_name).decode()
+
+    assert re.search(r"^Name: agentveil-mcp-proxy\s*$", metadata, re.MULTILINE)
+    assert re.search(rf"^Version: {CURRENT_PROXY_VERSION}\s*$", metadata, re.MULTILINE)
+
+
+def _unreleased_changelog_section(changelog_text: str) -> str:
+    match = re.search(r"^## \[Unreleased\]\s*\n(.*?)(?=^## \[|\Z)", changelog_text, re.MULTILINE | re.DOTALL)
+    assert match is not None, "CHANGELOG.md must contain an [Unreleased] section"
+    return match.group(1)
+
+
+def test_changelog_describes_0_7_50_as_unpublished_candidate():
+    changelog = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    unreleased = _unreleased_changelog_section(changelog)
+    lowered = unreleased.lower()
+    assert "0.7.50" in unreleased
+    assert "candidate" in lowered or "unpublished" in lowered
+
+    assert "metadata" in lowered or "identity" in lowered
+    assert "w-08" in lowered
+    assert "runtime" in lowered or "source" in lowered
+    assert "accepted" in lowered
+
+    for product_marker in (
+        "connect",
+        "package",
+        "credential",
+        "passphrase",
+        "prepare/apply",
+        "safe-action",  # claim-check: allow product feature marker, not a broad safety claim.
+        "console",
+        "project history",
+        "phase correlation",
+    ):
+        assert product_marker in lowered, f"missing W-08 product scope marker: {product_marker}"
+
+    for negative_marker in (
+        "unpublished",
+        "not tagged",
+        "not pushed",
+        "not published",
+        "not deployed",
+        "not yet",
+        "w-09",
+    ):
+        assert negative_marker in lowered, f"missing explicit non-release marker: {negative_marker}"
+    assert "pass" in lowered
+    assert re.search(r"not yet[^.\n]*release", lowered) is not None
+
+    forbidden_release_claims = (
+        "pypi release: `agentveil-mcp-proxy 0.7.50`",
+        "published to pypi as `agentveil-mcp-proxy 0.7.50`",
+        "deployed `agentveil-mcp-proxy 0.7.50`",
+        "released `agentveil-mcp-proxy 0.7.50` to pypi",
+    )
+    for claim in forbidden_release_claims:
+        assert claim not in lowered

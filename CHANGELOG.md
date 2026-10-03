@@ -8,6 +8,19 @@ All notable changes to the `agentveil` SDK.
 - Clarified the public version source of truth across README, changelog, and
   roadmap surfaces.
 
+### MCP Proxy package
+- Changelog and package-identity slice only: this entry does not change MCP Proxy
+  runtime source. The unpublished `agentveil-mcp-proxy 0.7.50` candidate wheel
+  already carries the accepted W-08 public runtime source line.
+- Bounded W-08 product content in that candidate: automatic project
+  connect/package alignment; local credential and passphrase custody hardening;
+  protected-write prepare/apply plus safe-action fixes; bounded Console <!-- claim-check: allow safe-action is the product feature name, not a universal safety claim. -->
+  event/proof truth, project history, and prepare/apply phase correlation.
+- Explicit non-release state: unpublished, not tagged, not pushed, not published,
+  not deployed, and not yet release, W-08, or W-09 PASS.
+- Package metadata in this slice: core `agentveil` remains `0.7.23` with
+  unchanged runtime dependencies.
+
 ## [0.7.44-mcp-proxy] - 2026-08-10
 
 Current public MCP Proxy package marker.
