@@ -792,11 +792,11 @@ def test_paid_activate_install_uses_composed_artifact_sequence(tmp_path, mock_pa
     assert code == 0, err
     assert _MockPaidBackendHandler.state.authorize_artifact_ids == [
         "art_pkg_private_guardrails_base_001",
-        "art_pkg_ca_basic_006",
+        "art_pkg_ca_basic_008",
     ]
     assert COMPOSED_BASE_ARTIFACT_ID == "art_pkg_private_guardrails_base_001"
-    assert COMPOSED_THIN_ARTIFACT_ID == "art_pkg_ca_basic_006"
-    assert COMPOSED_THIN_PACKAGE_VERSION == "0.1.6"
+    assert COMPOSED_THIN_ARTIFACT_ID == "art_pkg_ca_basic_008"
+    assert COMPOSED_THIN_PACKAGE_VERSION == "0.1.7"
     assert _MockPaidBackendHandler.state.entitlement_call_count == 1
     assert _MockPaidBackendHandler.state.safety_call_count == 1
     assert _MockPaidBackendHandler.state.authorize_call_count == 2
@@ -2244,26 +2244,31 @@ def test_load_install_state_reads_predecessor_composed_thin_version(tmp_path):
     home = tmp_path / "avp-home"
     install_path = install_state_path(home)
     install_path.parent.mkdir(parents=True, exist_ok=True)
-    install_path.write_text(
-        json.dumps(_composed_split_install_payload(thin_version=COMPOSED_THIN_PACKAGE_VERSION_PREDECESSOR)),
-        encoding="utf-8",
-    )
-    loaded = load_install_state(install_path)
-    assert loaded is not None
-    thin_entry = next(
-        entry for entry in loaded["install_components"] if entry["role"] == COMPONENT_ROLE_THIN
-    )
-    assert thin_entry["package_version"] == COMPOSED_THIN_PACKAGE_VERSION_PREDECESSOR
+    for thin_version in ("0.1.5", COMPOSED_THIN_PACKAGE_VERSION_PREDECESSOR):
+        payload_bytes = json.dumps(
+            _composed_split_install_payload(thin_version=thin_version),
+            sort_keys=True,
+        ).encode("utf-8")
+        install_path.write_bytes(payload_bytes)
+        prior_bytes = install_path.read_bytes()
+        loaded = load_install_state(install_path)
+        assert loaded is not None
+        thin_entry = next(
+            entry for entry in loaded["install_components"] if entry["role"] == COMPONENT_ROLE_THIN
+        )
+        assert thin_entry["package_version"] == thin_version
+        assert install_path.read_bytes() == prior_bytes
 
 
 def test_write_install_state_rejects_unknown_composed_thin_version(tmp_path):
     home = tmp_path / "avp-home"
     install_path = install_state_path(home)
-    with pytest.raises(PaidInstallError, match=ERROR_VERSION_MISMATCH):
-        write_install_state(
-            install_path,
-            _composed_split_install_payload(thin_version="0.1.4"),
-        )
+    for thin_version in ("0.1.4", COMPOSED_THIN_PACKAGE_VERSION_PREDECESSOR, "0.1.5"):
+        with pytest.raises(PaidInstallError, match=ERROR_VERSION_MISMATCH):
+            write_install_state(
+                install_path,
+                _composed_split_install_payload(thin_version=thin_version),
+            )
 
 
 def test_repeated_composed_install_leaves_no_staging_residue(tmp_path, mock_paid_backend, monkeypatch):

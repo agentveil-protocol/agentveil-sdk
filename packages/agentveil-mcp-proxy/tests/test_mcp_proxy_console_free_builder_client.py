@@ -1919,6 +1919,8 @@ def test_upgrade_rejects_already_composed_install(tmp_path, monkeypatch):
 
 def test_upgrade_composed_pair_preview_allows_exact_newer_thin(tmp_path, monkeypatch):
     home = _seed_composed_active_pair_install(tmp_path, monkeypatch)
+    assert COMPOSED_THIN_PACKAGE_VERSION_PREDECESSOR == "0.1.6"
+    assert COMPOSED_THIN_PACKAGE_VERSION == "0.1.7"
     prior_install_bytes = install_state_path(home).read_bytes()
     base_bytes, base_hash = _build_base_wheel(tmp_path / "upgrade-base")
     thin_bytes, thin_hash = _build_thin_wheel_for_version(
@@ -1962,6 +1964,8 @@ def test_upgrade_composed_pair_apply_replaces_only_thin_with_newer_server_target
         f"{PACKAGE_NAME}-{COMPOSED_THIN_PACKAGE_VERSION_PREDECESSOR}"
     )
     assert prior_thin_vendor.is_dir()
+    assert COMPOSED_THIN_PACKAGE_VERSION_PREDECESSOR == "0.1.6"
+    assert COMPOSED_THIN_PACKAGE_VERSION == "0.1.7"
 
     base_bytes, base_hash = _build_base_wheel(tmp_path / "upgrade-base")
     thin_bytes, thin_hash = _build_thin_wheel_for_version(
