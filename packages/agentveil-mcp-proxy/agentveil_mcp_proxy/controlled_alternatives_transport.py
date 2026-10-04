@@ -63,6 +63,8 @@ _REGISTER_KEYS = frozenset({
     "catalog_digest",
     "declared_executor_capabilities",
 })
+_REGISTER_KEYS_V2 = _REGISTER_KEYS | {"client_installation_ref"}
+_CLIENT_INSTALLATION_REF = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _EVALUATE_KEYS = frozenset({
     "schema_version",
     "runtime_installation_id",
@@ -80,6 +82,81 @@ _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _AV02_SHORT_TOKEN = re.compile(r"^[a-zA-Z0-9._-]{1,64}$")
 _BINDING = re.compile(r"[A-Za-z0-9._~-]{20,128}\Z")
 _MAX_RESPONSE = 16384
+_BOUND_RUNTIME_SESSION: dict[str, str] = {}
+
+
+def reset_bound_runtime_session_for_tests() -> None:
+    """Clear in-process runtime id cache (tests only)."""
+
+    _BOUND_RUNTIME_SESSION.clear()
+
+
+def validate_bounded_runtime_installation_id(value: str) -> bool:
+    return bool(isinstance(value, str) and _UUID.fullmatch(value))
+
+
+def validate_bounded_summary_credential_token(value: str) -> bool:
+    return bool(isinstance(value, str) and _CONSOLE_CREDENTIAL.fullmatch(value))
+
+
+def validate_bounded_runtime_binding_token(value: str) -> bool:
+    return bool(isinstance(value, str) and _BINDING.fullmatch(value))
+
+
+def runtime_binding_token_fingerprint(binding_token: str) -> str:
+    if not validate_bounded_runtime_binding_token(binding_token):
+        raise ValueError("binding_token_invalid")
+    return hashlib.sha256(binding_token.encode("utf-8")).hexdigest()
+
+
+def av02_upload_authority_fingerprint(
+    *,
+    summary_fingerprint: str,
+    binding_fingerprint: str,
+) -> str:
+    if (
+        not isinstance(summary_fingerprint, str)
+        or len(summary_fingerprint) != 64
+        or not isinstance(binding_fingerprint, str)
+        or len(binding_fingerprint) != 64
+    ):
+        raise ValueError("fingerprint_invalid")
+    canonical = {
+        "schema_version": "av02-upload-authority/1",
+        "summary_fingerprint": summary_fingerprint,
+        "binding_fingerprint": binding_fingerprint,
+    }
+    blob = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def _bound_runtime_session_key(
+    state_root: Path | str,
+    *,
+    client_installation_ref: str,
+    upload_authority_fingerprint: str,
+) -> str:
+    fingerprint = av02_registration_fingerprint(
+        client_installation_ref=client_installation_ref,
+    )
+    return f"{Path(state_root)}|{fingerprint}|{upload_authority_fingerprint}"
+
+
+def remember_bound_runtime_installation_id(
+    state_root: Path | str,
+    runtime_installation_id: str,
+    *,
+    client_installation_ref: str,
+    upload_authority_fingerprint: str,
+) -> None:
+    if not validate_bounded_runtime_installation_id(runtime_installation_id):
+        return
+    key = _bound_runtime_session_key(
+        state_root,
+        client_installation_ref=client_installation_ref,
+        upload_authority_fingerprint=upload_authority_fingerprint,
+    )
+    _BOUND_RUNTIME_SESSION[key] = runtime_installation_id
 _REQUEST_DEADLINE_SECONDS = 5.0
 _MAX_WORKER_INPUT = 8192
 
@@ -199,6 +276,18 @@ class ControlledAlternativeRuntimeContext:
         default=None,
         repr=False,
     )
+    pinned_summary_fingerprint: str | None = field(default=None, repr=False)
+
+
+def controlled_runtime_upload_authority_stale(
+    runtime_context: ControlledAlternativeRuntimeContext,
+    *,
+    live_summary_fingerprint: str,
+) -> bool:
+    pinned = getattr(runtime_context, "pinned_summary_fingerprint", None)
+    if pinned is None:
+        return False
+    return live_summary_fingerprint != pinned
 
 
 def bind_installed_runtime_context(instance: Any, context: Any) -> Any:
@@ -214,19 +303,9 @@ def bind_installed_runtime_context(instance: Any, context: Any) -> Any:
     return bind(context) if callable(bind) else instance
 
 
-def _validate_register_payload(payload: Mapping[str, Any]) -> dict[str, Any] | None:
-    if set(payload) != _REGISTER_KEYS:
-        return None
-    if payload.get("schema_version") != "runtime/register/1":
-        return None
-    for key in ("runtime_version", "contract_range"):
-        value = payload.get(key)
-        if not isinstance(value, str) or not _AV02_SHORT_TOKEN.fullmatch(value):
-            return None
-    digest = payload.get("catalog_digest")
-    if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
-        return None
-    capabilities = payload.get("declared_executor_capabilities")
+def _normalize_register_capabilities(
+    capabilities: object,
+) -> list[str] | None:
     if not isinstance(capabilities, list) or not capabilities:
         return None
     seen: set[str] = set()
@@ -238,6 +317,24 @@ def _validate_register_payload(payload: Mapping[str, Any]) -> dict[str, Any] | N
             return None
         seen.add(item)
         cleaned.append(item)
+    return cleaned
+
+
+def _validate_register_v1_payload(payload: Mapping[str, Any]) -> dict[str, Any] | None:
+    if set(payload) != _REGISTER_KEYS:
+        return None
+    if payload.get("schema_version") != "runtime/register/1":
+        return None
+    for key in ("runtime_version", "contract_range"):
+        value = payload.get(key)
+        if not isinstance(value, str) or not _AV02_SHORT_TOKEN.fullmatch(value):
+            return None
+    digest = payload.get("catalog_digest")
+    if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
+        return None
+    cleaned = _normalize_register_capabilities(payload.get("declared_executor_capabilities"))
+    if cleaned is None:
+        return None
     return {
         "schema_version": "runtime/register/1",
         "runtime_version": payload["runtime_version"],
@@ -245,6 +342,55 @@ def _validate_register_payload(payload: Mapping[str, Any]) -> dict[str, Any] | N
         "catalog_digest": payload["catalog_digest"],
         "declared_executor_capabilities": cleaned,
     }
+
+
+def _validate_register_v2_payload(payload: Mapping[str, Any]) -> dict[str, Any] | None:
+    if set(payload) != _REGISTER_KEYS_V2:
+        return None
+    if payload.get("schema_version") != "runtime/register/2":
+        return None
+    for key in ("runtime_version", "contract_range"):
+        value = payload.get(key)
+        if not isinstance(value, str) or not _AV02_SHORT_TOKEN.fullmatch(value):
+            return None
+    digest = payload.get("catalog_digest")
+    if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
+        return None
+    client_ref = payload.get("client_installation_ref")
+    if not isinstance(client_ref, str) or not _CLIENT_INSTALLATION_REF.fullmatch(client_ref):
+        return None
+    cleaned = _normalize_register_capabilities(payload.get("declared_executor_capabilities"))
+    if cleaned is None:
+        return None
+    return {
+        "schema_version": "runtime/register/2",
+        "runtime_version": payload["runtime_version"],
+        "contract_range": payload["contract_range"],
+        "catalog_digest": payload["catalog_digest"],
+        "declared_executor_capabilities": cleaned,
+        "client_installation_ref": client_ref,
+    }
+
+
+def _validate_register_payload(payload: Mapping[str, Any]) -> dict[str, Any] | None:
+    version = payload.get("schema_version")
+    if version == "runtime/register/1":
+        return _validate_register_v1_payload(payload)
+    if version == "runtime/register/2":
+        return _validate_register_v2_payload(payload)
+    return None
+
+
+def _upgrade_register_v1_to_v2(
+    payload: Mapping[str, Any],
+    client_installation_ref: str,
+) -> dict[str, Any] | None:
+    if not _CLIENT_INSTALLATION_REF.fullmatch(client_installation_ref):
+        return None
+    upgraded = dict(payload)
+    upgraded["schema_version"] = "runtime/register/2"
+    upgraded["client_installation_ref"] = client_installation_ref
+    return _validate_register_v2_payload(upgraded)
 
 
 def _validate_policy_context(value: object) -> dict[str, Any] | None:
@@ -376,18 +522,39 @@ _AV02_DECLARED_EXECUTOR_CAPABILITIES = (
 )
 
 
-def _av02_registration_fingerprint() -> str:
-    canonical = {
+def av02_registration_fingerprint(*, client_installation_ref: str | None = None) -> str:
+    canonical: dict[str, object] = {
         "runtime_version": "1.0.0",
         "contract_range": "av02.v1",
         "catalog_digest": "aa" * 32,
         "declared_executor_capabilities": list(_AV02_DECLARED_EXECUTOR_CAPABILITIES),
     }
+    if client_installation_ref is not None:
+        canonical["client_installation_ref"] = client_installation_ref
     blob = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()
 
 
-def _coerce_av02_runtime_state(raw: object) -> str | None:
+def _av02_registration_fingerprint() -> str:
+    return av02_registration_fingerprint()
+
+
+def common_av02_register_payload_v1() -> dict[str, Any]:
+    return {
+        "schema_version": "runtime/register/1",
+        "runtime_version": "1.0.0",
+        "contract_range": "av02.v1",
+        "catalog_digest": "aa" * 32,
+        "declared_executor_capabilities": list(_AV02_DECLARED_EXECUTOR_CAPABILITIES),
+    }
+
+
+def _coerce_av02_runtime_state(
+    raw: object,
+    *,
+    expected_fingerprint: str,
+    expected_upload_authority_fingerprint: str | None = None,
+) -> str | None:
     if not isinstance(raw, dict):
         return None
     if raw.get("schema_version") != _AV02_RUNTIME_STATE_SCHEMA:
@@ -398,12 +565,25 @@ def _coerce_av02_runtime_state(raw: object) -> str | None:
         return None
     if not isinstance(fingerprint, str) or len(fingerprint) != 64:
         return None
-    if fingerprint != _av02_registration_fingerprint():
+    if fingerprint != expected_fingerprint:
         return None
+    if expected_upload_authority_fingerprint is not None:
+        upload_auth = raw.get("upload_authority_fingerprint")
+        if (
+            not isinstance(upload_auth, str)
+            or len(upload_auth) != 64
+            or upload_auth != expected_upload_authority_fingerprint
+        ):
+            return None
     return runtime_id
 
 
-def read_cached_av02_runtime_installation_id(state_root: Path) -> str | None:
+def read_cached_av02_runtime_installation_id(
+    state_root: Path,
+    *,
+    client_installation_ref: str | None = None,
+    upload_authority_fingerprint: str | None = None,
+) -> str | None:
     """Recover a validated thin opaque runtime id from the scoped state root only."""
 
     directory = state_root / _AV02_STATE_REL
@@ -446,7 +626,129 @@ def read_cached_av02_runtime_installation_id(state_root: Path) -> str | None:
         parsed = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError, TypeError):
         return None
-    return _coerce_av02_runtime_state(parsed)
+    expected = av02_registration_fingerprint(
+        client_installation_ref=client_installation_ref,
+    )
+    return _coerce_av02_runtime_state(
+        parsed,
+        expected_fingerprint=expected,
+        expected_upload_authority_fingerprint=upload_authority_fingerprint,
+    )
+
+
+def write_cached_av02_runtime_installation_id(
+    state_root: Path,
+    runtime_installation_id: str,
+    *,
+    client_installation_ref: str | None = None,
+    upload_authority_fingerprint: str | None = None,
+) -> None:
+    """Persist one validated AV-02 runtime id under the scoped state root only."""
+
+    if not _UUID.fullmatch(runtime_installation_id):
+        raise ValueError("runtime_installation_id_invalid")
+    from agentveil_mcp_proxy.control_artifacts import (
+        ControlArtifactError,
+        ensure_control_directory,
+        write_atomic_control_file,
+    )
+
+    directory = Path(state_root) / _AV02_STATE_REL
+    ensure_control_directory(directory)
+    payload: dict[str, str] = {
+        "schema_version": _AV02_RUNTIME_STATE_SCHEMA,
+        "runtime_installation_id": runtime_installation_id,
+        "registration_fingerprint": av02_registration_fingerprint(
+            client_installation_ref=client_installation_ref,
+        ),
+    }
+    if upload_authority_fingerprint is not None:
+        if len(upload_authority_fingerprint) != 64:
+            raise ValueError("upload_authority_fingerprint_invalid")
+        payload["upload_authority_fingerprint"] = upload_authority_fingerprint
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > _AV02_STATE_MAX_BYTES:
+        raise ControlArtifactError("control_artifact_write_failed")
+    try:
+        write_atomic_control_file(directory / _AV02_STATE_FILENAME, encoded)
+    except ControlArtifactError:
+        raise
+    except OSError as exc:
+        raise ControlArtifactError("control_artifact_write_failed") from exc
+
+
+def ensure_project_bound_runtime_registered(
+    runtime_context: ControlledAlternativeRuntimeContext,
+    *,
+    client_installation_ref: str,
+    upload_authority_fingerprint: str,
+    live_summary_fingerprint: str,
+    register_payload: Mapping[str, Any] | None = None,
+) -> str | None:
+    """Resolve a bounded runtime id from session, cache, or one register attempt."""
+
+    register = runtime_context.runtime_register
+    if register is None:
+        return None
+    if not _CLIENT_INSTALLATION_REF.fullmatch(client_installation_ref):
+        return None
+    if len(upload_authority_fingerprint) != 64:
+        return None
+    if controlled_runtime_upload_authority_stale(
+        runtime_context,
+        live_summary_fingerprint=live_summary_fingerprint,
+    ):
+        return None
+    state_root = Path(runtime_context.state_root)
+    session_key = _bound_runtime_session_key(
+        state_root,
+        client_installation_ref=client_installation_ref,
+        upload_authority_fingerprint=upload_authority_fingerprint,
+    )
+    session_cached = _BOUND_RUNTIME_SESSION.get(session_key)
+    if (
+        isinstance(session_cached, str)
+        and validate_bounded_runtime_installation_id(session_cached)
+    ):
+        return session_cached
+    disk_cached = read_cached_av02_runtime_installation_id(
+        state_root,
+        client_installation_ref=client_installation_ref,
+        upload_authority_fingerprint=upload_authority_fingerprint,
+    )
+    if disk_cached is not None:
+        remember_bound_runtime_installation_id(
+            state_root,
+            disk_cached,
+            client_installation_ref=client_installation_ref,
+            upload_authority_fingerprint=upload_authority_fingerprint,
+        )
+        return disk_cached
+    payload = dict(register_payload or common_av02_register_payload_v1())
+    status, response = register(payload)
+    if status != 200 or not isinstance(response, Mapping):
+        return None
+    runtime_id = response.get("runtime_installation_id")
+    if not isinstance(runtime_id, str) or not validate_bounded_runtime_installation_id(
+        runtime_id
+    ):
+        return None
+    remember_bound_runtime_installation_id(
+        state_root,
+        runtime_id,
+        client_installation_ref=client_installation_ref,
+        upload_authority_fingerprint=upload_authority_fingerprint,
+    )
+    try:
+        write_cached_av02_runtime_installation_id(
+            state_root,
+            runtime_id,
+            client_installation_ref=client_installation_ref,
+            upload_authority_fingerprint=upload_authority_fingerprint,
+        )
+    except Exception:
+        pass
+    return runtime_id
 
 
 def build_controlled_alternative_context(
@@ -659,7 +961,10 @@ def build_controlled_alternative_context(
             agent_did=did,
         )
     runtime_installation_id: dict[str, str | None] = {
-        "value": read_cached_av02_runtime_installation_id(effective_state_root),
+        "value": read_cached_av02_runtime_installation_id(
+            effective_state_root,
+            client_installation_ref=client_installation_ref,
+        ),
     }
 
     def _sync_live_scoped_custody() -> bool:
@@ -722,11 +1027,62 @@ def build_controlled_alternative_context(
             return 503, {}
 
     def runtime_register(payload: Mapping[str, Any]) -> tuple[int, Mapping[str, Any]]:
-        status, response = _av02_exchange("register", payload)
+        normalized_v1 = _validate_register_v1_payload(payload)
+        if normalized_v1 is None:
+            return 400, {}
+        outbound: dict[str, Any] = normalized_v1
+        fingerprint_ref: str | None = None
+        if (
+            client_installation_ref is not None
+            and binding_resolution["scoped"] is True
+            and _sync_live_scoped_custody()
+            and _binding_token() is not None
+        ):
+            upgraded = _upgrade_register_v1_to_v2(
+                normalized_v1,
+                client_installation_ref,
+            )
+            if upgraded is None:
+                return 400, {}
+            outbound = upgraded
+            fingerprint_ref = client_installation_ref
+        status, response = _av02_exchange("register", outbound)
         if status == 200 and isinstance(response, Mapping):
             runtime_id = response.get("runtime_installation_id")
             if isinstance(runtime_id, str) and _UUID.fullmatch(runtime_id):
                 runtime_installation_id["value"] = runtime_id
+                upload_auth: str | None = None
+                binding = _binding_token()
+                if (
+                    fingerprint_ref is not None
+                    and binding is not None
+                    and pinned_summary_fingerprint is not None
+                ):
+                    try:
+                        upload_auth = av02_upload_authority_fingerprint(
+                            summary_fingerprint=pinned_summary_fingerprint,
+                            binding_fingerprint=runtime_binding_token_fingerprint(
+                                binding,
+                            ),
+                        )
+                    except ValueError:
+                        upload_auth = None
+                if fingerprint_ref is not None and upload_auth is not None:
+                    remember_bound_runtime_installation_id(
+                        effective_state_root,
+                        runtime_id,
+                        client_installation_ref=fingerprint_ref,
+                        upload_authority_fingerprint=upload_auth,
+                    )
+                try:
+                    write_cached_av02_runtime_installation_id(
+                        Path(effective_state_root),
+                        runtime_id,
+                        client_installation_ref=fingerprint_ref,
+                        upload_authority_fingerprint=upload_auth,
+                    )
+                except Exception:
+                    pass
         return status, response
 
     def policy_evaluate(payload: Mapping[str, Any]) -> tuple[int, Mapping[str, Any]]:
@@ -852,6 +1208,7 @@ def build_controlled_alternative_context(
             runtime_register=runtime_register,
             policy_evaluate=policy_evaluate,
             resolve_decision_verification_key=resolve_decision_verification_key,
+            pinned_summary_fingerprint=pinned_summary_fingerprint,
         )
     return ControlledAlternativeRuntimeContext(
         request=request,

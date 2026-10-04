@@ -2168,3 +2168,444 @@ def test_phase_correlation_summary_never_exposes_prepared_artifact_reference():
     assert "prepared_artifact_ref" not in encoded
     assert "prepared_artifact_hash" not in encoded
     assert body["bounded_phase_correlation_id"] == phase_id
+
+
+RUNTIME_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+SUMMARY_TOKEN = "bounded-summary-upload-token-001"
+BINDING_TOKEN = "paired-runtime-binding-token-001"
+
+
+def _source_context(**overrides):
+    from agentveil_mcp_proxy.console_decision_summary_client import (
+        SourceAwareSummaryUploadContext,
+    )
+    from nacl.signing import SigningKey
+
+    key = SigningKey.generate()
+    base = {
+        "runtime_installation_id": RUNTIME_ID,
+        "summary_credential": SUMMARY_TOKEN,
+        "runtime_binding_credential": BINDING_TOKEN,
+        "private_key_hex": bytes(key).hex(),
+        "agent_did": "did:key:test-source-upload",
+    }
+    base.update(overrides)
+    return SourceAwareSummaryUploadContext(**base)
+
+
+def test_source_aware_upload_signs_runtime_path_and_preserves_schema_bodies():
+    from agentveil_mcp_proxy.console_decision_summary_client import (
+        sync_source_aware_decision_summary,
+    )
+    from agentveil_mcp_proxy.controlled_alternatives_runtime import (
+        derive_bounded_phase_correlation_id,
+    )
+
+    transport = BackendEchoTransport()
+    phase_id = derive_bounded_phase_correlation_id(PREPARED_ARTIFACT_REF)
+    schemas = [
+        _payload(schema_version="1"),
+        _payload(
+            schema_version="2",
+            controlled_alternative_id="filesystem.stage_delete.v1",
+            controlled_outcome="completed_safely",
+            rollback_available=True,
+            verification_level="mechanism_verified",
+            result_hash=RESULT_HASH,
+            redirected=False,
+        ),
+        _payload(
+            schema_version="3",
+            controlled_alternative_id="protected_write.apply_prepared_patch.v1",
+            controlled_outcome="completed_safely",
+            rollback_available=False,
+            verification_level="mechanism_verified",
+            result_hash=RESULT_HASH,
+            redirected=False,
+            bounded_phase_correlation_id=phase_id,
+        ),
+    ]
+    source = _source_context()
+    for payload in schemas:
+        transport.calls.clear()
+        assert (
+            sync_source_aware_decision_summary(payload, source=source, transport=transport)
+            == "accepted"
+        )
+        assert len(transport.calls) == 1
+        call = transport.calls[0]
+        assert call["url"] == (
+            CONSOLE_ORIGIN + f"/console/decision-summaries/ingest/source/v1/{RUNTIME_ID}"
+        )
+        assert call["headers"]["Authorization"].startswith('AVP-Sig v="2"')
+        assert call["headers"]["X-AgentVeil-Console-Credential"] == SUMMARY_TOKEN
+        assert call["headers"]["X-AVP-CA-Runtime-Binding"] == BINDING_TOKEN
+        assert "Bearer" not in call["headers"]["Authorization"]
+        assert json.loads(call["body"].decode("utf-8")) == payload_to_request_body(payload)
+
+
+def test_source_aware_rejection_never_falls_back_to_legacy_ingest():
+    from agentveil_mcp_proxy.console_decision_summary_client import (
+        sync_source_aware_decision_summary,
+    )
+
+    class RejectSourceTransport:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, method, url, *, headers, body, timeout):
+            self.calls.append(url)
+            return _json_response(403, {"error": "forbidden"}, content_type="application/json")
+
+    transport = RejectSourceTransport()
+    payload = _payload()
+    assert (
+        sync_source_aware_decision_summary(payload, source=_source_context(), transport=transport)
+        == "unavailable"
+    )
+    assert len(transport.calls) == 1
+    assert transport.calls[0].endswith(f"/ingest/source/v1/{RUNTIME_ID}")
+    assert transport.calls[0] != CONSOLE_ORIGIN + "/console/decision-summaries/ingest"
+
+
+def test_missing_source_context_keeps_legacy_bearer_upload_exact():
+    transport = BackendEchoTransport()
+    payload = _payload()
+    assert (
+        sync_decision_summary(
+            payload,
+            home=Path("/unused"),
+            load_credential_fn=_load_credential_ok,
+            transport=transport,
+        )
+        == "accepted"
+    )
+    call = transport.calls[0]
+    assert call["url"] == CONSOLE_ORIGIN + "/console/decision-summaries/ingest"
+    assert call["headers"]["Authorization"] == f"Bearer {TOKEN}"
+    assert json.loads(call["body"].decode("utf-8")) == payload_to_request_body(payload)
+
+
+def test_source_aware_upload_never_logs_or_returns_credentials_or_project_ref(capsys):
+    from agentveil_mcp_proxy.console_decision_summary_client import (
+        SourceAwareSummaryUploadContext,
+        sync_source_aware_decision_summary,
+    )
+
+    project_ref = "cir1." + ("a" * 120)
+    source = _source_context()
+    transport = BackendEchoTransport()
+    outcome = sync_source_aware_decision_summary(_payload(), source=source, transport=transport)
+    captured = capsys.readouterr()
+    blob = outcome + captured.out + captured.err + repr(source) + str(
+        SourceAwareSummaryUploadContext(
+            runtime_installation_id=RUNTIME_ID,
+            summary_credential=SUMMARY_TOKEN,
+            runtime_binding_credential=BINDING_TOKEN,
+            private_key_hex=source.private_key_hex,
+            agent_did=source.agent_did,
+        )
+    )
+    for forbidden in (
+        SUMMARY_TOKEN,
+        BINDING_TOKEN,
+        source.private_key_hex,
+        source.agent_did,
+        RUNTIME_ID,
+        project_ref,
+    ):
+        assert forbidden not in blob
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"runtime_installation_id": "not-a-uuid"},
+        {"summary_credential": "short"},
+        {"runtime_binding_credential": "short"},
+        {"private_key_hex": "abcd"},
+        {"agent_did": "did:web:example"},
+    ],
+)
+def test_invalid_source_authority_yields_bounded_failure_without_transport(
+    override,
+):
+    from agentveil_mcp_proxy.console_decision_summary_client import (
+        sync_source_aware_decision_summary,
+    )
+
+    transport = BackendEchoTransport()
+    source = _source_context(**override)
+    assert (
+        sync_source_aware_decision_summary(_payload(), source=source, transport=transport)
+        == "rejected"
+    )
+    assert transport.calls == []
+
+
+def test_run_proxy_source_upload_reloads_custody_each_event(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from agentveil_mcp_proxy.console_credentials import (
+        credential_path,
+        save_credential,
+        save_scoped_runtime_binding_credential,
+    )
+    from agentveil_mcp_proxy.console_decision_summary_client import (
+        build_run_proxy_decision_summary_upload_fn,
+    )
+    from agentveil_mcp_proxy.controlled_alternatives_transport import (
+        reset_bound_runtime_session_for_tests,
+    )
+    from nacl.signing import SigningKey
+
+    reset_bound_runtime_session_for_tests()
+    key = SigningKey.generate()
+    agent = SimpleNamespace(private_key_hex=bytes(key).hex(), did="did:key:test-reload")
+    home = tmp_path / "global"
+    state_root = tmp_path / "runtime"
+    state_root.mkdir()
+    save_credential(SUMMARY_TOKEN, home=home)
+    save_scoped_runtime_binding_credential(
+        BINDING_TOKEN,
+        agent_did=agent.did,
+        summary_token=SUMMARY_TOKEN,
+        home=state_root,
+    )
+    register_calls = {"count": 0}
+
+    def register(_payload):
+        register_calls["count"] += 1
+        return 200, {
+            "schema_version": "runtime/register-response/1",
+            "runtime_installation_id": RUNTIME_ID,
+        }
+
+    runtime_context = SimpleNamespace(
+        runtime_register=register,
+        state_root=str(state_root),
+    )
+    transport = BackendEchoTransport()
+    upload = build_run_proxy_decision_summary_upload_fn(
+        agent=agent,
+        runtime_context=runtime_context,
+        client_installation_ref="cir1.project-ref",
+        home=home,
+        state_root=state_root,
+        transport=transport,
+    )
+    payload = _payload()
+    assert upload(payload) == "accepted"
+    assert register_calls["count"] == 1
+    assert len(transport.calls) == 1
+
+    cred_file = credential_path(home)
+    if cred_file.exists():
+        cred_file.unlink()
+    transport.calls.clear()
+    assert upload(payload) == "unavailable"
+    assert transport.calls == []
+
+    save_credential(SUMMARY_TOKEN, home=home)
+    transport.calls.clear()
+    assert upload(payload) == "accepted"
+    assert register_calls["count"] == 1
+    assert len(transport.calls) == 1
+
+
+def test_run_proxy_source_upload_retries_register_after_transient_failure(tmp_path):
+    from agentveil_mcp_proxy.console_credentials import (
+        save_credential,
+        save_scoped_runtime_binding_credential,
+    )
+    from agentveil_mcp_proxy.console_decision_summary_client import (
+        build_run_proxy_decision_summary_upload_fn,
+    )
+    from agentveil_mcp_proxy.controlled_alternatives_transport import (
+        reset_bound_runtime_session_for_tests,
+    )
+    from nacl.signing import SigningKey
+    from types import SimpleNamespace
+
+    reset_bound_runtime_session_for_tests()
+    key = SigningKey.generate()
+    agent = SimpleNamespace(private_key_hex=bytes(key).hex(), did="did:key:test-retry")
+    home = tmp_path / "global"
+    state_root = tmp_path / "runtime"
+    state_root.mkdir()
+    save_credential(SUMMARY_TOKEN, home=home)
+    save_scoped_runtime_binding_credential(
+        BINDING_TOKEN,
+        agent_did=agent.did,
+        summary_token=SUMMARY_TOKEN,
+        home=state_root,
+    )
+    attempts = {"count": 0}
+
+    def register(_payload):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            return 503, {}
+        return 200, {
+            "schema_version": "runtime/register-response/1",
+            "runtime_installation_id": RUNTIME_ID,
+        }
+
+    runtime_context = SimpleNamespace(
+        runtime_register=register,
+        state_root=str(state_root),
+    )
+    transport = BackendEchoTransport()
+    upload = build_run_proxy_decision_summary_upload_fn(
+        agent=agent,
+        runtime_context=runtime_context,
+        client_installation_ref="cir1.project-ref",
+        home=home,
+        state_root=state_root,
+        transport=transport,
+    )
+    payload = _payload()
+    assert upload(payload) == "unavailable"
+    assert transport.calls == []
+    assert attempts["count"] == 1
+
+    transport.calls.clear()
+    assert upload(payload) == "accepted"
+    assert attempts["count"] == 2
+    assert len(transport.calls) == 1
+
+    transport.calls.clear()
+    assert upload(payload) == "accepted"
+    assert attempts["count"] == 2
+    assert len(transport.calls) == 1
+
+
+def test_run_proxy_source_upload_rejects_summary_rotation_on_stale_context(
+    tmp_path, monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from agentveil_mcp_proxy import controlled_alternatives_transport as ca_transport
+    from agentveil_mcp_proxy.console_credentials import (
+        save_credential,
+        save_scoped_runtime_binding_credential,
+    )
+    from agentveil_mcp_proxy.console_decision_summary_client import (
+        build_run_proxy_decision_summary_upload_fn,
+    )
+    from agentveil_mcp_proxy.console_project_status_client import (
+        build_client_installation_ref,
+    )
+    from agentveil_mcp_proxy.controlled_alternatives_transport import (
+        reset_bound_runtime_session_for_tests,
+    )
+    from nacl.signing import SigningKey
+
+    reset_bound_runtime_session_for_tests()
+    key = SigningKey.generate()
+    agent = SimpleNamespace(private_key_hex=bytes(key).hex(), did="did:key:test-rotate")
+    state_root = tmp_path
+    home = tmp_path
+    project = tmp_path / "project"
+    project.mkdir()
+    save_credential(SUMMARY_TOKEN, home=home)
+    save_scoped_runtime_binding_credential(
+        BINDING_TOKEN,
+        agent_did=agent.did,
+        summary_token=SUMMARY_TOKEN,
+        home=state_root,
+    )
+    register_calls = {"count": 0}
+
+    def exchange(_url, _headers, body, method="POST"):
+        register_calls["count"] += 1
+        return 200, {
+            "schema_version": "runtime/register-response/1",
+            "runtime_installation_id": RUNTIME_ID,
+        }
+
+    monkeypatch.setattr(ca_transport, "_run_bounded_exchange", exchange)
+    runtime_context = ca_transport.build_controlled_alternative_context(
+        agent=agent,
+        base_url="https://agentveil.dev",
+        state_root=state_root,
+        summary_token=SUMMARY_TOKEN,
+        canonical_project_root=project,
+    )
+    assert runtime_context is not None
+    project_ref = build_client_installation_ref(
+        canonical_project_root=project,
+        agent_did=agent.did,
+    )
+    assert project_ref is not None
+    transport = BackendEchoTransport()
+    upload = build_run_proxy_decision_summary_upload_fn(
+        agent=agent,
+        runtime_context=runtime_context,
+        client_installation_ref=project_ref,
+        home=home,
+        state_root=state_root,
+        transport=transport,
+    )
+    payload = _payload()
+    assert upload(payload) == "accepted"
+    assert register_calls["count"] == 1
+    assert len(transport.calls) == 1
+
+    summary_token_b = "bounded-summary-upload-token-b0123456789ab"
+    binding_token_b = "issued-runtime-binding-token-b0123456789ab"
+    save_credential(summary_token_b, home=home)
+    save_scoped_runtime_binding_credential(
+        binding_token_b,
+        agent_did=agent.did,
+        summary_token=summary_token_b,
+        home=state_root,
+    )
+    transport.calls.clear()
+    assert upload(payload) == "unavailable"
+    assert transport.calls == []
+    assert register_calls["count"] == 1
+
+    runtime_context_b = ca_transport.build_controlled_alternative_context(
+        agent=agent,
+        base_url="https://agentveil.dev",
+        state_root=state_root,
+        summary_token=summary_token_b,
+        canonical_project_root=project,
+    )
+    assert runtime_context_b is not None
+    runtime_id_b = "bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+    def exchange_b(_url, _headers, body, method="POST"):
+        register_calls["count"] += 1
+        return 200, {
+            "schema_version": "runtime/register-response/1",
+            "runtime_installation_id": runtime_id_b,
+        }
+
+    monkeypatch.setattr(ca_transport, "_run_bounded_exchange", exchange_b)
+    upload_b = build_run_proxy_decision_summary_upload_fn(
+        agent=agent,
+        runtime_context=runtime_context_b,
+        client_installation_ref=project_ref,
+        home=home,
+        state_root=state_root,
+        transport=transport,
+    )
+    transport.calls.clear()
+    assert upload_b(payload) == "accepted"
+    assert register_calls["count"] == 2
+    assert len(transport.calls) == 1
+    assert runtime_id_b in transport.calls[0]["url"]
+
+    save_credential(SUMMARY_TOKEN, home=home)
+    save_scoped_runtime_binding_credential(
+        BINDING_TOKEN,
+        agent_did=agent.did,
+        summary_token=SUMMARY_TOKEN,
+        home=state_root,
+    )
+    transport.calls.clear()
+    assert upload_b(payload) == "unavailable"
+    assert transport.calls == []
+    assert register_calls["count"] == 2

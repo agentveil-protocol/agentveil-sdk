@@ -595,6 +595,155 @@ def test_run_auto_deny_requires_headless(tmp_path):
         raise AssertionError("expected --auto-deny without --headless to fail")
 
 
+def test_run_proxy_binds_controlled_runtime_before_source_upload_fn(tmp_path, monkeypatch):
+    home = tmp_path / "project" / ".avp"
+    monkeypatch.delenv("AVP_HOME", raising=False)
+    init_proxy(home=home, agent_name="proxy", plaintext=True)
+    config = json.loads((home / "mcp-proxy" / "config.json").read_text(encoding="utf-8"))
+    config["downstream"] = {
+        "name": "idle",
+        "command": sys.executable,
+        "args": ["-c", "import time; time.sleep(3600)"],
+    }
+    (home / "mcp-proxy" / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    order: list[str] = []
+
+    def capture_bind(**kwargs):
+        order.append("bind")
+        return None
+
+    def capture_upload_fn(**kwargs):
+        order.append("upload_fn")
+        return lambda _payload, **_kw: "accepted"
+
+    monkeypatch.setattr(proxy_cli, "bind_controlled_alternative_runtime", capture_bind)
+    monkeypatch.setattr(
+        proxy_cli,
+        "build_run_proxy_decision_summary_upload_fn",
+        capture_upload_fn,
+    )
+    monkeypatch.setattr(
+        proxy_cli,
+        "ConsoleDecisionSummaryDispatcher",
+        lambda **kwargs: type(
+            "NoopDecision",
+            (),
+            {"is_active": False, "__init__": lambda self, **kw: None, "start": lambda self: None, "stop": lambda self, **kw: None},
+        )(**kwargs),
+    )
+    monkeypatch.setattr(
+        proxy_cli,
+        "ControlledAlternativesStatusDispatcher",
+        lambda **kwargs: type(
+            "NoopStatus",
+            (),
+            {"__init__": lambda self, **kw: None, "start": lambda self: None, "stop": lambda self, **kw: None},
+        )(**kwargs),
+    )
+    monkeypatch.setattr(
+        proxy_cli,
+        "ConsoleApprovalSummaryDispatcher",
+        lambda **kwargs: type(
+            "NoopApproval",
+            (),
+            {
+                "is_active": False,
+                "__init__": lambda self, **kw: None,
+                "start": lambda self: None,
+                "stop": lambda self, **kw: None,
+                "request_snapshot": lambda self: None,
+            },
+        )(**kwargs),
+    )
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(""),
+        out=io.StringIO(),
+        approval_ui_mode="none",
+    ) == 0
+    assert order == ["bind", "upload_fn"]
+
+
+def test_run_proxy_wires_one_common_source_aware_dispatcher(tmp_path, monkeypatch):
+    home = tmp_path / "project" / ".avp"
+    monkeypatch.delenv("AVP_HOME", raising=False)
+    init_proxy(home=home, agent_name="proxy", plaintext=True)
+    config = json.loads((home / "mcp-proxy" / "config.json").read_text(encoding="utf-8"))
+    config["downstream"] = {
+        "name": "idle",
+        "command": sys.executable,
+        "args": ["-c", "import time; time.sleep(3600)"],
+    }
+    (home / "mcp-proxy" / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    wiring = {"count": 0, "dispatcher_upload_fn": None}
+
+    def capture_upload_fn(**kwargs):
+        wiring["count"] += 1
+        wiring["build_kwargs"] = kwargs
+        return lambda _payload, **_kw: "accepted"
+
+    class RecordingDecisionDispatcher:
+        is_active = False
+
+        def __init__(self, **kwargs):
+            wiring["dispatcher_upload_fn"] = kwargs.get("upload_fn")
+
+        def start(self):
+            return None
+
+        def stop(self, **kwargs):
+            return None
+
+    monkeypatch.setattr(
+        proxy_cli,
+        "build_run_proxy_decision_summary_upload_fn",
+        capture_upload_fn,
+    )
+    monkeypatch.setattr(
+        proxy_cli,
+        "ConsoleDecisionSummaryDispatcher",
+        RecordingDecisionDispatcher,
+    )
+    monkeypatch.setattr(
+        proxy_cli,
+        "ControlledAlternativesStatusDispatcher",
+        lambda **kwargs: type(
+            "NoopStatus",
+            (),
+            {
+                "__init__": lambda self, **kw: None,
+                "start": lambda self: None,
+                "stop": lambda self, **kw: None,
+            },
+        )(**kwargs),
+    )
+    monkeypatch.setattr(
+        proxy_cli,
+        "ConsoleApprovalSummaryDispatcher",
+        lambda **kwargs: type(
+            "NoopApproval",
+            (),
+            {
+                "is_active": False,
+                "__init__": lambda self, **kw: None,
+                "start": lambda self: None,
+                "stop": lambda self, **kw: None,
+                "request_snapshot": lambda self: None,
+            },
+        )(**kwargs),
+    )
+
+    assert run_proxy(
+        home=home,
+        client_in=io.StringIO(""),
+        out=io.StringIO(),
+        approval_ui_mode="none",
+    ) == 0
+    assert wiring["count"] == 1
+    assert callable(wiring["dispatcher_upload_fn"])
+    assert wiring["build_kwargs"]["state_root"] == home
+
+
 def test_run_proxy_starts_and_stops_decision_summary_dispatcher(tmp_path, monkeypatch):
     home = tmp_path / "project" / ".avp"
     monkeypatch.delenv("AVP_HOME", raising=False)

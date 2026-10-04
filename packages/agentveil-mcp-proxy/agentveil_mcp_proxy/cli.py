@@ -249,6 +249,7 @@ from agentveil_mcp_proxy.console_pairing_client import (
 from agentveil_mcp_proxy.console_decision_summary_client import (
     ConsoleDecisionSummaryDispatcher,
     attach_terminal_evidence_observer,
+    build_run_proxy_decision_summary_upload_fn,
 )
 from agentveil_mcp_proxy.console_controlled_alternatives_status_client import (
     ControlledAlternativesStatusDispatcher,
@@ -4106,15 +4107,6 @@ def run_proxy(
             approval_grant_agent_did=approval_grant_agent_did,
         )
         console_credential_home = console_credential_home_for_runtime(paths.home)
-        decision_summary_dispatcher = ConsoleDecisionSummaryDispatcher(
-            home=console_credential_home
-        )
-        decision_summary_dispatcher.start()
-        if decision_summary_dispatcher.is_active:
-            attach_terminal_evidence_observer(
-                approval_manager,
-                decision_summary_dispatcher,
-            )
         approval_summary_dispatcher = ConsoleApprovalSummaryDispatcher(
             home=console_credential_home,
             snapshot_source=lambda: build_approval_summary_snapshot(evidence_store),
@@ -4153,12 +4145,41 @@ def run_proxy(
             state_root=paths.home,
             canonical_project_root=canonical_project_root,
         )
+        client_installation_ref = None
+        if canonical_project_root is not None and isinstance(
+            approval_grant_agent_did, str
+        ):
+            from agentveil_mcp_proxy.console_project_status_client import (
+                build_client_installation_ref,
+            )
+
+            client_installation_ref = build_client_installation_ref(
+                canonical_project_root=canonical_project_root,
+                agent_did=approval_grant_agent_did,
+            )
         controlled_runtime = bind_controlled_alternative_runtime(
             home=paths.home,
             downstream=dict(config.downstream),
             paid_snapshot=discover_paid_provider(home=paths.home),
             runtime_context=controlled_runtime_context,
         )
+        decision_summary_upload_fn = build_run_proxy_decision_summary_upload_fn(
+            agent=proxy_agent,
+            runtime_context=controlled_runtime_context,
+            client_installation_ref=client_installation_ref,
+            home=console_credential_home,
+            state_root=paths.home,
+        )
+        decision_summary_dispatcher = ConsoleDecisionSummaryDispatcher(
+            home=console_credential_home,
+            upload_fn=decision_summary_upload_fn,
+        )
+        decision_summary_dispatcher.start()
+        if decision_summary_dispatcher.is_active:
+            attach_terminal_evidence_observer(
+                approval_manager,
+                decision_summary_dispatcher,
+            )
         controlled_status_dispatcher = ControlledAlternativesStatusDispatcher(
             runtime_context=(
                 controlled_runtime_context if controlled_runtime is not None else None

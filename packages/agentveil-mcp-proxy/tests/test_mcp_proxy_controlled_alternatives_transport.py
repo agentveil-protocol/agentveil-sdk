@@ -877,7 +877,21 @@ def test_context_without_active_authority_does_not_load_provider(identity, tmp_p
 SUMMARY_TOKEN = "bounded-summary-upload-token-0123456789ab"
 SUMMARY_TOKEN_B = "bounded-summary-upload-token-b0123456789ab"
 BINDING_TOKEN = "issued-runtime-binding-token-0123456789ab"
+BINDING_TOKEN_B = "issued-runtime-binding-token-b0123456789ab"
 LEGACY_BINDING = "legacy-global-runtime-binding-token-0123456789ab"
+RUNTIME_ID_B = "bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+
+def _project_upload_authority(summary_token: str, binding_token: str) -> tuple[str, str]:
+    from agentveil_mcp_proxy.console_credentials import summary_token_fingerprint
+
+    summary_fp = summary_token_fingerprint(summary_token)
+    binding_fp = transport.runtime_binding_token_fingerprint(binding_token)
+    upload_auth = transport.av02_upload_authority_fingerprint(
+        summary_fingerprint=summary_fp,
+        binding_fingerprint=binding_fp,
+    )
+    return summary_fp, upload_auth
 
 
 def _patch_heartbeat_exchange(monkeypatch):
@@ -1486,3 +1500,442 @@ def test_legacy_binding_without_summary_retains_av02_transport(
     assert consumer.context is runtime_context
     status, _payload = runtime_context.runtime_register(_register_payload())
     assert status == 200
+
+
+def test_scoped_context_upgrades_registration_to_v2_with_project_ref(
+    identity, tmp_path, monkeypatch,
+):
+    from agentveil_mcp_proxy.console_credentials import (
+        save_credential,
+        save_scoped_runtime_binding_credential,
+    )
+    from agentveil_mcp_proxy.console_project_status_client import (
+        build_client_installation_ref,
+    )
+
+    project = tmp_path / "workspace"
+    project.mkdir()
+    save_credential(SUMMARY_TOKEN, home=tmp_path)
+    save_scoped_runtime_binding_credential(
+        BINDING_TOKEN,
+        agent_did=identity[1].did,
+        summary_token=SUMMARY_TOKEN,
+        home=tmp_path,
+    )
+    project_ref = build_client_installation_ref(
+        canonical_project_root=project,
+        agent_did=identity[1].did,
+    )
+    assert project_ref is not None
+    seen: list[dict[str, object]] = []
+
+    def exchange(_url, _headers, body, method="POST"):
+        seen.append(json.loads(body))
+        return 200, {
+            "schema_version": "runtime/register-response/1",
+            "runtime_installation_id": RUNTIME_ID,
+        }
+
+    monkeypatch.setattr(transport, "_run_bounded_exchange", exchange)
+    bound = transport.build_controlled_alternative_context(
+        agent=identity[1],
+        base_url="https://agentveil.dev",
+        state_root=tmp_path,
+        summary_token=SUMMARY_TOKEN,
+        canonical_project_root=project,
+    )
+    assert bound is not None and bound.runtime_register is not None
+    status, _payload = bound.runtime_register(_register_payload())
+    assert status == 200
+    assert seen == [
+        {
+            "schema_version": "runtime/register/2",
+            "runtime_version": "1.0.0",
+            "contract_range": "av02.v1",
+            "catalog_digest": "aa" * 32,
+            "declared_executor_capabilities": [CAPABILITY],
+            "client_installation_ref": project_ref,
+        }
+    ]
+
+
+def test_context_without_project_ref_preserves_register_v1_body(
+    identity, tmp_path, monkeypatch,
+):
+    seen: list[dict[str, object]] = []
+
+    def exchange(_url, _headers, body, method="POST"):
+        seen.append(json.loads(body))
+        return 200, {
+            "schema_version": "runtime/register-response/1",
+            "runtime_installation_id": RUNTIME_ID,
+        }
+
+    monkeypatch.setattr(transport, "_run_bounded_exchange", exchange)
+    _install_binding(tmp_path)
+    bound = transport.build_controlled_alternative_context(
+        agent=identity[1],
+        base_url="https://agentveil.dev",
+        state_root=tmp_path,
+    )
+    assert bound is not None and bound.runtime_register is not None
+    register_payload = _register_payload()
+    status, _payload = bound.runtime_register(register_payload)
+    assert status == 200
+    assert seen == [register_payload]
+
+
+def test_cached_runtime_id_is_invalidated_when_project_source_changes(
+    identity, tmp_path,
+):
+    from agentveil_mcp_proxy.console_credentials import (
+        save_credential,
+        save_scoped_runtime_binding_credential,
+        scoped_runtime_binding_namespace_hash,
+    )
+    from agentveil_mcp_proxy.console_project_status_client import (
+        build_client_installation_ref,
+    )
+
+    project_a = tmp_path / "project-a"
+    project_b = tmp_path / "project-b"
+    project_a.mkdir()
+    project_b.mkdir()
+    save_credential(SUMMARY_TOKEN, home=tmp_path)
+    save_scoped_runtime_binding_credential(
+        BINDING_TOKEN,
+        agent_did=identity[1].did,
+        summary_token=SUMMARY_TOKEN,
+        home=tmp_path,
+    )
+    ref_a = build_client_installation_ref(
+        canonical_project_root=project_a,
+        agent_did=identity[1].did,
+    )
+    ref_b = build_client_installation_ref(
+        canonical_project_root=project_b,
+        agent_did=identity[1].did,
+    )
+    assert ref_a is not None and ref_b is not None
+    state_dir = tmp_path / (
+        "ca-agent-" + scoped_runtime_binding_namespace_hash(identity[1].did, SUMMARY_TOKEN)[:32]
+    )
+    state_dir.mkdir(parents=True)
+    os.chmod(state_dir, 0o700)
+    transport.write_cached_av02_runtime_installation_id(
+        state_dir,
+        RUNTIME_ID,
+        client_installation_ref=ref_a,
+    )
+    assert (
+        transport.read_cached_av02_runtime_installation_id(
+            state_dir,
+            client_installation_ref=ref_a,
+        )
+        == RUNTIME_ID
+    )
+    assert (
+        transport.read_cached_av02_runtime_installation_id(
+            state_dir,
+            client_installation_ref=ref_b,
+        )
+        is None
+    )
+
+
+@pytest.fixture(autouse=True)
+def _reset_bound_runtime_session() -> None:
+    transport.reset_bound_runtime_session_for_tests()
+
+
+def test_ensure_project_bound_returns_response_id_when_cache_write_fails(
+    identity, tmp_path, monkeypatch,
+):
+    from agentveil_mcp_proxy.console_project_status_client import (
+        build_client_installation_ref,
+    )
+
+    project = tmp_path / "workspace"
+    project.mkdir()
+    project_ref = build_client_installation_ref(
+        canonical_project_root=project,
+        agent_did=identity[1].did,
+    )
+    assert project_ref is not None
+    register_calls = {"count": 0}
+
+    def exchange(_url, _headers, body, method="POST"):
+        register_calls["count"] += 1
+        return 200, {
+            "schema_version": "runtime/register-response/1",
+            "runtime_installation_id": RUNTIME_ID,
+        }
+
+    monkeypatch.setattr(transport, "_run_bounded_exchange", exchange)
+
+    def fail_cache_write(*_args, **_kwargs):
+        raise OSError("cache_write_failed")
+
+    monkeypatch.setattr(transport, "write_cached_av02_runtime_installation_id", fail_cache_write)
+    from agentveil_mcp_proxy.console_credentials import save_scoped_runtime_binding_credential
+
+    save_credential(SUMMARY_TOKEN, home=tmp_path)
+    save_scoped_runtime_binding_credential(
+        BINDING_TOKEN,
+        agent_did=identity[1].did,
+        summary_token=SUMMARY_TOKEN,
+        home=tmp_path,
+    )
+    bound = transport.build_controlled_alternative_context(
+        agent=identity[1],
+        base_url="https://agentveil.dev",
+        state_root=tmp_path,
+        summary_token=SUMMARY_TOKEN,
+        canonical_project_root=project,
+    )
+    assert bound is not None and bound.runtime_register is not None
+    summary_fp, upload_auth = _project_upload_authority(SUMMARY_TOKEN, BINDING_TOKEN)
+    runtime_id = transport.ensure_project_bound_runtime_registered(
+        bound,
+        client_installation_ref=project_ref,
+        upload_authority_fingerprint=upload_auth,
+        live_summary_fingerprint=summary_fp,
+    )
+    assert runtime_id == RUNTIME_ID
+    assert register_calls["count"] == 1
+    assert (
+        transport.ensure_project_bound_runtime_registered(
+            bound,
+            client_installation_ref=project_ref,
+            upload_authority_fingerprint=upload_auth,
+            live_summary_fingerprint=summary_fp,
+        )
+        == RUNTIME_ID
+    )
+    assert register_calls["count"] == 1
+
+
+def test_ensure_project_bound_rejects_malformed_response_runtime_id(
+    identity, tmp_path, monkeypatch,
+):
+    from agentveil_mcp_proxy.console_project_status_client import (
+        build_client_installation_ref,
+    )
+
+    project = tmp_path / "workspace"
+    project.mkdir()
+    project_ref = build_client_installation_ref(
+        canonical_project_root=project,
+        agent_did=identity[1].did,
+    )
+    assert project_ref is not None
+
+    def exchange(_url, _headers, body, method="POST"):
+        return 200, {
+            "schema_version": "runtime/register-response/1",
+            "runtime_installation_id": "not-a-valid-runtime-id",
+        }
+
+    monkeypatch.setattr(transport, "_run_bounded_exchange", exchange)
+    from agentveil_mcp_proxy.console_credentials import save_scoped_runtime_binding_credential
+
+    save_credential(SUMMARY_TOKEN, home=tmp_path)
+    save_scoped_runtime_binding_credential(
+        BINDING_TOKEN,
+        agent_did=identity[1].did,
+        summary_token=SUMMARY_TOKEN,
+        home=tmp_path,
+    )
+    bound = transport.build_controlled_alternative_context(
+        agent=identity[1],
+        base_url="https://agentveil.dev",
+        state_root=tmp_path,
+        summary_token=SUMMARY_TOKEN,
+        canonical_project_root=project,
+    )
+    assert bound is not None
+    summary_fp, upload_auth = _project_upload_authority(SUMMARY_TOKEN, BINDING_TOKEN)
+    assert (
+        transport.ensure_project_bound_runtime_registered(
+            bound,
+            client_installation_ref=project_ref,
+            upload_authority_fingerprint=upload_auth,
+            live_summary_fingerprint=summary_fp,
+        )
+        is None
+    )
+
+
+def test_stale_pinned_context_rejects_summary_rotation_without_register(
+    identity, tmp_path, monkeypatch,
+):
+    from agentveil_mcp_proxy.console_credentials import save_scoped_runtime_binding_credential
+    from agentveil_mcp_proxy.console_project_status_client import (
+        build_client_installation_ref,
+    )
+
+    project = tmp_path / "workspace"
+    project.mkdir()
+    project_ref = build_client_installation_ref(
+        canonical_project_root=project,
+        agent_did=identity[1].did,
+    )
+    assert project_ref is not None
+    register_calls = {"count": 0}
+
+    def exchange(_url, _headers, body, method="POST"):
+        register_calls["count"] += 1
+        return 200, {
+            "schema_version": "runtime/register-response/1",
+            "runtime_installation_id": RUNTIME_ID,
+        }
+
+    monkeypatch.setattr(transport, "_run_bounded_exchange", exchange)
+    save_credential(SUMMARY_TOKEN, home=tmp_path)
+    save_scoped_runtime_binding_credential(
+        BINDING_TOKEN,
+        agent_did=identity[1].did,
+        summary_token=SUMMARY_TOKEN,
+        home=tmp_path,
+    )
+    bound = transport.build_controlled_alternative_context(
+        agent=identity[1],
+        base_url="https://agentveil.dev",
+        state_root=tmp_path,
+        summary_token=SUMMARY_TOKEN,
+        canonical_project_root=project,
+    )
+    assert bound is not None and bound.pinned_summary_fingerprint is not None
+    summary_fp_a, upload_auth_a = _project_upload_authority(SUMMARY_TOKEN, BINDING_TOKEN)
+    assert transport.ensure_project_bound_runtime_registered(
+        bound,
+        client_installation_ref=project_ref,
+        upload_authority_fingerprint=upload_auth_a,
+        live_summary_fingerprint=summary_fp_a,
+    ) == RUNTIME_ID
+    assert register_calls["count"] == 1
+
+    save_credential(SUMMARY_TOKEN_B, home=tmp_path)
+    save_scoped_runtime_binding_credential(
+        BINDING_TOKEN_B,
+        agent_did=identity[1].did,
+        summary_token=SUMMARY_TOKEN_B,
+        home=tmp_path,
+    )
+    summary_fp_b, upload_auth_b = _project_upload_authority(
+        SUMMARY_TOKEN_B,
+        BINDING_TOKEN_B,
+    )
+    assert transport.ensure_project_bound_runtime_registered(
+        bound,
+        client_installation_ref=project_ref,
+        upload_authority_fingerprint=upload_auth_b,
+        live_summary_fingerprint=summary_fp_b,
+    ) is None
+    assert register_calls["count"] == 1
+
+
+def test_fresh_context_registers_runtime_under_rotated_summary_authority(
+    identity, tmp_path, monkeypatch,
+):
+    from agentveil_mcp_proxy.console_credentials import save_scoped_runtime_binding_credential
+    from agentveil_mcp_proxy.console_project_status_client import (
+        build_client_installation_ref,
+    )
+
+    project = tmp_path / "workspace"
+    project.mkdir()
+    project_ref = build_client_installation_ref(
+        canonical_project_root=project,
+        agent_did=identity[1].did,
+    )
+    assert project_ref is not None
+
+    def exchange(_url, _headers, body, method="POST"):
+        return 200, {
+            "schema_version": "runtime/register-response/1",
+            "runtime_installation_id": RUNTIME_ID_B,
+        }
+
+    monkeypatch.setattr(transport, "_run_bounded_exchange", exchange)
+    save_credential(SUMMARY_TOKEN_B, home=tmp_path)
+    save_scoped_runtime_binding_credential(
+        BINDING_TOKEN_B,
+        agent_did=identity[1].did,
+        summary_token=SUMMARY_TOKEN_B,
+        home=tmp_path,
+    )
+    bound_b = transport.build_controlled_alternative_context(
+        agent=identity[1],
+        base_url="https://agentveil.dev",
+        state_root=tmp_path,
+        summary_token=SUMMARY_TOKEN_B,
+        canonical_project_root=project,
+    )
+    assert bound_b is not None
+    summary_fp_b, upload_auth_b = _project_upload_authority(
+        SUMMARY_TOKEN_B,
+        BINDING_TOKEN_B,
+    )
+    assert transport.ensure_project_bound_runtime_registered(
+        bound_b,
+        client_installation_ref=project_ref,
+        upload_authority_fingerprint=upload_auth_b,
+        live_summary_fingerprint=summary_fp_b,
+    ) == RUNTIME_ID_B
+
+
+def test_disk_runtime_cache_requires_matching_upload_authority(
+    identity, tmp_path,
+):
+    from agentveil_mcp_proxy.console_credentials import save_scoped_runtime_binding_credential
+    from agentveil_mcp_proxy.console_credentials import (
+        scoped_runtime_binding_namespace_hash,
+    )
+    from agentveil_mcp_proxy.console_project_status_client import (
+        build_client_installation_ref,
+    )
+
+    project = tmp_path / "workspace"
+    project.mkdir()
+    project_ref = build_client_installation_ref(
+        canonical_project_root=project,
+        agent_did=identity[1].did,
+    )
+    assert project_ref is not None
+    save_credential(SUMMARY_TOKEN, home=tmp_path)
+    save_scoped_runtime_binding_credential(
+        BINDING_TOKEN,
+        agent_did=identity[1].did,
+        summary_token=SUMMARY_TOKEN,
+        home=tmp_path,
+    )
+    _, upload_auth_a = _project_upload_authority(SUMMARY_TOKEN, BINDING_TOKEN)
+    _, upload_auth_b = _project_upload_authority(SUMMARY_TOKEN_B, BINDING_TOKEN_B)
+    state_dir = tmp_path / (
+        "ca-agent-" + scoped_runtime_binding_namespace_hash(identity[1].did, SUMMARY_TOKEN)[:32]
+    )
+    state_dir.mkdir(parents=True)
+    os.chmod(state_dir, 0o700)
+    transport.write_cached_av02_runtime_installation_id(
+        state_dir,
+        RUNTIME_ID,
+        client_installation_ref=project_ref,
+        upload_authority_fingerprint=upload_auth_a,
+    )
+    assert (
+        transport.read_cached_av02_runtime_installation_id(
+            state_dir,
+            client_installation_ref=project_ref,
+            upload_authority_fingerprint=upload_auth_a,
+        )
+        == RUNTIME_ID
+    )
+    assert (
+        transport.read_cached_av02_runtime_installation_id(
+            state_dir,
+            client_installation_ref=project_ref,
+            upload_authority_fingerprint=upload_auth_b,
+        )
+        is None
+    )

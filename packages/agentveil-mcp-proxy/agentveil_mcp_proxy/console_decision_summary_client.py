@@ -18,7 +18,8 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import partial
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -32,6 +33,21 @@ from agentveil_mcp_proxy.console_credentials import (
     StoredCredential,
     console_credential_home_for_runtime,
     load_credential,
+    load_scoped_runtime_binding_credential,
+    resolve_runtime_binding_for_context,
+    summary_token_fingerprint,
+)
+from agentveil_mcp_proxy.controlled_alternatives_transport import (
+    CONSOLE_CREDENTIAL_HEADER,
+    RUNTIME_BINDING_HEADER,
+    av02_upload_authority_fingerprint,
+    common_av02_register_payload_v1,
+    controlled_runtime_upload_authority_stale,
+    ensure_project_bound_runtime_registered,
+    runtime_binding_token_fingerprint,
+    validate_bounded_runtime_binding_token,
+    validate_bounded_runtime_installation_id,
+    validate_bounded_summary_credential_token,
 )
 from agentveil_mcp_proxy.evidence import ApprovalStatus, PendingApproval
 from agentveil_mcp_proxy.evidence.observability import parse_action_gate_metadata
@@ -39,6 +55,7 @@ from agentveil_mcp_proxy.evidence.observability import parse_action_gate_metadat
 CONSOLE_ORIGIN = "https://agentveil.dev"
 _ORIGIN_HOST = "agentveil.dev"
 _INGEST_PATH = "/console/decision-summaries/ingest"
+_SOURCE_INGEST_PATH_PREFIX = "/console/decision-summaries/ingest/source/v1/"
 
 _REQUEST_TIMEOUT_SECONDS = 3.0
 _MAX_RESPONSE_BYTES = 16 * 1024
@@ -214,6 +231,20 @@ Transport = Callable[..., RawResponse]
 LoadCredential = Callable[..., StoredCredential | None]
 TerminalEvidenceObserver = Callable[[PendingApproval], None]
 UploadSummary = Callable[[DecisionSummaryPayload], str]
+
+
+@dataclass(frozen=True)
+class SourceAwareSummaryUploadContext:
+    """Bounded source-aware upload authority; credential fields use repr=False."""
+
+    runtime_installation_id: str
+    summary_credential: str = field(repr=False)
+    runtime_binding_credential: str = field(repr=False)
+    private_key_hex: str = field(repr=False)
+    agent_did: str = field(repr=False)
+
+    def __repr__(self) -> str:
+        return "SourceAwareSummaryUploadContext(has_runtime_id=True)"
 
 
 @dataclass(frozen=True)
@@ -1143,6 +1174,54 @@ class ConsoleDecisionSummaryClient:
     ) -> None:
         self._transport = transport or _urllib_transport
 
+    def upload_source_aware(
+        self,
+        payload: DecisionSummaryPayload,
+        *,
+        source: SourceAwareSummaryUploadContext,
+    ) -> str:
+        invalid = _source_aware_upload_authority_invalid(source)
+        if invalid is not None:
+            raise DecisionSummaryClientError(invalid)
+        path = f"{_SOURCE_INGEST_PATH_PREFIX}{source.runtime_installation_id}"
+        url = CONSOLE_ORIGIN + path
+        split = urlsplit(url)
+        if split.scheme != "https" or split.netloc != _ORIGIN_HOST:
+            raise DecisionSummaryClientError("invalid_origin")
+        body_obj = payload_to_request_body(payload)
+        body = json.dumps(body_obj, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+        try:
+            from agentveil.auth import build_auth_header
+
+            key = bytes.fromhex(source.private_key_hex)
+            headers = build_auth_header(
+                key,
+                source.agent_did,
+                "POST",
+                path,
+                body,
+                force_v2=True,
+            )
+        except Exception as exc:
+            raise DecisionSummaryClientError("transport_failed") from exc
+        headers["Accept"] = "application/json"
+        headers["Content-Type"] = "application/json"
+        headers[CONSOLE_CREDENTIAL_HEADER] = source.summary_credential
+        headers[RUNTIME_BINDING_HEADER] = source.runtime_binding_credential
+        try:
+            response = self._transport(
+                "POST",
+                url,
+                headers=headers,
+                body=body,
+                timeout=_REQUEST_TIMEOUT_SECONDS,
+            )
+        except TransportError as exc:
+            raise DecisionSummaryClientError("transport_failed") from exc
+        return _decode_response_object(response, request=payload)
+
     def upload(
         self,
         payload: DecisionSummaryPayload,
@@ -1175,6 +1254,28 @@ class ConsoleDecisionSummaryClient:
         return _decode_response_object(response, request=payload)
 
 
+def _source_aware_upload_authority_invalid(
+    source: SourceAwareSummaryUploadContext,
+) -> str | None:
+    if not validate_bounded_runtime_installation_id(source.runtime_installation_id):
+        return "invalid_source_context"
+    if not validate_bounded_summary_credential_token(source.summary_credential):
+        return "invalid_source_context"
+    if not validate_bounded_runtime_binding_token(source.runtime_binding_credential):
+        return "invalid_source_context"
+    if not isinstance(source.agent_did, str) or not source.agent_did.startswith(
+        "did:key:"
+    ):
+        return "invalid_source_context"
+    try:
+        key = bytes.fromhex(source.private_key_hex)
+    except (AttributeError, TypeError, ValueError):
+        return "invalid_source_context"
+    if len(key) != 32:
+        return "invalid_source_context"
+    return None
+
+
 def _resolve_credential(
     *,
     home: Path | None,
@@ -1189,6 +1290,23 @@ def _resolve_credential(
     if credential.scope != CREDENTIAL_SCOPE:
         return None, "skipped_unsafe_credential"
     return credential, None
+
+
+def sync_source_aware_decision_summary(
+    payload: DecisionSummaryPayload,
+    *,
+    source: SourceAwareSummaryUploadContext,
+    transport: Transport | None = None,
+) -> str:
+    """Upload over the signed source route without legacy fallback."""
+
+    client = ConsoleDecisionSummaryClient(transport=transport)
+    try:
+        return client.upload_source_aware(payload, source=source)
+    except DecisionSummaryClientError as exc:
+        if exc.code in {"transport_failed", "unexpected_status"}:
+            return "unavailable"
+        return "rejected"
 
 
 def sync_decision_summary(
@@ -1340,6 +1458,138 @@ class ConsoleDecisionSummaryDispatcher:
             self._remember_event(payload.event_id)
 
 
+def _project_source_upload_context_complete(
+    *,
+    agent: Any,
+    runtime_context: Any,
+    client_installation_ref: str | None,
+    home: Path,
+    state_root: Path,
+    load_credential_fn: LoadCredential,
+) -> tuple[StoredCredential | None, str | None]:
+    if runtime_context is None or client_installation_ref is None:
+        return None, None
+    if getattr(runtime_context, "runtime_register", None) is None:
+        return None, None
+    try:
+        credential = load_credential_fn(home=home)
+    except CredentialError:
+        return None, None
+    if credential is None or credential.scope != CREDENTIAL_SCOPE:
+        return None, None
+    try:
+        did = agent.did
+        if not isinstance(did, str) or not did.startswith("did:key:"):
+            return None, None
+        binding = resolve_runtime_binding_for_context(
+            did,
+            credential.token,
+            state_root,
+        )
+        scoped = load_scoped_runtime_binding_credential(
+            did,
+            credential.token,
+            home=state_root,
+        )
+    except (CredentialError, AttributeError, TypeError):
+        return None, None
+    if binding is None or scoped is None:
+        return None, None
+    return credential, binding.token
+
+
+def _project_source_upload_mode_available(
+    *,
+    runtime_context: Any,
+    client_installation_ref: str | None,
+) -> bool:
+    return (
+        runtime_context is not None
+        and client_installation_ref is not None
+        and getattr(runtime_context, "runtime_register", None) is not None
+    )
+
+
+def build_run_proxy_decision_summary_upload_fn(
+    *,
+    agent: Any,
+    runtime_context: Any,
+    client_installation_ref: str | None,
+    home: Path,
+    state_root: Path,
+    load_credential_fn: LoadCredential = load_credential,
+    transport: Transport | None = None,
+) -> UploadSummary:
+    """Return one upload callable; source route when project register context exists."""
+
+    if not _project_source_upload_mode_available(
+        runtime_context=runtime_context,
+        client_installation_ref=client_installation_ref,
+    ):
+        return partial(
+            sync_decision_summary,
+            home=home,
+            load_credential_fn=load_credential_fn,
+            transport=transport,
+        )
+
+    def _source_upload(payload: DecisionSummaryPayload, **_kwargs: object) -> str:
+        credential, binding_token = _project_source_upload_context_complete(
+            agent=agent,
+            runtime_context=runtime_context,
+            client_installation_ref=client_installation_ref,
+            home=home,
+            state_root=state_root,
+            load_credential_fn=load_credential_fn,
+        )
+        if credential is None or binding_token is None:
+            return "unavailable"
+        try:
+            summary_fp = summary_token_fingerprint(credential.token)
+            binding_fp = runtime_binding_token_fingerprint(binding_token)
+            upload_auth_fp = av02_upload_authority_fingerprint(
+                summary_fingerprint=summary_fp,
+                binding_fingerprint=binding_fp,
+            )
+        except (CredentialError, ValueError):
+            return "unavailable"
+        if controlled_runtime_upload_authority_stale(
+            runtime_context,
+            live_summary_fingerprint=summary_fp,
+        ):
+            return "unavailable"
+        runtime_id = ensure_project_bound_runtime_registered(
+            runtime_context,
+            client_installation_ref=client_installation_ref,
+            upload_authority_fingerprint=upload_auth_fp,
+            live_summary_fingerprint=summary_fp,
+            register_payload=common_av02_register_payload_v1(),
+        )
+        if runtime_id is None:
+            return "unavailable"
+        try:
+            private_key_hex = agent.private_key_hex
+            agent_did = agent.did
+            if not isinstance(private_key_hex, str) or not isinstance(agent_did, str):
+                raise AttributeError("agent_identity_invalid")
+            source = SourceAwareSummaryUploadContext(
+                runtime_installation_id=runtime_id,
+                summary_credential=credential.token,
+                runtime_binding_credential=binding_token,
+                private_key_hex=private_key_hex,
+                agent_did=agent_did,
+            )
+        except (AttributeError, TypeError, ValueError):
+            return "unavailable"
+        return sync_source_aware_decision_summary(
+            payload,
+            source=source,
+            transport=transport,
+        )
+
+    return _source_upload
+
+
 def attach_terminal_evidence_observer(
     manager: Any,
     dispatcher: ConsoleDecisionSummaryDispatcher,
@@ -1366,7 +1616,10 @@ __all__ = [
     "payload_to_request_body",
     "reset_hook_denied_upload_dedupe_for_tests",
     "run_hook_denied_upload_worker",
+    "SourceAwareSummaryUploadContext",
+    "build_run_proxy_decision_summary_upload_fn",
     "sync_decision_summary",
+    "sync_source_aware_decision_summary",
     "wait_for_hook_denied_uploads_for_tests",
 ]
 
