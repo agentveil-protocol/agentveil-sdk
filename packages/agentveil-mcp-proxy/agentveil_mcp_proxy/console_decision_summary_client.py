@@ -149,6 +149,7 @@ _RESPONSE_KEYS = frozenset({
 })
 _ACK_STATUSES = frozenset({"accepted", "duplicate"})
 _HOOK_DENIED_UPLOAD_ACK_STATUSES = frozenset({"accepted", "duplicate"})
+_LEGACY_SCHEMA3_INVALID_RESPONSE_BODY = b'{"detail":"decision_summary_invalid"}'
 
 _TERMINAL_SUMMARY_EVENT_DOMAIN = b"avp.console.decision_summary.terminal_event.v1"
 _TERMINAL_SUMMARY_EVENT_PREFIX = "ds.ev."
@@ -1164,6 +1165,56 @@ def _decode_response_object(
     return status
 
 
+def _is_exact_legacy_schema3_invalid_response(response: RawResponse) -> bool:
+    if response.status != 400:
+        return False
+    if len(response.content_types) != 1:
+        return False
+    try:
+        _validate_json_content_type(response.content_types[0])
+    except DecisionSummaryClientError:
+        return False
+    if len(response.body) > _MAX_RESPONSE_BYTES:
+        return False
+    return response.body == _LEGACY_SCHEMA3_INVALID_RESPONSE_BODY
+
+
+def _schema3_rollback_fallback_payload(
+    payload: DecisionSummaryPayload,
+) -> DecisionSummaryPayload | None:
+    if payload.schema_version != _CORRELATED_CONTROLLED_ALTERNATIVE_SCHEMA_VERSION:
+        return None
+    return DecisionSummaryPayload(
+        schema_version=_CONTROLLED_ALTERNATIVE_SCHEMA_VERSION,
+        event_id=payload.event_id,
+        action_family=payload.action_family,
+        decision=payload.decision,
+        occurred_at=payload.occurred_at,
+        target_reached=payload.target_reached,
+        proof_status=payload.proof_status,
+        proof_hash=payload.proof_hash,
+        idempotency_key=payload.idempotency_key,
+        controlled_alternative_id=payload.controlled_alternative_id,
+        controlled_outcome=payload.controlled_outcome,
+        rollback_available=payload.rollback_available,
+        verification_level=payload.verification_level,
+        result_hash=payload.result_hash,
+        redirected=payload.redirected,
+        bounded_phase_correlation_id=None,
+    )
+
+
+def _schema3_rollback_fallback_from_response(
+    payload: DecisionSummaryPayload,
+    response: RawResponse,
+) -> DecisionSummaryPayload | None:
+    if payload.schema_version != _CORRELATED_CONTROLLED_ALTERNATIVE_SCHEMA_VERSION:
+        return None
+    if not _is_exact_legacy_schema3_invalid_response(response):
+        return None
+    return _schema3_rollback_fallback_payload(payload)
+
+
 class ConsoleDecisionSummaryClient:
     """Fixed-origin client for bounded decision-summary ingest."""
 
@@ -1188,39 +1239,51 @@ class ConsoleDecisionSummaryClient:
         split = urlsplit(url)
         if split.scheme != "https" or split.netloc != _ORIGIN_HOST:
             raise DecisionSummaryClientError("invalid_origin")
-        body_obj = payload_to_request_body(payload)
-        body = json.dumps(body_obj, sort_keys=True, separators=(",", ":")).encode(
-            "utf-8"
-        )
-        try:
-            from agentveil.auth import build_auth_header
+        active = payload
+        allow_schema3_fallback = True
+        while True:
+            body_obj = payload_to_request_body(active)
+            body = json.dumps(body_obj, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+            try:
+                from agentveil.auth import build_auth_header
 
-            key = bytes.fromhex(source.private_key_hex)
-            headers = build_auth_header(
-                key,
-                source.agent_did,
-                "POST",
-                path,
-                body,
-                force_v2=True,
+                key = bytes.fromhex(source.private_key_hex)
+                headers = build_auth_header(
+                    key,
+                    source.agent_did,
+                    "POST",
+                    path,
+                    body,
+                    force_v2=True,
+                )
+            except Exception as exc:
+                raise DecisionSummaryClientError("transport_failed") from exc
+            headers["Accept"] = "application/json"
+            headers["Content-Type"] = "application/json"
+            headers[CONSOLE_CREDENTIAL_HEADER] = source.summary_credential
+            headers[RUNTIME_BINDING_HEADER] = source.runtime_binding_credential
+            try:
+                response = self._transport(
+                    "POST",
+                    url,
+                    headers=headers,
+                    body=body,
+                    timeout=_REQUEST_TIMEOUT_SECONDS,
+                )
+            except TransportError as exc:
+                raise DecisionSummaryClientError("transport_failed") from exc
+            fallback = (
+                _schema3_rollback_fallback_from_response(active, response)
+                if allow_schema3_fallback
+                else None
             )
-        except Exception as exc:
-            raise DecisionSummaryClientError("transport_failed") from exc
-        headers["Accept"] = "application/json"
-        headers["Content-Type"] = "application/json"
-        headers[CONSOLE_CREDENTIAL_HEADER] = source.summary_credential
-        headers[RUNTIME_BINDING_HEADER] = source.runtime_binding_credential
-        try:
-            response = self._transport(
-                "POST",
-                url,
-                headers=headers,
-                body=body,
-                timeout=_REQUEST_TIMEOUT_SECONDS,
-            )
-        except TransportError as exc:
-            raise DecisionSummaryClientError("transport_failed") from exc
-        return _decode_response_object(response, request=payload)
+            if fallback is not None:
+                active = fallback
+                allow_schema3_fallback = False
+                continue
+            return _decode_response_object(response, request=active)
 
     def upload(
         self,
@@ -1228,30 +1291,42 @@ class ConsoleDecisionSummaryClient:
         *,
         bearer_token: str,
     ) -> str:
-        body_obj = payload_to_request_body(payload)
-        body = json.dumps(body_obj, sort_keys=True, separators=(",", ":")).encode(
-            "utf-8"
-        )
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {bearer_token}",
-        }
         url = CONSOLE_ORIGIN + _INGEST_PATH
         split = urlsplit(url)
         if split.scheme != "https" or split.netloc != _ORIGIN_HOST:
             raise DecisionSummaryClientError("invalid_origin")
-        try:
-            response = self._transport(
-                "POST",
-                url,
-                headers=headers,
-                body=body,
-                timeout=_REQUEST_TIMEOUT_SECONDS,
+        active = payload
+        allow_schema3_fallback = True
+        while True:
+            body_obj = payload_to_request_body(active)
+            body = json.dumps(body_obj, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
             )
-        except TransportError as exc:
-            raise DecisionSummaryClientError("transport_failed") from exc
-        return _decode_response_object(response, request=payload)
+            headers = {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {bearer_token}",
+            }
+            try:
+                response = self._transport(
+                    "POST",
+                    url,
+                    headers=headers,
+                    body=body,
+                    timeout=_REQUEST_TIMEOUT_SECONDS,
+                )
+            except TransportError as exc:
+                raise DecisionSummaryClientError("transport_failed") from exc
+            fallback = (
+                _schema3_rollback_fallback_from_response(active, response)
+                if allow_schema3_fallback
+                else None
+            )
+            if fallback is not None:
+                active = fallback
+                allow_schema3_fallback = False
+                continue
+            return _decode_response_object(response, request=active)
 
 
 def _source_aware_upload_authority_invalid(

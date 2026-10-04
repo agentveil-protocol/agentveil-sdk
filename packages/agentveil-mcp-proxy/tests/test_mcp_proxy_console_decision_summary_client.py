@@ -2609,3 +2609,191 @@ def test_run_proxy_source_upload_rejects_summary_rotation_on_stale_context(
     assert upload_b(payload) == "unavailable"
     assert transport.calls == []
     assert register_calls["count"] == 2
+
+
+def _legacy_schema3_invalid_summary_response() -> RawResponse:
+    return RawResponse(
+        status=400,
+        content_types=("application/json",),
+        body=b'{"detail":"decision_summary_invalid"}',
+    )
+
+
+def _schema3_controlled_payload(**overrides) -> DecisionSummaryPayload:
+    from agentveil_mcp_proxy.controlled_alternatives_runtime import (
+        derive_bounded_phase_correlation_id,
+    )
+
+    phase_id = derive_bounded_phase_correlation_id(PREPARED_ARTIFACT_REF)
+    base = _payload(
+        schema_version="3",
+        controlled_alternative_id="protected_write.apply_prepared_patch.v1",
+        controlled_outcome="completed_safely",
+        rollback_available=False,
+        verification_level="mechanism_verified",
+        result_hash=RESULT_HASH,
+        redirected=False,
+        bounded_phase_correlation_id=phase_id,
+    )
+    if not overrides:
+        return base
+    return replace(base, **overrides)
+
+
+def test_schema3_exact_legacy_invalid_response_retries_once_as_schema2():
+    transport = FakeTransport([
+        _legacy_schema3_invalid_summary_response(),
+        lambda body: _json_response(200, _backend_ack_for_request(body)),
+    ])
+    payload = _schema3_controlled_payload()
+    assert (
+        sync_decision_summary(
+            payload,
+            load_credential_fn=_load_credential_ok,
+            transport=transport,
+        )
+        == "accepted"
+    )
+    assert len(transport.calls) == 2
+    first = json.loads(transport.calls[0]["body"].decode("utf-8"))
+    second = json.loads(transport.calls[1]["body"].decode("utf-8"))
+    assert first["schema_version"] == "3"
+    assert first["bounded_phase_correlation_id"] == payload.bounded_phase_correlation_id
+    assert second["schema_version"] == "2"
+    assert "bounded_phase_correlation_id" not in second
+    assert transport.calls[0]["url"] == transport.calls[1]["url"]
+    assert transport.calls[0]["url"] == CONSOLE_ORIGIN + "/console/decision-summaries/ingest"
+
+
+def test_source_aware_schema3_fallback_resigns_schema2_on_same_route():
+    from agentveil_mcp_proxy.console_decision_summary_client import (
+        sync_source_aware_decision_summary,
+    )
+
+    transport = FakeTransport([
+        _legacy_schema3_invalid_summary_response(),
+        lambda body: _json_response(200, _backend_ack_for_request(body)),
+    ])
+    payload = _schema3_controlled_payload()
+    source = _source_context()
+    assert (
+        sync_source_aware_decision_summary(payload, source=source, transport=transport)
+        == "accepted"
+    )
+    assert len(transport.calls) == 2
+    first_url = transport.calls[0]["url"]
+    second_url = transport.calls[1]["url"]
+    assert first_url == second_url
+    assert first_url.endswith(f"/ingest/source/v1/{RUNTIME_ID}")
+    first_auth = transport.calls[0]["headers"]["Authorization"]
+    second_auth = transport.calls[1]["headers"]["Authorization"]
+    assert first_auth.startswith('AVP-Sig v="2"')
+    assert second_auth.startswith('AVP-Sig v="2"')
+    assert first_auth != second_auth
+    second_body = json.loads(transport.calls[1]["body"].decode("utf-8"))
+    assert second_body["schema_version"] == "2"
+    assert "bounded_phase_correlation_id" not in second_body
+
+
+def test_schema3_fallback_rejects_non_exact_or_non_legacy_failures_without_retry():
+    from agentveil_mcp_proxy.console_decision_summary_client import (
+        sync_source_aware_decision_summary,
+    )
+
+    payload = _schema3_controlled_payload()
+    non_exact_responses = [
+        _json_response(400, {"detail": "other"}, content_type="application/json"),
+        _json_response(400, {"detail": "decision_summary_invalid", "extra": 1}),
+        RawResponse(status=400, content_types=("text/plain",), body=b'{"detail":"decision_summary_invalid"}'),
+        _json_response(401, {"detail": "decision_summary_invalid"}),
+        _json_response(500, {"detail": "decision_summary_invalid"}),
+        _legacy_schema3_invalid_summary_response(),
+    ]
+    for item in non_exact_responses[:-1]:
+        transport = FakeTransport([item])
+        assert (
+            sync_decision_summary(
+                payload,
+                load_credential_fn=_load_credential_ok,
+                transport=transport,
+            )
+            in {"unavailable", "rejected"}
+        )
+        assert len(transport.calls) == 1
+
+    transport = FakeTransport([TransportError()])
+    assert (
+        sync_decision_summary(
+            payload,
+            load_credential_fn=_load_credential_ok,
+            transport=transport,
+        )
+        == "unavailable"
+    )
+    assert len(transport.calls) == 1
+
+    transport = FakeTransport([non_exact_responses[-1], non_exact_responses[-1]])
+    assert (
+        sync_decision_summary(
+            payload,
+            load_credential_fn=_load_credential_ok,
+            transport=transport,
+        )
+        == "unavailable"
+    )
+    assert len(transport.calls) == 2
+
+    transport = BackendEchoTransport()
+    v2_payload = _payload(
+        schema_version="2",
+        controlled_alternative_id="filesystem.stage_delete.v1",
+        controlled_outcome="completed_safely",
+        rollback_available=True,
+        verification_level="mechanism_verified",
+        result_hash=RESULT_HASH,
+        redirected=False,
+    )
+    assert (
+        sync_decision_summary(
+            v2_payload,
+            load_credential_fn=_load_credential_ok,
+            transport=transport,
+        )
+        == "accepted"
+    )
+    assert len(transport.calls) == 1
+
+    source_transport = FakeTransport([
+        _json_response(403, {"error": "forbidden"}, content_type="application/json"),
+    ])
+    assert (
+        sync_source_aware_decision_summary(
+            payload,
+            source=_source_context(),
+            transport=source_transport,
+        )
+        == "unavailable"
+    )
+    assert len(source_transport.calls) == 1
+
+
+def test_schema3_fallback_preserves_bounded_fields_and_drops_only_phase_link():
+    transport = FakeTransport([
+        _legacy_schema3_invalid_summary_response(),
+        lambda body: _json_response(200, _backend_ack_for_request(body)),
+    ])
+    payload = _schema3_controlled_payload()
+    sync_decision_summary(
+        payload,
+        load_credential_fn=_load_credential_ok,
+        transport=transport,
+    )
+    first = json.loads(transport.calls[0]["body"].decode("utf-8"))
+    second = json.loads(transport.calls[1]["body"].decode("utf-8"))
+    assert set(second.keys()) == set(first.keys()) - {"bounded_phase_correlation_id"}
+    assert first["schema_version"] == "3"
+    assert second["schema_version"] == "2"
+    for key in set(second.keys()) - {"schema_version"}:
+        assert second[key] == first[key]
+    assert payload.event_id == second["event_id"]
+    assert payload.idempotency_key == second["idempotency_key"]
