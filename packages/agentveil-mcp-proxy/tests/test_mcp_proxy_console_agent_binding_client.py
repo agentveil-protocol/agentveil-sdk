@@ -229,7 +229,9 @@ def test_agent_binding_retry_idempotent() -> None:
     _scan(nonces)
 
 
-def test_agent_binding_custody_lifecycle(tmp_path: Path) -> None:
+def test_agent_binding_custody_lifecycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     agent_did = "did:key:z6MkhaWgW9R3mQ8p1k2v3N4m5L6n7O8p9Q0r1S2t3U4v5W6x7Y8z9"
     summary_a = "summary-token-a-0123456789abcdef0123456789ab"
     summary_b = "summary-token-b-0123456789abcdef0123456789ab"
@@ -279,8 +281,12 @@ def test_agent_binding_custody_lifecycle(tmp_path: Path) -> None:
     bad_file.write_text("{", encoding="utf-8")
     os.chmod(bad_file, 0o600)
     exchanges: list[str] = []
-    transport_mod._run_bounded_exchange = lambda _url, _headers, body, method="POST": (
-        exchanges.append(body) or (200, {"schema_version": "1"})
+    monkeypatch.setattr(
+        transport_mod,
+        "_run_bounded_exchange",
+        lambda _url, _headers, body, method="POST": (
+            exchanges.append(body) or (200, {"schema_version": "1"})
+        ),
     )
     bound = build_controlled_alternative_context(
         agent=_agent(key),
@@ -295,7 +301,9 @@ def test_agent_binding_custody_lifecycle(tmp_path: Path) -> None:
     _scan(token_a, legacy, resolved.token)
 
 
-def test_agent_binding_source_change_fails_closed(tmp_path: Path) -> None:
+def test_agent_binding_source_change_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     agent_did = "did:key:z6MkhaWgW9R3mQ8p1k2v3N4m5L6n7O8p9Q0r1S2t3U4v5W6x7Y8z9"
     summary_a = "summary-token-a-0123456789abcdef0123456789ab"
     summary_b = "summary-token-b-0123456789abcdef0123456789ab"
@@ -339,8 +347,12 @@ def test_agent_binding_source_change_fails_closed(tmp_path: Path) -> None:
     exchanges: list[str] = []
     import agentveil_mcp_proxy.controlled_alternatives_transport as transport_mod
 
-    transport_mod._run_bounded_exchange = lambda _url, _headers, body, method="POST": (
-        exchanges.append(body) or (200, {"schema_version": "1"})
+    monkeypatch.setattr(
+        transport_mod,
+        "_run_bounded_exchange",
+        lambda _url, _headers, body, method="POST": (
+            exchanges.append(body) or (200, {"schema_version": "1"})
+        ),
     )
     assert fresh.heartbeat(SUMMARY_TOKEN_B, "2026-09-15T12:00:00Z") == (401, {})
     assert exchanges == []
