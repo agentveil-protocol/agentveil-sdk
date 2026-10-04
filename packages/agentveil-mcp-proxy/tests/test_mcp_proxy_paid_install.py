@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import sys
@@ -18,6 +19,7 @@ import pytest
 
 from agentveil_mcp_proxy.cli import main
 from agentveil_mcp_proxy.paid_activation import ACTIVATION_FILENAME, STATUS_ACTIVE
+from agentveil_mcp_proxy.paid_provider import STATUS_MISSING
 from agentveil_mcp_proxy.paid_install import (
     COMPOSED_BASE_ARTIFACT_ID,
     COMPOSED_BASE_PACKAGE_NAME,
@@ -2769,3 +2771,486 @@ def run_activation_handoff(request):
     assert list(vendor_root(home).glob(".staging-*")) == []
     assert list((home / "paid" / "cache").glob(".staging-*")) == []
     _assert_no_paid_leaks(marker.read_text(encoding="utf-8"))
+
+
+class _SimulatedVendorHardCrash(BaseException):
+    pass
+
+
+def _simulate_missing_live_vendor_backup(live_dir: Path, *, marker_text: str) -> Path:
+    backup_dir = live_dir.with_name(f"{live_dir.name}.backup")
+    (live_dir / "recovery-marker.txt").write_text(marker_text, encoding="utf-8")
+    shutil.move(str(live_dir), str(backup_dir))
+    assert not live_dir.exists()
+    assert backup_dir.is_dir()
+    return backup_dir
+
+
+def _patch_hard_crash_after_vendor_live_backup(
+    monkeypatch,
+    *,
+    live_dir: Path,
+    gate: dict[str, bool],
+) -> None:
+    import agentveil_mcp_proxy.paid_install as paid_install_module
+
+    backup_dir = live_dir.with_name(f"{live_dir.name}.backup")
+    original_replace = paid_install_module.os.replace
+
+    def guarded_replace(src, dst):  # noqa: ANN001
+        original_replace(src, dst)
+        if gate.get("armed") and Path(src) == live_dir and Path(dst) == backup_dir:
+            raise _SimulatedVendorHardCrash()
+
+    monkeypatch.setattr(paid_install_module.os, "replace", guarded_replace)
+
+
+def _paired_free_builder_wheel_bytes(tmp_path: Path) -> tuple[bytes, str, bytes, str]:
+    from agentveil_mcp_proxy.paid_provider import (
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP,
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME,
+        PAID_PROVIDER_ENTRYPOINT_GROUP,
+    )
+
+    base_module = COMPOSED_BASE_PACKAGE_NAME.replace("-", "_")
+    handoff_source = """
+def run_activation_handoff(request):
+    return {
+        "contract_version": "1",
+        "status": "active",
+        "public_fallback_available": True,
+        "summary": "Installed hook completed.",
+        "error_code": None,
+    }
+"""
+    base_wheel_path, base_hash = _build_composed_base_wheel(
+        tmp_path / "wheel-base",
+        extra_entries={
+            f"{base_module}/handoff_hook.py": handoff_source,
+            f"{base_module}-{COMPOSED_BASE_PACKAGE_VERSION}.dist-info/entry_points.txt": (
+                f"[{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP}]\n"
+                f"{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME} = "
+                f"{base_module}.handoff_hook:run_activation_handoff\n\n"
+                f"[{PAID_PROVIDER_ENTRYPOINT_GROUP}]\n"
+                f"private_v1 = {base_module}.vendored_provider:build_vendored_provider\n"
+            ),
+        },
+    )
+    thin_wheel_path, thin_hash = _build_composed_thin_wheel(tmp_path / "wheel-thin")
+    return (
+        base_wheel_path.read_bytes(),
+        base_hash,
+        thin_wheel_path.read_bytes(),
+        thin_hash,
+    )
+
+
+def test_same_version_install_recovers_vendor_after_hard_crash_window(
+    tmp_path,
+    mock_paid_backend,
+    monkeypatch,
+):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    code, _out, err = _run_main_with_backend(
+        ["paid", "activate", "--license-key-stdin", "--home", str(home)],
+        home=home,
+        base_url=mock_paid_backend,
+        stdin_text=f"{RAW_LICENSE_KEY}\n",
+    )
+    assert code == 0, err
+
+    base_live = vendor_root(home) / f"{COMPOSED_BASE_PACKAGE_NAME}-{COMPOSED_BASE_PACKAGE_VERSION}"
+    base_backup = base_live.with_name(f"{base_live.name}.backup")
+    crash_marker = base_live / "crash-survivor.txt"
+    crash_marker.write_text("prior-vendor-bytes", encoding="utf-8")
+    prior_install_bytes = install_state_path(home).read_bytes()
+
+    crash_gate = {"armed": True}
+    _patch_hard_crash_after_vendor_live_backup(monkeypatch, live_dir=base_live, gate=crash_gate)
+    with pytest.raises(_SimulatedVendorHardCrash):
+        _run_main_with_backend(
+            ["paid", "activate", "--license-key-stdin", "--home", str(home)],
+            home=home,
+            base_url=mock_paid_backend,
+            stdin_text=f"{RAW_LICENSE_KEY}\n",
+        )
+
+    assert not base_live.exists()
+    assert base_backup.is_dir()
+    assert (base_backup / "crash-survivor.txt").read_text(encoding="utf-8") == "prior-vendor-bytes"
+    assert install_state_path(home).read_bytes() == prior_install_bytes
+
+    crash_gate["armed"] = False
+    code, out, err = _run_main_with_backend(
+        ["paid", "activate", "--license-key-stdin", "--home", str(home)],
+        home=home,
+        base_url=mock_paid_backend,
+        stdin_text=f"{RAW_LICENSE_KEY}\n",
+    )
+    assert code == 0, err
+    assert base_live.is_dir()
+    assert not base_backup.exists()
+    assert resolve_vendored_paid_provider(home=home) is not None
+    assert list(vendor_root(home).glob("*.backup")) == []
+    _assert_no_paid_leaks(out + err)
+
+
+def test_paired_install_recovers_missing_live_vendor_from_safe_backup(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    base_bytes, base_hash, thin_bytes, thin_hash = _paired_free_builder_wheel_bytes(tmp_path / "wheels")
+    expectations = (
+        FreeBuilderWheelExpectations(
+            artifact_hash=base_hash,
+            artifact_size_bytes=len(base_bytes),
+            package_name=COMPOSED_BASE_PACKAGE_NAME,
+            package_version=COMPOSED_BASE_PACKAGE_VERSION,
+        ),
+        FreeBuilderWheelExpectations(
+            artifact_hash=thin_hash,
+            artifact_size_bytes=len(thin_bytes),
+            package_name=THIN_PACKAGE_NAME,
+            package_version=COMPOSED_THIN_PACKAGE_VERSION,
+        ),
+    )
+
+    run_free_builder_paired_install_flow(
+        base_wheel_bytes=base_bytes,
+        thin_wheel_bytes=thin_bytes,
+        home=home,
+        activation_credential=RAW_LICENSE_KEY,
+        base_expectations=expectations[0],
+        thin_expectations=expectations[1],
+    )
+
+    base_live = vendor_root(home) / f"{COMPOSED_BASE_PACKAGE_NAME}-{COMPOSED_BASE_PACKAGE_VERSION}"
+    base_backup = base_live.with_name(f"{base_live.name}.backup")
+    (base_live / "paired-crash-survivor.txt").write_text("paired-prior-bytes", encoding="utf-8")
+    prior_install_bytes = install_state_path(home).read_bytes()
+
+    crash_gate = {"armed": True}
+    _patch_hard_crash_after_vendor_live_backup(monkeypatch, live_dir=base_live, gate=crash_gate)
+    with pytest.raises(_SimulatedVendorHardCrash):
+        run_free_builder_paired_install_flow(
+            base_wheel_bytes=base_bytes,
+            thin_wheel_bytes=thin_bytes,
+            home=home,
+            activation_credential=RAW_LICENSE_KEY,
+            base_expectations=expectations[0],
+            thin_expectations=expectations[1],
+        )
+
+    assert not base_live.exists()
+    assert base_backup.is_dir()
+    assert (base_backup / "paired-crash-survivor.txt").read_text(encoding="utf-8") == "paired-prior-bytes"
+    assert install_state_path(home).read_bytes() == prior_install_bytes
+
+    crash_gate["armed"] = False
+    run_free_builder_paired_install_flow(
+        base_wheel_bytes=base_bytes,
+        thin_wheel_bytes=thin_bytes,
+        home=home,
+        activation_credential=RAW_LICENSE_KEY,
+        base_expectations=expectations[0],
+        thin_expectations=expectations[1],
+    )
+    assert base_live.is_dir()
+    assert not base_backup.exists()
+    assert resolve_vendored_paid_provider(home=home) is not None
+    assert list(vendor_root(home).glob("*.backup")) == []
+
+
+def test_vendor_backup_recovery_rejects_symlink_and_non_directory_without_mutation(
+    tmp_path,
+    mock_paid_backend,
+    monkeypatch,
+):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    code, _out, err = _run_main_with_backend(
+        ["paid", "activate", "--license-key-stdin", "--home", str(home)],
+        home=home,
+        base_url=mock_paid_backend,
+        stdin_text=f"{RAW_LICENSE_KEY}\n",
+    )
+    assert code == 0, err
+
+    base_live = vendor_root(home) / f"{COMPOSED_BASE_PACKAGE_NAME}-{COMPOSED_BASE_PACKAGE_VERSION}"
+    base_backup = base_live.with_name(f"{base_live.name}.backup")
+    prior_install_bytes = install_state_path(home).read_bytes()
+    real_vendor = tmp_path / "outside-vendor"
+    real_vendor.mkdir()
+    (real_vendor / "marker.txt").write_text("outside", encoding="utf-8")
+
+    shutil.rmtree(base_live)
+    base_backup.symlink_to(real_vendor, target_is_directory=True)
+    assert not base_live.exists()
+    assert base_backup.is_symlink()
+
+    code, _out, err = _run_main_with_backend(
+        ["paid", "activate", "--license-key-stdin", "--home", str(home)],
+        home=home,
+        base_url=mock_paid_backend,
+        stdin_text=f"{RAW_LICENSE_KEY}\n",
+    )
+    assert code == 1
+    assert ERROR_INSTALL_FAILED in err or "install_failed" in err
+    assert not base_live.exists()
+    assert base_backup.is_symlink()
+    assert base_backup.resolve() == real_vendor.resolve()
+    assert install_state_path(home).read_bytes() == prior_install_bytes
+
+    base_backup.unlink()
+    base_backup.write_bytes(b"not-a-vendor-directory")
+    assert not base_live.exists()
+    assert base_backup.is_file()
+
+    code, _out, err = _run_main_with_backend(
+        ["paid", "activate", "--license-key-stdin", "--home", str(home)],
+        home=home,
+        base_url=mock_paid_backend,
+        stdin_text=f"{RAW_LICENSE_KEY}\n",
+    )
+    assert code == 1
+    assert ERROR_INSTALL_FAILED in err or "install_failed" in err
+    assert not base_live.exists()
+    assert base_backup.read_bytes() == b"not-a-vendor-directory"
+    assert install_state_path(home).read_bytes() == prior_install_bytes
+
+
+def test_vendor_backup_recovery_rejects_broken_live_symlink_without_mutation(
+    tmp_path,
+    mock_paid_backend,
+    monkeypatch,
+):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    code, _out, err = _run_main_with_backend(
+        ["paid", "activate", "--license-key-stdin", "--home", str(home)],
+        home=home,
+        base_url=mock_paid_backend,
+        stdin_text=f"{RAW_LICENSE_KEY}\n",
+    )
+    assert code == 0, err
+
+    base_live = vendor_root(home) / f"{COMPOSED_BASE_PACKAGE_NAME}-{COMPOSED_BASE_PACKAGE_VERSION}"
+    base_backup = base_live.with_name(f"{base_live.name}.backup")
+    prior_install_bytes = install_state_path(home).read_bytes()
+    broken_target = tmp_path / "missing-live-vendor-target"
+
+    shutil.rmtree(base_live)
+    base_live.symlink_to(broken_target, target_is_directory=True)
+    assert base_live.is_symlink()
+    assert not base_live.exists()
+    assert not base_backup.exists()
+    expected_link_target = os.readlink(base_live)
+
+    code, _out, err = _run_main_with_backend(
+        ["paid", "activate", "--license-key-stdin", "--home", str(home)],
+        home=home,
+        base_url=mock_paid_backend,
+        stdin_text=f"{RAW_LICENSE_KEY}\n",
+    )
+    assert code == 1
+    assert ERROR_INSTALL_FAILED in err or "install_failed" in err
+    assert base_live.is_symlink()
+    assert os.readlink(base_live) == expected_link_target
+    assert not base_backup.exists()
+    assert install_state_path(home).read_bytes() == prior_install_bytes
+
+
+def test_vendor_backup_recovery_rejects_broken_backup_symlink_without_mutation(
+    tmp_path,
+    mock_paid_backend,
+    monkeypatch,
+):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    code, _out, err = _run_main_with_backend(
+        ["paid", "activate", "--license-key-stdin", "--home", str(home)],
+        home=home,
+        base_url=mock_paid_backend,
+        stdin_text=f"{RAW_LICENSE_KEY}\n",
+    )
+    assert code == 0, err
+
+    base_live = vendor_root(home) / f"{COMPOSED_BASE_PACKAGE_NAME}-{COMPOSED_BASE_PACKAGE_VERSION}"
+    base_backup = base_live.with_name(f"{base_live.name}.backup")
+    prior_install_bytes = install_state_path(home).read_bytes()
+    broken_target = tmp_path / "missing-backup-vendor-target"
+
+    shutil.rmtree(base_live)
+    base_backup.symlink_to(broken_target, target_is_directory=True)
+    assert not base_live.exists()
+    assert base_backup.is_symlink()
+    assert not base_backup.exists()
+    expected_link_target = os.readlink(base_backup)
+
+    code, _out, err = _run_main_with_backend(
+        ["paid", "activate", "--license-key-stdin", "--home", str(home)],
+        home=home,
+        base_url=mock_paid_backend,
+        stdin_text=f"{RAW_LICENSE_KEY}\n",
+    )
+    assert code == 1
+    assert ERROR_INSTALL_FAILED in err or "install_failed" in err
+    assert not base_live.exists()
+    assert base_backup.is_symlink()
+    assert os.readlink(base_backup) == expected_link_target
+    assert install_state_path(home).read_bytes() == prior_install_bytes
+
+
+@pytest.mark.parametrize(
+    ("unowned_case",),
+    [
+        ("missing_install_state",),
+        ("inactive_install_state",),
+        ("malformed_install_state",),
+        ("mismatched_package_version",),
+    ],
+)
+def test_vendor_backup_recovery_rejects_unowned_backup_without_mutation(
+    tmp_path,
+    mock_paid_backend,
+    monkeypatch,
+    unowned_case: str,
+):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    code, _out, err = _run_main_with_backend(
+        ["paid", "activate", "--license-key-stdin", "--home", str(home)],
+        home=home,
+        base_url=mock_paid_backend,
+        stdin_text=f"{RAW_LICENSE_KEY}\n",
+    )
+    assert code == 0, err
+
+    base_live = vendor_root(home) / f"{COMPOSED_BASE_PACKAGE_NAME}-{COMPOSED_BASE_PACKAGE_VERSION}"
+    backup_marker = f"unowned-backup-{unowned_case}"
+    base_backup = _simulate_missing_live_vendor_backup(base_live, marker_text=backup_marker)
+    install_path = install_state_path(home)
+    prior_install_bytes = install_path.read_bytes()
+
+    if unowned_case == "missing_install_state":
+        install_path.unlink()
+        expected_install_bytes: bytes | None = None
+    elif unowned_case == "inactive_install_state":
+        payload = json.loads(prior_install_bytes.decode("utf-8"))
+        payload["status"] = STATUS_MISSING
+        install_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        expected_install_bytes = install_path.read_bytes()
+    elif unowned_case == "malformed_install_state":
+        install_path.write_text("{not-valid-json", encoding="utf-8")
+        expected_install_bytes = install_path.read_bytes()
+        assert load_install_state(install_path) is None
+    elif unowned_case == "mismatched_package_version":
+        payload = json.loads(prior_install_bytes.decode("utf-8"))
+        payload["package_version"] = "9.9.9"
+        for entry in payload["install_components"]:
+            if entry["role"] == COMPONENT_ROLE_BASE:
+                entry["package_version"] = "9.9.9"
+        install_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        expected_install_bytes = install_path.read_bytes()
+    else:
+        raise AssertionError(f"unknown unowned_case: {unowned_case}")
+
+    code, _out, err = _run_main_with_backend(
+        ["paid", "activate", "--license-key-stdin", "--home", str(home)],
+        home=home,
+        base_url=mock_paid_backend,
+        stdin_text=f"{RAW_LICENSE_KEY}\n",
+    )
+    assert code == 1
+    assert ERROR_INSTALL_FAILED in err or "install_failed" in err
+    assert not base_live.exists()
+    assert base_backup.is_dir()
+    assert (base_backup / "recovery-marker.txt").read_text(encoding="utf-8") == backup_marker
+    if expected_install_bytes is None:
+        assert not install_path.exists()
+    else:
+        assert install_path.read_bytes() == expected_install_bytes
+
+
+def test_legacy_vendor_backup_recovery_rejects_unowned_backup_without_mutation(
+    tmp_path,
+    monkeypatch,
+):
+    from agentveil_mcp_proxy.paid_install import _publish_staged_vendor, _vendor_stage_dir
+
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    wheel_path, _digest = _build_controlled_alternative_test_wheel(tmp_path / "wheel")
+    live_dir = _install_active_controlled_alternative(home, wheel_path=wheel_path)
+    backup_marker = "legacy-unowned-backup"
+    backup_dir = _simulate_missing_live_vendor_backup(live_dir, marker_text=backup_marker)
+    install_path = install_state_path(home)
+    payload = json.loads(install_path.read_bytes().decode("utf-8"))
+    payload["package_version"] = "8.8.8"
+    install_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    expected_install_bytes = install_path.read_bytes()
+
+    stage_dir = _vendor_stage_dir(
+        home,
+        package_name=PACKAGE_NAME,
+        package_version=PACKAGE_VERSION,
+    )
+    install_wheel_to_vendor(
+        home=home,
+        wheel_path=wheel_path,
+        target_dir=stage_dir,
+        expected_package_name=PACKAGE_NAME,
+        expected_package_version=PACKAGE_VERSION,
+        require_empty_target=True,
+    )
+    with pytest.raises(PaidInstallError, match=ERROR_INSTALL_FAILED):
+        _publish_staged_vendor(home=home, stage_dir=stage_dir, live_dir=live_dir)
+
+    assert not live_dir.exists()
+    assert backup_dir.is_dir()
+    assert (backup_dir / "recovery-marker.txt").read_text(encoding="utf-8") == backup_marker
+    assert install_path.read_bytes() == expected_install_bytes
+
+
+def test_vendor_publish_rejects_non_directory_live_without_mutation(
+    tmp_path,
+    mock_paid_backend,
+    monkeypatch,
+):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    code, _out, err = _run_main_with_backend(
+        ["paid", "activate", "--license-key-stdin", "--home", str(home)],
+        home=home,
+        base_url=mock_paid_backend,
+        stdin_text=f"{RAW_LICENSE_KEY}\n",
+    )
+    assert code == 0, err
+
+    base_live = vendor_root(home) / f"{COMPOSED_BASE_PACKAGE_NAME}-{COMPOSED_BASE_PACKAGE_VERSION}"
+    base_backup = base_live.with_name(f"{base_live.name}.backup")
+    prior_install_bytes = install_state_path(home).read_bytes()
+    live_marker_bytes = b"bounded-live-vendor-marker"
+
+    shutil.rmtree(base_live)
+    base_live.write_bytes(live_marker_bytes)
+    assert base_live.is_file()
+    assert not base_backup.exists()
+
+    code, _out, err = _run_main_with_backend(
+        ["paid", "activate", "--license-key-stdin", "--home", str(home)],
+        home=home,
+        base_url=mock_paid_backend,
+        stdin_text=f"{RAW_LICENSE_KEY}\n",
+    )
+    assert code == 1
+    assert ERROR_INSTALL_FAILED in err or "install_failed" in err
+    assert base_live.is_file()
+    assert base_live.read_bytes() == live_marker_bytes
+    assert not base_backup.exists()
+    assert install_state_path(home).read_bytes() == prior_install_bytes
+
+
+test_composed_pair_publish_failure_restores_prior_install = (
+    test_composed_publish_failure_rolls_back_first_component_and_preserves_legacy
+)

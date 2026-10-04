@@ -875,6 +875,80 @@ def _discard_staged_vendor(stage_dir: Path) -> None:
         shutil.rmtree(stage_dir, ignore_errors=True)
 
 
+def _deterministic_vendor_backup_dir(live_dir: Path) -> Path:
+    return live_dir.with_name(f"{live_dir.name}.backup")
+
+
+def _authorized_vendor_live_dirs_for_recovery(
+    home: Path,
+    install_state: Mapping[str, Any],
+) -> list[Path]:
+    """Return trusted live vendor dirs named by bounded active install state."""
+
+    if install_state.get("install_composition_version") is not None:
+        role_order = [spec.role for spec in COMPOSED_PAID_INSTALL_COMPONENTS]
+    else:
+        role_order = [COMPONENT_ROLE_BASE, COMPONENT_ROLE_THIN]
+
+    authorized: list[Path] = []
+    seen: set[Path] = set()
+    for role in role_order:
+        resolved_target = _resolve_install_component_target(install_state, role=role)
+        if resolved_target is None:
+            continue
+        package_name, package_version = resolved_target
+        candidate = _vendor_live_dir(
+            home,
+            package_name=package_name,
+            package_version=package_version,
+        )
+        resolved_candidate = _assert_trusted_home_path(home, candidate)
+        if resolved_candidate in seen:
+            continue
+        seen.add(resolved_candidate)
+        authorized.append(resolved_candidate)
+    return authorized
+
+
+def _assert_active_install_authorizes_vendor_live_recovery(*, home: Path, live_dir: Path) -> None:
+    install_state = load_install_state(install_state_path(home))
+    if install_state is None:
+        raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
+    if install_state.get("status") != STATUS_ACTIVE:
+        raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
+    assert_install_metadata_bounded(install_state)
+    resolved_live = _assert_trusted_home_path(home, live_dir)
+    authorized = _authorized_vendor_live_dirs_for_recovery(home, install_state)
+    if not any(resolved_live == candidate for candidate in authorized):
+        raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
+
+
+def _recover_missing_live_vendor_from_safe_backup(*, home: Path, live_dir: Path) -> None:
+    """Restore live vendor from its deterministic backup after a hard-crash window."""
+
+    backup_dir = _deterministic_vendor_backup_dir(live_dir)
+    if live_dir.is_symlink():
+        raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
+    if live_dir.exists() and not live_dir.is_dir():
+        raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
+    if backup_dir.is_symlink():
+        raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
+    live_exists = live_dir.exists()
+    backup_exists = backup_dir.exists()
+    if live_exists:
+        if backup_exists:
+            raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
+        return
+    if not backup_exists:
+        return
+    if not backup_dir.is_dir():
+        raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
+    _assert_non_symlink_vendor_path(home, backup_dir)
+    _assert_active_install_authorizes_vendor_live_recovery(home=home, live_dir=live_dir)
+    os.replace(backup_dir, live_dir)
+    _assert_non_symlink_vendor_path(home, live_dir)
+
+
 @dataclass(frozen=True)
 class _VendorPublishRollback:
     backup_dir: Path | None
@@ -883,9 +957,10 @@ class _VendorPublishRollback:
 
 def _publish_staged_vendor(*, home: Path, stage_dir: Path, live_dir: Path) -> _VendorPublishRollback:
     _assert_non_symlink_vendor_path(home, stage_dir)
+    _recover_missing_live_vendor_from_safe_backup(home=home, live_dir=live_dir)
     if live_dir.exists():
         _assert_non_symlink_vendor_path(home, live_dir)
-        backup_dir = live_dir.with_name(f"{live_dir.name}.backup")
+        backup_dir = _deterministic_vendor_backup_dir(live_dir)
         _discard_staged_vendor(backup_dir)
         os.replace(live_dir, backup_dir)
         try:
