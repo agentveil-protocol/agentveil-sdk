@@ -18,7 +18,7 @@ It works alongside agent runtimes such as Cursor, Claude Code, Codex, Gemini
 CLI, and Hermes CLI: attempt, decision, controlled path when available, local
 proof.
 
-[Quick Start](#quick-start) · [The Loop](#the-agentveil-loop) · [Connectors](#connectors-available-today) · [Evidence](#bounded-evidence) · [Scope](#scope) · [Design Basis](#design-basis) · [Docs](docs/)
+[Quick Start](#quick-start) · [Console](#start-from-the-console) · [The Loop](#the-agentveil-loop) · [Connectors](#connectors-available-today) · [Evidence](#bounded-evidence) · [Scope](#scope) · [Design Basis](#design-basis) · [Docs](docs/)
 
 </div>
 
@@ -26,7 +26,7 @@ proof.
 pip install agentveil-mcp-proxy
 ```
 
-**Packages**: [agentveil-mcp-proxy](https://pypi.org/project/agentveil-mcp-proxy/) · [agentveil](https://pypi.org/project/agentveil/) | **Website**: [agentveil.dev](https://agentveil.dev) | **Package source**: [`packages/agentveil-mcp-proxy/`](packages/agentveil-mcp-proxy/)
+**Packages**: [agentveil-mcp-proxy](https://pypi.org/project/agentveil-mcp-proxy/) · [agentveil](https://pypi.org/project/agentveil/) | **Website**: [agentveil.dev](https://agentveil.dev) | **Console**: [agentveil.dev/console](https://agentveil.dev/console/auth) | **Package source**: [`packages/agentveil-mcp-proxy/`](packages/agentveil-mcp-proxy/)
 
 > **Agent action boundary:** AI runtimes execute agents. AgentVeil mediates
 > configured action paths around them. When a native or risky action hits the
@@ -77,6 +77,30 @@ control layer around actions that are configured to pass through AgentVeil.
 ## Quick Start
 
 Use AgentVeil with a supported project connector, or run the Core MCP Proxy directly.
+
+### Start from the Console
+
+Sign in at [agentveil.dev/console/auth](https://agentveil.dev/console/auth)
+with GitHub or Google, pick your agent, and run the command the Console shows.
+The same commands are listed below for each connector.
+
+When you run a connector's `setup` command, AgentVeil opens the Console in your
+browser so you can approve this machine. The Console then shows what your
+connected projects report: project connection status, decision summaries and
+approval summaries. Raw prompts, source code and file contents stay on your
+machine. Local protection works without the Console.
+
+If the browser did not open (for example on a headless machine) or you closed
+it, connect later:
+
+```bash
+agentveil-mcp-proxy login
+```
+
+`login` prints a verification URL and a short code (`--no-open` for headless
+use); `agentveil-mcp-proxy logout` disconnects this machine. See
+[Connect To AgentVeil Console](packages/agentveil-mcp-proxy/README.md#connect-to-agentveil-console-optional)
+for the exact scope.
 
 ### Cursor project connector
 
