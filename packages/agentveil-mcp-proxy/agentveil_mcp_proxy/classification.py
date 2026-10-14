@@ -1087,6 +1087,18 @@ def _leading_env_assignments_are_secret(tokens: list[str]) -> bool:
     return False
 
 
+def _classify_rg_command(tokens: list[str]) -> RiskClass | None:
+    """Classify ``rg`` invocations; ``--pre`` runs arbitrary commands."""
+
+    if not tokens or tokens[0] != "rg":
+        return None
+    for token in tokens[1:]:
+        lowered = token.lower()
+        if lowered == "--pre" or lowered.startswith("--pre="):
+            return RiskClass.WRITE
+    return None
+
+
 def _classify_ruff_command(tokens: list[str]) -> RiskClass | None:
     """Classify ``ruff`` invocations; plain check is read, fix/format mutate."""
 
@@ -1173,7 +1185,13 @@ def _classify_native_shell_mutation(tokens: list[str]) -> RiskClass | None:
     if command == "find":
         if "-delete" in lower_tokens:
             return RiskClass.DESTRUCTIVE
-        if "-exec" in lower_tokens:
+        if "-exec" in lower_tokens or "-execdir" in lower_tokens:
+            return RiskClass.WRITE
+        if any(
+            token in {"-fprint", "-fprintf", "-fls"}
+            or token.startswith(("-fprint=", "-fprintf=", "-fls="))
+            for token in lower_tokens
+        ):
             return RiskClass.WRITE
     if command in {"sed", "perl"}:
         if any(token == "-i" or token.startswith("-i") or token.startswith("-pi") for token in lower_tokens):
@@ -1308,6 +1326,16 @@ def _git_ls_remote_ref_is_bounded(token: str) -> bool:
     return _GIT_LS_REMOTE_REF_RE.fullmatch(token) is not None
 
 
+def _git_subcommand_writes_output_file(raw_tokens: list[str]) -> bool:
+    """Return True when ``git diff``/``show`` (etc.) use ``--output`` to a file."""
+
+    for arg in raw_tokens[2:]:
+        lowered = arg.lower()
+        if lowered == "--output" or lowered.startswith("--output="):
+            return True
+    return False
+
+
 def _git_ls_remote_flag_is_forbidden(arg: str) -> bool:
     lowered = arg.lower()
     if lowered in _GIT_LS_REMOTE_FORBIDDEN_FLAG_PREFIXES:
@@ -1406,6 +1434,8 @@ def _classify_git_command(raw_tokens: list[str]) -> RiskClass:
         return RiskClass.READ
 
     if subcommand in _GIT_READ_SUBCOMMANDS:
+        if _git_subcommand_writes_output_file(raw_tokens):
+            return RiskClass.WRITE
         return RiskClass.READ
 
     if subcommand in _GIT_LOCAL_DEV_SUBCOMMANDS:
@@ -1442,6 +1472,10 @@ def _classify_simple_native_shell_tokens(raw_tokens: list[str]) -> RiskClass:
     ruff_risk = _classify_ruff_command(lower_tokens)
     if ruff_risk is not None:
         return ruff_risk
+
+    rg_risk = _classify_rg_command(lower_tokens)
+    if rg_risk is not None:
+        return rg_risk
 
     python_module_risk = _classify_python_module_invocation(lower_tokens)
     if python_module_risk is not None:

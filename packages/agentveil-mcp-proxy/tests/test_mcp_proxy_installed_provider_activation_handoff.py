@@ -30,6 +30,9 @@ from agentveil_mcp_proxy.paid_activation import (
 )
 from agentveil_mcp_proxy.paid_install import (
     BOUNDED_INSTALL_KEYS,
+    COMPOSED_INSTALL_COMPOSITION_VERSION,
+    COMPONENT_ROLE_BASE,
+    COMPONENT_ROLE_THIN,
     ERROR_HANDOFF_HOOK_EXCEPTION,
     ERROR_INSTALL_FAILED,
     INSTALL_FILENAME,
@@ -43,6 +46,7 @@ from agentveil_mcp_proxy.paid_install import (
     activation_reference_from_credential,
     discover_exact_installed_activation_hook,
     install_state_path,
+    install_wheel_to_vendor,
     invoke_installed_provider_activation_handoff,
     load_install_state,
     parse_vendored_entry_points,
@@ -98,9 +102,33 @@ from test_mcp_proxy_approval_run_proxy_e2e import (
 
 from mcp_fake_downstream import seed_tool_schemas, tool_entry
 
-PACKAGE_NAME = "agentveil-private-policy"
+LEGACY_PACKAGE_NAME = "agentveil-private-policy"
+LEGACY_PACKAGE_VERSION = "0.1.0"
+PACKAGE_NAME = "agentveil-private-guardrails-base"
 PACKAGE_VERSION = "0.1.0"
+THIN_PACKAGE_NAME = "agentveil-private-policy-thin"
+THIN_PACKAGE_VERSION = "0.1.3"
+COMPOSED_BASE_ARTIFACT_ID = "art_pkg_private_guardrails_base_001"
+COMPOSED_THIN_ARTIFACT_ID = "art_pkg_ca_basic_004"
 MODULE_NAME = PACKAGE_NAME.replace("-", "_")
+THIN_MODULE_NAME = THIN_PACKAGE_NAME.replace("-", "_")
+
+
+def _default_thin_wheel_bytes() -> tuple[bytes, str]:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(f"{THIN_MODULE_NAME}/__init__.py", "\n")
+        archive.writestr(
+            f"{THIN_MODULE_NAME}-{THIN_PACKAGE_VERSION}.dist-info/METADATA",
+            f"Name: {THIN_PACKAGE_NAME}\nVersion: {THIN_PACKAGE_VERSION}\n",
+        )
+    data = buffer.getvalue()
+    return data, sha256_hex(data)
+
+
+_DEFAULT_THIN_WHEEL_BYTES, _DEFAULT_THIN_WHEEL_DIGEST = _default_thin_wheel_bytes()
+_DEFAULT_THIN_WHEEL_SIZE = len(_DEFAULT_THIN_WHEEL_BYTES)
+
 RAW_LICENSE_KEY = "avp_live_handoff_secret_key_do_not_leak_xyz123"
 ALT_LICENSE_KEY_SAME_LENGTH = "avp_live_handoff_secret_key_do_not_leak_xyz124"
 EXPECTED_CREDENTIAL_DIGEST = hashlib.sha256(RAW_LICENSE_KEY.encode("utf-8")).hexdigest()
@@ -596,7 +624,11 @@ class _FakeBackend:
     wheel_bytes: bytes
     artifact_hash: str
     artifact_size: int
+    thin_wheel_bytes: bytes = _DEFAULT_THIN_WHEEL_BYTES
+    thin_artifact_hash: str = _DEFAULT_THIN_WHEEL_DIGEST
+    thin_artifact_size: int = _DEFAULT_THIN_WHEEL_SIZE
     provider_handoff_required: bool = False
+    authorize_artifact_ids: list[str] = field(default_factory=list)
 
     def validate_activation(self, license_key: str) -> ActivationValidateResult:
         assert license_key == RAW_LICENSE_KEY
@@ -640,23 +672,51 @@ class _FakeBackend:
         platform_name: str,
         python_version: str,
     ) -> PackageAuthorizeResult:
-        del artifact_id, platform_name, python_version
+        del platform_name, python_version
         assert entitlement_token == ENTITLEMENT_TOKEN
+        self.authorize_artifact_ids.append(artifact_id)
+        if artifact_id == COMPOSED_BASE_ARTIFACT_ID:
+            return PackageAuthorizeResult(
+                download_authorized=True,
+                artifact_id=COMPOSED_BASE_ARTIFACT_ID,
+                package_name=PACKAGE_NAME,
+                package_version=PACKAGE_VERSION,
+                artifact_hash=self.artifact_hash,
+                artifact_size_bytes=self.artifact_size,
+                download_authorization_id="dlauth_handoff_base_001",
+                public_fallback_available=True,
+                error_code=None,
+            )
+        if artifact_id == COMPOSED_THIN_ARTIFACT_ID:
+            return PackageAuthorizeResult(
+                download_authorized=True,
+                artifact_id=COMPOSED_THIN_ARTIFACT_ID,
+                package_name=THIN_PACKAGE_NAME,
+                package_version=THIN_PACKAGE_VERSION,
+                artifact_hash=self.thin_artifact_hash,
+                artifact_size_bytes=self.thin_artifact_size,
+                download_authorization_id="dlauth_handoff_thin_001",
+                public_fallback_available=True,
+                error_code=None,
+            )
         return PackageAuthorizeResult(
-            download_authorized=True,
-            artifact_id="art_pkg_private_policy_001",
-            package_name=PACKAGE_NAME,
-            package_version=PACKAGE_VERSION,
-            artifact_hash=self.artifact_hash,
-            artifact_size_bytes=self.artifact_size,
-            download_authorization_id="dlauth_handoff_001",
+            download_authorized=False,
+            artifact_id=artifact_id,
+            package_name=None,
+            package_version=None,
+            artifact_hash=None,
+            artifact_size_bytes=None,
+            download_authorization_id=None,
             public_fallback_available=True,
-            error_code=None,
+            error_code="download_denied",
         )
 
     def download_package(self, authorization: PackageAuthorizeResult) -> bytes:
-        assert authorization.download_authorization_id == "dlauth_handoff_001"
-        return self.wheel_bytes
+        if authorization.download_authorization_id == "dlauth_handoff_base_001":
+            return self.wheel_bytes
+        if authorization.download_authorization_id == "dlauth_handoff_thin_001":
+            return self.thin_wheel_bytes
+        raise AssertionError("unexpected download authorization")
 
 
 @dataclass
@@ -1027,6 +1087,103 @@ def test_handoff_request_redacts_credential_in_repr_and_str():
     assert "activation_credential='***'" in repr(request)
     assert "avp_home='***'" in repr(request)
     assert "/tmp/avp-home" not in repr(request)
+
+
+def test_composed_thin_stage_failure_skips_handoff_and_active_state(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    wheel, digest = _wheel_bytes(tmp_path / "wheel")
+    set_paid_backend_client(
+        _FakeBackend(
+            wheel_bytes=wheel,
+            artifact_hash=digest,
+            artifact_size=len(wheel),
+            provider_handoff_required=True,
+        )
+    )
+    real_install = install_wheel_to_vendor
+
+    def fail_thin_stage(**kwargs):  # noqa: ANN003
+        if kwargs.get("expected_package_name") == THIN_PACKAGE_NAME:
+            raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
+        return real_install(**kwargs)
+
+    monkeypatch.setattr(
+        "agentveil_mcp_proxy.paid_install.install_wheel_to_vendor",
+        fail_thin_stage,
+    )
+    with pytest.raises(PaidInstallError, match=ERROR_INSTALL_FAILED):
+        run_paid_activate_install_flow(
+            license_key=RAW_LICENSE_KEY,
+            home=home,
+        )
+    assert load_install_state(install_state_path(home)) is None
+    assert not (home / "paid" / ".handoff_trace.json").is_file()
+
+
+def test_composed_public_fallback_stays_false_when_later_authorization_is_true(
+    tmp_path,
+):
+    home = tmp_path / "avp-home"
+    wheel, digest = _wheel_bytes(tmp_path / "wheel")
+
+    @dataclass
+    class _ConservativeFallbackBackend(_FakeBackend):
+        def validate_activation(self, license_key: str) -> ActivationValidateResult:
+            result = super().validate_activation(license_key)
+            return ActivationValidateResult(
+                valid=result.valid,
+                customer_ref_fingerprint=result.customer_ref_fingerprint,
+                plan=result.plan,
+                license_status=result.license_status,
+                subscription_status=result.subscription_status,
+                period_end=result.period_end,
+                public_fallback_available=False,
+                error_code=result.error_code,
+                provider_handoff_required=result.provider_handoff_required,
+            )
+
+        def authorize_package(
+            self,
+            entitlement_token: str,
+            *,
+            artifact_id: str,
+            platform_name: str,
+            python_version: str,
+        ) -> PackageAuthorizeResult:
+            result = super().authorize_package(
+                entitlement_token,
+                artifact_id=artifact_id,
+                platform_name=platform_name,
+                python_version=python_version,
+            )
+            if artifact_id == COMPOSED_THIN_ARTIFACT_ID:
+                return PackageAuthorizeResult(
+                    download_authorized=result.download_authorized,
+                    artifact_id=result.artifact_id,
+                    package_name=result.package_name,
+                    package_version=result.package_version,
+                    artifact_hash=result.artifact_hash,
+                    artifact_size_bytes=result.artifact_size_bytes,
+                    download_authorization_id=result.download_authorization_id,
+                    public_fallback_available=True,
+                    error_code=result.error_code,
+                )
+            return result
+
+    backend = _ConservativeFallbackBackend(
+        wheel_bytes=wheel,
+        artifact_hash=digest,
+        artifact_size=len(wheel),
+        provider_handoff_required=True,
+    )
+    set_paid_backend_client(backend)
+    result = run_paid_activate_install_flow(
+        license_key=RAW_LICENSE_KEY,
+        home=home,
+        client=backend,
+    )
+    assert result.public_fallback_available is False
+    assert result.install_state["public_fallback_available"] is False
 
 
 def test_run_paid_activate_install_flow_delivers_exact_same_credential_once(tmp_path, capsys):
@@ -1613,7 +1770,7 @@ def test_late_wheel_cache_failure_preserves_prior_vendor_and_install_state(
         "agentveil_mcp_proxy.paid_install._commit_wheel_cache",
         _fail_wheel_cache,
     )
-    with pytest.raises(OSError, match="simulated wheel cache commit failure"):
+    with pytest.raises(PaidActivationError, match=ERROR_INSTALL_FAILED):
         build_paid_activate_payload(license_key=RAW_LICENSE_KEY, home=home)
 
     assert load_install_state(install_state_path(home)) == prior_install
@@ -1661,7 +1818,7 @@ def test_late_publish_failure_preserves_prior_vendor_and_install_state(
         "agentveil_mcp_proxy.paid_install._publish_staged_vendor",
         _fail_publish,
     )
-    with pytest.raises(OSError, match="simulated vendor publish failure"):
+    with pytest.raises(PaidActivationError, match=ERROR_INSTALL_FAILED):
         build_paid_activate_payload(license_key=RAW_LICENSE_KEY, home=home)
 
     preserved = load_install_state(install_state_path(home))
@@ -1689,7 +1846,7 @@ def test_first_install_cache_failure_removes_published_vendor(tmp_path, monkeypa
         "agentveil_mcp_proxy.paid_install._commit_wheel_cache",
         _fail_wheel_cache,
     )
-    with pytest.raises(OSError, match="simulated wheel cache commit failure"):
+    with pytest.raises(PaidActivationError, match=ERROR_INSTALL_FAILED):
         build_paid_activate_payload(license_key=RAW_LICENSE_KEY, home=home)
 
     assert load_install_state(install_state_path(home)) is None
@@ -1716,7 +1873,7 @@ def test_first_install_cache_chmod_failure_removes_committed_wheel(tmp_path, mon
         real_chmod(path, mode)
 
     monkeypatch.setattr(os, "chmod", _chmod_fail_on_cache)
-    with pytest.raises(OSError, match="simulated chmod failure"):
+    with pytest.raises(PaidActivationError, match=ERROR_INSTALL_FAILED):
         build_paid_activate_payload(license_key=RAW_LICENSE_KEY, home=home)
 
     cache_path = home / "paid" / "cache" / f"{PACKAGE_NAME}-{PACKAGE_VERSION}.whl"
@@ -1725,7 +1882,7 @@ def test_first_install_cache_chmod_failure_removes_committed_wheel(tmp_path, mon
     assert not (vendor_root(home) / f"{PACKAGE_NAME}-{PACKAGE_VERSION}").exists()
 
 
-def test_replacement_cache_backup_cleanup_failure_restores_prior_wheel(
+def test_replacement_cache_backup_cleanup_failure_keeps_active_install_and_retains_backup(
     tmp_path,
     monkeypatch,
 ):
@@ -1743,7 +1900,6 @@ def test_replacement_cache_backup_cleanup_failure_restores_prior_wheel(
         )
     )
     build_paid_activate_payload(license_key=RAW_LICENSE_KEY, home=home)
-    prior_install = load_install_state(install_state_path(home))
     cache_path = home / "paid" / "cache" / f"{PACKAGE_NAME}-{PACKAGE_VERSION}.whl"
     old_cache_bytes = cache_path.read_bytes()
     vendor_dir = vendor_root(home) / f"{PACKAGE_NAME}-{PACKAGE_VERSION}"
@@ -1771,13 +1927,45 @@ def test_replacement_cache_backup_cleanup_failure_restores_prior_wheel(
         return real_unlink(self, missing_ok=missing_ok)
 
     monkeypatch.setattr(Path, "unlink", _unlink_fail_backup)
-    with pytest.raises(OSError, match="simulated backup cleanup failure"):
-        build_paid_activate_payload(license_key=RAW_LICENSE_KEY, home=home)
+    payload = build_paid_activate_payload(license_key=RAW_LICENSE_KEY, home=home)
+    assert payload["activation"]["status"] == STATUS_ACTIVE
 
-    assert cache_path.read_bytes() == old_cache_bytes
-    assert not cache_path.with_name(f"{cache_path.name}.backup").exists()
-    assert load_install_state(install_state_path(home)) == prior_install
-    assert vendor_marker.read_text(encoding="utf-8") == "keep-me"
+    backup_path = cache_path.with_name(f"{cache_path.name}.backup")
+    assert cache_path.read_bytes() == wheel_new
+    assert backup_path.is_file()
+    assert backup_path.read_bytes() == old_cache_bytes
+
+    updated_install = load_install_state(install_state_path(home))
+    activation = load_activation_state(activation_path(home))
+    assert updated_install is not None and activation is not None
+    assert updated_install["status"] == STATUS_ACTIVE
+    assert activation["status"] == STATUS_ACTIVE
+    assert set(updated_install) <= set(BOUNDED_INSTALL_KEYS)
+    assert updated_install["package_name"] == PACKAGE_NAME
+    assert updated_install["package_version"] == PACKAGE_VERSION
+    assert (
+        updated_install["install_composition_version"]
+        == COMPOSED_INSTALL_COMPOSITION_VERSION
+    )
+    roles = {entry["role"] for entry in updated_install["install_components"]}
+    assert roles == {COMPONENT_ROLE_BASE, COMPONENT_ROLE_THIN}
+    assert payload["install"]["status"] == STATUS_ACTIVE
+    assert payload["install"]["package_name"] == PACKAGE_NAME
+    assert vendor_dir.is_dir()
+    assert not vendor_marker.exists()
+
+    response_text = json.dumps(payload, sort_keys=True)
+    assert RAW_LICENSE_KEY not in response_text
+    assert ENTITLEMENT_TOKEN not in response_text
+    assert "presigned" not in response_text.lower()
+    assert "X-Amz-" not in response_text
+    assert "https://" not in response_text
+    assert "http://" not in response_text
+    assert "/Users/" not in response_text
+    assert str(home.resolve()) not in response_text
+    assert COMPOSED_BASE_ARTIFACT_ID not in response_text
+    assert COMPOSED_THIN_ARTIFACT_ID not in response_text
+    assert "Traceback" not in response_text
 
 
 def test_preloaded_ambient_modules_rejected_by_origin_check(tmp_path, monkeypatch):

@@ -819,6 +819,39 @@ def test_classify_native_shell_allows_bounded_read_chains_and_diagnostics() -> N
     )
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rg --pre ./preprocessor needle ordinary.txt",
+        "rg --pre=./preprocessor needle ordinary.txt",
+        "find . -execdir touch audit-marker {} +",
+        "find . -fprint output.txt",
+        "find . -fprintf output.txt %p",
+        "find . -fls output.txt",
+        "git diff --output=output.txt",
+        "git diff --output output.txt",
+        "git show --output=output.txt",
+        "git show --output output.txt",
+    ],
+)
+def test_classify_native_shell_audited_side_effect_forms_are_not_read(
+    command: str,
+) -> None:
+    from agentveil_mcp_proxy.classification import classify_native_shell_command
+
+    assert classify_native_shell_command(command) is not RiskClass.READ
+
+
+def test_classify_native_shell_ordinary_read_forms_still_allowed() -> None:
+    from agentveil_mcp_proxy.classification import classify_native_shell_command
+
+    assert classify_native_shell_command("rg needle ordinary.txt") is RiskClass.READ
+    assert classify_native_shell_command("find . -maxdepth 2 -type f -name '*.py'") is RiskClass.READ
+    assert classify_native_shell_command("git status") is RiskClass.READ
+    assert classify_native_shell_command("git diff --check") is RiskClass.READ
+    assert classify_native_shell_command("git show HEAD:README.md") is RiskClass.READ
+
+
 def test_classify_native_shell_read_chain_fails_closed_on_unsafe_segment() -> None:
     from agentveil_mcp_proxy.classification import classify_native_shell_command
 
@@ -899,6 +932,16 @@ NATIVE_SHELL_COMMAND_MATRIX: tuple[tuple[str, RiskClass], ...] = (
     ("alembic upgrade head", RiskClass.WRITE),
     ("python -m pip install foo", RiskClass.WRITE),
     ("git status > out.txt", RiskClass.WRITE),
+    ("rg --pre ./preprocessor needle ordinary.txt", RiskClass.WRITE),
+    ("rg --pre=./preprocessor needle ordinary.txt", RiskClass.WRITE),
+    ("find . -execdir touch audit-marker {} +", RiskClass.WRITE),
+    ("find . -fprint output.txt", RiskClass.WRITE),
+    ("find . -fprintf output.txt %p", RiskClass.WRITE),
+    ("find . -fls output.txt", RiskClass.WRITE),
+    ("git diff --output=output.txt", RiskClass.WRITE),
+    ("git diff --output output.txt", RiskClass.WRITE),
+    ("git show --output=output.txt", RiskClass.WRITE),
+    ("git show --output output.txt", RiskClass.WRITE),
     # Remote mutation negative-test boundary.
     ("git fetch origin", RiskClass.PRODUCTION),  # claim-check: allow negative classifier assertion.
     ("git pull origin main", RiskClass.PRODUCTION),  # claim-check: allow negative classifier assertion.

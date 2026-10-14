@@ -19,8 +19,18 @@ import pytest
 from agentveil_mcp_proxy.cli import main
 from agentveil_mcp_proxy.paid_activation import ACTIVATION_FILENAME, STATUS_ACTIVE
 from agentveil_mcp_proxy.paid_install import (
+    COMPOSED_BASE_ARTIFACT_ID,
+    COMPOSED_BASE_PACKAGE_NAME,
+    COMPOSED_BASE_PACKAGE_VERSION,
+    COMPOSED_INSTALL_COMPOSITION_VERSION,
+    COMPOSED_THIN_ARTIFACT_ID,
+    COMPOSED_THIN_PACKAGE_VERSION,
+    COMPONENT_ROLE_BASE,
+    COMPONENT_ROLE_THIN,
     DEFAULT_ARTIFACT_ID,
     ERROR_INSTALL_FAILED,
+    ERROR_HASH_MISMATCH,
+    ERROR_DOWNLOAD_DENIED,
     ERROR_PACKAGE_NAME_MISMATCH,
     ERROR_VERSION_MISMATCH,
     INSTALL_FILENAME,
@@ -50,11 +60,15 @@ from agentveil_mcp_proxy.paid_install import (
     ERROR_VENDORED_PROVIDER_MISSING,
     discover_exact_vendored_controlled_alternative_provider_entry,
     install_state_path,
+    load_install_state,
     resolve_vendored_controlled_alternative_provider,
+    resolve_vendored_paid_provider,
+    resolve_vendored_controlled_alternative_authority,
     vendor_root,
     verify_free_builder_wheel_artifact,
     verify_wheel_artifact,
     write_install_state,
+    run_free_builder_paired_install_flow,
 )
 from agentveil_mcp_proxy.controlled_alternatives import (
     CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP,
@@ -63,6 +77,7 @@ from agentveil_mcp_proxy.controlled_alternatives import (
 
 PACKAGE_NAME = "agentveil-private-policy"
 PACKAGE_VERSION = "0.1.0"
+THIN_PACKAGE_NAME = "agentveil-private-policy-thin"
 ARTIFACT_ID = "art_pkg_private_policy_001"
 RAW_LICENSE_KEY = "avp_live_test_secret_key_do_not_leak_123456789"
 ENTITLEMENT_TOKEN = "avp_ent_v1.test.entitlement.token.secret.value.do.not.leak"
@@ -72,18 +87,94 @@ PRESIGNED_URL = (
 )
 CUSTOMER_REF = "cust_demo0001"
 
+_VENDORED_PROVIDER_DEFAULT_HOME_SOURCE = """
+from agentveil_mcp_proxy.paid_activation import default_home
+
+class _Provider:
+    provider_id = 'private_v1'
+    provider_contract_version = '1'
+
+    def status(self):
+        install_path = default_home() / 'paid' / 'install.json'
+        if install_path.is_file():
+            return {
+                'provider_present': True,
+                'provider_id': 'private_v1',
+                'provider_contract_version': '1',
+                'status': 'active',
+                'private_provider_enabled': True,
+                'public_fallback_available': True,
+                'summary': 'ok',
+                'error_code': None,
+            }
+        return {
+            'provider_present': True,
+            'provider_id': 'private_v1',
+            'provider_contract_version': '1',
+            'status': 'missing',
+            'private_provider_enabled': False,
+            'public_fallback_available': True,
+            'summary': 'awaiting install state',
+            'error_code': None,
+        }
+
+def build_vendored_provider():
+    return _Provider()
+"""
+
+_VENDORED_PROVIDER_REQUIRES_ACTIVATION_JSON = """
+from agentveil_mcp_proxy.paid_activation import default_home
+
+class _Provider:
+    provider_id = 'private_v1'
+    provider_contract_version = '1'
+
+    def status(self):
+        activation_path = default_home() / 'paid' / 'activation.json'
+        if activation_path.is_file():
+            return {
+                'provider_present': True,
+                'provider_id': 'private_v1',
+                'provider_contract_version': '1',
+                'status': 'active',
+                'private_provider_enabled': True,
+                'public_fallback_available': True,
+                'summary': 'ok',
+                'error_code': None,
+            }
+        return {
+            'provider_present': True,
+            'provider_id': 'private_v1',
+            'provider_contract_version': '1',
+            'status': 'missing',
+            'private_provider_enabled': False,
+            'public_fallback_available': True,
+            'summary': 'awaiting activation state',
+            'error_code': None,
+        }
+
+def build_vendored_provider():
+    return _Provider()
+"""
+
 
 @dataclass
 class _MockBackendState:
-    wheel_bytes: bytes
-    artifact_hash: str
-    artifact_size: int
+    base_wheel_bytes: bytes
+    base_artifact_hash: str
+    base_artifact_size: int
+    thin_wheel_bytes: bytes
+    thin_artifact_hash: str
+    thin_artifact_size: int
     last_authorize_artifact_id: str | None = None
+    authorize_artifact_ids: list[str] | None = None
     safety_decision: str = "allow"
     safety_reason_code: str | None = None
     post_paths: list[str] | None = None
     authorize_call_count: int = 0
     download_call_count: int = 0
+    entitlement_call_count: int = 0
+    safety_call_count: int = 0
 
 
 class _MockPaidBackendHandler(BaseHTTPRequestHandler):
@@ -101,6 +192,80 @@ class _MockPaidBackendHandler(BaseHTTPRequestHandler):
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_packages_authorize(self, payload: dict) -> None:
+        self.state.authorize_call_count += 1
+        artifact_id = payload.get("artifact_id")
+        self.state.last_authorize_artifact_id = artifact_id
+        self.state.authorize_artifact_ids = self.state.authorize_artifact_ids or []
+        self.state.authorize_artifact_ids.append(str(artifact_id))
+        if payload.get("entitlement_token") != ENTITLEMENT_TOKEN:
+            self._send_json(
+                {
+                    "download_authorized": False,
+                    "error_code": "download_entitlement_invalid",
+                    "public_fallback_available": True,
+                }
+            )
+            return
+        if artifact_id == COMPOSED_BASE_ARTIFACT_ID:
+            package_name = COMPOSED_BASE_PACKAGE_NAME
+            package_version = COMPOSED_BASE_PACKAGE_VERSION
+            artifact_hash = self.state.base_artifact_hash
+            artifact_size = self.state.base_artifact_size
+            download_authorization_id = "dlauth_test_base_001"
+        elif artifact_id == COMPOSED_THIN_ARTIFACT_ID:
+            package_name = THIN_PACKAGE_NAME
+            package_version = COMPOSED_THIN_PACKAGE_VERSION
+            artifact_hash = self.state.thin_artifact_hash
+            artifact_size = self.state.thin_artifact_size
+            download_authorization_id = "dlauth_test_thin_001"
+        else:
+            self._send_json(
+                {
+                    "download_authorized": False,
+                    "error_code": "download_denied",
+                    "public_fallback_available": True,
+                }
+            )
+            return
+        self._send_json(
+            {
+                "download_authorized": True,
+                "artifact_id": artifact_id,
+                "package_name": package_name,
+                "package_version": package_version,
+                "platform": payload.get("platform", "linux"),
+                "python_version": payload.get("python_version", "3.14"),
+                "artifact_hash": artifact_hash,
+                "artifact_size_bytes": artifact_size,
+                "entitlement_id": "ent_test_001",
+                "license_key_fingerprint": hashlib.sha256(RAW_LICENSE_KEY.encode()).hexdigest()[:16],
+                "customer_ref_fingerprint": hashlib.sha256(CUSTOMER_REF.encode()).hexdigest()[:16],
+                "download_authorization_id": download_authorization_id,
+                "download_authorization_ref": "abcd1234ef567890",
+                "expires_at": "2026-07-08T12:05:00+00:00",
+                "public_fallback_available": True,
+                "error_code": None,
+            }
+        )
+
+    def _handle_packages_download(self, payload: dict) -> None:
+        self.state.download_call_count += 1
+        auth_id = payload.get("download_authorization_id")
+        if auth_id == "dlauth_test_base_001":
+            body = self.state.base_wheel_bytes
+        elif auth_id == "dlauth_test_thin_001":
+            body = self.state.thin_wheel_bytes
+        else:
+            self.send_response(403)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -129,6 +294,7 @@ class _MockPaidBackendHandler(BaseHTTPRequestHandler):
             )
             return
         if self.path == "/v1/paid/activate/entitlement":
+            self.state.entitlement_call_count += 1
             payload = self._read_json()
             if payload.get("license_key") != RAW_LICENSE_KEY:
                 self._send_json({"error_code": "invalid_key"}, status=400)
@@ -143,6 +309,7 @@ class _MockPaidBackendHandler(BaseHTTPRequestHandler):
             return
         # claim-check: allow "safety" is the advisory endpoint label under test.
         if self.path == "/v1/paid/install/safety-check":
+            self.state.safety_call_count += 1
             payload = self._read_json()
             extra = set(payload) - INSTALL_SAFETY_ALLOWED_REQUEST_KEYS
             if extra:
@@ -213,52 +380,12 @@ class _MockPaidBackendHandler(BaseHTTPRequestHandler):
             )
             return
         if self.path == "/v1/paid/packages/authorize":
-            self.state.authorize_call_count += 1
             payload = self._read_json()
-            self.state.last_authorize_artifact_id = payload.get("artifact_id")
-            if payload.get("entitlement_token") != ENTITLEMENT_TOKEN:
-                self._send_json(
-                    {
-                        "download_authorized": False,
-                        "error_code": "download_entitlement_invalid",
-                        "public_fallback_available": True,
-                    }
-                )
-                return
-            self._send_json(
-                {
-                    "download_authorized": True,
-                    "artifact_id": ARTIFACT_ID,
-                    "package_name": PACKAGE_NAME,
-                    "package_version": PACKAGE_VERSION,
-                    "platform": payload.get("platform", "linux"),
-                    "python_version": payload.get("python_version", "3.14"),
-                    "artifact_hash": self.state.artifact_hash,
-                    "artifact_size_bytes": self.state.artifact_size,
-                    "entitlement_id": "ent_test_001",
-                    "license_key_fingerprint": hashlib.sha256(RAW_LICENSE_KEY.encode()).hexdigest()[:16],
-                    "customer_ref_fingerprint": hashlib.sha256(CUSTOMER_REF.encode()).hexdigest()[:16],
-                    "download_authorization_id": "dlauth_test_001",
-                    "download_authorization_ref": "abcd1234ef567890",
-                    "expires_at": "2026-07-08T12:05:00+00:00",
-                    "public_fallback_available": True,
-                    "error_code": None,
-                }
-            )
+            self._handle_packages_authorize(payload)
             return
         if self.path == "/v1/paid/packages/download":
-            self.state.download_call_count += 1
             payload = self._read_json()
-            if payload.get("download_authorization_id") != "dlauth_test_001":
-                self.send_response(403)
-                self.end_headers()
-                return
-            body = self.state.wheel_bytes
-            self.send_response(200)
-            self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._handle_packages_download(payload)
             return
         self.send_response(404)
         self.end_headers()
@@ -292,15 +419,129 @@ def _build_test_wheel(
     return wheel_path, sha256_hex(wheel_bytes)
 
 
+def _build_composed_base_wheel(
+    tmp_path: Path,
+    *,
+    package_version: str = COMPOSED_BASE_PACKAGE_VERSION,
+    extra_entries: dict[str, str] | None = None,
+) -> tuple[Path, str]:
+    from agentveil_mcp_proxy.paid_provider import PAID_PROVIDER_ENTRYPOINT_GROUP
+
+    module = COMPOSED_BASE_PACKAGE_NAME.replace("-", "_")
+    extra = {
+        f"{module}/vendored_provider.py": (
+            "import os\n"
+            "from pathlib import Path\n"
+            "class _Provider:\n"
+            "    provider_id = 'private_v1'\n"
+            "    provider_contract_version = '1'\n"
+            "    def _install_path(self):\n"
+            "        home = os.environ.get('AVP_HOME')\n"
+            "        if not home:\n"
+            "            return None\n"
+            "        return Path(home) / 'paid' / 'install.json'\n"
+            "    def status(self):\n"
+            "        install_path = self._install_path()\n"
+            "        if install_path is None or not install_path.is_file():\n"
+            "            return {'provider_present': True, 'provider_id': 'private_v1', "
+            "'provider_contract_version': '1', 'status': 'missing', "
+            "'private_provider_enabled': False, 'public_fallback_available': True, "
+            "'summary': 'awaiting install state', 'error_code': None}\n"
+            "        return {'provider_present': True, 'provider_id': 'private_v1', "
+            "'provider_contract_version': '1', 'status': 'active', "
+            "'private_provider_enabled': True, 'public_fallback_available': True, "
+            "'summary': 'ok', 'error_code': None}\n"
+            "def build_vendored_provider():\n"
+            "    return _Provider()\n"
+        ),
+        f"{module}-{package_version}.dist-info/entry_points.txt": (
+            f"[{PAID_PROVIDER_ENTRYPOINT_GROUP}]\n"
+            f"private_v1 = {module}.vendored_provider:build_vendored_provider\n"
+        ),
+    }
+    extra.update(extra_entries or {})
+    return _build_test_wheel(
+        tmp_path,
+        package_name=COMPOSED_BASE_PACKAGE_NAME,
+        package_version=package_version,
+        extra_entries=extra,
+    )
+
+
+def _build_composed_thin_wheel(
+    tmp_path: Path,
+    *,
+    extra_entries: dict[str, str] | None = None,
+) -> tuple[Path, str]:
+    module = THIN_PACKAGE_NAME.replace("-", "_")
+    thin_provider_source = (
+        "class _Provider:\n"
+        "    calls = []\n"
+        "    def descriptor(self):\n"
+        "        self.calls.append('descriptor')\n"
+        "        return {'provider_id': 'private_v1'}\n"
+        "def build_provider():\n"
+        "    return _Provider()\n"
+    )
+    extra = {
+        f"{module}/controlled_provider.py": thin_provider_source,
+        f"{module}-{COMPOSED_THIN_PACKAGE_VERSION}.dist-info/entry_points.txt": (
+            f"[{CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP}]\n"
+            f"private_v1 = {module}.controlled_provider:build_provider\n"
+            "[agentveil_mcp_proxy.controlled_alternative_authorities]\n"
+            f"ca_route_v1 = {module}.controlled_provider:build_provider\n"
+        ),
+    }
+    extra.update(extra_entries or {})
+    return _build_test_wheel(
+        tmp_path,
+        package_name=THIN_PACKAGE_NAME,
+        package_version=COMPOSED_THIN_PACKAGE_VERSION,
+        extra_entries=extra,
+    )
+
+
+def _start_mock_paid_backend(
+    tmp_path: Path,
+    *,
+    base_extra_entries: dict[str, str] | None = None,
+) -> tuple[str, ThreadingHTTPServer, threading.Thread]:
+    base_wheel_path, base_hash = _build_composed_base_wheel(
+        tmp_path / "wheel-base",
+        extra_entries=base_extra_entries,
+    )
+    thin_wheel_path, thin_hash = _build_composed_thin_wheel(tmp_path / "wheel-thin")
+    state = _MockBackendState(
+        base_wheel_bytes=base_wheel_path.read_bytes(),
+        base_artifact_hash=base_hash,
+        base_artifact_size=len(base_wheel_path.read_bytes()),
+        thin_wheel_bytes=thin_wheel_path.read_bytes(),
+        thin_artifact_hash=thin_hash,
+        thin_artifact_size=len(thin_wheel_path.read_bytes()),
+        post_paths=[],
+        authorize_artifact_ids=[],
+    )
+    _MockPaidBackendHandler.state = state
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _MockPaidBackendHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    return base_url, server, thread
+
+
 @pytest.fixture
 def mock_paid_backend(tmp_path):
-    wheel_path, artifact_hash = _build_test_wheel(tmp_path / "wheel-build")
-    wheel_bytes = wheel_path.read_bytes()
+    base_wheel_path, base_hash = _build_composed_base_wheel(tmp_path / "wheel-base")
+    thin_wheel_path, thin_hash = _build_composed_thin_wheel(tmp_path / "wheel-thin")
     state = _MockBackendState(
-        wheel_bytes=wheel_bytes,
-        artifact_hash=artifact_hash,
-        artifact_size=len(wheel_bytes),
+        base_wheel_bytes=base_wheel_path.read_bytes(),
+        base_artifact_hash=base_hash,
+        base_artifact_size=len(base_wheel_path.read_bytes()),
+        thin_wheel_bytes=thin_wheel_path.read_bytes(),
+        thin_artifact_hash=thin_hash,
+        thin_artifact_size=len(thin_wheel_path.read_bytes()),
         post_paths=[],
+        authorize_artifact_ids=[],
     )
     _MockPaidBackendHandler.state = state
     server = ThreadingHTTPServer(("127.0.0.1", 0), _MockPaidBackendHandler)
@@ -361,6 +602,38 @@ def _run_main_with_backend(
     return code, stdout.getvalue(), stderr.getvalue()
 
 
+def _run_main_with_backend_preserve_ambient_avp_home(
+    argv: list[str],
+    *,
+    base_url: str,
+    stdin_text: str | None = None,
+) -> tuple[int, str, str]:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    previous_base = os.environ.get("AVP_PAID_API_BASE_URL")
+    os.environ["AVP_PAID_API_BASE_URL"] = base_url
+    set_paid_backend_client(HttpPaidBackendClient(base_url=base_url))
+    previous_stdout = sys.stdout
+    previous_stderr = sys.stderr
+    previous_stdin = sys.stdin
+    sys.stdout = stdout
+    sys.stderr = stderr
+    if stdin_text is not None:
+        sys.stdin = io.StringIO(stdin_text)
+    try:
+        code = main(argv)
+    finally:
+        sys.stdout = previous_stdout
+        sys.stderr = previous_stderr
+        sys.stdin = previous_stdin
+        if previous_base is None:
+            os.environ["AVP_PAID_API_BASE_URL"] = ""
+        else:
+            os.environ["AVP_PAID_API_BASE_URL"] = previous_base
+        set_paid_backend_client(None)
+    return code, stdout.getvalue(), stderr.getvalue()
+
+
 def _assert_no_paid_leaks(text: str, *, file_text: str = "") -> None:
     combined = text + file_text
     scan_paid_output_for_leaks(
@@ -387,8 +660,8 @@ def test_paid_activate_install_local_flow(tmp_path, mock_paid_backend):
     assert code == 0, err
     assert "Status: active" in out
     assert "Provider: private_v1" in out
-    assert f"Installed package: {PACKAGE_NAME}" in out
-    assert f"Installed version: {PACKAGE_VERSION}" in out
+    assert f"Installed package: {COMPOSED_BASE_PACKAGE_NAME}" in out
+    assert f"Installed version: {COMPOSED_BASE_PACKAGE_VERSION}" in out
     assert "Public fallback: available" in out
     _assert_no_paid_leaks(out + err)
 
@@ -413,7 +686,7 @@ def test_paid_activate_install_local_flow(tmp_path, mock_paid_backend):
     )
     assert code == 0, err
     assert "Status: active" in out
-    assert f"Installed package: {PACKAGE_NAME}" in out
+    assert f"Installed package: {COMPOSED_BASE_PACKAGE_NAME}" in out
     _assert_no_paid_leaks(out + err)
 
 
@@ -507,7 +780,7 @@ def test_install_wheel_rejects_zip_slip_entry(tmp_path):
     assert exc.value.args[0] == ERROR_INSTALL_FAILED
 
 
-def test_paid_activate_install_uses_private_policy_artifact_id(tmp_path, mock_paid_backend):
+def test_paid_activate_install_uses_composed_artifact_sequence(tmp_path, mock_paid_backend):
     home = tmp_path / "avp-home"
     code, out, err = _run_main_with_backend(
         ["paid", "activate", "--license-key-stdin", "--home", str(home)],
@@ -516,17 +789,24 @@ def test_paid_activate_install_uses_private_policy_artifact_id(tmp_path, mock_pa
         stdin_text=f"{RAW_LICENSE_KEY}\n",
     )
     assert code == 0, err
-    assert _MockPaidBackendHandler.state.last_authorize_artifact_id == ARTIFACT_ID
+    assert _MockPaidBackendHandler.state.authorize_artifact_ids == [
+        COMPOSED_BASE_ARTIFACT_ID,
+        COMPOSED_THIN_ARTIFACT_ID,
+    ]
+    assert _MockPaidBackendHandler.state.entitlement_call_count == 1
+    assert _MockPaidBackendHandler.state.safety_call_count == 1
+    assert _MockPaidBackendHandler.state.authorize_call_count == 2
+    assert _MockPaidBackendHandler.state.download_call_count == 2
 
 
 def test_paid_activate_rejects_wheel_with_wrong_metadata_version(tmp_path, mock_paid_backend):
-    wheel_path, artifact_hash = _build_test_wheel(
+    wheel_path, artifact_hash = _build_composed_base_wheel(
         tmp_path / "bad-wheel",
         package_version="9.9.9",
     )
-    _MockPaidBackendHandler.state.wheel_bytes = wheel_path.read_bytes()
-    _MockPaidBackendHandler.state.artifact_hash = artifact_hash
-    _MockPaidBackendHandler.state.artifact_size = len(_MockPaidBackendHandler.state.wheel_bytes)
+    _MockPaidBackendHandler.state.base_wheel_bytes = wheel_path.read_bytes()
+    _MockPaidBackendHandler.state.base_artifact_hash = artifact_hash
+    _MockPaidBackendHandler.state.base_artifact_size = len(_MockPaidBackendHandler.state.base_wheel_bytes)
 
     home = tmp_path / "avp-home"
     code, out, err = _run_main_with_backend(
@@ -578,20 +858,22 @@ def test_paid_activate_rejects_backend_controlled_package_name(tmp_path, mock_pa
                     }
                 )
                 return
+            if payload.get("artifact_id") != COMPOSED_BASE_ARTIFACT_ID:
+                return original_authorize(self)
             self._send_json(
                 {
                     "download_authorized": True,
-                    "artifact_id": ARTIFACT_ID,
+                    "artifact_id": COMPOSED_BASE_ARTIFACT_ID,
                     "package_name": "../../escape",
-                    "package_version": PACKAGE_VERSION,
+                    "package_version": COMPOSED_BASE_PACKAGE_VERSION,
                     "platform": payload.get("platform", "linux"),
                     "python_version": payload.get("python_version", "3.14"),
-                    "artifact_hash": self.state.artifact_hash,
-                    "artifact_size_bytes": self.state.artifact_size,
+                    "artifact_hash": self.state.base_artifact_hash,
+                    "artifact_size_bytes": self.state.base_artifact_size,
                     "entitlement_id": "ent_test_001",
                     "license_key_fingerprint": hashlib.sha256(RAW_LICENSE_KEY.encode()).hexdigest()[:16],
                     "customer_ref_fingerprint": hashlib.sha256(CUSTOMER_REF.encode()).hexdigest()[:16],
-                    "download_authorization_id": "dlauth_test_001",
+                    "download_authorization_id": "dlauth_test_base_001",
                     "download_authorization_ref": "abcd1234ef567890",
                     "expires_at": "2026-07-08T12:05:00+00:00",
                     "public_fallback_available": True,
@@ -800,6 +1082,360 @@ def test_verify_free_builder_wheel_artifact_rejects_hash_mismatch(tmp_path):
                 package_version=PACKAGE_VERSION,
             ),
         )
+
+
+def test_run_free_builder_paired_install_flow_persists_split_state(tmp_path, monkeypatch):
+    from agentveil_mcp_proxy.paid_provider import (
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP,
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME,
+        PAID_PROVIDER_ENTRYPOINT_GROUP,
+    )
+
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    base_module = COMPOSED_BASE_PACKAGE_NAME.replace("-", "_")
+    handoff_source = """
+def run_activation_handoff(request):
+    return {
+        "contract_version": "1",
+        "status": "active",
+        "public_fallback_available": True,
+        "summary": "Installed hook completed.",
+        "error_code": None,
+    }
+"""
+    base_wheel_path, base_hash = _build_composed_base_wheel(
+        tmp_path / "wheel-base",
+        extra_entries={
+            f"{base_module}/handoff_hook.py": handoff_source,
+            f"{base_module}-{COMPOSED_BASE_PACKAGE_VERSION}.dist-info/entry_points.txt": (
+                f"[{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP}]\n"
+                f"{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME} = "
+                f"{base_module}.handoff_hook:run_activation_handoff\n\n"
+                f"[{PAID_PROVIDER_ENTRYPOINT_GROUP}]\n"
+                f"private_v1 = {base_module}.vendored_provider:build_vendored_provider\n"
+            ),
+        },
+    )
+    thin_wheel_path, thin_hash = _build_composed_thin_wheel(tmp_path / "wheel-thin")
+    base_bytes = base_wheel_path.read_bytes()
+    thin_bytes = thin_wheel_path.read_bytes()
+    result = run_free_builder_paired_install_flow(
+        base_wheel_bytes=base_bytes,
+        thin_wheel_bytes=thin_bytes,
+        home=home,
+        activation_credential=RAW_LICENSE_KEY,
+        base_expectations=FreeBuilderWheelExpectations(
+            artifact_hash=base_hash,
+            artifact_size_bytes=len(base_bytes),
+            package_name=COMPOSED_BASE_PACKAGE_NAME,
+            package_version=COMPOSED_BASE_PACKAGE_VERSION,
+        ),
+        thin_expectations=FreeBuilderWheelExpectations(
+            artifact_hash=thin_hash,
+            artifact_size_bytes=len(thin_bytes),
+            package_name=THIN_PACKAGE_NAME,
+            package_version=COMPOSED_THIN_PACKAGE_VERSION,
+        ),
+    )
+    assert result.install_state["install_composition_version"] == COMPOSED_INSTALL_COMPOSITION_VERSION
+    roles = {entry["role"] for entry in result.install_state["install_components"]}
+    assert roles == {COMPONENT_ROLE_BASE, COMPONENT_ROLE_THIN}
+    assert resolve_vendored_paid_provider(home=home) is not None
+    provider, error = resolve_vendored_controlled_alternative_provider(home=home)
+    assert error is None and provider is not None
+
+
+def test_run_free_builder_paired_install_honors_explicit_home_over_ambient_avp_home(
+    tmp_path, monkeypatch,
+):
+    from agentveil_mcp_proxy.paid_provider import (
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP,
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME,
+        PAID_PROVIDER_ENTRYPOINT_GROUP,
+    )
+
+    explicit_home = tmp_path / "explicit-home"
+    ambient_home = tmp_path / "ambient-home"
+    monkeypatch.setenv("AVP_HOME", str(ambient_home))
+    base_module = COMPOSED_BASE_PACKAGE_NAME.replace("-", "_")
+    handoff_source = """
+def run_activation_handoff(request):
+    return {
+        "contract_version": "1",
+        "status": "active",
+        "public_fallback_available": True,
+        "summary": "Installed hook completed.",
+        "error_code": None,
+    }
+"""
+    base_wheel_path, base_hash = _build_composed_base_wheel(
+        tmp_path / "wheel-base",
+        extra_entries={
+            f"{base_module}/vendored_provider.py": _VENDORED_PROVIDER_DEFAULT_HOME_SOURCE,
+            f"{base_module}/handoff_hook.py": handoff_source,
+            f"{base_module}-{COMPOSED_BASE_PACKAGE_VERSION}.dist-info/entry_points.txt": (
+                f"[{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP}]\n"
+                f"{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME} = "
+                f"{base_module}.handoff_hook:run_activation_handoff\n\n"
+                f"[{PAID_PROVIDER_ENTRYPOINT_GROUP}]\n"
+                f"private_v1 = {base_module}.vendored_provider:build_vendored_provider\n"
+            ),
+        },
+    )
+    thin_wheel_path, thin_hash = _build_composed_thin_wheel(tmp_path / "wheel-thin")
+    base_bytes = base_wheel_path.read_bytes()
+    thin_bytes = thin_wheel_path.read_bytes()
+    result = run_free_builder_paired_install_flow(
+        base_wheel_bytes=base_bytes,
+        thin_wheel_bytes=thin_bytes,
+        home=explicit_home,
+        activation_credential=RAW_LICENSE_KEY,
+        base_expectations=FreeBuilderWheelExpectations(
+            artifact_hash=base_hash,
+            artifact_size_bytes=len(base_bytes),
+            package_name=COMPOSED_BASE_PACKAGE_NAME,
+            package_version=COMPOSED_BASE_PACKAGE_VERSION,
+        ),
+        thin_expectations=FreeBuilderWheelExpectations(
+            artifact_hash=thin_hash,
+            artifact_size_bytes=len(thin_bytes),
+            package_name=THIN_PACKAGE_NAME,
+            package_version=COMPOSED_THIN_PACKAGE_VERSION,
+        ),
+    )
+    assert result.install_state["status"] == STATUS_ACTIVE
+    assert install_state_path(explicit_home).is_file()
+    assert not install_state_path(ambient_home).exists()
+    _assert_no_paid_leaks(json.dumps(result.install_state))
+
+
+def test_run_free_builder_paired_rollback_preserves_prior_state_with_ambient_home_mismatch(
+    tmp_path, monkeypatch,
+):
+    import agentveil_mcp_proxy.paid_install as paid_install_module
+    from agentveil_mcp_proxy.paid_provider import (
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP,
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME,
+        PAID_PROVIDER_ENTRYPOINT_GROUP,
+    )
+
+    explicit_home = tmp_path / "explicit-home"
+    ambient_home = tmp_path / "ambient-home"
+    monkeypatch.setenv("AVP_HOME", str(ambient_home))
+    install_path = install_state_path(explicit_home)
+    install_path.parent.mkdir(parents=True, exist_ok=True)
+    install_path.write_text(
+        json.dumps(
+            {
+                "status": STATUS_ACTIVE,
+                "provider_id": "private_v1",
+                "package_name": PACKAGE_NAME,
+                "package_version": PACKAGE_VERSION,
+                "public_fallback_available": True,
+                "error_code": None,
+                "last_installed_at": "2026-08-08T12:00:00+00:00",
+                "install_safety_state": INSTALL_SAFETY_STATE_VERIFIED,
+                "install_safety_reason": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    prior_install_bytes = install_path.read_bytes()
+
+    base_module = COMPOSED_BASE_PACKAGE_NAME.replace("-", "_")
+    handoff_source = """
+def run_activation_handoff(request):
+    return {
+        "contract_version": "1",
+        "status": "active",
+        "public_fallback_available": True,
+        "summary": "Installed hook completed.",
+        "error_code": None,
+    }
+"""
+    base_wheel_path, base_hash = _build_composed_base_wheel(
+        tmp_path / "wheel-base",
+        extra_entries={
+            f"{base_module}/vendored_provider.py": _VENDORED_PROVIDER_DEFAULT_HOME_SOURCE,
+            f"{base_module}/handoff_hook.py": handoff_source,
+            f"{base_module}-{COMPOSED_BASE_PACKAGE_VERSION}.dist-info/entry_points.txt": (
+                f"[{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP}]\n"
+                f"{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME} = "
+                f"{base_module}.handoff_hook:run_activation_handoff\n\n"
+                f"[{PAID_PROVIDER_ENTRYPOINT_GROUP}]\n"
+                f"private_v1 = {base_module}.vendored_provider:build_vendored_provider\n"
+            ),
+        },
+    )
+    thin_wheel_path, thin_hash = _build_composed_thin_wheel(tmp_path / "wheel-thin")
+    base_bytes = base_wheel_path.read_bytes()
+    thin_bytes = thin_wheel_path.read_bytes()
+
+    original_install = paid_install_module.install_wheel_to_vendor
+    install_calls = {"count": 0}
+
+    def fail_on_second_install(**kwargs):  # noqa: ANN003
+        install_calls["count"] += 1
+        if install_calls["count"] == 2:
+            raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
+        return original_install(**kwargs)
+
+    monkeypatch.setattr(paid_install_module, "install_wheel_to_vendor", fail_on_second_install)
+    with pytest.raises(FreeBuilderInstallError):
+        run_free_builder_paired_install_flow(
+            base_wheel_bytes=base_bytes,
+            thin_wheel_bytes=thin_bytes,
+            home=explicit_home,
+            activation_credential=RAW_LICENSE_KEY,
+            base_expectations=FreeBuilderWheelExpectations(
+                artifact_hash=base_hash,
+                artifact_size_bytes=len(base_bytes),
+                package_name=COMPOSED_BASE_PACKAGE_NAME,
+                package_version=COMPOSED_BASE_PACKAGE_VERSION,
+            ),
+            thin_expectations=FreeBuilderWheelExpectations(
+                artifact_hash=thin_hash,
+                artifact_size_bytes=len(thin_bytes),
+                package_name=THIN_PACKAGE_NAME,
+                package_version=COMPOSED_THIN_PACKAGE_VERSION,
+            ),
+        )
+    assert install_path.read_bytes() == prior_install_bytes
+    assert not (vendor_root(explicit_home) / f"{COMPOSED_BASE_PACKAGE_NAME}-{COMPOSED_BASE_PACKAGE_VERSION}").exists()
+
+
+def test_paid_activate_explicit_home_with_ambient_avp_home_mismatch(tmp_path, monkeypatch):
+    explicit_home = tmp_path / "explicit-home"
+    ambient_home = tmp_path / "ambient-home"
+    monkeypatch.setenv("AVP_HOME", str(ambient_home))
+    base_module = COMPOSED_BASE_PACKAGE_NAME.replace("-", "_")
+    base_url, server, thread = _start_mock_paid_backend(
+        tmp_path / "backend",
+        base_extra_entries={
+            f"{base_module}/vendored_provider.py": _VENDORED_PROVIDER_DEFAULT_HOME_SOURCE,
+        },
+    )
+    try:
+        code, out, err = _run_main_with_backend_preserve_ambient_avp_home(
+            ["paid", "activate", "--license-key-stdin", "--home", str(explicit_home)],
+            base_url=base_url,
+            stdin_text=f"{RAW_LICENSE_KEY}\n",
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+    assert code == 0, err
+    assert install_state_path(explicit_home).is_file()
+    assert not install_state_path(ambient_home).exists()
+    _assert_no_paid_leaks(out + err)
+
+
+def test_paid_activate_succeeds_when_provider_active_only_after_activation_json(
+    tmp_path, monkeypatch,
+):
+    """Regression: paid install must not require live provider.active before activation.json."""
+
+    from agentveil_mcp_proxy.paid_activation import build_paid_activate_payload
+
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    base_module = COMPOSED_BASE_PACKAGE_NAME.replace("-", "_")
+    base_url, server, thread = _start_mock_paid_backend(
+        tmp_path / "backend",
+        base_extra_entries={
+            f"{base_module}/vendored_provider.py": _VENDORED_PROVIDER_REQUIRES_ACTIVATION_JSON,
+        },
+    )
+    try:
+        set_paid_backend_client(HttpPaidBackendClient(base_url=base_url))
+        payload = build_paid_activate_payload(license_key=RAW_LICENSE_KEY, home=home)
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+    assert payload["activation"]["status"] == STATUS_ACTIVE
+    install_file = home / "paid" / INSTALL_FILENAME
+    activation_file = home / "paid" / ACTIVATION_FILENAME
+    assert install_file.is_file()
+    assert activation_file.is_file()
+    saved_install = json.loads(install_file.read_text(encoding="utf-8"))
+    assert saved_install["status"] == STATUS_ACTIVE
+    assert saved_install["install_composition_version"] == COMPOSED_INSTALL_COMPOSITION_VERSION
+    roles = {entry["role"] for entry in saved_install["install_components"]}
+    assert roles == {COMPONENT_ROLE_BASE, COMPONENT_ROLE_THIN}
+    _assert_no_paid_leaks("", file_text=install_file.read_text(encoding="utf-8"))
+    _assert_no_paid_leaks("", file_text=activation_file.read_text(encoding="utf-8"))
+
+
+def test_run_free_builder_paired_install_proves_missing_preinstall_then_active_post_state(
+    tmp_path, monkeypatch,
+):
+    """Fake base reports missing before durable install state, active after publish."""
+
+    from agentveil_mcp_proxy.console_project_status_client import (
+        resolve_private_guardrails_status,
+    )
+    from agentveil_mcp_proxy.paid_provider import (
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP,
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME,
+        PAID_PROVIDER_ENTRYPOINT_GROUP,
+        normalize_provider_response,
+    )
+
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    base_module = COMPOSED_BASE_PACKAGE_NAME.replace("-", "_")
+    handoff_source = """
+def run_activation_handoff(request):
+    return {
+        "contract_version": "1",
+        "status": "active",
+        "public_fallback_available": True,
+        "summary": "Installed hook completed.",
+        "error_code": None,
+    }
+"""
+    base_wheel_path, base_hash = _build_composed_base_wheel(
+        tmp_path / "wheel-base",
+        extra_entries={
+            f"{base_module}/handoff_hook.py": handoff_source,
+            f"{base_module}-{COMPOSED_BASE_PACKAGE_VERSION}.dist-info/entry_points.txt": (
+                f"[{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP}]\n"
+                f"{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME} = "
+                f"{base_module}.handoff_hook:run_activation_handoff\n\n"
+                f"[{PAID_PROVIDER_ENTRYPOINT_GROUP}]\n"
+                f"private_v1 = {base_module}.vendored_provider:build_vendored_provider\n"
+            ),
+        },
+    )
+    thin_wheel_path, thin_hash = _build_composed_thin_wheel(tmp_path / "wheel-thin")
+    base_bytes = base_wheel_path.read_bytes()
+    thin_bytes = thin_wheel_path.read_bytes()
+    preinstall_provider = resolve_vendored_paid_provider(home=home)
+    assert preinstall_provider is None
+    result = run_free_builder_paired_install_flow(
+        base_wheel_bytes=base_bytes,
+        thin_wheel_bytes=thin_bytes,
+        home=home,
+        activation_credential=RAW_LICENSE_KEY,
+        base_expectations=FreeBuilderWheelExpectations(
+            artifact_hash=base_hash,
+            artifact_size_bytes=len(base_bytes),
+            package_name=COMPOSED_BASE_PACKAGE_NAME,
+            package_version=COMPOSED_BASE_PACKAGE_VERSION,
+        ),
+        thin_expectations=FreeBuilderWheelExpectations(
+            artifact_hash=thin_hash,
+            artifact_size_bytes=len(thin_bytes),
+            package_name=THIN_PACKAGE_NAME,
+            package_version=COMPOSED_THIN_PACKAGE_VERSION,
+        ),
+    )
+    live_provider = resolve_vendored_paid_provider(home=home)
+    assert live_provider is not None
+    snapshot = normalize_provider_response(live_provider.status())
+    assert resolve_private_guardrails_status(snapshot) == "active"
+    assert result.install_state["status"] == STATUS_ACTIVE
 
 
 CA_MODULE_NAME = PACKAGE_NAME.replace("-", "_")
@@ -1144,3 +1780,930 @@ def test_vendored_controlled_alternative_provider_restores_module_identity(tmp_p
     assert sys.path == before_path
     assert sys.modules.get(CA_MODULE_NAME) is sentinel
     assert sys.modules.get(f"{CA_MODULE_NAME}.preexisting") is child
+
+
+def test_composed_activation_persists_split_state_and_vendors(tmp_path, mock_paid_backend, monkeypatch):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    code, out, err = _run_main_with_backend(
+        ["paid", "activate", "--license-key-stdin", "--home", str(home)],
+        home=home,
+        base_url=mock_paid_backend,
+        stdin_text=f"{RAW_LICENSE_KEY}\n",
+    )
+    assert code == 0, err
+    install_state = json.loads((home / "paid" / INSTALL_FILENAME).read_text(encoding="utf-8"))
+    assert install_state["install_composition_version"] == COMPOSED_INSTALL_COMPOSITION_VERSION
+    roles = {entry["role"] for entry in install_state["install_components"]}
+    assert roles == {COMPONENT_ROLE_BASE, COMPONENT_ROLE_THIN}
+    assert (vendor_root(home) / f"{COMPOSED_BASE_PACKAGE_NAME}-{COMPOSED_BASE_PACKAGE_VERSION}").is_dir()
+    assert (vendor_root(home) / f"{THIN_PACKAGE_NAME}-{COMPOSED_THIN_PACKAGE_VERSION}").is_dir()
+    assert (home / "paid" / "cache" / f"{COMPOSED_BASE_PACKAGE_NAME}-{COMPOSED_BASE_PACKAGE_VERSION}.whl").is_file()
+    assert (home / "paid" / "cache" / f"{THIN_PACKAGE_NAME}-{COMPOSED_THIN_PACKAGE_VERSION}.whl").is_file()
+    assert resolve_vendored_paid_provider(home=home) is not None
+    provider, error = resolve_vendored_controlled_alternative_provider(home=home)
+    assert error is None and provider is not None
+    authority, authority_error = resolve_vendored_controlled_alternative_authority(home=home)
+    assert authority_error is None and authority is not None
+    _assert_no_paid_leaks(out + err, file_text=json.dumps(install_state))
+
+
+def test_composed_activation_rejects_legacy_artifact_env(tmp_path, mock_paid_backend, monkeypatch):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_PAID_ARTIFACT_ID", ARTIFACT_ID)
+    code, out, err = _run_main_with_backend(
+        ["paid", "activate", "--license-key-stdin", "--home", str(home)],
+        home=home,
+        base_url=mock_paid_backend,
+        stdin_text=f"{RAW_LICENSE_KEY}\n",
+    )
+    assert code == 1
+    assert ERROR_DOWNLOAD_DENIED in err or "download_denied" in err
+    assert not (home / "paid" / INSTALL_FILENAME).exists()
+    _assert_no_paid_leaks(out + err)
+
+
+def test_composed_activation_rejects_mismatched_authorization_before_download(
+    tmp_path,
+    mock_paid_backend,
+):
+    original_authorize = _MockPaidBackendHandler.do_POST
+
+    def authorize_wrong_hash(self):  # noqa: ANN001
+        if self.path != "/v1/paid/packages/authorize":
+            return original_authorize(self)
+        payload = self._read_json()
+        if payload.get("artifact_id") == COMPOSED_THIN_ARTIFACT_ID:
+            self._send_json(
+                {
+                    "download_authorized": True,
+                    "artifact_id": COMPOSED_THIN_ARTIFACT_ID,
+                    "package_name": THIN_PACKAGE_NAME,
+                    "package_version": COMPOSED_THIN_PACKAGE_VERSION,
+                    "artifact_hash": "0" * 64,
+                    "artifact_size_bytes": self.state.thin_artifact_size,
+                    "download_authorization_id": "dlauth_test_thin_001",
+                    "public_fallback_available": True,
+                    "error_code": None,
+                }
+            )
+            return
+        self._handle_packages_authorize(payload)
+
+    _MockPaidBackendHandler.do_POST = authorize_wrong_hash
+    try:
+        home = tmp_path / "avp-home"
+        code, out, err = _run_main_with_backend(
+            ["paid", "activate", "--license-key-stdin", "--home", str(home)],
+            home=home,
+            base_url=mock_paid_backend,
+            stdin_text=f"{RAW_LICENSE_KEY}\n",
+        )
+    finally:
+        _MockPaidBackendHandler.do_POST = original_authorize
+
+    assert code == 1
+    assert ERROR_HASH_MISMATCH in err or "artifact_hash_mismatch" in err
+    assert _MockPaidBackendHandler.state.download_call_count == 2
+    assert not (home / "paid" / INSTALL_FILENAME).exists()
+
+
+def test_composed_activation_rejects_authorization_artifact_id_binding_before_download(
+    tmp_path,
+    mock_paid_backend,
+):
+    original_authorize = _MockPaidBackendHandler.do_POST
+
+    def authorize_wrong_artifact_id(self):  # noqa: ANN001
+        if self.path != "/v1/paid/packages/authorize":
+            return original_authorize(self)
+        payload = self._read_json()
+        if payload.get("artifact_id") == COMPOSED_THIN_ARTIFACT_ID:
+            self._send_json(
+                {
+                    "download_authorized": True,
+                    "artifact_id": "art_pkg_unexpected_other_001",
+                    "package_name": THIN_PACKAGE_NAME,
+                    "package_version": COMPOSED_THIN_PACKAGE_VERSION,
+                    "artifact_hash": _MockPaidBackendHandler.state.thin_artifact_hash,
+                    "artifact_size_bytes": _MockPaidBackendHandler.state.thin_artifact_size,
+                    "download_authorization_id": "dlauth_test_thin_001",
+                    "public_fallback_available": True,
+                    "error_code": None,
+                }
+            )
+            return
+        self._handle_packages_authorize(payload)
+
+    _MockPaidBackendHandler.do_POST = authorize_wrong_artifact_id
+    try:
+        home = tmp_path / "avp-home"
+        code, out, err = _run_main_with_backend(
+            ["paid", "activate", "--license-key-stdin", "--home", str(home)],
+            home=home,
+            base_url=mock_paid_backend,
+            stdin_text=f"{RAW_LICENSE_KEY}\n",
+        )
+    finally:
+        _MockPaidBackendHandler.do_POST = original_authorize
+
+    assert code == 1
+    assert ERROR_DOWNLOAD_DENIED in err or "download_denied" in err
+    assert _MockPaidBackendHandler.state.download_call_count == 1
+    assert not (home / "paid" / INSTALL_FILENAME).exists()
+
+
+def test_composed_second_component_failure_preserves_legacy_install(
+    tmp_path,
+    mock_paid_backend,
+):
+    home = tmp_path / "avp-home"
+    legacy_wheel, _legacy_hash = _build_test_wheel(tmp_path / "legacy-wheel")
+    legacy_vendor = vendor_root(home) / f"{PACKAGE_NAME}-{PACKAGE_VERSION}"
+    install_wheel_to_vendor(
+        home=home,
+        wheel_path=legacy_wheel,
+        target_dir=legacy_vendor,
+        expected_package_name=PACKAGE_NAME,
+        expected_package_version=PACKAGE_VERSION,
+        require_empty_target=True,
+    )
+    legacy_cache = home / "paid" / "cache" / f"{PACKAGE_NAME}-{PACKAGE_VERSION}.whl"
+    legacy_cache.parent.mkdir(parents=True, exist_ok=True)
+    legacy_cache.write_bytes(legacy_wheel.read_bytes())
+    write_install_state(
+        install_state_path(home),
+        {
+            "status": STATUS_ACTIVE,
+            "provider_id": "private_v1",
+            "package_name": PACKAGE_NAME,
+            "package_version": PACKAGE_VERSION,
+            "public_fallback_available": True,
+            "error_code": None,
+            "last_installed_at": "2026-08-08T12:00:00+00:00",
+            "install_safety_state": "verified",
+            "install_safety_reason": None,
+        },
+    )
+    prior_install_bytes = install_state_path(home).read_bytes()
+    prior_vendor_marker = legacy_vendor / "legacy-marker.txt"
+    prior_vendor_marker.write_text("keep-me", encoding="utf-8")
+
+    original_download = _MockPaidBackendHandler.do_POST
+
+    def fail_thin_download(self):  # noqa: ANN001
+        if self.path != "/v1/paid/packages/download":
+            return original_download(self)
+        payload = self._read_json()
+        if payload.get("download_authorization_id") == "dlauth_test_thin_001":
+            self.send_response(403)
+            self.end_headers()
+            return
+        self._handle_packages_download(payload)
+
+    _MockPaidBackendHandler.do_POST = fail_thin_download
+    try:
+        code, out, err = _run_main_with_backend(
+            ["paid", "activate", "--license-key-stdin", "--home", str(home)],
+            home=home,
+            base_url=mock_paid_backend,
+            stdin_text=f"{RAW_LICENSE_KEY}\n",
+        )
+    finally:
+        _MockPaidBackendHandler.do_POST = original_download
+
+    assert code == 1
+    assert install_state_path(home).read_bytes() == prior_install_bytes
+    assert prior_vendor_marker.read_text(encoding="utf-8") == "keep-me"
+    assert legacy_cache.is_file()
+    assert not (vendor_root(home) / f"{COMPOSED_BASE_PACKAGE_NAME}-{COMPOSED_BASE_PACKAGE_VERSION}").exists()
+    _assert_no_paid_leaks(out + err)
+
+
+def test_composed_publish_failure_rolls_back_first_component_and_preserves_legacy(
+    tmp_path,
+    mock_paid_backend,
+    monkeypatch,
+):
+    home = tmp_path / "avp-home"
+    legacy_wheel, _legacy_hash = _build_test_wheel(tmp_path / "legacy-wheel")
+    legacy_vendor = vendor_root(home) / f"{PACKAGE_NAME}-{PACKAGE_VERSION}"
+    install_wheel_to_vendor(
+        home=home,
+        wheel_path=legacy_wheel,
+        target_dir=legacy_vendor,
+        expected_package_name=PACKAGE_NAME,
+        expected_package_version=PACKAGE_VERSION,
+        require_empty_target=True,
+    )
+    write_install_state(
+        install_state_path(home),
+        {
+            "status": STATUS_ACTIVE,
+            "provider_id": "private_v1",
+            "package_name": PACKAGE_NAME,
+            "package_version": PACKAGE_VERSION,
+            "public_fallback_available": True,
+            "error_code": None,
+            "last_installed_at": "2026-08-08T12:00:00+00:00",
+            "install_safety_state": "verified",
+            "install_safety_reason": None,
+        },
+    )
+    prior_install_bytes = install_state_path(home).read_bytes()
+    marker = legacy_vendor / "legacy-marker.txt"
+    marker.write_text("keep-me", encoding="utf-8")
+    legacy_cache = home / "paid" / "cache" / f"{PACKAGE_NAME}-{PACKAGE_VERSION}.whl"
+    legacy_cache.parent.mkdir(parents=True, exist_ok=True)
+    legacy_cache.write_bytes(legacy_wheel.read_bytes())
+    prior_legacy_cache_bytes = legacy_cache.read_bytes()
+    base_cache = home / "paid" / "cache" / f"{COMPOSED_BASE_PACKAGE_NAME}-{COMPOSED_BASE_PACKAGE_VERSION}.whl"
+    base_cache.parent.mkdir(parents=True, exist_ok=True)
+    prior_base_cache_bytes = b"prior-base-cache-bytes"
+    base_cache.write_bytes(prior_base_cache_bytes)
+
+    import agentveil_mcp_proxy.paid_install as paid_install_module
+
+    original_publish = paid_install_module._publish_staged_vendor
+    publish_calls = {"count": 0}
+
+    def fail_on_second_publish(**kwargs):  # noqa: ANN003
+        publish_calls["count"] += 1
+        if publish_calls["count"] == 2:
+            raise OSError("simulated composed publish failure")
+        return original_publish(**kwargs)
+
+    monkeypatch.setattr(paid_install_module, "_publish_staged_vendor", fail_on_second_publish)
+    code, out, err = _run_main_with_backend(
+        ["paid", "activate", "--license-key-stdin", "--home", str(home)],
+        home=home,
+        base_url=mock_paid_backend,
+        stdin_text=f"{RAW_LICENSE_KEY}\n",
+    )
+    assert code == 1
+    assert ERROR_INSTALL_FAILED in err or "install_failed" in err
+    assert install_state_path(home).read_bytes() == prior_install_bytes
+    assert marker.read_text(encoding="utf-8") == "keep-me"
+    assert legacy_cache.read_bytes() == prior_legacy_cache_bytes
+    assert base_cache.read_bytes() == prior_base_cache_bytes
+    assert not (vendor_root(home) / f"{COMPOSED_BASE_PACKAGE_NAME}-{COMPOSED_BASE_PACKAGE_VERSION}").exists()
+    assert not (vendor_root(home) / f"{THIN_PACKAGE_NAME}-{COMPOSED_THIN_PACKAGE_VERSION}").exists()
+    assert list(vendor_root(home).glob(".staging-*")) == []
+    assert list((home / "paid" / "cache").glob(".staging-*")) == []
+    assert list((home / "paid" / "cache").glob("*.backup")) == []
+    _assert_no_paid_leaks(out + err)
+
+
+def test_composed_state_write_failure_after_publish_rolls_back_and_preserves_legacy(
+    tmp_path,
+    mock_paid_backend,
+    monkeypatch,
+):
+    home = tmp_path / "avp-home"
+    legacy_wheel, _legacy_hash = _build_test_wheel(tmp_path / "legacy-wheel")
+    legacy_vendor = vendor_root(home) / f"{PACKAGE_NAME}-{PACKAGE_VERSION}"
+    install_wheel_to_vendor(
+        home=home,
+        wheel_path=legacy_wheel,
+        target_dir=legacy_vendor,
+        expected_package_name=PACKAGE_NAME,
+        expected_package_version=PACKAGE_VERSION,
+        require_empty_target=True,
+    )
+    legacy_cache = home / "paid" / "cache" / f"{PACKAGE_NAME}-{PACKAGE_VERSION}.whl"
+    legacy_cache.parent.mkdir(parents=True, exist_ok=True)
+    legacy_cache.write_bytes(legacy_wheel.read_bytes())
+    write_install_state(
+        install_state_path(home),
+        {
+            "status": STATUS_ACTIVE,
+            "provider_id": "private_v1",
+            "package_name": PACKAGE_NAME,
+            "package_version": PACKAGE_VERSION,
+            "public_fallback_available": True,
+            "error_code": None,
+            "last_installed_at": "2026-08-08T12:00:00+00:00",
+            "install_safety_state": "verified",
+            "install_safety_reason": None,
+        },
+    )
+    prior_install_bytes = install_state_path(home).read_bytes()
+    prior_legacy_cache_bytes = legacy_cache.read_bytes()
+    marker = legacy_vendor / "legacy-marker.txt"
+    marker.write_text("keep-me", encoding="utf-8")
+
+    base_cache = home / "paid" / "cache" / f"{COMPOSED_BASE_PACKAGE_NAME}-{COMPOSED_BASE_PACKAGE_VERSION}.whl"
+    thin_cache = home / "paid" / "cache" / f"{THIN_PACKAGE_NAME}-{COMPOSED_THIN_PACKAGE_VERSION}.whl"
+    prior_base_cache_bytes = b"prior-base-cache-bytes"
+    prior_thin_cache_bytes = b"prior-thin-cache-bytes"
+    base_cache.write_bytes(prior_base_cache_bytes)
+    thin_cache.write_bytes(prior_thin_cache_bytes)
+    base_vendor = vendor_root(home) / f"{COMPOSED_BASE_PACKAGE_NAME}-{COMPOSED_BASE_PACKAGE_VERSION}"
+    thin_vendor = vendor_root(home) / f"{THIN_PACKAGE_NAME}-{COMPOSED_THIN_PACKAGE_VERSION}"
+    base_vendor.mkdir(parents=True)
+    thin_vendor.mkdir(parents=True)
+    (base_vendor / "prior-base-vendor.txt").write_text("base-bytes", encoding="utf-8")
+    (thin_vendor / "prior-thin-vendor.txt").write_text("thin-bytes", encoding="utf-8")
+
+    import agentveil_mcp_proxy.paid_install as paid_install_module
+
+    def fail_state_write(path, data):  # noqa: ANN001
+        raise OSError("simulated composed install state write failure")
+
+    monkeypatch.setattr(paid_install_module, "write_install_state", fail_state_write)
+    code, out, err = _run_main_with_backend(
+        ["paid", "activate", "--license-key-stdin", "--home", str(home)],
+        home=home,
+        base_url=mock_paid_backend,
+        stdin_text=f"{RAW_LICENSE_KEY}\n",
+    )
+    combined = out + err
+    assert code == 1
+    assert ERROR_INSTALL_FAILED in err or "install_failed" in err
+    assert "Traceback" not in combined
+    assert install_state_path(home).read_bytes() == prior_install_bytes
+    loaded = load_install_state(install_state_path(home))
+    assert loaded is not None
+    assert loaded.get("install_composition_version") is None
+    assert marker.read_text(encoding="utf-8") == "keep-me"
+    assert legacy_cache.read_bytes() == prior_legacy_cache_bytes
+    assert base_cache.read_bytes() == prior_base_cache_bytes
+    assert thin_cache.read_bytes() == prior_thin_cache_bytes
+    assert (base_vendor / "prior-base-vendor.txt").read_text(encoding="utf-8") == "base-bytes"
+    assert (thin_vendor / "prior-thin-vendor.txt").read_text(encoding="utf-8") == "thin-bytes"
+    assert list(vendor_root(home).glob(".staging-*")) == []
+    assert list((home / "paid" / "cache").glob(".staging-*")) == []
+    assert list(vendor_root(home).glob("*.backup")) == []
+    assert list((home / "paid" / "cache").glob("*.backup")) == []
+    _assert_no_paid_leaks(combined)
+
+
+def test_composed_activation_preserves_legacy_vendor_and_cache_on_success(
+    tmp_path,
+    mock_paid_backend,
+    monkeypatch,
+):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    legacy_wheel, _legacy_hash = _build_test_wheel(tmp_path / "legacy-wheel")
+    legacy_vendor = vendor_root(home) / f"{PACKAGE_NAME}-{PACKAGE_VERSION}"
+    install_wheel_to_vendor(
+        home=home,
+        wheel_path=legacy_wheel,
+        target_dir=legacy_vendor,
+        expected_package_name=PACKAGE_NAME,
+        expected_package_version=PACKAGE_VERSION,
+        require_empty_target=True,
+    )
+    legacy_cache = home / "paid" / "cache" / f"{PACKAGE_NAME}-{PACKAGE_VERSION}.whl"
+    legacy_cache.parent.mkdir(parents=True, exist_ok=True)
+    legacy_cache.write_bytes(legacy_wheel.read_bytes())
+    marker = legacy_vendor / "legacy-marker.txt"
+    marker.write_text("keep-me", encoding="utf-8")
+
+    code, out, err = _run_main_with_backend(
+        ["paid", "activate", "--license-key-stdin", "--home", str(home)],
+        home=home,
+        base_url=mock_paid_backend,
+        stdin_text=f"{RAW_LICENSE_KEY}\n",
+    )
+    assert code == 0, err
+    assert marker.read_text(encoding="utf-8") == "keep-me"
+    assert legacy_cache.is_file()
+    install_state = json.loads((home / "paid" / INSTALL_FILENAME).read_text(encoding="utf-8"))
+    assert install_state["install_composition_version"] == COMPOSED_INSTALL_COMPOSITION_VERSION
+    _assert_no_paid_leaks(out + err)
+
+
+def test_malformed_split_install_state_fails_closed_without_fallback(tmp_path, monkeypatch):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    install_path = install_state_path(home)
+    install_path.parent.mkdir(parents=True, exist_ok=True)
+    install_path.write_text(
+        json.dumps(
+            {
+                "status": STATUS_ACTIVE,
+                "provider_id": "private_v1",
+                "package_name": COMPOSED_BASE_PACKAGE_NAME,
+                "package_version": COMPOSED_BASE_PACKAGE_VERSION,
+                "install_composition_version": COMPOSED_INSTALL_COMPOSITION_VERSION,
+                "install_components": [
+                    {
+                        "role": COMPONENT_ROLE_BASE,
+                        "package_name": COMPOSED_BASE_PACKAGE_NAME,
+                        "package_version": COMPOSED_BASE_PACKAGE_VERSION,
+                    }
+                ],
+                "public_fallback_available": True,
+                "error_code": None,
+                "last_installed_at": "2026-08-08T12:00:00+00:00",
+                "install_safety_state": "verified",
+                "install_safety_reason": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert load_install_state(install_state_path(home)) is None
+    provider, error = resolve_vendored_controlled_alternative_provider(home=home)
+    assert provider is None and error is not None
+
+
+def test_repeated_composed_install_leaves_no_staging_residue(tmp_path, mock_paid_backend, monkeypatch):
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    for _ in range(2):
+        code, out, err = _run_main_with_backend(
+            ["paid", "activate", "--license-key-stdin", "--home", str(home)],
+            home=home,
+            base_url=mock_paid_backend,
+            stdin_text=f"{RAW_LICENSE_KEY}\n",
+        )
+        assert code == 0, err
+    assert list(vendor_root(home).glob(".staging-*")) == []
+    assert list((home / "paid" / "cache").glob(".staging-*")) == []
+    assert list(vendor_root(home).glob("*.backup")) == []
+    assert list((home / "paid" / "cache").glob("*.backup")) == []
+    _assert_no_paid_leaks(out + err)
+
+
+def test_run_free_builder_paired_rejects_expectation_metadata_mismatch(tmp_path):
+    base_wheel_path, base_hash = _build_composed_base_wheel(tmp_path / "wheel-base")
+    thin_wheel_path, thin_hash = _build_composed_thin_wheel(tmp_path / "wheel-thin")
+    base_bytes = base_wheel_path.read_bytes()
+    thin_bytes = thin_wheel_path.read_bytes()
+    with pytest.raises(FreeBuilderInstallError, match=ERROR_PACKAGE_NAME_MISMATCH):
+        run_free_builder_paired_install_flow(
+            base_wheel_bytes=base_bytes,
+            thin_wheel_bytes=thin_bytes,
+            home=tmp_path / "avp-home",
+            activation_credential=RAW_LICENSE_KEY,
+            base_expectations=FreeBuilderWheelExpectations(
+                artifact_hash=base_hash,
+                artifact_size_bytes=len(base_bytes),
+                package_name=THIN_PACKAGE_NAME,
+                package_version=COMPOSED_BASE_PACKAGE_VERSION,
+            ),
+            thin_expectations=FreeBuilderWheelExpectations(
+                artifact_hash=thin_hash,
+                artifact_size_bytes=len(thin_bytes),
+                package_name=THIN_PACKAGE_NAME,
+                package_version=COMPOSED_THIN_PACKAGE_VERSION,
+            ),
+        )
+
+
+def test_run_free_builder_paired_fails_before_commit_when_paid_provider_missing(
+    tmp_path, monkeypatch,
+):
+    from agentveil_mcp_proxy.paid_provider import (
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP,
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME,
+    )
+
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    base_module = COMPOSED_BASE_PACKAGE_NAME.replace("-", "_")
+    handoff_source = """
+def run_activation_handoff(request):
+    return {
+        "contract_version": "1",
+        "status": "active",
+        "public_fallback_available": True,
+        "summary": "Installed hook completed.",
+        "error_code": None,
+    }
+"""
+    handoff_only_entry_points = (
+        f"[{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP}]\n"
+        f"{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME} = "
+        f"{base_module}.handoff_hook:run_activation_handoff\n"
+    )
+    base_wheel_path, base_hash = _build_composed_base_wheel(
+        tmp_path / "wheel-base",
+        extra_entries={
+            f"{base_module}/handoff_hook.py": handoff_source,
+            f"{base_module}-{COMPOSED_BASE_PACKAGE_VERSION}.dist-info/entry_points.txt": (
+                handoff_only_entry_points
+            ),
+        },
+    )
+    thin_wheel_path, thin_hash = _build_composed_thin_wheel(tmp_path / "wheel-thin")
+    base_bytes = base_wheel_path.read_bytes()
+    thin_bytes = thin_wheel_path.read_bytes()
+    with pytest.raises(FreeBuilderInstallError, match=ERROR_VENDORED_PROVIDER_MISSING):
+        run_free_builder_paired_install_flow(
+            base_wheel_bytes=base_bytes,
+            thin_wheel_bytes=thin_bytes,
+            home=home,
+            activation_credential=RAW_LICENSE_KEY,
+            base_expectations=FreeBuilderWheelExpectations(
+                artifact_hash=base_hash,
+                artifact_size_bytes=len(base_bytes),
+                package_name=COMPOSED_BASE_PACKAGE_NAME,
+                package_version=COMPOSED_BASE_PACKAGE_VERSION,
+            ),
+            thin_expectations=FreeBuilderWheelExpectations(
+                artifact_hash=thin_hash,
+                artifact_size_bytes=len(thin_bytes),
+                package_name=THIN_PACKAGE_NAME,
+                package_version=COMPOSED_THIN_PACKAGE_VERSION,
+            ),
+        )
+    assert not install_state_path(home).exists()
+    assert RAW_LICENSE_KEY not in (home / "paid").as_posix()
+    assert list(vendor_root(home).glob(".staging-*")) == []
+    assert list((home / "paid" / "cache").glob(".staging-*")) == []
+
+
+def test_run_free_builder_paired_rejects_inactive_base_provider_before_commit(
+    tmp_path, monkeypatch,
+):
+    from agentveil_mcp_proxy.paid_provider import (
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP,
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME,
+        PAID_PROVIDER_ENTRYPOINT_GROUP,
+    )
+
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    install_path = install_state_path(home)
+    install_path.parent.mkdir(parents=True, exist_ok=True)
+    install_path.write_text(
+        json.dumps(
+            {
+                "status": STATUS_ACTIVE,
+                "provider_id": "private_v1",
+                "package_name": PACKAGE_NAME,
+                "package_version": PACKAGE_VERSION,
+                "public_fallback_available": True,
+                "error_code": None,
+                "last_installed_at": "2026-08-08T12:00:00+00:00",
+                "install_safety_state": INSTALL_SAFETY_STATE_VERIFIED,
+                "install_safety_reason": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    prior_install_bytes = install_path.read_bytes()
+    legacy_vendor = vendor_root(home) / f"{PACKAGE_NAME}-{PACKAGE_VERSION}"
+    legacy_wheel, _ = _build_test_wheel(tmp_path / "legacy-wheel")
+    install_wheel_to_vendor(
+        home=home,
+        wheel_path=legacy_wheel,
+        target_dir=legacy_vendor,
+        expected_package_name=PACKAGE_NAME,
+        expected_package_version=PACKAGE_VERSION,
+        require_empty_target=True,
+    )
+    legacy_marker = legacy_vendor / "legacy-marker.txt"
+    legacy_marker.write_text("keep-me", encoding="utf-8")
+    prior_vendor_bytes = legacy_marker.read_bytes()
+    cache_path = home / "paid" / "cache" / f"{PACKAGE_NAME}-{PACKAGE_VERSION}.whl"
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_bytes(b"prior-cache-wheel")
+    prior_cache_bytes = cache_path.read_bytes()
+
+    base_module = COMPOSED_BASE_PACKAGE_NAME.replace("-", "_")
+    handoff_source = """
+def run_activation_handoff(request):
+    return {
+        "contract_version": "1",
+        "status": "active",
+        "public_fallback_available": True,
+        "summary": "Installed hook completed.",
+        "error_code": None,
+    }
+"""
+    inactive_provider_source = """
+class _Provider:
+    provider_id = 'private_v1'
+    provider_contract_version = '1'
+    def status(self):
+        return {
+            'provider_present': True,
+            'provider_id': 'private_v1',
+            'provider_contract_version': '1',
+            'status': 'revoked',
+            'private_provider_enabled': False,
+            'public_fallback_available': True,
+            'summary': 'inactive',
+            'error_code': None,
+        }
+def build_vendored_provider():
+    return _Provider()
+"""
+    base_wheel_path, base_hash = _build_composed_base_wheel(
+        tmp_path / "wheel-base",
+        extra_entries={
+            f"{base_module}/handoff_hook.py": handoff_source,
+            f"{base_module}/vendored_provider.py": inactive_provider_source,
+            f"{base_module}-{COMPOSED_BASE_PACKAGE_VERSION}.dist-info/entry_points.txt": (
+                f"[{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP}]\n"
+                f"{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME} = "
+                f"{base_module}.handoff_hook:run_activation_handoff\n\n"
+                f"[{PAID_PROVIDER_ENTRYPOINT_GROUP}]\n"
+                f"private_v1 = {base_module}.vendored_provider:build_vendored_provider\n"
+            ),
+        },
+    )
+    thin_wheel_path, thin_hash = _build_composed_thin_wheel(tmp_path / "wheel-thin")
+    with pytest.raises(FreeBuilderInstallError, match=ERROR_VENDORED_PROVIDER_MALFORMED):
+        run_free_builder_paired_install_flow(
+            base_wheel_bytes=base_wheel_path.read_bytes(),
+            thin_wheel_bytes=thin_wheel_path.read_bytes(),
+            home=home,
+            activation_credential=RAW_LICENSE_KEY,
+            base_expectations=FreeBuilderWheelExpectations(
+                artifact_hash=base_hash,
+                artifact_size_bytes=len(base_wheel_path.read_bytes()),
+                package_name=COMPOSED_BASE_PACKAGE_NAME,
+                package_version=COMPOSED_BASE_PACKAGE_VERSION,
+            ),
+            thin_expectations=FreeBuilderWheelExpectations(
+                artifact_hash=thin_hash,
+                artifact_size_bytes=len(thin_wheel_path.read_bytes()),
+                package_name=THIN_PACKAGE_NAME,
+                package_version=COMPOSED_THIN_PACKAGE_VERSION,
+            ),
+        )
+    assert install_path.read_bytes() == prior_install_bytes
+    assert legacy_marker.read_bytes() == prior_vendor_bytes
+    assert cache_path.read_bytes() == prior_cache_bytes
+    assert not (vendor_root(home) / f"{COMPOSED_BASE_PACKAGE_NAME}-{COMPOSED_BASE_PACKAGE_VERSION}").exists()
+    assert not (vendor_root(home) / f"{THIN_PACKAGE_NAME}-{COMPOSED_THIN_PACKAGE_VERSION}").exists()
+    assert list(vendor_root(home).glob(".staging-*")) == []
+    assert list((home / "paid" / "cache").glob(".staging-*")) == []
+
+
+def test_run_free_builder_paired_rejects_thin_authority_missing_before_commit(
+    tmp_path, monkeypatch,
+):
+    from agentveil_mcp_proxy.paid_provider import (
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP,
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME,
+        PAID_PROVIDER_ENTRYPOINT_GROUP,
+    )
+
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    install_path = install_state_path(home)
+    install_path.parent.mkdir(parents=True, exist_ok=True)
+    install_path.write_text(
+        json.dumps(
+            {
+                "status": STATUS_ACTIVE,
+                "provider_id": "private_v1",
+                "package_name": PACKAGE_NAME,
+                "package_version": PACKAGE_VERSION,
+                "public_fallback_available": True,
+                "error_code": None,
+                "last_installed_at": "2026-08-08T12:00:00+00:00",
+                "install_safety_state": INSTALL_SAFETY_STATE_VERIFIED,
+                "install_safety_reason": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    prior_install_bytes = install_path.read_bytes()
+
+    base_module = COMPOSED_BASE_PACKAGE_NAME.replace("-", "_")
+    thin_module = THIN_PACKAGE_NAME.replace("-", "_")
+    handoff_source = """
+def run_activation_handoff(request):
+    return {
+        "contract_version": "1",
+        "status": "active",
+        "public_fallback_available": True,
+        "summary": "Installed hook completed.",
+        "error_code": None,
+    }
+"""
+    base_wheel_path, base_hash = _build_composed_base_wheel(
+        tmp_path / "wheel-base",
+        extra_entries={
+            f"{base_module}/handoff_hook.py": handoff_source,
+            f"{base_module}-{COMPOSED_BASE_PACKAGE_VERSION}.dist-info/entry_points.txt": (
+                f"[{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP}]\n"
+                f"{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME} = "
+                f"{base_module}.handoff_hook:run_activation_handoff\n\n"
+                f"[{PAID_PROVIDER_ENTRYPOINT_GROUP}]\n"
+                f"private_v1 = {base_module}.vendored_provider:build_vendored_provider\n"
+            ),
+        },
+    )
+    thin_wheel_path, thin_hash = _build_composed_thin_wheel(
+        tmp_path / "wheel-thin",
+        extra_entries={
+            f"{thin_module}-{COMPOSED_THIN_PACKAGE_VERSION}.dist-info/entry_points.txt": (
+                f"[{CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP}]\n"
+                f"private_v1 = {thin_module}.controlled_provider:build_provider\n"
+            ),
+        },
+    )
+    with pytest.raises(FreeBuilderInstallError, match=ERROR_VENDORED_PROVIDER_MISSING):
+        run_free_builder_paired_install_flow(
+            base_wheel_bytes=base_wheel_path.read_bytes(),
+            thin_wheel_bytes=thin_wheel_path.read_bytes(),
+            home=home,
+            activation_credential=RAW_LICENSE_KEY,
+            base_expectations=FreeBuilderWheelExpectations(
+                artifact_hash=base_hash,
+                artifact_size_bytes=len(base_wheel_path.read_bytes()),
+                package_name=COMPOSED_BASE_PACKAGE_NAME,
+                package_version=COMPOSED_BASE_PACKAGE_VERSION,
+            ),
+            thin_expectations=FreeBuilderWheelExpectations(
+                artifact_hash=thin_hash,
+                artifact_size_bytes=len(thin_wheel_path.read_bytes()),
+                package_name=THIN_PACKAGE_NAME,
+                package_version=COMPOSED_THIN_PACKAGE_VERSION,
+            ),
+        )
+    assert install_path.read_bytes() == prior_install_bytes
+    assert list(vendor_root(home).glob(".staging-*")) == []
+    assert list((home / "paid" / "cache").glob(".staging-*")) == []
+
+
+def test_run_free_builder_paired_rejects_malformed_thin_authority_before_commit(
+    tmp_path, monkeypatch,
+):
+    from agentveil_mcp_proxy.paid_provider import (
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP,
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME,
+        PAID_PROVIDER_ENTRYPOINT_GROUP,
+    )
+
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    install_path = install_state_path(home)
+    install_path.parent.mkdir(parents=True, exist_ok=True)
+    install_path.write_text(
+        json.dumps(
+            {
+                "status": STATUS_ACTIVE,
+                "provider_id": "private_v1",
+                "package_name": PACKAGE_NAME,
+                "package_version": PACKAGE_VERSION,
+                "public_fallback_available": True,
+                "error_code": None,
+                "last_installed_at": "2026-08-08T12:00:00+00:00",
+                "install_safety_state": INSTALL_SAFETY_STATE_VERIFIED,
+                "install_safety_reason": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    prior_install_bytes = install_path.read_bytes()
+
+    base_module = COMPOSED_BASE_PACKAGE_NAME.replace("-", "_")
+    thin_module = THIN_PACKAGE_NAME.replace("-", "_")
+    handoff_source = """
+def run_activation_handoff(request):
+    return {
+        "contract_version": "1",
+        "status": "active",
+        "public_fallback_available": True,
+        "summary": "Installed hook completed.",
+        "error_code": None,
+    }
+"""
+    base_wheel_path, base_hash = _build_composed_base_wheel(
+        tmp_path / "wheel-base",
+        extra_entries={
+            f"{base_module}/handoff_hook.py": handoff_source,
+            f"{base_module}-{COMPOSED_BASE_PACKAGE_VERSION}.dist-info/entry_points.txt": (
+                f"[{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP}]\n"
+                f"{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME} = "
+                f"{base_module}.handoff_hook:run_activation_handoff\n\n"
+                f"[{PAID_PROVIDER_ENTRYPOINT_GROUP}]\n"
+                f"private_v1 = {base_module}.vendored_provider:build_vendored_provider\n"
+            ),
+        },
+    )
+    thin_wheel_path, thin_hash = _build_composed_thin_wheel(
+        tmp_path / "wheel-thin",
+        extra_entries={
+            f"{thin_module}-{COMPOSED_THIN_PACKAGE_VERSION}.dist-info/entry_points.txt": (
+                f"[{CONTROLLED_ALTERNATIVE_PROVIDER_ENTRYPOINT_GROUP}]\n"
+                f"private_v1 = {thin_module}.controlled_provider:build_provider\n"
+                "[agentveil_mcp_proxy.controlled_alternative_authorities]\n"
+                "ca_route_v1 = missing_authority_module:build_authority\n"
+            ),
+        },
+    )
+    with pytest.raises(FreeBuilderInstallError, match=ERROR_HANDOFF_HOOK_IMPORT_FAILED):
+        run_free_builder_paired_install_flow(
+            base_wheel_bytes=base_wheel_path.read_bytes(),
+            thin_wheel_bytes=thin_wheel_path.read_bytes(),
+            home=home,
+            activation_credential=RAW_LICENSE_KEY,
+            base_expectations=FreeBuilderWheelExpectations(
+                artifact_hash=base_hash,
+                artifact_size_bytes=len(base_wheel_path.read_bytes()),
+                package_name=COMPOSED_BASE_PACKAGE_NAME,
+                package_version=COMPOSED_BASE_PACKAGE_VERSION,
+            ),
+            thin_expectations=FreeBuilderWheelExpectations(
+                artifact_hash=thin_hash,
+                artifact_size_bytes=len(thin_wheel_path.read_bytes()),
+                package_name=THIN_PACKAGE_NAME,
+                package_version=COMPOSED_THIN_PACKAGE_VERSION,
+            ),
+        )
+    assert install_path.read_bytes() == prior_install_bytes
+    assert list(vendor_root(home).glob(".staging-*")) == []
+    assert list((home / "paid" / "cache").glob(".staging-*")) == []
+
+
+def test_run_free_builder_paired_second_component_stage_failure_cleans_and_preserves_prior(
+    tmp_path, monkeypatch,
+):
+    import agentveil_mcp_proxy.paid_install as paid_install_module
+
+    home = tmp_path / "avp-home"
+    monkeypatch.setenv("AVP_HOME", str(home))
+    legacy_wheel, _legacy_hash = _build_test_wheel(tmp_path / "legacy-wheel")
+    legacy_vendor = vendor_root(home) / f"{PACKAGE_NAME}-{PACKAGE_VERSION}"
+    install_wheel_to_vendor(
+        home=home,
+        wheel_path=legacy_wheel,
+        target_dir=legacy_vendor,
+        expected_package_name=PACKAGE_NAME,
+        expected_package_version=PACKAGE_VERSION,
+        require_empty_target=True,
+    )
+    marker = legacy_vendor / "legacy-marker.txt"
+    marker.write_text("keep-me", encoding="utf-8")
+    prior_vendor_bytes = marker.read_bytes()
+
+    from agentveil_mcp_proxy.paid_provider import (
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP,
+        INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME,
+        PAID_PROVIDER_ENTRYPOINT_GROUP,
+    )
+
+    base_module = COMPOSED_BASE_PACKAGE_NAME.replace("-", "_")
+    handoff_source = """
+def run_activation_handoff(request):
+    return {
+        "contract_version": "1",
+        "status": "active",
+        "public_fallback_available": True,
+        "summary": "Installed hook completed.",
+        "error_code": None,
+    }
+"""
+    base_wheel_path, base_hash = _build_composed_base_wheel(
+        tmp_path / "wheel-base",
+        extra_entries={
+            f"{base_module}/handoff_hook.py": handoff_source,
+            f"{base_module}-{COMPOSED_BASE_PACKAGE_VERSION}.dist-info/entry_points.txt": (
+                f"[{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_GROUP}]\n"
+                f"{INSTALLED_PROVIDER_ACTIVATION_HANDOFF_ENTRYPOINT_NAME} = "
+                f"{base_module}.handoff_hook:run_activation_handoff\n\n"
+                f"[{PAID_PROVIDER_ENTRYPOINT_GROUP}]\n"
+                f"private_v1 = {base_module}.vendored_provider:build_vendored_provider\n"
+            ),
+        },
+    )
+    thin_wheel_path, thin_hash = _build_composed_thin_wheel(tmp_path / "wheel-thin")
+    base_bytes = base_wheel_path.read_bytes()
+    thin_bytes = thin_wheel_path.read_bytes()
+
+    original_install = paid_install_module.install_wheel_to_vendor
+    install_calls = {"count": 0}
+
+    def fail_on_second_install(**kwargs):  # noqa: ANN003
+        install_calls["count"] += 1
+        if install_calls["count"] == 2:
+            raise PaidInstallError(ERROR_INSTALL_FAILED, exit_code=1)
+        return original_install(**kwargs)
+
+    monkeypatch.setattr(paid_install_module, "install_wheel_to_vendor", fail_on_second_install)
+    with pytest.raises(FreeBuilderInstallError):
+        run_free_builder_paired_install_flow(
+            base_wheel_bytes=base_bytes,
+            thin_wheel_bytes=thin_bytes,
+            home=home,
+            activation_credential=RAW_LICENSE_KEY,
+            base_expectations=FreeBuilderWheelExpectations(
+                artifact_hash=base_hash,
+                artifact_size_bytes=len(base_bytes),
+                package_name=COMPOSED_BASE_PACKAGE_NAME,
+                package_version=COMPOSED_BASE_PACKAGE_VERSION,
+            ),
+            thin_expectations=FreeBuilderWheelExpectations(
+                artifact_hash=thin_hash,
+                artifact_size_bytes=len(thin_bytes),
+                package_name=THIN_PACKAGE_NAME,
+                package_version=COMPOSED_THIN_PACKAGE_VERSION,
+            ),
+        )
+    assert marker.read_bytes() == prior_vendor_bytes
+    assert not install_state_path(home).exists()
+    assert not (vendor_root(home) / f"{COMPOSED_BASE_PACKAGE_NAME}-{COMPOSED_BASE_PACKAGE_VERSION}").exists()
+    assert not (vendor_root(home) / f"{THIN_PACKAGE_NAME}-{COMPOSED_THIN_PACKAGE_VERSION}").exists()
+    assert list(vendor_root(home).glob(".staging-*")) == []
+    assert list((home / "paid" / "cache").glob(".staging-*")) == []
+    _assert_no_paid_leaks(marker.read_text(encoding="utf-8"))
