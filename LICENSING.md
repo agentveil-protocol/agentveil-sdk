@@ -36,6 +36,13 @@ commercial risk scoring, billing, private customer integrations, and other
 AgentVeil commercial control-plane services are not included in the MIT SDK
 license unless explicitly stated in a separate written license.
 
+Public CLI code may include clients for pairing, hosted summary reporting and
+conditional provider delivery. That client code does not include the hosted
+service implementation or grant a workspace entitlement. A software license,
+Console access and an additional provider's availability are separate matters;
+see the [package scope](packages/agentveil-mcp-proxy/README.md#connect-to-agentveil-console-optional)
+and [plans and pricing](https://agentveil.dev/#pricing).
+
 ## Packaging Boundary
 
 The `agentveil` PyPI package is MIT licensed and must not ship the

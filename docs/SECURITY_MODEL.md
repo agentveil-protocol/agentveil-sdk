@@ -38,6 +38,17 @@ MCP Proxy does not control host shell commands, IDE-native edits, direct git or
 pip commands, or calls made to tools outside the proxy. Actions not routed
 through the proxy are not classified or logged.
 
+Project hook connectors are an additional boundary around supported native agent
+tools. Their coverage depends on the configured project, client hook support,
+required trust/reload steps and an observed working hook. This does not extend
+the Core MCP Proxy's coverage to arbitrary host commands. See
+[connector coverage](../README.md#connectors-available-today).
+
+Console connection status and uploaded summaries are not substitutes for route
+and hook evidence. Pairing, provider installation, workspace entitlement and
+policy activation are separate checks; see the
+[package scope](../packages/agentveil-mcp-proxy/README.md#connect-to-agentveil-console-optional).
+
 ## Boundary Patterns
 
 Credential custody, egress boundaries, and API gates are stronger boundary

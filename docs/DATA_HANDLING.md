@@ -21,6 +21,25 @@ Lurkr, the separate pre-runtime scanner, is also local-only: it does not upload
 source code, scan reports, findings, or usage telemetry to AgentVeil and does
 not make network calls during scan.
 
+Console-connected setup/status is not a purely local inspection: it can attempt
+browser pairing and contact hosted services, and eligible workspaces can receive
+an additional local provider package. Those network/install paths are distinct
+from the local evidence store. See the
+[package Console scope](../packages/agentveil-mcp-proxy/README.md#connect-to-agentveil-console-optional).
+
+The reporting channels have different content boundaries:
+
+| Channel | What crosses the boundary | When |
+|---|---|---|
+| Local evidence and offline verification | Local artifacts are read or written; offline verification does not upload the bundle. | Local inspection/export/verification commands. |
+| Routed Runtime Gate decisions | Privacy-filtered action metadata, resource/payload hashes and policy context. | A routed decision requires the configured backend. |
+| Console reporting | Bounded project connection and decision/approval summaries, including local provider status; not raw prompts, source code or file contents in this summary flow. | Accepted pairing credential plus the relevant connection or action-reporting path. |
+| Console pairing and provider delivery | Pairing/credential requests, eligibility requests and provider package download. | Setup/status or explicit login as described in the package scope; installation is eligibility-dependent. |
+| Direct hosted SDK/API and support workflows | User-supplied content or execution parameters may be processed as workflow input. | The caller invokes that hosted content workflow; see Hosted Content Surfaces below. |
+
+Do not extend the privacy properties of one row to every AgentVeil API or to an
+unrelated downstream server's own data handling.
+
 ## Hosted AgentVeil Ledger
 
 Runtime Gate, receipts, approvals, delegation, reputation, governance, and audit
