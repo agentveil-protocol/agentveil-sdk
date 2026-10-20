@@ -78,6 +78,11 @@ Use AgentVeil with a supported project connector, or run the Core MCP Proxy dire
 
 ### Start from the Console
 
+**Access:** AgentVeil Solo is available through a free trial and a paid
+subscription. See [plans and access terms](https://agentveil.dev/#pricing).
+The public SDK and MCP Proxy are software components distributed under their
+respective licenses.
+
 Sign in at [agentveil.dev/console/auth](https://agentveil.dev/console/auth)
 with GitHub or Google, pick your agent, and run the command the Console shows.
 The same commands are listed below for each connector.
