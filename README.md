@@ -11,12 +11,9 @@
 [![Proxy License: BUSL-1.1](https://img.shields.io/badge/Proxy-BUSL--1.1-orange)](LICENSING.md)
 [![Glama MCP Directory](https://img.shields.io/badge/Glama-MCP%20Directory-blue)](https://glama.ai/mcp/servers/agentveil-protocol/avp-sdk)
 
-**The risk isn't what AI says. It's what AI does.**
+**Stop risky AI agent actions. Not the work.**
 
-AgentVeil is an independent action-control layer for AI agents and MCP tools.
-It works alongside agent runtimes such as Cursor, Claude Code, Codex, Gemini
-CLI, and Hermes CLI: attempt, decision, controlled path when available, local
-proof.
+Independent AI agent security. For supported actions on configured routes, risky actions get a safe alternative or your approval before they run, so the task still gets done. Works with Cursor, Claude Code, Codex, Gemini CLI, Hermes CLI, and MCP tools.
 
 [Quick Start](#quick-start) · [Console](#start-from-the-console) · [The Loop](#the-agentveil-loop) · [Connectors](#connectors-available-today) · [Evidence](#bounded-evidence) · [Scope](#scope) · [Design Basis](#design-basis) · [Docs](docs/)
 
