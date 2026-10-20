@@ -21,6 +21,9 @@ The Business Source License 1.1 limits offering this package, or a modified
 version, as a competing hosted or embedded service. See [`LICENSE`](LICENSE)
 for the complete Additional Use Grant.
 
+These license permissions apply to the public software component. They do not
+include access to Solo's private capabilities or hosted services.
+
 ## Scope
 
 AgentVeil control is scoped to configured project connectors and routed MCP
@@ -179,6 +182,8 @@ agentveil-mcp-proxy events show --last
 ```
 
 ### Core MCP Proxy
+
+"Core MCP Proxy" refers to the manual MCP routing path.
 
 This is the manual route for an MCP client or downstream server; it is not an
 extra setup step for project connector users. For registration, backend readiness
