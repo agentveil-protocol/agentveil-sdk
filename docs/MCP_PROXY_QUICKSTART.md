@@ -1,11 +1,21 @@
 # MCP Proxy Quickstart
 
-This is the cold customer path for wrapping one downstream MCP server with the
-AgentVeil MCP Proxy and producing an evidence bundle that is verifiable offline
-in strict/proof-grade mode with an externally pinned signer DID. Every
-step describes behavior that is implemented and locally verifiable. Anything
-this quickstart does not cover yet is listed under
+This guide is the manual Core MCP Proxy path for wrapping one downstream MCP
+server and producing an evidence bundle for offline verification with an
+externally pinned signer DID. It is intended for operators configuring a
+specific downstream, identity and backend. For ordinary project connector setup,
+start with the [Console and connector instructions](../README.md#start-from-the-console);
+do not repeat this manual sequence on top of an existing connector setup unless
+that is the intended configuration.
+
+Follow the steps in order for a new manual route. Completing an individual step
+does not establish the end-to-end result. The evidence limits are listed under
 [What this quickstart does NOT prove](#what-this-quickstart-does-not-prove).
+
+Console pairing is distinct from `register`: pairing connects the machine to
+Console reporting, while `register` registers the proxy identity with its configured
+backend. Console-integrated connector setup/status can also attempt an eligible
+provider installation; see the [package scope](../packages/agentveil-mcp-proxy/README.md#connect-to-agentveil-console-optional).
 
 For day-2 operations, headless mode, multi-IDE deployment, evidence vacuum, and
 identity migration, see [`MCP_PROXY_OPERATIONS.md`](MCP_PROXY_OPERATIONS.md).

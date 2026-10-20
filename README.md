@@ -13,7 +13,7 @@
 
 **Stop risky AI agent actions. Not the work.**
 
-Independent AI agent security. For supported actions on configured routes, risky actions get a safe alternative or your approval before they run, so the task still gets done. Works with Cursor, Claude Code, Codex, Gemini CLI, Hermes CLI, and MCP tools.
+Independent AI agent security. On configured routes, AgentVeil checks supported actions and applies policy: allow, request approval, provide redirect guidance to a controlled path, or block. Safe alternatives require an available controlled path. Works with Cursor, Claude Code, Codex, Gemini CLI, Hermes CLI, and MCP tools.
 
 [Quick Start](#quick-start) · [Console](#start-from-the-console) · [The Loop](#the-agentveil-loop) · [Connectors](#connectors-available-today) · [Evidence](#bounded-evidence) · [Scope](#scope) · [Design Basis](#design-basis) · [Docs](docs/)
 
@@ -23,7 +23,7 @@ Independent AI agent security. For supported actions on configured routes, risky
 pip install agentveil-mcp-proxy
 ```
 
-**Packages**: [agentveil-mcp-proxy](https://pypi.org/project/agentveil-mcp-proxy/) · [agentveil](https://pypi.org/project/agentveil/) | **Website**: [agentveil.dev](https://agentveil.dev) | **Console**: [agentveil.dev/console](https://agentveil.dev/console/auth) | **Package source**: [`packages/agentveil-mcp-proxy/`](packages/agentveil-mcp-proxy/)
+**Packages**: [agentveil-mcp-proxy](https://pypi.org/project/agentveil-mcp-proxy/) · [agentveil](https://pypi.org/project/agentveil/) | **Website**: [agentveil.dev](https://agentveil.dev) | **Console**: [agentveil.dev/console](https://agentveil.dev/console/auth) | **Plans**: [agentveil.dev/#pricing](https://agentveil.dev/#pricing) | **Package source**: [`packages/agentveil-mcp-proxy/`](packages/agentveil-mcp-proxy/)
 
 > **Agent action boundary:** AI runtimes execute agents. AgentVeil mediates
 > configured action paths around them. When a native or risky action hits the
@@ -55,7 +55,8 @@ AgentVeil is one product loop, not a pile of separate components:
 Approval fixes actions that need human review. Redirect tells the agent to
 retry through the controlled MCP route when one is available. Hard-block means
 approval will not help for that action. Local proof is available now through
-the CLI—not a future dashboard page.
+the CLI. Console summaries complement those local records; they do not replace
+local evidence export or offline verification.
 
 ## What AgentVeil Adds
 
@@ -85,7 +86,17 @@ When you run a connector's `setup` command, AgentVeil opens the Console in your
 browser so you can approve this machine. The Console then shows what your
 connected projects report: project connection status, decision summaries and
 approval summaries. Raw prompts, source code and file contents stay on your
-machine. Local protection works without the Console.
+machine in this connector-summary flow. This is not a blanket statement about
+content supplied to hosted SDK/API workflows; see [Data Handling](docs/DATA_HANDLING.md).
+Local connector and proxy control do not require Console pairing; backend-backed
+SDK and Runtime Gate workflows have their own service requirements.
+
+Successful connector setup and explicit status checks can also attempt browser
+pairing and, for an eligible Console workspace, download and install an additional
+local provider package. Availability depends on the workspace capability and
+provider checks; installing the public proxy alone does not grant that capability.
+See [the package's Console scope](packages/agentveil-mcp-proxy/README.md#connect-to-agentveil-console-optional)
+for the distinction between pairing, reporting, and provider installation.
 
 If the browser did not open (for example on a headless machine) or you closed
 it, connect later:
@@ -194,7 +205,8 @@ In this profile:
 
 ### Core MCP Proxy path
 
-For lower-level MCP routing without an IDE connector:
+For lower-level MCP routing without an IDE connector (an alternative to the
+connector setup above, not an additional required step after connector setup):
 
 ```bash
 pip install agentveil-mcp-proxy
@@ -204,6 +216,8 @@ agentveil-mcp-proxy run
 ```
 
 This starts the core route: MCP tool calls explicitly pointed at `agentveil-mcp-proxy`.
+For manual identity registration, backend readiness and signer-pinned offline
+verification, follow the [Core MCP Proxy quickstart](docs/MCP_PROXY_QUICKSTART.md).
 
 ### Verify your setup works
 
@@ -248,6 +262,11 @@ runtime-agnostic for MCP clients that are explicitly configured to call it.
 | Hermes CLI profile | AgentVeil launcher + project-local Hermes MCP route | Routed MCP approval/evidence, sandbox boundaries, redirect guidance inside the AgentVeil route | Available |
 | Core MCP Proxy | MCP transport boundary | Routed MCP policy, approval, redirect / policy-stop outcomes, bounded evidence | Available |
 
+Here, **Available** identifies a shipped integration mechanism, not control of
+unlisted client modes or a guarantee that a project's connection is active. Required
+reloads, trust prompts, route configuration and observed hook evidence still
+apply. Check the connector instructions above and local setup status.
+
 The Python SDK also includes framework examples and optional helper modules for
 CrewAI, LangGraph, AutoGen, PydanticAI, OpenAI, Gemini, and AWS Bedrock. Those
 examples are not the same as a project connector: they show how agent workflows
@@ -269,6 +288,13 @@ Current connector checks have been run with:
 | Gemini CLI | 0.49.0 folder trust path |
 | Hermes CLI | live controlled MCP route path |
 | Python package metadata | Python 3.10-3.13 |
+
+Compatibility is scoped to the versions and client paths listed here. It does
+not establish support for other client modes or later releases. Python metadata
+states the declared interpreter range; runtime checks remain environment-specific.
+Where a row omits an exact version
+or check date, it is not a version-pinned compatibility guarantee. For project
+readiness, use the connector-specific instructions and local status.
 
 Other versions may work, but are not listed here until verified.
 
@@ -382,6 +408,14 @@ agentveil-mcp-proxy setup remove gemini-cli --yes
 
 ## Scope
 
+| Component | Availability and boundary |
+|---|---|
+| Public local packages | Project connectors, explicitly routed MCP calls and local evidence; Console pairing is optional. Backend-backed flows still need the configured backend. |
+| Hosted Console | Device pairing and bounded connection/decision/approval summaries; visibility depends on what the connected project reports. |
+| Additional local provider capabilities | Separate package, workspace eligibility and activation checks; they are not granted by installing the public proxy. See the [package scope](packages/agentveil-mcp-proxy/README.md#connect-to-agentveil-console-optional). |
+| SDK primitives | APIs and examples for application-owned integrations, distinct from ready-to-use project connectors. |
+| Preview / design-partner flows | The limited-release patterns listed below; they are not general public connector coverage. |
+
 Available today:
 
 - MCP Proxy for routed MCP tool calls;
@@ -414,7 +448,9 @@ Not included in the public connector:
 - global Cursor / Claude / Codex / Gemini / Hermes lock;
 - automatic control of unrelated chats;
 - private enterprise policy packs;
-- hosted auth, licensing, telemetry, or enterprise custody logic.
+- hosted service implementations for auth, licensing, telemetry, or enterprise
+  custody. Public clients may still contain pairing, summary upload and provider
+  installation code; this exclusion concerns the hosted implementation.
 
 ## Example Risk Patterns
 
@@ -492,6 +528,12 @@ Security-sensitive reports should not include secrets, raw credentials, private 
 The root SDK is MIT-licensed.
 
 `agentveil-mcp-proxy` is a separately packaged source-available component under BUSL-1.1. See [Licensing](LICENSING.md) before using it in commercial or competing hosted services.
+
+**Hosted Console and plans.** Local connector and proxy control do not require
+Console pairing. Hosted services and additional capabilities have their own
+availability and terms; see [plans and pricing](https://agentveil.dev/#pricing).
+A software license describes rights to the package, not a hosted subscription
+or entitlement.
 
 ## Python SDK and advanced protocol primitives
 

@@ -93,6 +93,13 @@ SDK is installed as a dependency.
 
 ## Quick Start
 
+Choose one connector below, or use the Core MCP Proxy path for manual downstream
+routing. Console pairing and eligible provider installation can be attempted by
+successful setup and explicit status commands; read
+[Connect To AgentVeil Console](#connect-to-agentveil-console-optional) for the
+network and installation scope. Local connector/proxy control does not require
+Console pairing; backend-backed actions retain their backend requirements.
+
 ### Cursor project connector
 
 ```bash
@@ -172,6 +179,11 @@ agentveil-mcp-proxy events show --last
 ```
 
 ### Core MCP Proxy
+
+This is the manual route for an MCP client or downstream server; it is not an
+extra setup step for project connector users. For registration, backend readiness
+and signer-pinned offline verification, see the
+[full Core MCP Proxy quickstart](../../docs/MCP_PROXY_QUICKSTART.md).
 
 Create a local proxy identity, config, and control grant:
 
@@ -274,9 +286,11 @@ agentveil-mcp-proxy export-evidence ./bundle.json
 agentveil-mcp-proxy verify ./bundle.json --trusted-signer-did did:key:...
 ```
 
-Raw MCP arguments, prompts, outputs, tokens, source code, secrets, and private
-logs remain local by default. Runtime decisions should use bounded metadata and
-hashes. See [Data Handling](../../docs/DATA_HANDLING.md).
+For the routed MCP privacy path, local evidence omits raw MCP arguments and
+content by default; decision requests use privacy-filtered metadata and hashes.
+Console summary upload is a separate bounded reporting channel. Content supplied
+to direct hosted SDK/API workflows has a different boundary; do not describe
+those workflows as metadata-only. See [Data Handling](../../docs/DATA_HANDLING.md).
 
 ## Built-In Policy Packs
 
@@ -299,6 +313,7 @@ for your specific downstream server.
 | `login` | Connect this machine to the optional AgentVeil Console via device pairing. |
 | `logout` | Revoke the Console device token and remove the local credential. |
 | `init` | Create encrypted identity, config, and control grant. |
+| `upgrade-ca-policy` | Preview filesystem CA policy additions; applying requires `--apply` and the expected config hash. It does not activate an unavailable provider. |
 | `init --quickstart-filesystem <path>` | Configure the built-in filesystem downstream for local first run. |
 | `doctor` | Validate local files and control grant. |
 | `doctor --full` | Launch downstream and verify MCP `initialize` / `tools/list`. |
@@ -337,28 +352,48 @@ device token locally at `~/.avp/console/device-token.json` with owner-only
 `0600` permissions. `logout` revokes that token with the Console and removes the
 local file.
 
-Connecting to Console is optional. It does not activate paid, Team, policy, or
-project-sync features, and it does not change how routed MCP calls or project
-connectors are controlled locally. The stored token grants only the
-`bounded_summary_upload` scope.
+Console pairing is optional for local connector/proxy control. The device token
+grants the `bounded_summary_upload` scope; pairing is not a general Team,
+billing or administration credential, and the token scope alone does not grant
+a paid capability.
 
-After `login`, successful project connector setup and explicit `setup status`
-for Codex, Claude Code, Cursor, or Gemini CLI may send one bounded project
-connection summary to the Console. The upload includes a bounded local report
-field, `private_guardrails_status`, with one of `active`, `inactive`, or
-`unavailable`. That value reflects only the installed local paid provider state;
-it does not grant entitlement. Console combines this report with server-owned
-workspace capability before showing `Active`. Without a stored credential this
-step is a silent no-op: no network request, no provider discovery, and no extra
-CLI output. Boundary: the upload is best-effort and isolated from local setup;
-Console rejection or outage does not change setup results, exit codes, connector
-files, or Approval Center behavior.
+**Pairing and reporting.** Successful connector setup and explicit `setup status`
+for Codex, Claude Code, Cursor or Gemini CLI can attempt browser-session pairing
+when no credential is stored. Status sync can also attempt to repair a rejected
+credential through pairing. These paths may therefore open the browser or
+contact Console before a stored credential is available; they are not an
+unconditional offline no-op.
+
+With an accepted credential, the project-status client can send a bounded
+project connection summary. Separate decision and approval summary clients
+provide bounded action reporting; these are distinct reporting paths.
+The `private_guardrails_status` field reports local provider state as `active`,
+`inactive` or `unavailable`; it does not grant entitlement. Console also uses
+server-owned workspace capability when presenting availability.
+
+**Conditional provider installation.** Successful connector setup and explicit
+status paths also contain a best-effort provider-install flow. It checks the
+Console credential, installed provider state and backend workspace eligibility.
+If eligible, it downloads a provider wheel and invokes its installation and
+activation flow. Installing the public proxy or holding a summary-upload token
+does not by itself establish eligibility. This is a separate local package
+installation, not just a summary upload. Saved filesystem CA rules still require
+the explicit policy-upgrade path described above.
+
+**Failure boundary.** Console sync and conditional installation are best-effort.
+Their failure is not evidence that a capability is active, and an uploaded
+summary is not proof of installation. Check local provider and connector status.
+Backend-backed Runtime Gate actions retain their own availability requirements.
+
+For the data-channel distinctions, see [Data Handling](../../docs/DATA_HANDLING.md).
 
 ## Relationship To AgentVeil
 
 `agentveil-mcp-proxy` is the public package for AgentVeil project connectors
 and the routed MCP action-control path. The root `agentveil` SDK contains
 identity, delegation, Runtime Gate client helpers, receipt helpers, and
-framework adapters.
+framework adapters. Local package licensing, hosted Console access and workspace
+capabilities are separate boundaries; see [Licensing](../../LICENSING.md) and
+[plans and pricing](https://agentveil.dev/#pricing).
 
 [ops-passphrase]: ../../docs/MCP_PROXY_OPERATIONS.md#security-trade-offs-by-passphrase-source

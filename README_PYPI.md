@@ -14,7 +14,15 @@ pip install agentveil-mcp-proxy
 
 ## Quick Start
 
-Route MCP tool calls through AgentVeil:
+For a project connector, start at the [Console](https://agentveil.dev/console/auth)
+and follow the command for your agent, or use the
+[connector instructions](https://github.com/agentveil-protocol/agentveil-sdk#start-from-the-console).
+Console pairing is optional for local connector/proxy control. Connector
+setup/status can also attempt browser pairing and, for eligible workspaces,
+install an additional provider; see the
+[package scope](https://github.com/agentveil-protocol/agentveil-sdk/blob/main/packages/agentveil-mcp-proxy/README.md#connect-to-agentveil-console-optional).
+
+For manual routing of one downstream MCP server, use the Core MCP Proxy path:
 
 ```bash
 pip install agentveil-mcp-proxy
@@ -26,7 +34,12 @@ agentveil-mcp-proxy run
 MCP Proxy gates only tool calls routed through the proxy. It does not control
 host shell, IDE-native edits, direct git/pip commands, or other actions that
 bypass the proxy. Actions not routed through AgentVeil are not classified or
-logged.
+logged by that proxy. Project hooks add only their documented native-tool coverage.
+Backend-backed actions still require the configured service; see the
+[manual quickstart](https://github.com/agentveil-protocol/agentveil-sdk/blob/main/docs/MCP_PROXY_QUICKSTART.md).
+
+Console summaries and direct hosted SDK/API calls have different data boundaries;
+see [Data Handling](https://github.com/agentveil-protocol/agentveil-sdk/blob/main/docs/DATA_HANDLING.md).
 
 ## Python SDK and advanced protocol primitives
 
@@ -81,3 +94,5 @@ print("scope:", verification["scope"][0]["value"])
 The `agentveil` package is MIT licensed. The separate `agentveil-mcp-proxy`
 package is source-available under Business Source License 1.1. See the
 [licensing boundary](https://github.com/agentveil-protocol/agentveil-sdk/blob/main/LICENSING.md).
+Hosted Console and additional capabilities have separate availability and terms;
+see [plans and pricing](https://agentveil.dev/#pricing).
