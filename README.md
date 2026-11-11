@@ -23,7 +23,7 @@ Independent AI agent security. On configured routes, AgentVeil checks supported 
 pip install agentveil-mcp-proxy
 ```
 
-**Packages**: [agentveil-mcp-proxy](https://pypi.org/project/agentveil-mcp-proxy/) · [agentveil](https://pypi.org/project/agentveil/) | **Website**: [agentveil.dev](https://agentveil.dev) | **Console**: [agentveil.dev/console](https://agentveil.dev/console/auth) | **Plans**: [agentveil.dev/#pricing](https://agentveil.dev/#pricing) | **Package source**: [`packages/agentveil-mcp-proxy/`](packages/agentveil-mcp-proxy/)
+**Packages**: [agentveil-mcp-proxy](https://pypi.org/project/agentveil-mcp-proxy/) · [agentveil](https://pypi.org/project/agentveil/) | **Website**: [agentveil.dev](https://agentveil.dev) | **Console**: [agentveil.dev/console](https://agentveil.dev/console/auth) (early access) | **Plans**: [agentveil.dev/#pricing](https://agentveil.dev/#pricing) | **Package source**: [`packages/agentveil-mcp-proxy/`](packages/agentveil-mcp-proxy/)
 
 > **Agent action boundary:** AI runtimes execute agents. AgentVeil mediates
 > configured action paths around them. When a native or risky action hits the
@@ -83,7 +83,7 @@ subscription. See [plans and access terms](https://agentveil.dev/#pricing).
 The public SDK and MCP Proxy are software components distributed under their
 respective licenses.
 
-Sign in at [agentveil.dev/console/auth](https://agentveil.dev/console/auth)
+Sign in at [agentveil.dev/console/auth](https://agentveil.dev/console/auth) (early access)
 with GitHub or Google, pick your agent, and run the command the Console shows.
 The same commands are listed below for each connector.
 
